@@ -28,7 +28,16 @@ def load_state(state_file: Path) -> dict:
         return dict(DEFAULT_STATE)
     try:
         data = json.loads(state_file.read_text(encoding="utf-8"))
-        return {**DEFAULT_STATE, **data}
+        merged = {**DEFAULT_STATE, **data}
+
+        # Backward-compatible migration from legacy boolean flags.
+        if merged.get("cron_schedule_mode") is None:
+            if merged.get("cron_set_30m_for_zero_balance"):
+                merged["cron_schedule_mode"] = "30m"
+            elif merged.get("cron_set_2m_for_positive_balance"):
+                merged["cron_schedule_mode"] = "2m"
+
+        return merged
     except (json.JSONDecodeError, OSError):
         log.warning("Could not read state file %s, starting fresh.", state_file)
         return dict(DEFAULT_STATE)
