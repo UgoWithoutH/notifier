@@ -30,6 +30,11 @@ jobs:
       - name: Install Python dependencies
         run: pip install -r requirements.txt
 
+      - name: Remove broken third-party apt repos (Azure CLI / Microsoft)
+        run: |
+          sudo rm -f /etc/apt/sources.list.d/azure-cli.list /etc/apt/sources.list.d/microsoft-prod.list
+          sudo apt-get update || true
+
       - name: Cache Playwright browsers
         uses: actions/cache@v4
         id: playwright-cache
