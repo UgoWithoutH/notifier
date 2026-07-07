@@ -17,7 +17,7 @@ concurrency:
 
 jobs:
   monitor:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -32,8 +32,19 @@ jobs:
 
       - name: Remove broken third-party apt repos (Azure CLI / Microsoft)
         run: |
-          sudo rm -f /etc/apt/sources.list.d/azure-cli.list /etc/apt/sources.list.d/microsoft-prod.list
-          sudo apt-get update || true
+          echo "Before cleanup:" 
+          sudo ls -la /etc/apt/sources.list.d || true
+          sudo grep -RinE "packages\.microsoft\.com|azure-cli" /etc/apt/sources.list /etc/apt/sources.list.d || true
+
+          # GitHub runner images can ship these repos as either .list or .sources.
+          sudo find /etc/apt/sources.list.d -maxdepth 1 -type f \( -name "*microsoft*" -o -name "*azure*" \) -print -delete || true
+          sudo sed -i '/packages.microsoft.com/d;/azure-cli/d' /etc/apt/sources.list || true
+
+          echo "After cleanup:" 
+          sudo ls -la /etc/apt/sources.list.d || true
+          sudo grep -RinE "packages\.microsoft\.com|azure-cli" /etc/apt/sources.list /etc/apt/sources.list.d || true
+
+          sudo apt-get update
 
       - name: Cache Playwright browsers
         uses: actions/cache@v4
@@ -65,6 +76,9 @@ jobs:
           SWAPER_EMAIL: ${{ secrets.SWAPER_EMAIL }}
           SWAPER_PASSWORD: ${{ secrets.SWAPER_PASSWORD }}
           SWAPER_TOTP_SECRET: ${{ secrets.SWAPER_TOTP_SECRET }}
+          CRON_JOB_API_KEY: ${{ secrets.CRON_JOB_API_KEY }}
+          CRON_JOB_ID: ${{ secrets.CRON_JOB_ID }}
+          CRON_JOB_TIMEZONE: ${{ secrets.CRON_JOB_TIMEZONE }}
           SMTP_HOST: ${{ secrets.SMTP_HOST }}
           SMTP_PORT: ${{ secrets.SMTP_PORT }}
           SMTP_USER: ${{ secrets.SMTP_USER }}

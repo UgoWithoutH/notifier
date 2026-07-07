@@ -24,6 +24,8 @@ import random
 import sys
 import time
 import logging
+import json
+from urllib import request, error
 from pathlib import Path
 
 import pyotp
@@ -46,6 +48,11 @@ SCREENSHOT_ON_ERROR = Path(__file__).parent / "error_screenshot.png"
 SWAPER_EMAIL = os.environ.get("SWAPER_EMAIL")
 SWAPER_PASSWORD = os.environ.get("SWAPER_PASSWORD")
 SWAPER_TOTP_SECRET = os.environ.get("SWAPER_TOTP_SECRET")
+CRON_JOB_API_KEY = os.environ.get("CRON_JOB_API_KEY")
+CRON_JOB_ID = os.environ.get("CRON_JOB_ID")
+CRON_JOB_TIMEZONE = os.environ.get("CRON_JOB_TIMEZONE", "UTC")
+EVERY_30_MINUTES = [0, 30]
+EVERY_2_MINUTES = list(range(0, 60, 2))
 
 # A small pool of realistic, current desktop Chrome UA/viewport combos - the
 # default Playwright/Chromium UA advertises "HeadlessChrome" (or a mismatched
@@ -261,6 +268,104 @@ def extract_balance(payload) -> float:
     return 0.0
 
 
+def set_cron_to_every_30_minutes() -> bool:
+    """Patch cron-job.org schedule to run at minute 0 and 30 each hour."""
+    if not CRON_JOB_API_KEY or not CRON_JOB_ID:
+        log.info("CRON_JOB_API_KEY or CRON_JOB_ID missing, skipping cron-job.org update.")
+        return False
+
+    endpoint = f"https://api.cron-job.org/jobs/{CRON_JOB_ID}"
+    payload = {
+        "job": {
+            "schedule": {
+                "timezone": CRON_JOB_TIMEZONE,
+                "minutes": EVERY_30_MINUTES,
+            }
+        }
+    }
+    req = request.Request(
+        endpoint,
+        method="PATCH",
+        data=json.dumps(payload).encode("utf-8"),
+        headers={
+            "Authorization": f"Bearer {CRON_JOB_API_KEY}",
+            "Content-Type": "application/json",
+        },
+    )
+
+    try:
+        with request.urlopen(req, timeout=20) as resp:
+            if 200 <= resp.status < 300:
+                log.info("cron-job.org schedule set to every 30 minutes.")
+                return True
+            log.warning("cron-job.org update returned unexpected HTTP status %s.", resp.status)
+            return False
+    except error.HTTPError as exc:
+        details = ""
+        try:
+            details = exc.read().decode("utf-8", errors="ignore")
+        except Exception:
+            pass
+        log.warning(
+            "cron-job.org update failed (HTTP %s). Response: %s",
+            exc.code,
+            details[:400],
+        )
+    except Exception:
+        log.exception("cron-job.org update failed.")
+
+    return False
+
+
+def set_cron_to_every_2_minutes() -> bool:
+    """Patch cron-job.org schedule to run every 2 minutes."""
+    if not CRON_JOB_API_KEY or not CRON_JOB_ID:
+        log.info("CRON_JOB_API_KEY or CRON_JOB_ID missing, skipping cron-job.org update.")
+        return False
+
+    endpoint = f"https://api.cron-job.org/jobs/{CRON_JOB_ID}"
+    payload = {
+        "job": {
+            "schedule": {
+                "timezone": CRON_JOB_TIMEZONE,
+                "minutes": EVERY_2_MINUTES,
+            }
+        }
+    }
+    req = request.Request(
+        endpoint,
+        method="PATCH",
+        data=json.dumps(payload).encode("utf-8"),
+        headers={
+            "Authorization": f"Bearer {CRON_JOB_API_KEY}",
+            "Content-Type": "application/json",
+        },
+    )
+
+    try:
+        with request.urlopen(req, timeout=20) as resp:
+            if 200 <= resp.status < 300:
+                log.info("cron-job.org schedule set to every 2 minutes.")
+                return True
+            log.warning("cron-job.org update returned unexpected HTTP status %s.", resp.status)
+            return False
+    except error.HTTPError as exc:
+        details = ""
+        try:
+            details = exc.read().decode("utf-8", errors="ignore")
+        except Exception:
+            pass
+        log.warning(
+            "cron-job.org update failed (HTTP %s). Response: %s",
+            exc.code,
+            details[:400],
+        )
+    except Exception:
+        log.exception("cron-job.org update failed.")
+
+    return False
+
+
 def redact_sensitive_fields(page) -> None:
     """Blank out credential/2FA-code/account-balance-looking fields before a
     debug screenshot is taken, so the uploaded artifact can't leak the
@@ -346,13 +451,42 @@ def run(headless: bool = True) -> None:
         log.info("FORCE_TEST_EMAIL is set - sending a forced test recap email.")
         send_email(balance, loans)
 
+    current_cron_mode = state.get("cron_schedule_mode")
+    target_cron_mode = "30m" if balance <= 0 else "2m"
+    log.info(
+        "Cron decision context: balance=%.2f, current_mode=%s, target_mode=%s",
+        balance,
+        current_cron_mode,
+        target_cron_mode,
+    )
+
     if balance <= 0:
+        if current_cron_mode != "30m":
+            log.info("Cron decision: UPDATE requested (from=%s to=30m).", current_cron_mode)
+            if set_cron_to_every_30_minutes():
+                state["cron_schedule_mode"] = "30m"
+                log.info("Cron decision: UPDATE success (new_mode=30m).")
+            else:
+                log.warning("Cron decision: UPDATE failed (target_mode=30m).")
+        else:
+            log.info("Cron already marked as 30m in local state, skipping update.")
+
         if state.get("notified_for_positive_cycle"):
             log.info("Balance back to 0 - resetting notification gate for the next positive cycle.")
         state["notified_for_positive_cycle"] = False
         state["cycle_balance_marker"] = None
         log.info("Balance is 0 (or unavailable), nothing to notify.")
     else:
+        if current_cron_mode != "2m":
+            log.info("Cron decision: UPDATE requested (from=%s to=2m).", current_cron_mode)
+            if set_cron_to_every_2_minutes():
+                state["cron_schedule_mode"] = "2m"
+                log.info("Cron decision: UPDATE success (new_mode=2m).")
+            else:
+                log.warning("Cron decision: UPDATE failed (target_mode=2m).")
+        else:
+            log.info("Cron already marked as 2m in local state, skipping update.")
+
         rounded_balance = round(balance, 2)
         previous_marker = state.get("cycle_balance_marker")
         balance_changed = previous_marker != rounded_balance

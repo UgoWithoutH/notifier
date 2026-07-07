@@ -19,6 +19,7 @@ log = logging.getLogger("swaper_monitor")
 DEFAULT_STATE = {
     "notified_for_positive_cycle": False,
     "cycle_balance_marker": None,
+    "cron_schedule_mode": None,
 }
 
 
