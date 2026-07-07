@@ -1,4 +1,4 @@
-name: Swaper Loan Monitor
+name: Notifier Monitor
 
 on:
   schedule:
