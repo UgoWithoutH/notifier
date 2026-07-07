@@ -1,8 +1,6 @@
 name: Notifier Monitor
 
 on:
-  schedule:
-    - cron: '*/15 * * * *'
   workflow_dispatch:
     inputs:
       force_test_email:
@@ -12,6 +10,10 @@ on:
 
 permissions:
   contents: read
+
+concurrency:
+  group: swaper-monitor
+  cancel-in-progress: false
 
 jobs:
   monitor:
