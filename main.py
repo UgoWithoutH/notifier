@@ -47,6 +47,92 @@ SWAPER_EMAIL = os.environ.get("SWAPER_EMAIL")
 SWAPER_PASSWORD = os.environ.get("SWAPER_PASSWORD")
 SWAPER_TOTP_SECRET = os.environ.get("SWAPER_TOTP_SECRET")
 
+# A small pool of realistic, current desktop Chrome UA/viewport combos - the
+# default Playwright/Chromium UA advertises "HeadlessChrome" (or a mismatched
+# version), one of the easiest bot signals. Picking one combo at random per
+# run (instead of always sending the exact same fingerprint from the same
+# GitHub Actions IP range) makes traffic correlation slightly harder.
+BROWSER_PROFILES = [
+    {
+        "user_agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
+        ),
+        "viewport": {"width": 1366, "height": 768},
+    },
+    {
+        "user_agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"
+        ),
+        "viewport": {"width": 1536, "height": 864},
+    },
+    {
+        "user_agent": (
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
+        ),
+        "viewport": {"width": 1440, "height": 900},
+    },
+    {
+        "user_agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+        ),
+        "viewport": {"width": 1920, "height": 1080},
+    },
+]
+
+# Patched into every page before any site JS runs, to undo the most common
+# "is this a real browser?" checks (navigator.webdriver, empty plugins list,
+# missing chrome.runtime object).
+STEALTH_INIT_SCRIPT = """
+Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'] });
+Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
+window.chrome = window.chrome || { runtime: {} };
+const originalQuery = window.navigator.permissions && window.navigator.permissions.query;
+if (originalQuery) {
+    window.navigator.permissions.query = (parameters) => (
+        parameters.name === 'notifications'
+            ? Promise.resolve({ state: Notification.permission })
+            : originalQuery(parameters)
+    );
+}
+"""
+
+
+def human_pause(min_seconds: float = 0.4, max_seconds: float = 1.2) -> None:
+    """Sleep for a small random duration to avoid the instant, uniformly
+    timed actions that give away scripted (non-human) interactions."""
+    time.sleep(random.uniform(min_seconds, max_seconds))
+
+
+def human_mouse_wander(page, moves: int = None) -> None:
+    """Move the mouse through a few random points and scroll a bit, so the
+    page isn't left completely idle/static the way a script would leave it -
+    some bot-detection scripts specifically watch for the total absence of
+    mousemove/scroll events during a session."""
+    try:
+        viewport = page.viewport_size or {"width": 1280, "height": 720}
+        for _ in range(moves or random.randint(2, 4)):
+            x = random.randint(0, max(viewport["width"] - 1, 1))
+            y = random.randint(0, max(viewport["height"] - 1, 1))
+            page.mouse.move(x, y, steps=random.randint(5, 15))
+            human_pause(0.1, 0.4)
+        page.mouse.wheel(0, random.randint(150, 500))
+    except Exception:
+        pass  # purely cosmetic, never fail the run because of it
+
+
+def human_type(locator, text: str) -> None:
+    """Type into a field one character at a time with randomized per-key
+    delay, instead of `.fill()` which sets the value instantly - an easy
+    signal for behavioral bot detection."""
+    locator.click()
+    for char in text:
+        locator.type(char, delay=random.uniform(60, 180))
+
 
 def handle_two_factor(page) -> None:
     """If Swaper prompts for a Google Authenticator code after submitting
@@ -73,7 +159,8 @@ def handle_two_factor(page) -> None:
 
     log.info("2FA prompt detected, generating and submitting TOTP code...")
     code = pyotp.TOTP(SWAPER_TOTP_SECRET).now()
-    otp_input.fill(code)
+    human_type(otp_input, code)
+    human_pause()
 
     try:
         page.get_by_text("Trust this browser").click(timeout=3000)
@@ -94,6 +181,7 @@ def login(page) -> None:
     """
     log.info("Navigating to login page...")
     page.goto(LOGIN_URL, wait_until="domcontentloaded")
+    human_mouse_wander(page)
 
     # Dismiss the Cookiebot consent banner if it shows up.
     try:
@@ -108,8 +196,10 @@ def login(page) -> None:
         return
 
     log.info("Filling in credentials...")
-    page.locator("input[name='email']").fill(SWAPER_EMAIL)
-    page.locator("input[name='password']").fill(SWAPER_PASSWORD)
+    human_type(page.locator("input[name='email']"), SWAPER_EMAIL)
+    human_pause()
+    human_type(page.locator("input[name='password']"), SWAPER_PASSWORD)
+    human_pause()
     page.locator("div.button.clickable", has_text="Log In").click()
 
     handle_two_factor(page)
@@ -141,6 +231,7 @@ def fetch_loans(page) -> dict:
     response = response_info.value
     if not response.ok:
         raise RuntimeError(f"Loans API returned status {response.status}")
+    human_mouse_wander(page)
     return response.json()
 
 
@@ -205,9 +296,22 @@ def run(headless: bool = True) -> None:
     state = load_state(STATE_FILE)
 
     with sync_playwright() as p:
-        browser = p.chromium.launch(headless=headless)
+        browser = p.chromium.launch(
+            headless=headless,
+            args=[
+                "--disable-blink-features=AutomationControlled",
+            ],
+        )
         storage_state = str(STORAGE_STATE_FILE) if STORAGE_STATE_FILE.exists() else None
-        context = browser.new_context(storage_state=storage_state)
+        profile = random.choice(BROWSER_PROFILES)
+        context = browser.new_context(
+            storage_state=storage_state,
+            user_agent=profile["user_agent"],
+            viewport=profile["viewport"],
+            locale="en-US",
+            timezone_id="Europe/Paris",
+        )
+        context.add_init_script(STEALTH_INIT_SCRIPT)
         page = context.new_page()
 
         try:
