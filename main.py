@@ -232,7 +232,7 @@ def run(headless: bool = True) -> None:
     loans = extract_loans(payload)
     balance = extract_balance(payload)
 
-    log.info("Balance: %.2f EUR, %d loan(s) available.", balance, len(loans))
+    log.info("Balance %s, %d loan(s) available.", "positive" if balance > 0 else "zero/unavailable", len(loans))
 
     if balance <= 0:
         if state.get("seen_loan_ids"):
@@ -247,8 +247,8 @@ def run(headless: bool = True) -> None:
 
         if new_loans:
             log.info(
-                "Balance %.2f EUR + %d new loan(s) since last notification - sending notification email.",
-                balance, len(new_loans),
+                "Balance positive + %d new loan(s) since last notification - sending notification email.",
+                len(new_loans),
             )
             send_email(balance, new_loans)
         elif loans:
