@@ -3,7 +3,12 @@ name: Swaper Loan Monitor
 on:
   schedule:
     - cron: '*/15 * * * *'
-  workflow_dispatch: {}
+  workflow_dispatch:
+    inputs:
+      force_test_email:
+        description: 'TEMP DEBUG: force-send a recap email regardless of balance/new loans'
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -59,6 +64,7 @@ jobs:
           SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
           EMAIL_FROM: ${{ secrets.EMAIL_FROM }}
           EMAIL_TO: ${{ secrets.EMAIL_TO }}
+          FORCE_TEST_EMAIL: ${{ github.event.inputs.force_test_email }}
         run: python main.py
 
       - name: Save persisted state (session cookies + seen loan IDs) for the next run

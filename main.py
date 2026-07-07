@@ -3,12 +3,10 @@
 Logs into swaper.com with Playwright, fetches the available loans and the
 uninvested account balance via the site's own API (using the authenticated
 browser session so cookies are sent automatically), and sends an email
-notification when there is BOTH an uninvested balance > 0 AND at least one
-*new* manual loan available to invest in (tracked by loan ID, see state.py -
-this catches turnover in the loan list even if the total count never drops
-to 0). If the balance is 0, no notification is sent even if loans are
-available, and the "already notified" loan IDs are reset so a fresh alert
-fires next time money becomes available again.
+notification only once per positive-balance cycle: when balance is > 0 and
+at least one manual loan is available. No further notifications are sent while
+balance stays > 0 at the same amount. The notification gate is reset when
+balance drops back to 0 or when the balance amount changes.
 
 Required env vars:
     SWAPER_EMAIL, SWAPER_PASSWORD          -> Swaper account credentials
@@ -234,29 +232,57 @@ def run(headless: bool = True) -> None:
 
     log.info("Balance %s, %d loan(s) available.", "positive" if balance > 0 else "zero/unavailable", len(loans))
 
+    # TEMPORARY DEBUG: force-send a recap email regardless of balance/new
+    # loans, to validate the SMTP pipeline end-to-end. Triggered via the
+    # `force_test_email` workflow_dispatch input. Remove once confirmed working.
+    force_test_email = os.environ.get("FORCE_TEST_EMAIL", "").lower() == "true"
+    if force_test_email:
+        log.info("FORCE_TEST_EMAIL is set - sending a forced test recap email.")
+        send_email(balance, loans)
+
     if balance <= 0:
-        if state.get("seen_loan_ids"):
-            log.info("Balance back to 0 - resetting seen loans so a fresh alert fires next time money is available.")
-        state["seen_loan_ids"] = []
+        if state.get("notified_for_positive_cycle"):
+            log.info("Balance back to 0 - resetting notification gate for the next positive cycle.")
+        state["notified_for_positive_cycle"] = False
+        state["cycle_balance_marker"] = None
         log.info("Balance is 0 (or unavailable), nothing to notify.")
     else:
-        seen_ids = set(state.get("seen_loan_ids", []))
-        current_ids = {str(loan.get("id")) for loan in loans}
-        new_ids = current_ids - seen_ids
-        new_loans = [loan for loan in loans if str(loan.get("id")) in new_ids]
+        rounded_balance = round(balance, 2)
+        previous_marker = state.get("cycle_balance_marker")
+        balance_changed = previous_marker != rounded_balance
+        if balance_changed:
+            if previous_marker is not None:
+                log.info("Balance changed - resetting notification gate for this new balance level.")
+            state["notified_for_positive_cycle"] = False
+            state["cycle_balance_marker"] = rounded_balance
 
-        if new_loans:
+        already_notified = bool(state.get("notified_for_positive_cycle", False))
+
+        log.info(
+            "Notification decision context: balance_positive=true, loans_count=%d, balance_changed=%s, already_notified=%s, force_test_email=%s",
+            len(loans),
+            balance_changed,
+            already_notified,
+            force_test_email,
+        )
+
+        if loans and not already_notified and not force_test_email:
             log.info(
-                "Balance positive + %d new loan(s) since last notification - sending notification email.",
-                len(new_loans),
+                "Notification decision: SEND (reason=balance_positive_and_loans_and_gate_open). loans_count=%d",
+                len(loans),
             )
-            send_email(balance, new_loans)
+            send_email(balance, loans)
+            state["notified_for_positive_cycle"] = True
         elif loans:
-            log.info("Balance positive but no new loan since last notification - skipping email to avoid spam.")
+            if force_test_email:
+                log.info("Notification decision: SKIP normal cycle send (reason=force_test_email_already_sent).")
+            else:
+                log.info("Notification decision: SKIP (reason=already_notified_for_current_cycle).")
         else:
-            log.info("Balance positive but no loan currently available, nothing to notify.")
-
-        state["seen_loan_ids"] = sorted(current_ids)
+            if state.get("notified_for_positive_cycle"):
+                log.info("Loan count dropped to 0 - resetting notification gate.")
+            state["notified_for_positive_cycle"] = False
+            log.info("Notification decision: SKIP (reason=no_available_loans).")
 
     save_state(STATE_FILE, state)
 

@@ -1,11 +1,13 @@
 """Persistence helpers for tracking the loan-monitor's state across runs.
 
-Stores a small dict in a JSON file, notably `seen_loan_ids`: the loan IDs
-already notified about while the uninvested balance was > 0. This is reset
-to empty whenever the balance drops back to 0 (money is no longer available
-to invest, so past listings become irrelevant), and lets us detect a genuinely
-new loan even if the total available count never actually reaches 0 (e.g. one
-loan disappears exactly as a different one appears).
+Stores a small dict in a JSON file, notably:
+- `notified_for_positive_cycle`: whether a notification has already been sent
+    for the current positive-balance cycle.
+- `cycle_balance_marker`: last seen rounded balance while in a positive cycle.
+
+The notification gate is reset when balance goes back to 0 or when the balance
+value changes, which avoids spam while still allowing a fresh alert on a new
+funding level.
 """
 
 import json
@@ -14,7 +16,10 @@ from pathlib import Path
 
 log = logging.getLogger("swaper_monitor")
 
-DEFAULT_STATE = {"seen_loan_ids": []}
+DEFAULT_STATE = {
+    "notified_for_positive_cycle": False,
+    "cycle_balance_marker": None,
+}
 
 
 def load_state(state_file: Path) -> dict:
