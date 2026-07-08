@@ -281,25 +281,39 @@ def fetch_account_balance(page) -> float | None:
     the OS certificate store. This endpoint requires authentication
     (verified: HTTP 401 without a session), which the browser's cookies
     provide automatically.
+
+    Retries a couple of times on HTTP 401: verified in production
+    (2026-07-08) that right after a fresh 2FA login, the session can still
+    return 401 here for a moment before becoming fully usable server-side
+    (a backend-side race, not something controllable from here) - the same
+    request succeeds a couple of minutes later on the next run.
     """
-    try:
-        result = page.evaluate(
-            """
-            async (url) => {
-                const res = await fetch(url, { credentials: 'include' });
-                return { ok: res.ok, status: res.status, body: await res.json().catch(() => null) };
-            }
-            """,
-            BALANCE_API_URL,
-        )
-        if not result["ok"]:
-            log.warning("Balance API returned HTTP %s.", result["status"])
+    result = None
+    for attempt in range(3):
+        try:
+            result = page.evaluate(
+                """
+                async (url) => {
+                    const res = await fetch(url, { credentials: 'include' });
+                    return { ok: res.ok, status: res.status, body: await res.json().catch(() => null) };
+                }
+                """,
+                BALANCE_API_URL,
+            )
+        except Exception:
+            log.exception("Failed to fetch the Lendermarket account balance.")
             return None
-        payload = result["body"]
-    except Exception:
-        log.exception("Failed to fetch the Lendermarket account balance.")
+
+        if result["ok"]:
+            break
+        log.warning("Balance API returned HTTP %s (attempt %d/3).", result["status"], attempt + 1)
+        if attempt < 2:
+            page.wait_for_timeout(2000)
+
+    if result is None or not result["ok"]:
         return None
 
+    payload = result["body"]
     balance = (payload.get("data") or {}).get("investorAvailableBalanceAmount")
     try:
         return float(balance)
