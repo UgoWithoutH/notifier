@@ -1,0 +1,83 @@
+name: Lendermarket Monitor
+
+on:
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+concurrency:
+  group: lendermarket-monitor
+  cancel-in-progress: false
+
+jobs:
+  lendermarket:
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install Python dependencies
+        run: pip install -r requirements.txt
+
+      - name: Remove broken third-party apt repos (Azure CLI / Microsoft)
+        run: |
+          sudo find /etc/apt/sources.list.d -maxdepth 1 -type f \( -name "*microsoft*" -o -name "*azure*" \) -print -delete || true
+          sudo sed -i '/packages.microsoft.com/d;/azure-cli/d' /etc/apt/sources.list || true
+          sudo apt-get update
+
+      - name: Cache Playwright browsers
+        uses: actions/cache@v4
+        id: playwright-cache
+        with:
+          path: ~/.cache/ms-playwright
+          key: ${{ runner.os }}-playwright-${{ hashFiles('requirements.txt') }}
+
+      - name: Install Playwright Chromium (cache miss only)
+        if: steps.playwright-cache.outputs.cache-hit != 'true'
+        run: playwright install --with-deps chromium
+
+      - name: Install Playwright OS dependencies (cache hit)
+        if: steps.playwright-cache.outputs.cache-hit == 'true'
+        run: playwright install-deps chromium
+
+      - name: Restore persisted state (already-notified loan IDs + session cookies + cron schedule)
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            lendermarket_state.json
+            lendermarket_storage_state.json
+            lendermarket_cron_schedule_state.json
+          key: lendermarket-state-${{ github.run_id }}
+          restore-keys: |
+            lendermarket-state-
+
+      - name: Run Lendermarket monitor
+        env:
+          LENDERMARKET_EMAIL: ${{ secrets.LENDERMARKET_EMAIL }}
+          LENDERMARKET_PASSWORD: ${{ secrets.LENDERMARKET_PASSWORD }}
+          LENDERMARKET_TOTP_SECRET: ${{ secrets.LENDERMARKET_TOTP_SECRET }}
+          CRON_JOB_API_KEY: ${{ secrets.CRON_JOB_API_KEY }}
+          LENDERMARKET_CRON_JOB_ID: ${{ secrets.LENDERMARKET_CRON_JOB_ID }}
+          SMTP_HOST: ${{ secrets.SMTP_HOST }}
+          SMTP_PORT: ${{ secrets.SMTP_PORT }}
+          SMTP_USER: ${{ secrets.SMTP_USER }}
+          SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
+          EMAIL_FROM: ${{ secrets.EMAIL_FROM }}
+          EMAIL_TO: ${{ secrets.EMAIL_TO }}
+        run: python lendermarket_monitor.py
+
+      - name: Save persisted state (already-notified loan IDs + session cookies + cron schedule) for the next run
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            lendermarket_state.json
+            lendermarket_storage_state.json
+            lendermarket_cron_schedule_state.json
+          key: lendermarket-state-${{ github.run_id }}

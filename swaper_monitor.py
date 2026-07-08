@@ -24,16 +24,21 @@ import random
 import sys
 import time
 import logging
-import json
-from urllib import request, error
 from pathlib import Path
 
 import pyotp
 from dotenv import load_dotenv
 from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
 
-from notifier import send_email
+from notifier import send_swaper_email
 from state import load_state, save_state
+from cron_schedule import ensure_schedule
+from notification_gate import should_notify
+from browser_stealth import get_context_options, apply_stealth
+
+DEFAULT_STATE = {
+    "gates": {},
+}
 
 load_dotenv()
 
@@ -41,72 +46,15 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(me
 log = logging.getLogger("swaper_monitor")
 
 LOGIN_URL = "https://swaper.com/en/login"
-STATE_FILE = Path(__file__).parent / "state.json"
-STORAGE_STATE_FILE = Path(__file__).parent / "storage_state.json"
+STATE_FILE = Path(__file__).parent / "swaper_state.json"
+STORAGE_STATE_FILE = Path(__file__).parent / "swaper_storage_state.json"
 SCREENSHOT_ON_ERROR = Path(__file__).parent / "error_screenshot.png"
+CRON_SCHEDULE_STATE_FILE = Path(__file__).parent / "cron_schedule_state.json"
 
 SWAPER_EMAIL = os.environ.get("SWAPER_EMAIL")
 SWAPER_PASSWORD = os.environ.get("SWAPER_PASSWORD")
 SWAPER_TOTP_SECRET = os.environ.get("SWAPER_TOTP_SECRET")
-CRON_JOB_API_KEY = os.environ.get("CRON_JOB_API_KEY")
-CRON_JOB_ID = os.environ.get("CRON_JOB_ID")
-CRON_JOB_TIMEZONE = os.environ.get("CRON_JOB_TIMEZONE", "UTC")
-EVERY_30_MINUTES = [0, 30]
-EVERY_2_MINUTES = list(range(0, 60, 2))
-
-# A small pool of realistic, current desktop Chrome UA/viewport combos - the
-# default Playwright/Chromium UA advertises "HeadlessChrome" (or a mismatched
-# version), one of the easiest bot signals. Picking one combo at random per
-# run (instead of always sending the exact same fingerprint from the same
-# GitHub Actions IP range) makes traffic correlation slightly harder.
-BROWSER_PROFILES = [
-    {
-        "user_agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-            "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
-        ),
-        "viewport": {"width": 1366, "height": 768},
-    },
-    {
-        "user_agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-            "(KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"
-        ),
-        "viewport": {"width": 1536, "height": 864},
-    },
-    {
-        "user_agent": (
-            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
-            "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
-        ),
-        "viewport": {"width": 1440, "height": 900},
-    },
-    {
-        "user_agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-            "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
-        ),
-        "viewport": {"width": 1920, "height": 1080},
-    },
-]
-
-# Patched into every page before any site JS runs, to undo the most common
-# "is this a real browser?" checks (navigator.webdriver, empty plugins list,
-# missing chrome.runtime object).
-STEALTH_INIT_SCRIPT = """
-Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
-Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'] });
-Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
-window.chrome = window.chrome || { runtime: {} };
-const originalQuery = window.navigator.permissions && window.navigator.permissions.query;
-if (originalQuery) {
-    window.navigator.permissions.query = (parameters) => (
-        parameters.name === 'notifications'
-            ? Promise.resolve({ state: Notification.permission })
-            : originalQuery(parameters)
-    );
-}
-"""
+SWAPER_CRON_JOB_ID = os.environ.get("SWAPER_CRON_JOB_ID")
 
 
 def human_pause(min_seconds: float = 0.4, max_seconds: float = 1.2) -> None:
@@ -268,104 +216,6 @@ def extract_balance(payload) -> float:
     return 0.0
 
 
-def set_cron_to_every_30_minutes() -> bool:
-    """Patch cron-job.org schedule to run at minute 0 and 30 each hour."""
-    if not CRON_JOB_API_KEY or not CRON_JOB_ID:
-        log.info("CRON_JOB_API_KEY or CRON_JOB_ID missing, skipping cron-job.org update.")
-        return False
-
-    endpoint = f"https://api.cron-job.org/jobs/{CRON_JOB_ID}"
-    payload = {
-        "job": {
-            "schedule": {
-                "timezone": CRON_JOB_TIMEZONE,
-                "minutes": EVERY_30_MINUTES,
-            }
-        }
-    }
-    req = request.Request(
-        endpoint,
-        method="PATCH",
-        data=json.dumps(payload).encode("utf-8"),
-        headers={
-            "Authorization": f"Bearer {CRON_JOB_API_KEY}",
-            "Content-Type": "application/json",
-        },
-    )
-
-    try:
-        with request.urlopen(req, timeout=20) as resp:
-            if 200 <= resp.status < 300:
-                log.info("cron-job.org schedule set to every 30 minutes.")
-                return True
-            log.warning("cron-job.org update returned unexpected HTTP status %s.", resp.status)
-            return False
-    except error.HTTPError as exc:
-        details = ""
-        try:
-            details = exc.read().decode("utf-8", errors="ignore")
-        except Exception:
-            pass
-        log.warning(
-            "cron-job.org update failed (HTTP %s). Response: %s",
-            exc.code,
-            details[:400],
-        )
-    except Exception:
-        log.exception("cron-job.org update failed.")
-
-    return False
-
-
-def set_cron_to_every_2_minutes() -> bool:
-    """Patch cron-job.org schedule to run every 2 minutes."""
-    if not CRON_JOB_API_KEY or not CRON_JOB_ID:
-        log.info("CRON_JOB_API_KEY or CRON_JOB_ID missing, skipping cron-job.org update.")
-        return False
-
-    endpoint = f"https://api.cron-job.org/jobs/{CRON_JOB_ID}"
-    payload = {
-        "job": {
-            "schedule": {
-                "timezone": CRON_JOB_TIMEZONE,
-                "minutes": EVERY_2_MINUTES,
-            }
-        }
-    }
-    req = request.Request(
-        endpoint,
-        method="PATCH",
-        data=json.dumps(payload).encode("utf-8"),
-        headers={
-            "Authorization": f"Bearer {CRON_JOB_API_KEY}",
-            "Content-Type": "application/json",
-        },
-    )
-
-    try:
-        with request.urlopen(req, timeout=20) as resp:
-            if 200 <= resp.status < 300:
-                log.info("cron-job.org schedule set to every 2 minutes.")
-                return True
-            log.warning("cron-job.org update returned unexpected HTTP status %s.", resp.status)
-            return False
-    except error.HTTPError as exc:
-        details = ""
-        try:
-            details = exc.read().decode("utf-8", errors="ignore")
-        except Exception:
-            pass
-        log.warning(
-            "cron-job.org update failed (HTTP %s). Response: %s",
-            exc.code,
-            details[:400],
-        )
-    except Exception:
-        log.exception("cron-job.org update failed.")
-
-    return False
-
-
 def redact_sensitive_fields(page) -> None:
     """Blank out credential/2FA-code/account-balance-looking fields before a
     debug screenshot is taken, so the uploaded artifact can't leak the
@@ -398,7 +248,8 @@ def run(headless: bool = True) -> None:
         log.error("SWAPER_EMAIL and SWAPER_PASSWORD environment variables are required.")
         sys.exit(1)
 
-    state = load_state(STATE_FILE)
+    state = load_state(STATE_FILE, DEFAULT_STATE)
+    gates = state.setdefault("gates", {})
 
     with sync_playwright() as p:
         browser = p.chromium.launch(
@@ -408,15 +259,13 @@ def run(headless: bool = True) -> None:
             ],
         )
         storage_state = str(STORAGE_STATE_FILE) if STORAGE_STATE_FILE.exists() else None
-        profile = random.choice(BROWSER_PROFILES)
         context = browser.new_context(
             storage_state=storage_state,
-            user_agent=profile["user_agent"],
-            viewport=profile["viewport"],
             locale="en-US",
             timezone_id="Europe/Paris",
+            **get_context_options(),
         )
-        context.add_init_script(STEALTH_INIT_SCRIPT)
+        apply_stealth(context)
         page = context.new_page()
 
         try:
@@ -449,80 +298,39 @@ def run(headless: bool = True) -> None:
     force_test_email = os.environ.get("FORCE_TEST_EMAIL", "").lower() == "true"
     if force_test_email:
         log.info("FORCE_TEST_EMAIL is set - sending a forced test recap email.")
-        send_email(balance, loans)
-
-    current_cron_mode = state.get("cron_schedule_mode")
-    target_cron_mode = "30m" if balance <= 0 else "2m"
-    log.info(
-        "Cron decision context: balance=%.2f, current_mode=%s, target_mode=%s",
-        balance,
-        current_cron_mode,
-        target_cron_mode,
-    )
+        send_swaper_email(balance, loans)
 
     if balance <= 0:
-        if current_cron_mode != "30m":
-            log.info("Cron decision: UPDATE requested (from=%s to=30m).", current_cron_mode)
-            if set_cron_to_every_30_minutes():
-                state["cron_schedule_mode"] = "30m"
-                log.info("Cron decision: UPDATE success (new_mode=30m).")
-            else:
-                log.warning("Cron decision: UPDATE failed (target_mode=30m).")
-        else:
-            log.info("Cron already marked as 30m in local state, skipping update.")
-
-        if state.get("notified_for_positive_cycle"):
-            log.info("Balance back to 0 - resetting notification gate for the next positive cycle.")
-        state["notified_for_positive_cycle"] = False
-        state["cycle_balance_marker"] = None
-        log.info("Balance is 0 (or unavailable), nothing to notify.")
+        ensure_schedule("30m", cron_job_id=SWAPER_CRON_JOB_ID, state_file=CRON_SCHEDULE_STATE_FILE)
     else:
-        if current_cron_mode != "2m":
-            log.info("Cron decision: UPDATE requested (from=%s to=2m).", current_cron_mode)
-            if set_cron_to_every_2_minutes():
-                state["cron_schedule_mode"] = "2m"
-                log.info("Cron decision: UPDATE success (new_mode=2m).")
-            else:
-                log.warning("Cron decision: UPDATE failed (target_mode=2m).")
+        ensure_schedule("2m", cron_job_id=SWAPER_CRON_JOB_ID, state_file=CRON_SCHEDULE_STATE_FILE)
+
+    # Same rule for both monitors (see notification_gate.py): only really
+    # "available" when there's money to invest AND at least one loan listed.
+    available = balance > 0 and bool(loans)
+    send, was_reset = should_notify(gates, "swaper", available, record=not force_test_email)
+
+    if was_reset:
+        log.info("Resetting notification gate (balance<=0 or no loans available).")
+
+    log.info(
+        "Notification decision context: balance=%.2f, loans_count=%d, available=%s, force_test_email=%s",
+        balance,
+        len(loans),
+        available,
+        force_test_email,
+    )
+
+    if send and not force_test_email:
+        log.info("Notification decision: SEND (reason=balance_positive_and_loans_and_gate_open).")
+        send_swaper_email(balance, loans)
+    elif available:
+        if force_test_email:
+            log.info("Notification decision: SKIP normal cycle send (reason=force_test_email_already_sent).")
         else:
-            log.info("Cron already marked as 2m in local state, skipping update.")
-
-        rounded_balance = round(balance, 2)
-        previous_marker = state.get("cycle_balance_marker")
-        balance_changed = previous_marker != rounded_balance
-        if balance_changed:
-            if previous_marker is not None:
-                log.info("Balance changed - resetting notification gate for this new balance level.")
-            state["notified_for_positive_cycle"] = False
-            state["cycle_balance_marker"] = rounded_balance
-
-        already_notified = bool(state.get("notified_for_positive_cycle", False))
-
-        log.info(
-            "Notification decision context: balance_positive=true, loans_count=%d, balance_changed=%s, already_notified=%s, force_test_email=%s",
-            len(loans),
-            balance_changed,
-            already_notified,
-            force_test_email,
-        )
-
-        if loans and not already_notified and not force_test_email:
-            log.info(
-                "Notification decision: SEND (reason=balance_positive_and_loans_and_gate_open). loans_count=%d",
-                len(loans),
-            )
-            send_email(balance, loans)
-            state["notified_for_positive_cycle"] = True
-        elif loans:
-            if force_test_email:
-                log.info("Notification decision: SKIP normal cycle send (reason=force_test_email_already_sent).")
-            else:
-                log.info("Notification decision: SKIP (reason=already_notified_for_current_cycle).")
-        else:
-            if state.get("notified_for_positive_cycle"):
-                log.info("Loan count dropped to 0 - resetting notification gate.")
-            state["notified_for_positive_cycle"] = False
-            log.info("Notification decision: SKIP (reason=no_available_loans).")
+            log.info("Notification decision: SKIP (reason=already_notified_for_current_cycle).")
+    else:
+        log.info("Notification decision: SKIP (reason=no_available_loans_or_balance).")
 
     save_state(STATE_FILE, state)
 
@@ -534,6 +342,6 @@ if __name__ == "__main__":
     log.info("Startup jitter: sleeping for %.1f seconds before starting.", delay)
     time.sleep(delay)
 
-    # Set headless=False locally (e.g. via `python main.py --show`) to watch
-    # the browser and debug the login flow if selectors need adjusting.
+    # Set headless=False locally (e.g. via `python swaper_monitor.py --show`) to
+    # watch the browser and debug the login flow if selectors need adjusting.
     run(headless="--show" not in sys.argv)

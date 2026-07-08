@@ -1,4 +1,4 @@
-name: Notifier Monitor
+name: Swaper Monitor
 
 on:
   workflow_dispatch:
@@ -16,7 +16,7 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  monitor:
+  swaper:
     runs-on: ubuntu-22.04
     steps:
       - name: Checkout repository
@@ -61,24 +61,24 @@ jobs:
         if: steps.playwright-cache.outputs.cache-hit == 'true'
         run: playwright install-deps chromium
 
-      - name: Restore persisted state (session cookies + seen loan IDs)
+      - name: Restore persisted state (session cookies + seen loan IDs + cron schedule)
         uses: actions/cache/restore@v4
         with:
           path: |
-            storage_state.json
-            state.json
+            swaper_storage_state.json
+            swaper_state.json
+            cron_schedule_state.json
           key: swaper-state-${{ github.run_id }}
           restore-keys: |
             swaper-state-
 
-      - name: Run monitor
+      - name: Run Swaper monitor
         env:
           SWAPER_EMAIL: ${{ secrets.SWAPER_EMAIL }}
           SWAPER_PASSWORD: ${{ secrets.SWAPER_PASSWORD }}
           SWAPER_TOTP_SECRET: ${{ secrets.SWAPER_TOTP_SECRET }}
           CRON_JOB_API_KEY: ${{ secrets.CRON_JOB_API_KEY }}
-          CRON_JOB_ID: ${{ secrets.CRON_JOB_ID }}
-          CRON_JOB_TIMEZONE: ${{ secrets.CRON_JOB_TIMEZONE }}
+          SWAPER_CRON_JOB_ID: ${{ secrets.SWAPER_CRON_JOB_ID }}
           SMTP_HOST: ${{ secrets.SMTP_HOST }}
           SMTP_PORT: ${{ secrets.SMTP_PORT }}
           SMTP_USER: ${{ secrets.SMTP_USER }}
@@ -86,13 +86,14 @@ jobs:
           EMAIL_FROM: ${{ secrets.EMAIL_FROM }}
           EMAIL_TO: ${{ secrets.EMAIL_TO }}
           FORCE_TEST_EMAIL: ${{ github.event.inputs.force_test_email }}
-        run: python main.py
+        run: python swaper_monitor.py
 
-      - name: Save persisted state (session cookies + seen loan IDs) for the next run
+      - name: Save persisted state (session cookies + seen loan IDs + cron schedule) for the next run
         if: always()
         uses: actions/cache/save@v4
         with:
           path: |
-            storage_state.json
-            state.json
+            swaper_storage_state.json
+            swaper_state.json
+            cron_schedule_state.json
           key: swaper-state-${{ github.run_id }}

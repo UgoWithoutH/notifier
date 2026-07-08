@@ -4,5 +4,9 @@ __pycache__/
 *.pyc
 .env
 error_screenshot.png
-storage_state.json
-state.json
+swaper_storage_state.json
+swaper_state.json
+lendermarket_state.json
+lendermarket_storage_state.json
+cron_schedule_state.json
+lendermarket_cron_schedule_state.json
