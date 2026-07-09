@@ -300,18 +300,18 @@ def run(headless: bool = True) -> None:
         log.info("FORCE_TEST_EMAIL is set - sending a forced test recap email.")
         send_swaper_email(balance, loans)
 
-    if balance <= 0:
+    if balance < 10:
         ensure_schedule("30m", cron_job_id=SWAPER_CRON_JOB_ID, state_file=CRON_SCHEDULE_STATE_FILE)
     else:
         ensure_schedule("2m", cron_job_id=SWAPER_CRON_JOB_ID, state_file=CRON_SCHEDULE_STATE_FILE)
 
     # Same rule for both monitors (see notification_gate.py): only really
     # "available" when there's money to invest AND at least one loan listed.
-    available = balance > 0 and bool(loans)
+    available = balance >= 10 and bool(loans)
     send, was_reset = should_notify(gates, "swaper", available, record=not force_test_email)
 
     if was_reset:
-        log.info("Resetting notification gate (balance<=0 or no loans available).")
+        log.info("Resetting notification gate (balance < 10 or no loans available).")
 
     log.info(
         "Notification decision context: balance=%.2f, loans_count=%d, available=%s, force_test_email=%s",
@@ -322,7 +322,7 @@ def run(headless: bool = True) -> None:
     )
 
     if send and not force_test_email:
-        log.info("Notification decision: SEND (reason=balance_positive_and_loans_and_gate_open).")
+        log.info("Notification decision: SEND (reason=balance >= 10 and loans available and gate open).")
         send_swaper_email(balance, loans)
     elif available:
         if force_test_email:
@@ -330,7 +330,7 @@ def run(headless: bool = True) -> None:
         else:
             log.info("Notification decision: SKIP (reason=already_notified_for_current_cycle).")
     else:
-        log.info("Notification decision: SKIP (reason=no_available_loans_or_balance).")
+        log.info("Notification decision: SKIP (reason=balance < 10 or no loans available).")
 
     save_state(STATE_FILE, state)
 

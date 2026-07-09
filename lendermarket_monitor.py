@@ -367,7 +367,7 @@ def run() -> None:
     # couldn't be determined, rather than guessing and possibly slowing down
     # polling incorrectly.
     if balance is not None:
-        mode = "30m" if balance <= 0 else "2m"
+        mode = "30m" if balance < 10 else "2m"
         ensure_schedule(mode, cron_job_id=LENDERMARKET_CRON_JOB_ID, state_file=CRON_SCHEDULE_STATE_FILE)
 
     newly_available = {}
@@ -377,7 +377,7 @@ def run() -> None:
         count = len(loans)
         log.info("Segment '%s': %d loan(s) currently available.", segment["label"], count)
 
-        available = (balance is None or balance > 0) and count > 0
+        available = (balance is None or balance >= 10) and count > 0
         send, was_reset = should_notify(gates, segment["key"], available)
 
         if was_reset:
@@ -400,7 +400,7 @@ def run() -> None:
         elif available:
             log.info("Notification decision: SKIP (reason=already_notified_for_current_cycle).")
         else:
-            log.info("Notification decision: SKIP (reason=no_loans_or_no_balance).")
+            log.info("Notification decision: SKIP (reason=balance < 10 or no loans available).")
 
     if newly_available:
         log.info("Sending notification for %d segment(s) with newly available loans.", len(newly_available))
