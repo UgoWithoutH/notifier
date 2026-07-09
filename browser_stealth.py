@@ -1,9 +1,12 @@
-"""Shared browser-fingerprint helpers for the Playwright-driven monitors
-(Swaper, Lendermarket), used to make automated traffic look less bot-like:
-a rotating pool of realistic desktop Chrome UA/viewport combos (instead of
-Playwright's default, which advertises "HeadlessChrome" or a mismatched
-version - one of the easiest bot signals), plus an init script that patches
-over the most common "is this a real browser?" checks.
+"""Shared bot-evasion helpers for the Playwright-driven monitors (Swaper,
+Lendermarket, PeerBerry): a rotating pool of realistic desktop Chrome
+UA/viewport combos (instead of Playwright's default, which advertises
+"HeadlessChrome" or a mismatched version - one of the easiest bot signals),
+an init script that patches over the most common "is this a real browser?"
+checks, and behavioral helpers (human_pause/human_mouse_wander/human_type,
+at the bottom of this file) that avoid the instant, uniformly-timed
+interactions (`.fill()`, zero mouse movement) that behavioral bot detection
+watches for.
 
 IMPORTANT - only enabled where it's safe to:
 on a network that inspects/validates the browser fingerprint (e.g. a
@@ -14,11 +17,13 @@ network on 2026-07-08. So this rotation is only applied when NOT running
 locally: detected via the `GITHUB_ACTIONS` env var (set to "true" by GitHub
 Actions runners), overridable with FORCE_BROWSER_STEALTH=true/false for
 testing. When disabled, Playwright's own real UA/fingerprint is used as-is,
-which avoids that mismatch entirely.
+which avoids that mismatch entirely. The behavioral helpers are unaffected
+by this flag - they don't touch the UA/fingerprint, so they're always used.
 """
 
 import os
 import random
+import time
 
 _force = os.environ.get("FORCE_BROWSER_STEALTH")
 STEALTH_ENABLED = (_force.lower() == "true") if _force is not None else (os.environ.get("GITHUB_ACTIONS") == "true")
@@ -90,3 +95,46 @@ def apply_stealth(context, languages: str = "['en-US', 'en']") -> None:
     """Add the stealth init script to `context`, only when enabled."""
     if STEALTH_ENABLED:
         context.add_init_script(_stealth_init_script(languages))
+
+
+# --- Behavioral (human-like interaction) helpers -----------------------
+#
+# Originally written for swaper_monitor.py, now shared by all three
+# Playwright-driven monitors (Swaper, Lendermarket, PeerBerry) so login
+# flows don't leave the instant, uniformly-timed fingerprints (`.fill()`
+# setting a value in 0ms, zero mouse/scroll activity for the whole session)
+# that behavioral bot-detection specifically watches for. Unlike the
+# fingerprint helpers above, these are always applied (not gated behind
+# STEALTH_ENABLED/GITHUB_ACTIONS) - they don't touch the UA/Client-Hints, so
+# they're safe on every network, including locally.
+
+def human_pause(min_seconds: float = 0.4, max_seconds: float = 1.2) -> None:
+    """Sleep for a small random duration to avoid the instant, uniformly
+    timed actions that give away scripted (non-human) interactions."""
+    time.sleep(random.uniform(min_seconds, max_seconds))
+
+
+def human_mouse_wander(page, moves: int = None) -> None:
+    """Move the mouse through a few random points and scroll a bit, so the
+    page isn't left completely idle/static the way a script would leave it -
+    some bot-detection scripts specifically watch for the total absence of
+    mousemove/scroll events during a session."""
+    try:
+        viewport = page.viewport_size or {"width": 1280, "height": 720}
+        for _ in range(moves or random.randint(2, 4)):
+            x = random.randint(0, max(viewport["width"] - 1, 1))
+            y = random.randint(0, max(viewport["height"] - 1, 1))
+            page.mouse.move(x, y, steps=random.randint(5, 15))
+            human_pause(0.1, 0.4)
+        page.mouse.wheel(0, random.randint(150, 500))
+    except Exception:
+        pass  # purely cosmetic, never fail the run because of it
+
+
+def human_type(locator, text: str) -> None:
+    """Type into a field one character at a time with randomized per-key
+    delay, instead of `.fill()` which sets the value instantly - an easy
+    signal for behavioral bot detection."""
+    locator.click()
+    for char in text:
+        locator.type(char, delay=random.uniform(60, 180))

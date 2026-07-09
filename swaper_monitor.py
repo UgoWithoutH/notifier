@@ -34,7 +34,7 @@ from notifier import send_swaper_email
 from state import load_state, save_state
 from cron_schedule import ensure_schedule
 from notification_gate import should_notify
-from browser_stealth import get_context_options, apply_stealth
+from browser_stealth import get_context_options, apply_stealth, human_pause, human_mouse_wander, human_type
 
 DEFAULT_STATE = {
     "gates": {},
@@ -48,45 +48,12 @@ log = logging.getLogger("swaper_monitor")
 LOGIN_URL = "https://swaper.com/en/login"
 STATE_FILE = Path(__file__).parent / "swaper_state.json"
 STORAGE_STATE_FILE = Path(__file__).parent / "swaper_storage_state.json"
-SCREENSHOT_ON_ERROR = Path(__file__).parent / "error_screenshot.png"
 CRON_SCHEDULE_STATE_FILE = Path(__file__).parent / "cron_schedule_state.json"
 
 SWAPER_EMAIL = os.environ.get("SWAPER_EMAIL")
 SWAPER_PASSWORD = os.environ.get("SWAPER_PASSWORD")
 SWAPER_TOTP_SECRET = os.environ.get("SWAPER_TOTP_SECRET")
 SWAPER_CRON_JOB_ID = os.environ.get("SWAPER_CRON_JOB_ID")
-
-
-def human_pause(min_seconds: float = 0.4, max_seconds: float = 1.2) -> None:
-    """Sleep for a small random duration to avoid the instant, uniformly
-    timed actions that give away scripted (non-human) interactions."""
-    time.sleep(random.uniform(min_seconds, max_seconds))
-
-
-def human_mouse_wander(page, moves: int = None) -> None:
-    """Move the mouse through a few random points and scroll a bit, so the
-    page isn't left completely idle/static the way a script would leave it -
-    some bot-detection scripts specifically watch for the total absence of
-    mousemove/scroll events during a session."""
-    try:
-        viewport = page.viewport_size or {"width": 1280, "height": 720}
-        for _ in range(moves or random.randint(2, 4)):
-            x = random.randint(0, max(viewport["width"] - 1, 1))
-            y = random.randint(0, max(viewport["height"] - 1, 1))
-            page.mouse.move(x, y, steps=random.randint(5, 15))
-            human_pause(0.1, 0.4)
-        page.mouse.wheel(0, random.randint(150, 500))
-    except Exception:
-        pass  # purely cosmetic, never fail the run because of it
-
-
-def human_type(locator, text: str) -> None:
-    """Type into a field one character at a time with randomized per-key
-    delay, instead of `.fill()` which sets the value instantly - an easy
-    signal for behavioral bot detection."""
-    locator.click()
-    for char in text:
-        locator.type(char, delay=random.uniform(60, 180))
 
 
 def handle_two_factor(page) -> None:
@@ -113,7 +80,8 @@ def handle_two_factor(page) -> None:
         )
 
     log.info("2FA prompt detected, generating and submitting TOTP code...")
-    code = pyotp.TOTP(SWAPER_TOTP_SECRET).now()
+    totp = pyotp.TOTP(SWAPER_TOTP_SECRET)
+    code = totp.now()
     human_type(otp_input, code)
     human_pause()
 
@@ -121,6 +89,20 @@ def handle_two_factor(page) -> None:
         page.get_by_text("Trust this browser").click(timeout=3000)
     except PlaywrightTimeoutError:
         log.warning("Could not find the 'trust this browser' checkbox, continuing anyway.")
+
+    # Guard against the 30s TOTP window rolling over while we were typing
+    # the code / clicking "trust this browser" - suspected cause of a
+    # GitHub Actions failure on 2026-07-09 where the whole 2FA sequence
+    # completed without any Playwright error, but the page never left
+    # /login (i.e. the code was silently rejected as stale). If a
+    # freshly-generated code differs from what's currently filled in,
+    # clear the field and retype it right before submitting.
+    fresh_code = totp.now()
+    if fresh_code != code:
+        log.info("TOTP code rolled over to a new 30s window while typing, retyping the fresh code.")
+        otp_input.fill("")
+        human_type(otp_input, fresh_code)
+        human_pause()
 
     page.locator("div.button.clickable", has_text="Log In").click()
 
@@ -216,33 +198,6 @@ def extract_balance(payload) -> float:
     return 0.0
 
 
-def redact_sensitive_fields(page) -> None:
-    """Blank out credential/2FA-code/account-balance-looking fields before a
-    debug screenshot is taken, so the uploaded artifact can't leak the
-    password, a live TOTP code (its input is a plain text field, not
-    type=password) or account data.
-    """
-    try:
-        page.evaluate(
-            """
-            () => {
-                const selectors = [
-                    "input[name='email']",
-                    "input[name='password']",
-                    "input[name='code']",
-                ];
-                for (const sel of selectors) {
-                    document.querySelectorAll(sel).forEach(el => { el.value = '***redacted***'; });
-                }
-                // Blur any focused field so masked dots/values re-render before the screenshot.
-                if (document.activeElement) document.activeElement.blur();
-            }
-            """
-        )
-    except Exception:
-        log.warning("Could not redact sensitive fields before screenshot.")
-
-
 def run(headless: bool = True) -> None:
     if not SWAPER_EMAIL or not SWAPER_PASSWORD:
         log.error("SWAPER_EMAIL and SWAPER_PASSWORD environment variables are required.")
@@ -273,11 +228,6 @@ def run(headless: bool = True) -> None:
             payload = fetch_loans(page)
         except Exception:
             log.exception("Failed to log in or fetch loans.")
-            try:
-                redact_sensitive_fields(page)
-                page.screenshot(path=str(SCREENSHOT_ON_ERROR), full_page=True)
-            except Exception:
-                pass
             browser.close()
             sys.exit(1)
 

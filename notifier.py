@@ -58,7 +58,7 @@ def send_swaper_email(balance: float, loans: list) -> None:
     msg.attach(MIMEText(body, "plain"))
 
     try:
-        with smtplib.SMTP(SMTP_HOST, SMTP_PORT) as server:
+        with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=15) as server:
             server.starttls()
             server.login(SMTP_USER, SMTP_PASSWORD)
             server.sendmail(EMAIL_FROM, [EMAIL_TO], msg.as_string())
@@ -123,10 +123,50 @@ def send_lendermarket_email(balance: float | None, segments: dict) -> None:
     msg.attach(MIMEText(body, "plain"))
 
     try:
-        with smtplib.SMTP(SMTP_HOST, SMTP_PORT) as server:
+        with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=15) as server:
             server.starttls()
             server.login(SMTP_USER, SMTP_PASSWORD)
             server.sendmail(EMAIL_FROM, [EMAIL_TO], msg.as_string())
         log.info("Lendermarket notification email sent to %s.", EMAIL_TO)
     except Exception:
         log.exception("Failed to send Lendermarket notification email.")
+
+
+def send_peerberry_email(originators: list) -> None:
+    """Send the PeerBerry "distribution by loan originators" recap.
+
+    `originators` is the list built by
+    peerberry_monitor.normalize_originators(): one dict per loan originator
+    with `originator`, `company`, `iso2`, `amount` (EUR, float) and `part`
+    (%, float), already sorted by amount descending.
+    """
+    if not all([SMTP_HOST, SMTP_USER, SMTP_PASSWORD, EMAIL_TO]):
+        log.error(
+            "SMTP configuration is incomplete; cannot send email. "
+            "Required env vars: SMTP_HOST, SMTP_USER, SMTP_PASSWORD, EMAIL_TO."
+        )
+        return
+
+    total_amount = sum(o["amount"] for o in originators)
+    subject = f"[PeerBerry] Répartition par prêteur ({len(originators)} prêteurs, {total_amount:.2f} €)"
+
+    body_parts = [f"Montant total investi : {total_amount:.2f} €", ""]
+    for o in originators:
+        label = f"{o['originator']} ({o['iso2']})" if o.get("iso2") else o["originator"]
+        body_parts.append(f"{label} : {o['amount']:.2f} € ({o['part']:.2f}%)")
+    body = "\n".join(body_parts)
+
+    msg = MIMEMultipart()
+    msg["From"] = EMAIL_FROM
+    msg["To"] = EMAIL_TO
+    msg["Subject"] = subject
+    msg.attach(MIMEText(body, "plain"))
+
+    try:
+        with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=15) as server:
+            server.starttls()
+            server.login(SMTP_USER, SMTP_PASSWORD)
+            server.sendmail(EMAIL_FROM, [EMAIL_TO], msg.as_string())
+        log.info("PeerBerry notification email sent to %s.", EMAIL_TO)
+    except Exception:
+        log.exception("Failed to send PeerBerry notification email.")

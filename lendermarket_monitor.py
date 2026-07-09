@@ -47,7 +47,7 @@ from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeo
 from notifier import send_lendermarket_email
 from state import load_state, save_state
 from notification_gate import should_notify
-from browser_stealth import get_context_options, apply_stealth
+from browser_stealth import get_context_options, apply_stealth, human_pause, human_mouse_wander, human_type
 from cron_schedule import ensure_schedule
 
 load_dotenv()
@@ -192,6 +192,7 @@ def login(page) -> None:
     button.
     """
     page.goto(LOGIN_URL, wait_until="domcontentloaded")
+    human_mouse_wander(page)
 
     for label in ["Tout accepter", "Accepter tout", "Refuser"]:
         try:
@@ -222,9 +223,11 @@ def login(page) -> None:
             raise RuntimeError("Could not locate the Lendermarket login form fields.")
 
         email_input.click()
-        email_input.fill(LENDERMARKET_EMAIL)
+        human_type(email_input, LENDERMARKET_EMAIL)
+        human_pause()
         password_input.click()
-        password_input.fill(LENDERMARKET_PASSWORD)
+        human_type(password_input, LENDERMARKET_PASSWORD)
+        human_pause()
 
         submitted = False
         for label in ["Se connecter", "Connexion", "Login"]:
@@ -264,11 +267,32 @@ def handle_two_factor(page) -> None:
         )
 
     log.info("2FA prompt detected, generating and submitting TOTP code...")
-    code = pyotp.TOTP(LENDERMARKET_TOTP_SECRET).now()
+    totp = pyotp.TOTP(LENDERMARKET_TOTP_SECRET)
+    code = totp.now()
     otp_input.click()
     otp_input.type(code, delay=80)
 
-    page.get_by_role("button", name="Continuer").click()
+    # Guard against the 30s TOTP window rolling over while typing (same fix
+    # applied to swaper_monitor.py after a 2026-07-09 GitHub Actions failure
+    # where the whole 2FA sequence completed with no Playwright error, but
+    # the page never left the login/otp URL - suspected stale-code rejection).
+    fresh_code = totp.now()
+    if fresh_code != code:
+        log.info("TOTP code rolled over to a new 30s window while typing, retyping the fresh code.")
+        otp_input.fill("")
+        otp_input.type(fresh_code, delay=80)
+
+    human_pause()
+    try:
+        # Verified against the real 2FA screen on 2026-07-09: filling in all
+        # 6 digits can auto-submit the form on its own (same behavior as
+        # PeerBerry's 2FA) - by the time we try to click "Continuer" the
+        # page may have already navigated away, so this click racing against
+        # that navigation would otherwise hang for the full default timeout
+        # waiting for a button that's never coming back.
+        page.get_by_role("button", name="Continuer").click(timeout=5000)
+    except PlaywrightTimeoutError:
+        log.info("'Continuer' button not found/clickable - the code likely auto-submitted already.")
 
 
 def fetch_account_balance(page) -> float | None:
