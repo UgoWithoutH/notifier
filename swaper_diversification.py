@@ -211,6 +211,7 @@ def fetch_current_month_interest_received(page) -> float:
     now = datetime.now(REPORT_TIMEZONE)
     start_date = now.replace(day=1).strftime("%Y-%m-%d")
     end_date = now.strftime("%Y-%m-%d")
+    log.info("Requesting account-entries API for booking dates %s to %s...", start_date, end_date)
 
     result = page.evaluate(
         """
@@ -235,11 +236,18 @@ def fetch_current_month_interest_received(page) -> float:
         """,
         [ACCOUNT_ENTRIES_API_URL, start_date, end_date],
     )
+    log.info("Account entries API response: ok=%s status=%s", result.get("ok"), result.get("status"))
     if not result.get("ok"):
         raise RuntimeError(f"Account entries API returned status {result.get('status')}")
 
     body = result.get("body") or {}
-    return float(body.get("earnedInterest") or 0.0)
+    raw_value = body.get("earnedInterest")
+    log.info("Raw 'earnedInterest' value from the account entries API: %r", raw_value)
+    try:
+        return float(raw_value or 0.0)
+    except (TypeError, ValueError):
+        log.warning("Could not parse 'earnedInterest' value %r as a float - defaulting to 0.0.", raw_value)
+        return 0.0
 
 
 def update_google_sheet(originators: list, interest_received: float) -> None:
@@ -270,6 +278,8 @@ def run(headless: bool = True) -> None:
         log.error("SWAPER_EMAIL and SWAPER_PASSWORD environment variables are required.")
         sys.exit(1)
 
+    log.info("Starting Swaper diversification run (headless=%s, storage_state_exists=%s).", headless, STORAGE_STATE_FILE.exists())
+
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=headless)
         storage_state = str(STORAGE_STATE_FILE) if STORAGE_STATE_FILE.exists() else None
@@ -284,12 +294,18 @@ def run(headless: bool = True) -> None:
         try:
             login(page)
             breakdown = fetch_breakdown(page)
+        except Exception:
+            log.exception("Failed to log in or fetch Swaper's loan originator breakdown.")
+            browser.close()
+            sys.exit(1)
+
+        try:
+            log.info("Navigating to the account statement page to fetch this month's Interest Received...")
             page.goto(STATEMENT_PAGE_URL, wait_until="domcontentloaded")
             interest_received = fetch_current_month_interest_received(page)
         except Exception:
-            log.exception("Failed to log in or fetch Swaper's diversification/statement data.")
-            browser.close()
-            sys.exit(1)
+            log.exception("Failed to fetch this month's Interest Received - defaulting to 0.0.")
+            interest_received = 0.0
 
         # Persist cookies/local storage so the next run can skip login (and
         # 2FA) while the session remains valid.

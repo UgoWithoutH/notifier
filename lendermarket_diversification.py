@@ -22,6 +22,18 @@ the browser's own `fetch()` with `credentials: 'include'` - unlike
 PeerBerry's API, Lendermarket's doesn't reject credentialed cross-origin
 requests (no CORS error), so no manual bearer-token header is needed here.
 
+Also fetches this calendar month's "Intérêts reçus" + "Intérêts de retard
+reçus" (summed into one "interest received" figure, per explicit user
+instructions) and "Primes promotionnelles et bonus" from the Account
+Statement page (https://app.lendermarket.com/fr/statement) - see
+fetch_current_month_statement_totals() below, same idea as
+loanch_diversification.fetch_current_month_statement_totals() /
+swaper_diversification.fetch_current_month_interest_received() /
+afranga_diversification.fetch_current_month_statement_totals() /
+bienpreter_diversification.fetch_current_month_interest_totals(). Unlike
+Bienpreter, Lendermarket has a clean, ready-made JSON summary endpoint for
+this - no gross/net/tax reconstruction needed here.
+
 Required env vars:
     LENDERMARKET_EMAIL, LENDERMARKET_PASSWORD  -> Lendermarket credentials
 Optional:
@@ -34,7 +46,9 @@ Optional:
 
 import logging
 import sys
+from datetime import datetime
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 from dotenv import load_dotenv
 
@@ -50,7 +64,17 @@ log = logging.getLogger("lendermarket_diversification")
 
 INVESTMENTS_PAGE_URL = "https://app.lendermarket.com/fr/investissements"
 INVESTMENTS_API_URL = "https://api.lendermarket.com/claims/v1/investor/getInvestorInvestments"
+STATEMENT_PAGE_URL = "https://app.lendermarket.com/fr/statement"
+STATEMENT_SUMMARY_API_URL = "https://api.lendermarket.com/ledger/v1/investor/getInvestorAccountStatementSummary"
 STORAGE_STATE_FILE = Path(__file__).parent / "lendermarket_diversification_storage_state.json"
+# Lendermarket is a French-facing platform (app.lendermarket.com/fr/...);
+# "this month" below means the current calendar month up to TODAY (1st of
+# the month through today, NOT the full month) - same semantics as the
+# equivalent quick filters on Swaper/Afranga/Bienpreter, matched here by
+# reproducing the exact date range the page's own "Mois en cours" filter
+# sends. Pinned explicitly rather than relying on the executing machine's
+# local clock (e.g. UTC on a CI runner).
+REPORT_TIMEZONE = ZoneInfo("Europe/Paris")
 
 
 def fetch_investments(page) -> list:
@@ -60,6 +84,7 @@ def fetch_investments(page) -> list:
     investments = []
     page_number = 1
     while True:
+        log.info("Requesting investments API page %d...", page_number)
         result = page.evaluate(
             """
             async ([url, pageNumber]) => {
@@ -69,11 +94,14 @@ def fetch_investments(page) -> list:
             """,
             [INVESTMENTS_API_URL, page_number],
         )
+        log.info("Investments API page %d response: ok=%s status=%s", page_number, result.get("ok"), result.get("status"))
         if not result.get("ok"):
             raise RuntimeError(f"Investments API returned status {result.get('status')} on page {page_number}")
 
         body = result.get("body") or {}
-        investments.extend(body.get("data") or [])
+        page_investments = body.get("data") or []
+        investments.extend(page_investments)
+        log.info("Page %d: %d investment(s) found (running total: %d).", page_number, len(page_investments), len(investments))
 
         meta = body.get("meta") or {}
         if page_number >= (meta.get("last_page") or 1):
@@ -105,27 +133,112 @@ def aggregate_by_lender(investments: list) -> list:
     return lenders
 
 
-def update_google_sheet(lenders: list) -> None:
-    """Skeleton: write the per-lender remaining-capital amounts into the
-    Google Sheet. Mirrors peerberry_diversification.update_google_sheet() -
-    not implemented yet on purpose, fill in the actual cell/row mapping once
-    you know which cells should hold which lender's amount, e.g.:
+def fetch_current_month_statement_totals(page) -> dict:
+    """Fetch this calendar month's "Intérêts reçus", "Intérêts de retard
+    reçus" and "Primes promotionnelles et bonus", as shown in the summary
+    panel of the Account Statement page
+    (https://app.lendermarket.com/fr/statement), via the same JSON API the
+    page's own "Mois en cours" quick filter calls.
+
+    Verified against the real account on 2026-07-10 (network capture while
+    the statement page loaded with its default date range, which already
+    matches "Mois en cours" - 1st of the current month through TODAY):
+
+        GET https://api.lendermarket.com/ledger/v1/investor/getInvestorAccountStatementSummary?currency=EUR&startDate=2026-07-01&endDate=2026-07-10
+        -> {"data": {"investorReceivedInterestsAmount": "7.32",
+                     "investorReceivedDelayedInterestsAmount": "0.03",
+                     "investorBonusesAmount": "0.00", ...}}
+
+    which matched the page's own displayed "Intérêts reçus" (7,32 €),
+    "Intérêts de retard reçus" (0,03 €) and "Primes promotionnelles et
+    bonus" (0,00 €) figures exactly. Per explicit user instructions, the
+    first two are summed into a single "interest received" figure; unlike
+    PeerBerry/Loanch's APIs, this endpoint accepts a plain credentialed
+    fetch (`credentials: 'include'`) with no CORS/bearer-token workaround
+    needed, same as fetch_investments() above.
+
+    Uses REPORT_TIMEZONE (Europe/Paris) rather than the executing machine's
+    local clock to decide what "this month" means, so this stays correct
+    regardless of where/when (e.g. a UTC CI runner around midnight) this
+    script actually runs.
+    """
+    now = datetime.now(REPORT_TIMEZONE)
+    start_date = now.replace(day=1).strftime("%Y-%m-%d")
+    end_date = now.strftime("%Y-%m-%d")
+    log.info("Requesting account statement summary API for %s to %s...", start_date, end_date)
+
+    result = page.evaluate(
+        """
+        async ([url, startDate, endDate]) => {
+            const params = new URLSearchParams({ currency: 'EUR', startDate, endDate });
+            const res = await fetch(`${url}?${params.toString()}`, { credentials: 'include' });
+            return { ok: res.ok, status: res.status, body: await res.json().catch(() => null) };
+        }
+        """,
+        [STATEMENT_SUMMARY_API_URL, start_date, end_date],
+    )
+    log.info("Account statement summary API response: ok=%s status=%s", result.get("ok"), result.get("status"))
+    if not result.get("ok"):
+        raise RuntimeError(f"Account statement summary API returned status {result.get('status')}")
+
+    data = (result.get("body") or {}).get("data") or {}
+    log.info("Raw statement summary data: %r", data)
+    try:
+        interest_received = float(data.get("investorReceivedInterestsAmount") or 0.0)
+    except (TypeError, ValueError):
+        log.warning("Could not parse 'investorReceivedInterestsAmount' %r - defaulting to 0.0.", data.get("investorReceivedInterestsAmount"))
+        interest_received = 0.0
+    try:
+        delayed_interest_received = float(data.get("investorReceivedDelayedInterestsAmount") or 0.0)
+    except (TypeError, ValueError):
+        log.warning("Could not parse 'investorReceivedDelayedInterestsAmount' %r - defaulting to 0.0.", data.get("investorReceivedDelayedInterestsAmount"))
+        delayed_interest_received = 0.0
+    try:
+        bonuses = float(data.get("investorBonusesAmount") or 0.0)
+    except (TypeError, ValueError):
+        log.warning("Could not parse 'investorBonusesAmount' %r - defaulting to 0.0.", data.get("investorBonusesAmount"))
+        bonuses = 0.0
+
+    log.info(
+        "Parsed statement totals: interest_received=%.2f (incl. delayed=%.2f), bonuses=%.2f",
+        interest_received + delayed_interest_received, delayed_interest_received, bonuses,
+    )
+    return {
+        "interest_received": interest_received + delayed_interest_received,
+        "bonuses": bonuses,
+    }
+
+
+def update_google_sheet(lenders: list, statement_totals: dict) -> None:
+    """Skeleton: write the per-lender remaining-capital amounts and this
+    month's statement totals (interest received, bonuses) into the Google
+    Sheet. Mirrors afranga_diversification.update_google_sheet() /
+    loanch_diversification.update_google_sheet() - not implemented yet on
+    purpose, fill in the actual cell/row mapping once you know which cells
+    should hold which value, e.g.:
 
         from google_sheet import get_latest_dashboard_worksheet, SPREADSHEET_ID
         worksheet = get_latest_dashboard_worksheet(SPREADSHEET_ID)
         for l in lenders:
             ...  # look up the right cell for l["lender"] and write l["remaining_principal"]
+        ...  # look up the right cells for statement_totals["interest_received"] / ["bonuses"]
 
     Left as a no-op for now so running this script never requires
     GOOGLE_SHEET_ID/GOOGLE_CREDENTIALS to be set.
     """
-    log.info("update_google_sheet() is not implemented yet - skipping (%d lender(s) available).", len(lenders))
+    log.info(
+        "update_google_sheet() is not implemented yet - skipping (%d lender(s), "
+        "interest_received=%.2f, bonuses=%.2f available).",
+        len(lenders), statement_totals.get("interest_received", 0.0), statement_totals.get("bonuses", 0.0),
+    )
 
 
 def run(headless: bool = True) -> None:
     if not LENDERMARKET_EMAIL or not LENDERMARKET_PASSWORD:
         log.error("LENDERMARKET_EMAIL and LENDERMARKET_PASSWORD environment variables are required.")
         sys.exit(1)
+
+    log.info("Starting Lendermarket diversification run (headless=%s, storage_state_exists=%s).", headless, STORAGE_STATE_FILE.exists())
 
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=headless)
@@ -147,6 +260,14 @@ def run(headless: bool = True) -> None:
             browser.close()
             sys.exit(1)
 
+        try:
+            log.info("Navigating to the account statement page to fetch this month's statement totals...")
+            page.goto(STATEMENT_PAGE_URL, wait_until="domcontentloaded")
+            statement_totals = fetch_current_month_statement_totals(page)
+        except Exception:
+            log.exception("Failed to fetch this month's interest received/bonuses - defaulting both to 0.0.")
+            statement_totals = {"interest_received": 0.0, "bonuses": 0.0}
+
         # Persist cookies/local storage so the next run can skip login (and
         # 2FA) while the session remains valid.
         context.storage_state(path=str(STORAGE_STATE_FILE))
@@ -157,7 +278,12 @@ def run(headless: bool = True) -> None:
     for l in lenders:
         log.info("  %s: %.2f EUR", l["lender"], l["remaining_principal"])
 
-    update_google_sheet(lenders)
+    log.info(
+        "This month's statement totals: interest_received=%.2f EUR, bonuses=%.2f EUR",
+        statement_totals["interest_received"], statement_totals["bonuses"],
+    )
+
+    update_google_sheet(lenders, statement_totals)
 
 
 if __name__ == "__main__":

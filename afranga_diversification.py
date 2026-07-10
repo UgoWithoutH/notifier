@@ -33,6 +33,13 @@ JSON. Verified against the real account on 2026-07-09:
   `page.evaluate`), not a Python HTML parser - avoids adding a new
   dependency (e.g. BeautifulSoup) just for this.
 
+Also fetches this calendar month's "Gross interest received" and
+"Withholding Tax" from the Account Statement page
+(https://afranga.com/profile/account-statement) - see
+fetch_current_month_statement_totals() below, same idea as
+swaper_diversification.fetch_current_month_interest_received() /
+loanch_diversification.fetch_current_month_statement_totals().
+
 Required env vars:
     AFRANGA_EMAIL, AFRANGA_PASSWORD    -> Afranga account credentials
 Optional:
@@ -47,7 +54,9 @@ import os
 import re
 import sys
 import logging
+from datetime import datetime
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import pyotp
 from dotenv import load_dotenv
@@ -64,8 +73,18 @@ log = logging.getLogger("afranga_diversification")
 LOGIN_URL = "https://afranga.com/login"
 MY_INVESTMENTS_URL = "https://afranga.com/profile/my-investments"
 REFRESH_URL = "https://afranga.com/profile/my-investments/refresh"
+STATEMENT_PAGE_URL = "https://afranga.com/profile/account-statement"
+STATEMENT_REFRESH_URL = "https://afranga.com/profile/account-statement/refresh"
 STORAGE_STATE_FILE = Path(__file__).parent / "afranga_diversification_storage_state.json"
 MAX_LIMIT = 250  # largest value offered by the page's own rows-per-page dropdown
+# Afranga's own "Current Month" quick filter on the Account Statement page
+# (verified 2026-07-10 by capturing its request) uses the CURRENT calendar
+# month up to TODAY (createdAt[from] = 1st of the month, createdAt[to] =
+# today) - same "this month, not the full month" semantics as Swaper's
+# equivalent filter. Pin the timezone explicitly (rather than relying on the
+# executing machine's local clock, e.g. UTC on a CI runner) so "today"/"this
+# month" are computed in the account's own local time.
+REPORT_TIMEZONE = ZoneInfo("Europe/Paris")
 
 AFRANGA_EMAIL = os.environ.get("AFRANGA_EMAIL")
 AFRANGA_PASSWORD = os.environ.get("AFRANGA_PASSWORD")
@@ -171,6 +190,7 @@ def fetch_investments(page) -> list:
     csrf_token = page.locator("input[name='_token']").first.get_attribute("value")
     if not csrf_token:
         raise RuntimeError("Could not find the CSRF _token on the My investments page.")
+    log.info("Requesting My investments refresh endpoint (limit=%d)...", MAX_LIMIT)
 
     result = page.evaluate(
         """
@@ -205,12 +225,15 @@ def fetch_investments(page) -> list:
         [REFRESH_URL, csrf_token, MAX_LIMIT],
     )
 
+    log.info("My investments refresh endpoint response: ok=%s status=%s", result.get("ok"), result.get("status"))
     if not result.get("ok"):
         raise RuntimeError(f"My investments refresh endpoint returned status {result.get('status')}")
 
     rows = result.get("rows") or []
+    log.info("Parsed %d raw row(s) from the My investments table (before filtering the Total row).", len(rows))
     # The trailing "Total:" row has no loan ID / originator - skip it.
     investments = [r for r in rows if r.get("loanIdText") and r.get("originator")]
+    log.info("%d row(s) remain after filtering out the trailing Total row.", len(investments))
 
     if len(investments) >= MAX_LIMIT:
         log.warning(
@@ -249,28 +272,119 @@ def aggregate_by_originator(investments: list) -> list:
     return originators
 
 
-def update_google_sheet(originators: list) -> None:
-    """Skeleton: write the per-originator outstanding amounts into the
-    Google Sheet. Mirrors peerberry_diversification.update_google_sheet() /
-    lendermarket_diversification.update_google_sheet() - not implemented
-    yet on purpose, fill in the actual cell/row mapping once you know which
-    cells should hold which originator's amount, e.g.:
+def fetch_current_month_statement_totals(page) -> dict:
+    """Fetch this calendar month's "Gross interest received" and
+    "Withholding Tax" totals, as shown in the "Transaction Summary" panel
+    of the Account Statement page (https://afranga.com/profile/account-statement),
+    via the same HTML-fragment endpoint the page's own "Current Month" quick
+    filter uses (same idea as
+    swaper_diversification.fetch_current_month_interest_received() /
+    loanch_diversification.fetch_current_month_statement_totals()).
+
+    Verified against the real account on 2026-07-10:
+
+    1. Clicking "Current Month" on the Account Statement page sends
+       `GET https://afranga.com/profile/account-statement/refresh?_token=...&createdAt[from]=<1st of month, dd.mm.yyyy>&createdAt[to]=<today, dd.mm.yyyy>`
+       - reproduced here the same way (needs the same `_token` CSRF param
+       as fetch_investments(), read from the same `input[name='_token']`
+       field, present on this page too).
+    2. The response is an HTML fragment (like the my-investments refresh
+       endpoint) whose "Transaction Summary" panel has one `<div
+       class="row">` per summary line, each with a `.text-18-400-gray`
+       label `<div>` and a sibling `.text-18-400` value `<div>` (e.g.
+       "Deposited funds" / "€ 500.00"). The "Gross interest received" row's
+       label actually reads "Gross interest received (net € X.XX)" (the net
+       amount is baked into the label itself) - matched here via
+       `startswith` rather than an exact string. "Withholding Tax" matches
+       exactly. Confirmed against June 2026 data: Gross interest received =
+       5.51 EUR, Withholding Tax = 0.57 EUR.
+    3. Both rows are only rendered when non-zero (e.g. they were entirely
+       absent when fetching the empty first-10-days-of-July range during
+       exploration) - a missing row is treated as 0.0, not an error.
+    """
+    now = datetime.now(REPORT_TIMEZONE)
+    start_date = now.replace(day=1).strftime("%d.%m.%Y")
+    end_date = now.strftime("%d.%m.%Y")
+
+    csrf_token = page.locator("input[name='_token']").first.get_attribute("value")
+    if not csrf_token:
+        raise RuntimeError("Could not find the CSRF _token on the Account statement page.")
+    log.info("Requesting Account statement refresh endpoint for %s to %s...", start_date, end_date)
+
+    result = page.evaluate(
+        """
+        async ([refreshUrl, token, from_, to_]) => {
+            const params = new URLSearchParams({ _token: token, 'createdAt[from]': from_, 'createdAt[to]': to_ });
+            const res = await fetch(`${refreshUrl}?${params.toString()}`, { credentials: 'include' });
+            const html = await res.text();
+            if (!res.ok) {
+                return { ok: false, status: res.status, rows: [] };
+            }
+            const doc = new DOMParser().parseFromString(html, 'text/html');
+            const rows = Array.from(doc.querySelectorAll('.row')).map((row) => {
+                const label = row.querySelector('.text-18-400-gray');
+                const value = row.querySelector('.text-18-400, .text-18-500, .text-18-600');
+                return label ? { label: label.textContent.trim(), value: value ? value.textContent.trim() : null } : null;
+            }).filter(Boolean);
+            return { ok: true, status: res.status, rows };
+        }
+        """,
+        [STATEMENT_REFRESH_URL, csrf_token, start_date, end_date],
+    )
+    log.info("Account statement refresh endpoint response: ok=%s status=%s", result.get("ok"), result.get("status"))
+    if not result.get("ok"):
+        raise RuntimeError(f"Account statement refresh endpoint returned status {result.get('status')}")
+
+    rows = result.get("rows") or []
+    log.info("Found %d summary row(s) in the Transaction Summary panel: %r", len(rows), [r.get("label") for r in rows])
+
+    gross_interest_received = 0.0
+    withholding_tax = 0.0
+    for row in rows:
+        label = row.get("label") or ""
+        if label.startswith("Gross interest received"):
+            gross_interest_received = _parse_amount(row.get("value"))
+        elif label == "Withholding Tax":
+            withholding_tax = _parse_amount(row.get("value"))
+
+    log.info(
+        "Parsed statement totals: gross_interest_received=%.2f, withholding_tax=%.2f",
+        gross_interest_received, withholding_tax,
+    )
+    return {"gross_interest_received": gross_interest_received, "withholding_tax": withholding_tax}
+
+
+def update_google_sheet(originators: list, statement_totals: dict) -> None:
+    """Skeleton: write the per-originator outstanding amounts and this
+    month's statement totals (Gross interest received, Withholding Tax)
+    into the Google Sheet. Mirrors
+    swaper_diversification.update_google_sheet() /
+    loanch_diversification.update_google_sheet() - not implemented yet on
+    purpose, fill in the actual cell/row mapping once you know which cells
+    should hold which value, e.g.:
 
         from google_sheet import get_latest_dashboard_worksheet, SPREADSHEET_ID
         worksheet = get_latest_dashboard_worksheet(SPREADSHEET_ID)
         for o in originators:
             ...  # look up the right cell for o["originator"] and write o["outstanding"]
+        ...  # look up the right cells for statement_totals["gross_interest_received"] / ["withholding_tax"]
 
     Left as a no-op for now so running this script never requires
     GOOGLE_SHEET_ID/GOOGLE_CREDENTIALS to be set.
     """
-    log.info("update_google_sheet() is not implemented yet - skipping (%d originator(s) available).", len(originators))
+    log.info(
+        "update_google_sheet() is not implemented yet - skipping (%d originator(s), "
+        "gross_interest_received=%.2f, withholding_tax=%.2f available).",
+        len(originators), statement_totals.get("gross_interest_received", 0.0), statement_totals.get("withholding_tax", 0.0),
+    )
 
 
 def run(headless: bool = True) -> None:
     if not AFRANGA_EMAIL or not AFRANGA_PASSWORD:
         log.error("AFRANGA_EMAIL and AFRANGA_PASSWORD environment variables are required.")
         sys.exit(1)
+
+    log.info("Starting Afranga diversification run (headless=%s, storage_state_exists=%s).", headless, STORAGE_STATE_FILE.exists())
 
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=headless)
@@ -292,6 +406,16 @@ def run(headless: bool = True) -> None:
             browser.close()
             sys.exit(1)
 
+        try:
+            log.info("Navigating to the account statement page to fetch this month's statement totals...")
+            page.goto(STATEMENT_PAGE_URL, wait_until="domcontentloaded")
+            statement_totals = fetch_current_month_statement_totals(page)
+        except Exception:
+            log.exception(
+                "Failed to fetch this month's Gross interest received/Withholding Tax - defaulting both to 0.0."
+            )
+            statement_totals = {"gross_interest_received": 0.0, "withholding_tax": 0.0}
+
         # Persist cookies/local storage so the next run can skip login (and
         # 2FA) while the session remains valid.
         context.storage_state(path=str(STORAGE_STATE_FILE))
@@ -302,7 +426,12 @@ def run(headless: bool = True) -> None:
     for o in originators:
         log.info("  %s: %.2f EUR", o["originator"], o["outstanding"])
 
-    update_google_sheet(originators)
+    log.info(
+        "This month's statement totals: gross_interest_received=%.2f EUR, withholding_tax=%.2f EUR",
+        statement_totals["gross_interest_received"], statement_totals["withholding_tax"],
+    )
+
+    update_google_sheet(originators, statement_totals)
 
 
 if __name__ == "__main__":

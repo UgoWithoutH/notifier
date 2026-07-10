@@ -40,6 +40,19 @@ Optional:
                                             a 2FA prompt is actually detected
     GOOGLE_SHEET_ID, GOOGLE_CREDENTIALS  -> only needed once update_google_sheet()
                                             below is filled in (see google_sheet.py)
+
+Also fetches this calendar month's "From daily returns" / "Rewards & bonuses"
+/ "Matured Vaults" totals from the Account Statement page
+(https://smartsaver.monefit.com/en/account-statement) - see
+fetch_current_month_statement_totals() below. Unlike every other
+*_diversification.py's API calls, this one's auth token could not be found
+in a cookie or a (legibly-named) localStorage key - the SmartSaver SPA
+stores dozens of obfuscated/hashed-looking localStorage keys, none
+obviously the JWT - so instead of reverse-engineering that, this just
+listens for the page's OWN request to `v1/account/summary` (which it fires
+itself, already defaulting to "Current month") via
+`page.expect_response()` while navigating, and reads that response body
+directly - no manual fetch/token needed at all.
 """
 
 import os
@@ -62,6 +75,8 @@ log = logging.getLogger("monefit_diversification")
 
 LOGIN_URL = "https://smartsaver.monefit.com/en/login"
 SUMMARY_URL = "https://smartsaver.monefit.com/en/summary"
+STATEMENT_URL = "https://smartsaver.monefit.com/en/account-statement"
+ACCOUNT_SUMMARY_API_PATH = "/v1/account/summary"
 STORAGE_STATE_FILE = Path(__file__).parent / "monefit_diversification_storage_state.json"
 LOAN_ORIGINATOR_LABEL = "monefit"
 
@@ -235,27 +250,95 @@ def fetch_balance(page) -> float:
     return amount
 
 
-def update_google_sheet(originators: list) -> None:
-    """Skeleton: write the balance into the Google Sheet. Mirrors
-    afranga_diversification.update_google_sheet() - not implemented yet on
-    purpose, fill in the actual cell/row mapping once you know which cell
-    should hold Monefit's balance, e.g.:
+def fetch_current_month_statement_totals(page) -> dict:
+    """Fetch this calendar month's "From daily returns" / "Rewards &
+    bonuses" / "Matured Vaults" totals, as shown on the Account Statement
+    page's Summary panel (https://smartsaver.monefit.com/en/account-statement).
+
+    Verified against the real account on 2026-07-10: that page defaults to
+    "Current month" (from the 1st of the current month through TODAY, same
+    semantics as Swaper/Afranga/Lendermarket/PeerBerry's equivalents) and
+    fires `GET https://api-smartsaver.monefit.com/v1/account/summary?dateFrom=<1st>&dateTo=<today>`
+    itself on load, returning `{"data": {"result": {"interestIncome":
+    "0.00000240", "bonus": "0.00000000", "maturedVaults": "0", ...}}}` -
+    `interestIncome`/`bonus`/`maturedVaults` match the page's "From daily
+    returns"/"Rewards & bonuses"/"Matured Vaults" figures exactly (rounded
+    to 2 decimals for display - e.g. 0.0000024 shows as "€0.00").
+
+    Unlike every other *_diversification.py's API calls, this endpoint's
+    auth (a bearer token returned at login) could not be located in a
+    cookie or an obviously-named localStorage key (see module docstring),
+    so rather than reverse-engineer it, this listens for the page's OWN
+    request instead of making a new one - `page.expect_response()` is set
+    up BEFORE navigating to the statement page, matching the first response
+    whose URL contains `/v1/account/summary`, and its JSON body is read
+    directly.
+    """
+    with page.expect_response(lambda r: ACCOUNT_SUMMARY_API_PATH in r.url, timeout=30000) as response_info:
+        log.info("Navigating to the account statement page, waiting for its own account/summary API call...")
+        page.goto(STATEMENT_URL, wait_until="domcontentloaded")
+    response = response_info.value
+    log.info("Account summary API response: ok=%s status=%s url=%s", response.ok, response.status, response.url)
+    if not response.ok:
+        raise RuntimeError(f"Account summary API returned status {response.status}")
+
+    result = (response.json() or {}).get("data", {}).get("result") or {}
+    log.info("Raw account/summary result: %r", result)
+    try:
+        daily_returns = round(float(result.get("interestIncome") or 0.0), 2)
+    except (TypeError, ValueError):
+        log.warning("Could not parse 'interestIncome' %r - defaulting to 0.0.", result.get("interestIncome"))
+        daily_returns = 0.0
+    try:
+        rewards_bonuses = round(float(result.get("bonus") or 0.0), 2)
+    except (TypeError, ValueError):
+        log.warning("Could not parse 'bonus' %r - defaulting to 0.0.", result.get("bonus"))
+        rewards_bonuses = 0.0
+    try:
+        matured_vaults = round(float(result.get("maturedVaults") or 0.0), 2)
+    except (TypeError, ValueError):
+        log.warning("Could not parse 'maturedVaults' %r - defaulting to 0.0.", result.get("maturedVaults"))
+        matured_vaults = 0.0
+
+    log.info(
+        "Parsed statement totals: daily_returns=%.2f, rewards_bonuses=%.2f, matured_vaults=%.2f",
+        daily_returns, rewards_bonuses, matured_vaults,
+    )
+    return {
+        "daily_returns": daily_returns,
+        "rewards_bonuses": rewards_bonuses,
+        "matured_vaults": matured_vaults,
+    }
+
+
+def update_google_sheet(originators: list, statement_totals: dict) -> None:
+    """Skeleton: write the balance and this month's statement totals into
+    the Google Sheet. Mirrors the other *_diversification.py scripts - not
+    implemented yet on purpose, fill in the actual cell/row mapping once
+    you know which cell should hold which value, e.g.:
 
         from google_sheet import get_latest_dashboard_worksheet, SPREADSHEET_ID
         worksheet = get_latest_dashboard_worksheet(SPREADSHEET_ID)
         for o in originators:
             ...  # look up the right cell for o["originator"] (== "monefit") and write o["outstanding"]
+        ...  # look up the right cells for statement_totals["daily_returns"] / ["rewards_bonuses"] / ["matured_vaults"]
 
     Left as a no-op for now so running this script never requires
     GOOGLE_SHEET_ID/GOOGLE_CREDENTIALS to be set.
     """
-    log.info("update_google_sheet() is not implemented yet - skipping (%d entry(ies) available).", len(originators))
+    log.info(
+        "update_google_sheet() is not implemented yet - skipping (%d entry(ies), "
+        "statement_totals=%s available).",
+        len(originators), statement_totals,
+    )
 
 
 def run(headless: bool = True) -> None:
     if not MONEFIT_EMAIL or not MONEFIT_PASSWORD:
         log.error("MONEFIT_EMAIL and MONEFIT_PASSWORD environment variables are required.")
         sys.exit(1)
+
+    log.info("Starting Monefit diversification run (headless=%s, storage_state_exists=%s).", headless, STORAGE_STATE_FILE.exists())
 
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=headless)
@@ -276,6 +359,16 @@ def run(headless: bool = True) -> None:
             browser.close()
             sys.exit(1)
 
+        try:
+            log.info("Fetching this month's statement totals...")
+            statement_totals = fetch_current_month_statement_totals(page)
+        except Exception:
+            log.exception(
+                "Failed to fetch this month's From daily returns/Rewards & bonuses/Matured Vaults - "
+                "defaulting all three to 0.0."
+            )
+            statement_totals = {"daily_returns": 0.0, "rewards_bonuses": 0.0, "matured_vaults": 0.0}
+
         # Persist cookies/local storage so the next run can skip login (and
         # 2FA) while the session remains valid.
         context.storage_state(path=str(STORAGE_STATE_FILE))
@@ -283,8 +376,12 @@ def run(headless: bool = True) -> None:
 
     originators = [{"originator": LOAN_ORIGINATOR_LABEL, "outstanding": balance}]
     log.info("Monefit balance: %.2f EUR", balance)
+    log.info(
+        "This month's From daily returns: %.2f EUR, Rewards & bonuses: %.2f EUR, Matured Vaults: %.2f EUR",
+        statement_totals["daily_returns"], statement_totals["rewards_bonuses"], statement_totals["matured_vaults"],
+    )
 
-    update_google_sheet(originators)
+    update_google_sheet(originators, statement_totals)
 
 
 if __name__ == "__main__":

@@ -225,6 +225,7 @@ def fetch_investments(page) -> list:
     investments = []
     page_number = 1
     while True:
+        log.info("Requesting investments API page %d...", page_number)
         result = page.evaluate(
             """
             async ([url, pageNumber, pageSize]) => {
@@ -237,17 +238,21 @@ def fetch_investments(page) -> list:
             """,
             [INVESTMENTS_API_URL, page_number, PAGE_SIZE],
         )
+        log.info("Investments API page %d response: ok=%s status=%s", page_number, result.get("ok"), result.get("status"))
         if not result.get("ok"):
             raise RuntimeError(f"Investments API returned status {result.get('status')} on page {page_number}")
 
         body = result.get("body") or {}
-        investments.extend(body.get("results") or [])
+        page_investments = body.get("results") or []
+        investments.extend(page_investments)
+        log.info("Page %d: %d investment(s) found (running total: %d).", page_number, len(page_investments), len(investments))
 
         if not body.get("next") or page_number >= (body.get("total_pages") or 1):
             break
         page_number += 1
 
-    for inv in investments:
+    log.info("Fetching principal_left detail for %d active investment(s)...", len(investments))
+    for i, inv in enumerate(investments, start=1):
         detail_result = page.evaluate(
             """
             async ([url, id]) => {
@@ -260,6 +265,8 @@ def fetch_investments(page) -> list:
         if not detail_result.get("ok"):
             raise RuntimeError(f"Investment detail API returned status {detail_result.get('status')} for {inv['id']}")
         inv["principal_left"] = (detail_result.get("body") or {}).get("principal_left")
+        if i % 20 == 0 or i == len(investments):
+            log.info("Fetched detail for %d/%d investment(s) so far.", i, len(investments))
 
     return investments
 
@@ -309,6 +316,7 @@ def fetch_current_month_statement_totals(page) -> dict:
     start_date = now.replace(day=1).strftime("%Y-%m-%d")
     last_day_of_month = calendar.monthrange(now.year, now.month)[1]
     end_date = now.replace(day=last_day_of_month).strftime("%Y-%m-%d")
+    log.info("Requesting statement-report API for %s to %s...", start_date, end_date)
 
     result = page.evaluate(
         """
@@ -320,13 +328,27 @@ def fetch_current_month_statement_totals(page) -> dict:
         """,
         [STATEMENT_API_URL, start_date, end_date],
     )
+    log.info("Statement-report API response: ok=%s status=%s", result.get("ok"), result.get("status"))
     if not result.get("ok"):
         raise RuntimeError(f"Statement report API returned status {result.get('status')}")
 
     body = result.get("body") or {}
+    log.info("Raw statement-report body: %r", body)
+    try:
+        interest_paid = float(body.get("total_interest") or 0.0)
+    except (TypeError, ValueError):
+        log.warning("Could not parse 'total_interest' %r - defaulting to 0.0.", body.get("total_interest"))
+        interest_paid = 0.0
+    try:
+        rewards = float(body.get("total_bonus") or 0.0)
+    except (TypeError, ValueError):
+        log.warning("Could not parse 'total_bonus' %r - defaulting to 0.0.", body.get("total_bonus"))
+        rewards = 0.0
+
+    log.info("Parsed statement totals: interest_paid=%.2f, rewards=%.2f", interest_paid, rewards)
     return {
-        "interest_paid": float(body.get("total_interest") or 0.0),
-        "rewards": float(body.get("total_bonus") or 0.0),
+        "interest_paid": interest_paid,
+        "rewards": rewards,
     }
 
 
@@ -359,6 +381,8 @@ def run(headless: bool = True) -> None:
         log.error("LOANCH_EMAIL and LOANCH_PASSWORD environment variables are required.")
         sys.exit(1)
 
+    log.info("Starting Loanch diversification run (headless=%s, storage_state_exists=%s).", headless, STORAGE_STATE_FILE.exists())
+
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=headless)
         storage_state = str(STORAGE_STATE_FILE) if STORAGE_STATE_FILE.exists() else None
@@ -374,11 +398,17 @@ def run(headless: bool = True) -> None:
             login(page)
             page.goto(INVESTMENTS_PAGE_URL, wait_until="domcontentloaded")
             investments = fetch_investments(page)
-            statement_totals = fetch_current_month_statement_totals(page)
         except Exception:
-            log.exception("Failed to log in or fetch Loanch investments/statement.")
+            log.exception("Failed to log in or fetch Loanch investments.")
             browser.close()
             sys.exit(1)
+
+        try:
+            log.info("Fetching this month's statement totals...")
+            statement_totals = fetch_current_month_statement_totals(page)
+        except Exception:
+            log.exception("Failed to fetch this month's interest paid/rewards - defaulting both to 0.0.")
+            statement_totals = {"interest_paid": 0.0, "rewards": 0.0}
 
         # Persist cookies/local storage so the next run can skip login (and
         # 2FA) while the session remains valid.

@@ -39,6 +39,17 @@ rather than a generic heuristic:
   keyword heuristic matches multiple candidates ambiguously. Hence the
   precise selectors above instead.
 
+Also fetches this calendar month's interest received (like
+loanch_diversification.fetch_current_month_statement_totals() /
+swaper_diversification.fetch_current_month_interest_received() /
+afranga_diversification.fetch_current_month_statement_totals()) from the
+"Toutes mes opérations" page (https://www.bienpreter.com/u/operations) -
+see fetch_current_month_interest_totals() below for exactly how gross/net/
+withholding tax are obtained (Bienpreter has no single labeled "gross
+interest" figure anywhere, unlike Afranga/Loanch/Swaper, so this is
+reconstructed from GROSS = NET + TAX using two real figures read off the
+page, not a guessed/configured flat tax rate).
+
 Required env vars:
     BIENPRETER_EMAIL, BIENPRETER_PASSWORD -> Bienpreter account credentials
 Optional:
@@ -50,7 +61,9 @@ import re
 import os
 import sys
 import logging
+from datetime import datetime
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 from dotenv import load_dotenv
 
@@ -65,7 +78,15 @@ log = logging.getLogger("bienpreter_diversification")
 
 LOGIN_URL = "https://www.bienpreter.com/connexion"
 DASHBOARD_URL = "https://www.bienpreter.com/u/tableau-de-bord"
+OPERATIONS_URL = "https://www.bienpreter.com/u/operations"
 STORAGE_STATE_FILE = Path(__file__).parent / "bienpreter_diversification_storage_state.json"
+MAX_OPERATIONS_PAGES = 300  # safety cap against an infinite loop if pagination ever misbehaves
+# Bienpreter is a French platform; "this month" below means the current
+# calendar month up to TODAY (1st of the month through today, NOT the full
+# month) - same semantics verified for Swaper's "This Month" / Afranga's
+# "Current Month" quick filters. Pinned explicitly rather than relying on
+# the executing machine's local clock (e.g. UTC on a CI runner).
+REPORT_TIMEZONE = ZoneInfo("Europe/Paris")
 
 BIENPRETER_EMAIL = os.environ.get("BIENPRETER_EMAIL")
 BIENPRETER_PASSWORD = os.environ.get("BIENPRETER_PASSWORD")
@@ -205,26 +226,160 @@ def fetch_balances(page) -> dict:
     return {"available_balance": available_balance, "capital_to_receive": capital_to_receive}
 
 
-def update_google_sheet(total: float) -> None:
+def _fetch_operations_page(page, start_date: str, end_date: str, page_number: int) -> list:
+    """Fetch one page of https://www.bienpreter.com/u/operations (a
+    server-rendered, non-JSON page - there is no JSON API here, unlike
+    Loanch/Swaper/Afranga's statement endpoints) filtered to the given
+    date range (`startDate`/`endDate` query params, "yyyy-mm-dd", verified
+    against the real account on 2026-07-10 to correctly narrow the
+    "X résultats au total" count), and extract each transaction row.
+
+    Verified table markup on 2026-07-10: each `<tr>` has a
+    `.transaction__name` label (e.g. "Remboursement mensuel", "Prélèvements
+    fiscaux") and a `.transaction__amount` (the total booked amount, e.g.
+    "0,13 €" or "-1,43 €"). Crucially, "Remboursement mensuel" rows also
+    contain one `.transaction__interests` span PER underlying project
+    (e.g. "0,13 €") giving the INTEREST-ONLY portion of that repayment,
+    separate from the row's total amount - this matters because Bienpreter
+    loans are "In Fine" (capital is repaid entirely at the loan's closing
+    date, interest paid periodically before that) and a row's total
+    `.transaction__amount` would silently include the bundled capital
+    for any loan reaching maturity within the reporting window otherwise.
+    Some rows bundle several projects repaid together on the same day
+    (e.g. one row can list 3 different "Noces d'or - Facture ..." project
+    links) - each has its own `.transaction__interests` span, so all of
+    them are summed, not just the first.
+    """
+    url = f"{OPERATIONS_URL}?selected-tab=1&startDate={start_date}&endDate={end_date}&page={page_number}"
+    log.info("Requesting operations page %d for %s to %s...", page_number, start_date, end_date)
+    page.goto(url, wait_until="domcontentloaded")
+    page.wait_for_timeout(1500)
+
+    return page.evaluate(
+        """
+        () => {
+            const rows = Array.from(document.querySelectorAll('table tbody tr'));
+            return rows.map((tr) => {
+                const nameEl = tr.querySelector('.transaction__name');
+                const amountEl = tr.querySelector('.transaction__amount');
+                const interestEls = Array.from(tr.querySelectorAll('.transaction__interests'));
+                return {
+                    label: nameEl ? nameEl.textContent.replace(/\\s+/g, ' ').trim() : null,
+                    amountText: amountEl ? amountEl.textContent.trim() : null,
+                    interestTexts: interestEls.map((e) => e.textContent.trim()),
+                };
+            });
+        }
+        """
+    )
+
+
+def fetch_current_month_interest_totals(page) -> dict:
+    """Fetch this calendar month's interest received, split into net/gross/
+    withholding tax, from the "Toutes mes opérations" page
+    (https://www.bienpreter.com/u/operations) - Bienpreter has no single
+    page/endpoint exposing a ready-made "gross interest received" figure
+    like Loanch/Swaper/Afranga do, so this reconstructs it from two real
+    (not estimated/guessed) figures read off the page:
+
+    - `net_interest_received`: sum of every `.transaction__interests` value
+      found across all "Remboursement mensuel" (and any other) rows in the
+      date range - the interest-only portion of each repayment, immune to
+      the capital-at-maturity contamination risk described in
+      `_fetch_operations_page()`'s docstring.
+    - `withholding_tax`: sum of the (absolute) `.transaction__amount` of
+      every row labeled "Prélèvements fiscaux" (covers both "Prélèvements
+      sociaux" and "Impôts sur le revenu" sub-lines, verified 2026-07-10:
+      -1,43 € and -0,98 € respectively) - the actual tax withheld at
+      source on interest income, always negative/deducted.
+    - `gross_interest_received` = net_interest_received + withholding_tax
+      (interest income tax is only ever withheld on interest, never on
+      capital, so this identity holds regardless of any capital bundled
+      into a "Remboursement mensuel" row's total amount).
+
+    Paginates via the `page` query param, stopping once a page returns no
+    rows (bounded by MAX_OPERATIONS_PAGES as a safety net). Uses
+    REPORT_TIMEZONE (Europe/Paris) to decide "this month" (1st of the
+    current month through TODAY, not the full month - same semantics as
+    Swaper's "This Month" / Afranga's "Current Month" quick filters)
+    rather than the executing machine's local clock.
+    """
+    now = datetime.now(REPORT_TIMEZONE)
+    start_date = now.replace(day=1).strftime("%Y-%m-%d")
+    end_date = now.strftime("%Y-%m-%d")
+
+    net_interest_received = 0.0
+    withholding_tax = 0.0
+
+    for page_number in range(1, MAX_OPERATIONS_PAGES + 1):
+        rows = _fetch_operations_page(page, start_date, end_date, page_number)
+        # BUG FOUND 2026-07-10: out-of-range pages don't return a genuinely
+        # empty <tbody> - they render one placeholder <tr> with no
+        # .transaction__name/.transaction__amount at all (label=None,
+        # amountText=None, interestTexts=[]). Filter those out before
+        # deciding a page is "empty" - otherwise `if not rows: break` never
+        # fires (len is 1, not 0) and every run used to waste ~47 extra
+        # requests hitting MAX_OPERATIONS_PAGES every single time.
+        rows = [r for r in rows if r.get("label")]
+        log.info("Operations page %d: %d real row(s) found (placeholder rows filtered out).", page_number, len(rows))
+        if not rows:
+            break
+
+        for row in rows:
+            for interest_text in row.get("interestTexts") or []:
+                net_interest_received += _parse_amount(interest_text) or 0.0
+
+            if (row.get("label") or "") == "Prélèvements fiscaux":
+                withholding_tax += abs(_parse_amount(row.get("amountText")) or 0.0)
+    else:
+        log.warning(
+            "Hit MAX_OPERATIONS_PAGES (%d) without an empty page - results may be truncated.",
+            MAX_OPERATIONS_PAGES,
+        )
+
+    gross_interest_received = net_interest_received + withholding_tax
+    log.info(
+        "Parsed interest totals: net_interest_received=%.2f, withholding_tax=%.2f, gross_interest_received=%.2f",
+        net_interest_received, withholding_tax, gross_interest_received,
+    )
+    return {
+        "net_interest_received": net_interest_received,
+        "withholding_tax": withholding_tax,
+        "gross_interest_received": gross_interest_received,
+    }
+
+
+def update_google_sheet(total: float, interest_totals: dict) -> None:
     """Skeleton: write the total (solde disponible + capital à recevoir)
-    into the Google Sheet. Not implemented yet on purpose - no
-    per-originator mapping needed here (unlike the other
-    *_diversification.py scripts), just a single cell, e.g.:
+    and this month's interest totals (gross/net/withholding tax) into the
+    Google Sheet. Mirrors loanch_diversification.update_google_sheet() /
+    swaper_diversification.update_google_sheet() /
+    afranga_diversification.update_google_sheet() - not implemented yet on
+    purpose, fill in the actual cell/row mapping once you know which cells
+    should hold which value, e.g.:
 
         from google_sheet import get_latest_dashboard_worksheet, SPREADSHEET_ID
         worksheet = get_latest_dashboard_worksheet(SPREADSHEET_ID)
         ...  # look up the right cell for Bienpreter and write `total`
+        ...  # look up the right cells for interest_totals["gross_interest_received"] / ["net_interest_received"] / ["withholding_tax"]
 
     Left as a no-op for now so running this script never requires
     GOOGLE_SHEET_ID/GOOGLE_CREDENTIALS to be set.
     """
-    log.info("update_google_sheet() is not implemented yet - skipping (total=%.2f EUR).", total)
+    log.info(
+        "update_google_sheet() is not implemented yet - skipping (total=%.2f EUR, "
+        "gross_interest_received=%.2f, net_interest_received=%.2f, withholding_tax=%.2f available).",
+        total, interest_totals.get("gross_interest_received", 0.0),
+        interest_totals.get("net_interest_received", 0.0), interest_totals.get("withholding_tax", 0.0),
+    )
 
 
 def run(headless: bool = True) -> None:
     if not BIENPRETER_EMAIL or not BIENPRETER_PASSWORD:
         log.error("BIENPRETER_EMAIL and BIENPRETER_PASSWORD environment variables are required.")
         sys.exit(1)
+
+    log.info("Starting Bienpreter diversification run (headless=%s, storage_state_exists=%s).", headless, STORAGE_STATE_FILE.exists())
 
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=headless)
@@ -245,6 +400,13 @@ def run(headless: bool = True) -> None:
             browser.close()
             sys.exit(1)
 
+        try:
+            log.info("Fetching this month's interest totals from the operations page...")
+            interest_totals = fetch_current_month_interest_totals(page)
+        except Exception:
+            log.exception("Failed to fetch this month's interest totals - defaulting all figures to 0.0.")
+            interest_totals = {"net_interest_received": 0.0, "withholding_tax": 0.0, "gross_interest_received": 0.0}
+
         # Persist cookies/local storage so the next run can skip login
         # while the session remains valid.
         context.storage_state(path=str(STORAGE_STATE_FILE))
@@ -255,8 +417,13 @@ def run(headless: bool = True) -> None:
         "Bienpreter: solde disponible=%.2f EUR + capital à recevoir=%.2f EUR = %.2f EUR",
         balances["available_balance"], balances["capital_to_receive"], total,
     )
+    log.info(
+        "This month's interest totals: gross_interest_received=%.2f EUR, net_interest_received=%.2f EUR, "
+        "withholding_tax=%.2f EUR",
+        interest_totals["gross_interest_received"], interest_totals["net_interest_received"], interest_totals["withholding_tax"],
+    )
 
-    update_google_sheet(total)
+    update_google_sheet(total, interest_totals)
 
 
 if __name__ == "__main__":
