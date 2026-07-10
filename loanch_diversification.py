@@ -5,10 +5,13 @@ code, same idea as Swaper/Lendermarket/PeerBerry) and fetches every active
 investment via the site's own "Mes investissements"
 (https://loanch.com/fr/dashboard/investments) API, then groups them by loan
 originator and sums the currently remaining (not yet repaid) principal of
-every active investment per originator. No email is sent - the amounts are
-just logged and handed to update_google_sheet() (currently a skeleton, see
-its docstring) so they can be filled into a Google Sheet, mirroring
-afranga_diversification.py / peerberry_diversification.py /
+every active investment per originator. It also fetches this calendar
+month's "Total des interets payes" / "Total des recompenses" from the
+"Releve de compte" (https://loanch.com/fr/dashboard/statement) API - see
+fetch_current_month_statement_totals() below. No email is sent - the
+amounts are just logged and handed to update_google_sheet() (currently a
+skeleton, see its docstring) so they can be filled into a Google Sheet,
+mirroring afranga_diversification.py / peerberry_diversification.py /
 lendermarket_diversification.py.
 
 API verified against the real account on 2026-07-09, in two steps:
@@ -57,12 +60,14 @@ Optional:
                                            below is filled in (see google_sheet.py)
 """
 
+import calendar
 import os
 import sys
 import logging
 from datetime import datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import pyotp
 from dotenv import load_dotenv
@@ -79,8 +84,14 @@ log = logging.getLogger("loanch_diversification")
 LOGIN_URL = "https://loanch.com/fr/login"
 INVESTMENTS_PAGE_URL = "https://loanch.com/fr/dashboard/investments"
 INVESTMENTS_API_URL = "https://api.loanch.com/api/v1/investments"
+STATEMENT_API_URL = "https://api.loanch.com/api/v1/statement-report"
 STORAGE_STATE_FILE = Path(__file__).parent / "loanch_diversification_storage_state.json"
 PAGE_SIZE = 100
+# Loanch is a French platform and its "Ce mois-ci" filter means the current
+# calendar month in French local time - pin the timezone explicitly instead
+# of relying on the executing machine's local clock (e.g. UTC on a CI
+# runner), which would compute the wrong month boundary around midnight.
+REPORT_TIMEZONE = ZoneInfo("Europe/Paris")
 
 LOANCH_EMAIL = os.environ.get("LOANCH_EMAIL")
 LOANCH_PASSWORD = os.environ.get("LOANCH_PASSWORD")
@@ -271,22 +282,76 @@ def aggregate_by_originator(investments: list) -> list:
     return originators
 
 
-def update_google_sheet(originators: list) -> None:
-    """Skeleton: write the per-originator invested amounts into the Google
+def fetch_current_month_statement_totals(page) -> dict:
+    """Fetch this calendar month's "Total des interets payes" and "Total
+    des recompenses", as shown on
+    https://loanch.com/fr/dashboard/statement, via the same
+    `statement-report` API the page's own "Ce mois-ci" quick filter uses.
+
+    Verified against the real account on 2026-07-10, in two ways:
+
+    1. Network capture while clicking "Ce mois-ci" on the statement page
+       showed it requests
+       `GET .../statement-report?start_date=2026-07-01&end_date=2026-07-31`
+       - i.e. the entire calendar month (first day to last day), not
+       "start of month to today" as one might assume - so this reproduces
+       that exact range instead.
+    2. The response's `total_interest` (1.59) and `total_bonus` (0) fields
+       matched the "Total des interets payes" / "Total des recompenses"
+       figures shown on the page exactly for July 2026.
+
+    Uses REPORT_TIMEZONE (Europe/Paris) rather than the executing machine's
+    local clock to decide what "this month" means, so this stays correct
+    regardless of where/when (e.g. a UTC CI runner around midnight) this
+    script actually runs.
+    """
+    now = datetime.now(REPORT_TIMEZONE)
+    start_date = now.replace(day=1).strftime("%Y-%m-%d")
+    last_day_of_month = calendar.monthrange(now.year, now.month)[1]
+    end_date = now.replace(day=last_day_of_month).strftime("%Y-%m-%d")
+
+    result = page.evaluate(
+        """
+        async ([url, startDate, endDate]) => {
+            const params = new URLSearchParams({ start_date: startDate, end_date: endDate });
+            const res = await fetch(`${url}?${params.toString()}`, { credentials: 'include' });
+            return { ok: res.ok, status: res.status, body: await res.json().catch(() => null) };
+        }
+        """,
+        [STATEMENT_API_URL, start_date, end_date],
+    )
+    if not result.get("ok"):
+        raise RuntimeError(f"Statement report API returned status {result.get('status')}")
+
+    body = result.get("body") or {}
+    return {
+        "interest_paid": float(body.get("total_interest") or 0.0),
+        "rewards": float(body.get("total_bonus") or 0.0),
+    }
+
+
+def update_google_sheet(originators: list, statement_totals: dict) -> None:
+    """Skeleton: write the per-originator invested amounts and this
+    month's statement totals (interest paid, rewards) into the Google
     Sheet. Mirrors afranga_diversification.update_google_sheet() /
     peerberry_diversification.update_google_sheet() - not implemented yet
     on purpose, fill in the actual cell/row mapping once you know which
-    cells should hold which originator's amount, e.g.:
+    cells should hold which value, e.g.:
 
         from google_sheet import get_latest_dashboard_worksheet, SPREADSHEET_ID
         worksheet = get_latest_dashboard_worksheet(SPREADSHEET_ID)
         for o in originators:
             ...  # look up the right cell for o["originator"] and write o["amount"]
+        ...  # look up the right cells for statement_totals["interest_paid"] / ["rewards"]
 
     Left as a no-op for now so running this script never requires
     GOOGLE_SHEET_ID/GOOGLE_CREDENTIALS to be set.
     """
-    log.info("update_google_sheet() is not implemented yet - skipping (%d originator(s) available).", len(originators))
+    log.info(
+        "update_google_sheet() is not implemented yet - skipping (%d originator(s), "
+        "interest_paid=%.2f, rewards=%.2f available).",
+        len(originators), statement_totals.get("interest_paid", 0.0), statement_totals.get("rewards", 0.0),
+    )
 
 
 def run(headless: bool = True) -> None:
@@ -309,8 +374,9 @@ def run(headless: bool = True) -> None:
             login(page)
             page.goto(INVESTMENTS_PAGE_URL, wait_until="domcontentloaded")
             investments = fetch_investments(page)
+            statement_totals = fetch_current_month_statement_totals(page)
         except Exception:
-            log.exception("Failed to log in or fetch Loanch investments.")
+            log.exception("Failed to log in or fetch Loanch investments/statement.")
             browser.close()
             sys.exit(1)
 
@@ -324,7 +390,12 @@ def run(headless: bool = True) -> None:
     for o in originators:
         log.info("  %s: %.2f EUR", o["originator"], o["amount"])
 
-    update_google_sheet(originators)
+    log.info(
+        "This month's statement totals: interest_paid=%.2f EUR, rewards=%.2f EUR",
+        statement_totals["interest_paid"], statement_totals["rewards"],
+    )
+
+    update_google_sheet(originators, statement_totals)
 
 
 if __name__ == "__main__":
