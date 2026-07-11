@@ -5,8 +5,8 @@ idea as swaper_monitor.py / lendermarket_monitor.py) and fetches the
 per-loan-originator investment breakdown that's shown on the Overview page
 under Investments > "Loan originators" (amount invested + % of the
 portfolio, one row per originator). No email is sent - the amounts are just
-logged and handed to update_google_sheet() (currently a skeleton, see its
-docstring) so they can be filled into a Google Sheet.
+logged and handed to fill_current_month_amounts() (see google_sheet.py) so
+they can be filled into a Google Sheet.
 
 The breakdown itself is NOT re-fetched via a dedicated API call when
 switching that dropdown on the site - it's already loaded once and only
@@ -33,8 +33,10 @@ Optional:
     PEERBERRY_TOTP_SECRET                  -> base32 secret used to set up
                                                Google Authenticator, needed
                                                if 2FA is enabled on the account
-    GOOGLE_SHEET_ID, GOOGLE_CREDENTIALS     -> only needed once update_google_sheet()
-                                               below is filled in (see google_sheet.py)
+    GOOGLE_SHEET_ID, GOOGLE_CREDENTIALS     -> used to write this month's
+                                               totals to the Google Sheet via
+                                               fill_current_month_amounts()
+                                               (see google_sheet.py)
 """
 
 import os
@@ -46,6 +48,8 @@ from zoneinfo import ZoneInfo
 
 import pyotp
 from dotenv import load_dotenv
+
+from google_sheet import fill_current_month_amounts
 
 load_dotenv()
 
@@ -293,31 +297,6 @@ def fetch_current_month_interest_income(page) -> float:
     return interest_income
 
 
-def update_google_sheet(originators: list, interest_income: float) -> None:
-    """Skeleton: write the per-loan-originator amounts and this month's
-    Interest income into the Google Sheet.
-
-    Not implemented yet on purpose - fill in the actual cell/row mapping
-    once you know which cells in which sheet should hold which originator's
-    amount. `google_sheet.py` already provides `get_latest_dashboard_worksheet()`
-    (picks the most recent "Dashboard <year>" tab) as a starting point, e.g.:
-
-        from google_sheet import get_latest_dashboard_worksheet, SPREADSHEET_ID
-        worksheet = get_latest_dashboard_worksheet(SPREADSHEET_ID)
-        for o in originators:
-            ...  # look up the right cell for o["originator"] and write o["amount"]
-        ...  # look up the right cell for interest_income
-
-    Left as a no-op for now so running this script never requires
-    GOOGLE_SHEET_ID/GOOGLE_CREDENTIALS to be set.
-    """
-    log.info(
-        "update_google_sheet() is not implemented yet - skipping (%d originator(s), "
-        "interest_income=%.2f available).",
-        len(originators), interest_income,
-    )
-
-
 def run(headless: bool = True) -> None:
     if not PEERBERRY_EMAIL or not PEERBERRY_PASSWORD:
         log.error("PEERBERRY_EMAIL and PEERBERRY_PASSWORD environment variables are required.")
@@ -364,7 +343,23 @@ def run(headless: bool = True) -> None:
 
     log.info("This month's Interest income: %.2f EUR", interest_income)
 
-    update_google_sheet(originators, interest_income)
+    # PeerBerry's account-summary API has no gross/net/withholding-tax
+    # breakdown (unlike Afranga/Bienpreter) - interest_income is mapped to
+    # both gross_interest_received/net_interest_received since it's the
+    # only real figure on hand, withholding_tax defaults to 0.0. Same
+    # standardized dict shape as every other *_diversification.py, plus the
+    # platform-specific interest_income field kept alongside it.
+    amounts = {
+        "total": sum(o["amount"] for o in originators),
+        "gross_interest_received": interest_income,
+        "net_interest_received": interest_income,
+        "withholding_tax": 0.0,
+        "interest_income": interest_income,
+    }
+    fill_current_month_amounts(
+        platform="PeerBerry",
+        amounts=amounts
+    )
 
 
 if __name__ == "__main__":

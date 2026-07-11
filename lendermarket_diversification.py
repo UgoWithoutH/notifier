@@ -6,8 +6,8 @@ active investment via the site's own "Mes investissements"
 (https://app.lendermarket.com/fr/investissements) API, then groups them by
 loan originator ("fournisseur de crédit") and sums the remaining principal
 ("capital restant") per originator. No email is sent - the amounts are just
-logged and handed to update_google_sheet() (currently a skeleton, see its
-docstring) so they can be filled into a Google Sheet, mirroring
+logged and handed to fill_current_month_amounts() (see google_sheet.py) so
+they can be filled into a Google Sheet, mirroring
 peerberry_diversification.py.
 
 API verified against the real account on 2026-07-09:
@@ -40,8 +40,10 @@ Optional:
     LENDERMARKET_TOTP_SECRET                   -> base32 secret used to set up
                                                    Google Authenticator, needed
                                                    if 2FA is enabled on the account
-    GOOGLE_SHEET_ID, GOOGLE_CREDENTIALS         -> only needed once update_google_sheet()
-                                                   below is filled in (see google_sheet.py)
+    GOOGLE_SHEET_ID, GOOGLE_CREDENTIALS         -> used to write this month's
+                                                   totals to the Google Sheet
+                                                   via fill_current_month_amounts()
+                                                   (see google_sheet.py)
 """
 
 import logging
@@ -51,6 +53,8 @@ from pathlib import Path
 from zoneinfo import ZoneInfo
 
 from dotenv import load_dotenv
+
+from google_sheet import fill_current_month_amounts
 
 load_dotenv()
 
@@ -209,30 +213,6 @@ def fetch_current_month_statement_totals(page) -> dict:
     }
 
 
-def update_google_sheet(lenders: list, statement_totals: dict) -> None:
-    """Skeleton: write the per-lender remaining-capital amounts and this
-    month's statement totals (interest received, bonuses) into the Google
-    Sheet. Mirrors afranga_diversification.update_google_sheet() /
-    loanch_diversification.update_google_sheet() - not implemented yet on
-    purpose, fill in the actual cell/row mapping once you know which cells
-    should hold which value, e.g.:
-
-        from google_sheet import get_latest_dashboard_worksheet, SPREADSHEET_ID
-        worksheet = get_latest_dashboard_worksheet(SPREADSHEET_ID)
-        for l in lenders:
-            ...  # look up the right cell for l["lender"] and write l["remaining_principal"]
-        ...  # look up the right cells for statement_totals["interest_received"] / ["bonuses"]
-
-    Left as a no-op for now so running this script never requires
-    GOOGLE_SHEET_ID/GOOGLE_CREDENTIALS to be set.
-    """
-    log.info(
-        "update_google_sheet() is not implemented yet - skipping (%d lender(s), "
-        "interest_received=%.2f, bonuses=%.2f available).",
-        len(lenders), statement_totals.get("interest_received", 0.0), statement_totals.get("bonuses", 0.0),
-    )
-
-
 def run(headless: bool = True) -> None:
     if not LENDERMARKET_EMAIL or not LENDERMARKET_PASSWORD:
         log.error("LENDERMARKET_EMAIL and LENDERMARKET_PASSWORD environment variables are required.")
@@ -283,7 +263,24 @@ def run(headless: bool = True) -> None:
         statement_totals["interest_received"], statement_totals["bonuses"],
     )
 
-    update_google_sheet(lenders, statement_totals)
+    # Lendermarket's statement summary API has no gross/net/withholding-tax
+    # breakdown (unlike Afranga/Bienpreter) - interest_received is mapped to
+    # both gross_interest_received/net_interest_received since it's the
+    # only real figure on hand, withholding_tax defaults to 0.0. Same
+    # standardized dict shape as every other *_diversification.py, plus the
+    # platform-specific interest_received/bonuses fields kept alongside it.
+    amounts = {
+        "total": sum(l["remaining_principal"] for l in lenders),
+        "gross_interest_received": statement_totals["interest_received"],
+        "net_interest_received": statement_totals["interest_received"],
+        "withholding_tax": 0.0,
+        "interest_received": statement_totals["interest_received"],
+        "bonuses": statement_totals["bonuses"],
+    }
+    fill_current_month_amounts(
+        platform="Lendermarket",
+        amounts=amounts
+    )
 
 
 if __name__ == "__main__":

@@ -6,7 +6,7 @@ fetches every active investment from the "My investments"
 (https://afranga.com/profile/my-investments) page, then groups them by loan
 originator and sums the outstanding (remaining) investment amount per
 originator. No email is sent - the amounts are just logged and handed to
-update_google_sheet() (currently a skeleton, see its docstring) so they can
+fill_current_month_amounts() (see google_sheet.py) so they can
 be filled into a Google Sheet, mirroring peerberry_diversification.py /
 lendermarket_diversification.py.
 
@@ -46,8 +46,10 @@ Optional:
     AFRANGA_TOTP_SECRET                -> base32 secret used to set up
                                            Google Authenticator, needed if
                                            2FA is enabled on the account
-    GOOGLE_SHEET_ID, GOOGLE_CREDENTIALS -> only needed once update_google_sheet()
-                                           below is filled in (see google_sheet.py)
+    GOOGLE_SHEET_ID, GOOGLE_CREDENTIALS -> used to write this month's totals to
+                                           the Google Sheet via
+                                           fill_current_month_amounts() (see
+                                           google_sheet.py)
 """
 
 import os
@@ -60,6 +62,8 @@ from zoneinfo import ZoneInfo
 
 import pyotp
 from dotenv import load_dotenv
+
+from google_sheet import fill_current_month_amounts
 
 load_dotenv()
 
@@ -354,31 +358,6 @@ def fetch_current_month_statement_totals(page) -> dict:
     return {"gross_interest_received": gross_interest_received, "withholding_tax": withholding_tax}
 
 
-def update_google_sheet(originators: list, statement_totals: dict) -> None:
-    """Skeleton: write the per-originator outstanding amounts and this
-    month's statement totals (Gross interest received, Withholding Tax)
-    into the Google Sheet. Mirrors
-    swaper_diversification.update_google_sheet() /
-    loanch_diversification.update_google_sheet() - not implemented yet on
-    purpose, fill in the actual cell/row mapping once you know which cells
-    should hold which value, e.g.:
-
-        from google_sheet import get_latest_dashboard_worksheet, SPREADSHEET_ID
-        worksheet = get_latest_dashboard_worksheet(SPREADSHEET_ID)
-        for o in originators:
-            ...  # look up the right cell for o["originator"] and write o["outstanding"]
-        ...  # look up the right cells for statement_totals["gross_interest_received"] / ["withholding_tax"]
-
-    Left as a no-op for now so running this script never requires
-    GOOGLE_SHEET_ID/GOOGLE_CREDENTIALS to be set.
-    """
-    log.info(
-        "update_google_sheet() is not implemented yet - skipping (%d originator(s), "
-        "gross_interest_received=%.2f, withholding_tax=%.2f available).",
-        len(originators), statement_totals.get("gross_interest_received", 0.0), statement_totals.get("withholding_tax", 0.0),
-    )
-
-
 def run(headless: bool = True) -> None:
     if not AFRANGA_EMAIL or not AFRANGA_PASSWORD:
         log.error("AFRANGA_EMAIL and AFRANGA_PASSWORD environment variables are required.")
@@ -426,12 +405,21 @@ def run(headless: bool = True) -> None:
     for o in originators:
         log.info("  %s: %.2f EUR", o["originator"], o["outstanding"])
 
+    statement_totals["total"] = sum(o["outstanding"] for o in originators)
+    statement_totals["net_interest_received"] = (
+        statement_totals["gross_interest_received"] - statement_totals["withholding_tax"]
+    )
     log.info(
-        "This month's statement totals: gross_interest_received=%.2f EUR, withholding_tax=%.2f EUR",
-        statement_totals["gross_interest_received"], statement_totals["withholding_tax"],
+        "This month's statement totals: total=%.2f EUR, gross_interest_received=%.2f EUR, "
+        "net_interest_received=%.2f EUR, withholding_tax=%.2f EUR",
+        statement_totals["total"], statement_totals["gross_interest_received"],
+        statement_totals["net_interest_received"], statement_totals["withholding_tax"],
     )
 
-    update_google_sheet(originators, statement_totals)
+    fill_current_month_amounts(
+        platform="Afranga",
+        amounts=statement_totals
+    )
 
 
 if __name__ == "__main__":

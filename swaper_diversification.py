@@ -11,7 +11,7 @@ Finance 85.56%") plus the total currently allocated/invested amount (e.g.
 "5076.18 €"). The per-originator EUR amount isn't shown directly, so it's
 computed as `total_invested * percentage / 100`, per the user's own
 instructions. No email is sent - the amounts are just logged and handed to
-update_google_sheet() (currently a skeleton, see its docstring) so they can
+fill_current_month_amounts() (see google_sheet.py) so they can
 be filled into a Google Sheet, mirroring the other *_diversification.py
 scripts.
 
@@ -41,8 +41,10 @@ Optional:
     SWAPER_TOTP_SECRET                  -> base32 secret used to set up
                                             Google Authenticator, needed if
                                             2FA is enabled on the account
-    GOOGLE_SHEET_ID, GOOGLE_CREDENTIALS  -> only needed once update_google_sheet()
-                                            below is filled in (see google_sheet.py)
+    GOOGLE_SHEET_ID, GOOGLE_CREDENTIALS  -> used to write this month's totals
+                                            to the Google Sheet via
+                                            fill_current_month_amounts() (see
+                                            google_sheet.py)
 """
 
 import re
@@ -53,6 +55,8 @@ from pathlib import Path
 from zoneinfo import ZoneInfo
 
 from dotenv import load_dotenv
+
+from google_sheet import fill_current_month_amounts
 
 load_dotenv()
 
@@ -250,29 +254,6 @@ def fetch_current_month_interest_received(page) -> float:
         return 0.0
 
 
-def update_google_sheet(originators: list, interest_received: float) -> None:
-    """Skeleton: write the per-originator invested amounts and this month's
-    Interest Received into the Google Sheet. Mirrors
-    loanch_diversification.update_google_sheet() - not implemented yet on
-    purpose, fill in the actual cell/row mapping once you know which cells
-    should hold which value, e.g.:
-
-        from google_sheet import get_latest_dashboard_worksheet, SPREADSHEET_ID
-        worksheet = get_latest_dashboard_worksheet(SPREADSHEET_ID)
-        for o in originators:
-            ...  # look up the right cell for o["originator"] and write o["outstanding"]
-        ...  # look up the right cell for interest_received
-
-    Left as a no-op for now so running this script never requires
-    GOOGLE_SHEET_ID/GOOGLE_CREDENTIALS to be set.
-    """
-    log.info(
-        "update_google_sheet() is not implemented yet - skipping (%d originator(s), "
-        "interest_received=%.2f available).",
-        len(originators), interest_received,
-    )
-
-
 def run(headless: bool = True) -> None:
     if not SWAPER_EMAIL or not SWAPER_PASSWORD:
         log.error("SWAPER_EMAIL and SWAPER_PASSWORD environment variables are required.")
@@ -322,7 +303,23 @@ def run(headless: bool = True) -> None:
 
     log.info("This month's Interest Received: %.2f EUR", interest_received)
 
-    update_google_sheet(originators, interest_received)
+    # Swaper's account-entries API has no gross/net/withholding-tax
+    # breakdown (unlike Afranga/Bienpreter) - interest_received is mapped to
+    # both gross_interest_received/net_interest_received since it's the
+    # only real figure on hand, withholding_tax defaults to 0.0. Same
+    # standardized dict shape as every other *_diversification.py, plus the
+    # platform-specific interest_received field kept alongside it.
+    amounts = {
+        "total": breakdown["total_invested"],
+        "gross_interest_received": interest_received,
+        "net_interest_received": interest_received,
+        "withholding_tax": 0.0,
+        "interest_received": interest_received,
+    }
+    fill_current_month_amounts(
+        platform="Swaper",
+        amounts=amounts
+    )
 
 
 if __name__ == "__main__":

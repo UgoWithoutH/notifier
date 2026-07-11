@@ -7,9 +7,9 @@ https://www.bienpreter.com, reads two figures on the dashboard
 (https://www.bienpreter.com/u/tableau-de-bord):
   - "solde disponible" (available cash balance not yet invested)
   - "capital à recevoir" (capital still to be repaid on active investments)
-sums them, and hands the single total to update_google_sheet() (currently a
-skeleton, see its docstring) - no per-originator dict, just one number, no
-email sent either.
+sums them, and hands the single total to fill_current_month_amounts() (see
+google_sheet.py) - no per-originator dict, just one number, no email sent
+either.
 
 Login form verified against the real page on 2026-07-09: a textbox with
 accessible name "Email*", a textbox with accessible name "Mot de passe*",
@@ -45,16 +45,18 @@ swaper_diversification.fetch_current_month_interest_received() /
 afranga_diversification.fetch_current_month_statement_totals()) from the
 "Toutes mes opérations" page (https://www.bienpreter.com/u/operations) -
 see fetch_current_month_interest_totals() below for exactly how gross/net/
-withholding tax are obtained (Bienpreter has no single labeled "gross
+withholding tax are obtained (Bienpreter has no single labeled "net
 interest" figure anywhere, unlike Afranga/Loanch/Swaper, so this is
-reconstructed from GROSS = NET + TAX using two real figures read off the
+reconstructed from NET = GROSS - TAX using two real figures read off the
 page, not a guessed/configured flat tax rate).
 
 Required env vars:
     BIENPRETER_EMAIL, BIENPRETER_PASSWORD -> Bienpreter account credentials
 Optional:
-    GOOGLE_SHEET_ID, GOOGLE_CREDENTIALS    -> only needed once update_google_sheet()
-                                              below is filled in (see google_sheet.py)
+    GOOGLE_SHEET_ID, GOOGLE_CREDENTIALS    -> used to write this month's totals
+                                              to the Google Sheet via
+                                              fill_current_month_amounts() (see
+                                              google_sheet.py)
 """
 
 import re
@@ -66,6 +68,8 @@ from pathlib import Path
 from zoneinfo import ZoneInfo
 
 from dotenv import load_dotenv
+
+from google_sheet import fill_current_month_amounts
 
 load_dotenv()
 
@@ -282,17 +286,21 @@ def fetch_current_month_interest_totals(page) -> dict:
     like Loanch/Swaper/Afranga do, so this reconstructs it from two real
     (not estimated/guessed) figures read off the page:
 
-    - `net_interest_received`: sum of every `.transaction__interests` value
-      found across all "Remboursement mensuel" (and any other) rows in the
-      date range - the interest-only portion of each repayment, immune to
-      the capital-at-maturity contamination risk described in
-      `_fetch_operations_page()`'s docstring.
+    - `gross_interest_received`: sum of every `.transaction__interests`
+      value found across all "Remboursement mensuel" (and any other) rows
+      in the date range - the interest-only portion of each repayment,
+      immune to the capital-at-maturity contamination risk described in
+      `_fetch_operations_page()`'s docstring. CONFIRMED 2026-07-12 (by the
+      user, against their real account) that this figure is the GROSS
+      amount, i.e. BEFORE withholding tax - it was originally mislabeled
+      "net" here, which silently double-counted tax in the "gross" total
+      below.
     - `withholding_tax`: sum of the (absolute) `.transaction__amount` of
       every row labeled "Prélèvements fiscaux" (covers both "Prélèvements
       sociaux" and "Impôts sur le revenu" sub-lines, verified 2026-07-10:
       -1,43 € and -0,98 € respectively) - the actual tax withheld at
       source on interest income, always negative/deducted.
-    - `gross_interest_received` = net_interest_received + withholding_tax
+    - `net_interest_received` = gross_interest_received - withholding_tax
       (interest income tax is only ever withheld on interest, never on
       capital, so this identity holds regardless of any capital bundled
       into a "Remboursement mensuel" row's total amount).
@@ -308,7 +316,7 @@ def fetch_current_month_interest_totals(page) -> dict:
     start_date = now.replace(day=1).strftime("%Y-%m-%d")
     end_date = now.strftime("%Y-%m-%d")
 
-    net_interest_received = 0.0
+    gross_interest_received = 0.0
     withholding_tax = 0.0
 
     for page_number in range(1, MAX_OPERATIONS_PAGES + 1):
@@ -327,7 +335,7 @@ def fetch_current_month_interest_totals(page) -> dict:
 
         for row in rows:
             for interest_text in row.get("interestTexts") or []:
-                net_interest_received += _parse_amount(interest_text) or 0.0
+                gross_interest_received += _parse_amount(interest_text) or 0.0
 
             if (row.get("label") or "") == "Prélèvements fiscaux":
                 withholding_tax += abs(_parse_amount(row.get("amountText")) or 0.0)
@@ -337,41 +345,16 @@ def fetch_current_month_interest_totals(page) -> dict:
             MAX_OPERATIONS_PAGES,
         )
 
-    gross_interest_received = net_interest_received + withholding_tax
+    net_interest_received = gross_interest_received - withholding_tax
     log.info(
-        "Parsed interest totals: net_interest_received=%.2f, withholding_tax=%.2f, gross_interest_received=%.2f",
-        net_interest_received, withholding_tax, gross_interest_received,
+        "Parsed interest totals: gross_interest_received=%.2f, withholding_tax=%.2f, net_interest_received=%.2f",
+        gross_interest_received, withholding_tax, net_interest_received,
     )
     return {
         "net_interest_received": net_interest_received,
         "withholding_tax": withholding_tax,
         "gross_interest_received": gross_interest_received,
     }
-
-
-def update_google_sheet(total: float, interest_totals: dict) -> None:
-    """Skeleton: write the total (solde disponible + capital à recevoir)
-    and this month's interest totals (gross/net/withholding tax) into the
-    Google Sheet. Mirrors loanch_diversification.update_google_sheet() /
-    swaper_diversification.update_google_sheet() /
-    afranga_diversification.update_google_sheet() - not implemented yet on
-    purpose, fill in the actual cell/row mapping once you know which cells
-    should hold which value, e.g.:
-
-        from google_sheet import get_latest_dashboard_worksheet, SPREADSHEET_ID
-        worksheet = get_latest_dashboard_worksheet(SPREADSHEET_ID)
-        ...  # look up the right cell for Bienpreter and write `total`
-        ...  # look up the right cells for interest_totals["gross_interest_received"] / ["net_interest_received"] / ["withholding_tax"]
-
-    Left as a no-op for now so running this script never requires
-    GOOGLE_SHEET_ID/GOOGLE_CREDENTIALS to be set.
-    """
-    log.info(
-        "update_google_sheet() is not implemented yet - skipping (total=%.2f EUR, "
-        "gross_interest_received=%.2f, net_interest_received=%.2f, withholding_tax=%.2f available).",
-        total, interest_totals.get("gross_interest_received", 0.0),
-        interest_totals.get("net_interest_received", 0.0), interest_totals.get("withholding_tax", 0.0),
-    )
 
 
 def run(headless: bool = True) -> None:
@@ -413,6 +396,7 @@ def run(headless: bool = True) -> None:
         browser.close()
 
     total = balances["available_balance"] + balances["capital_to_receive"]
+    interest_totals["total"] = total
     log.info(
         "Bienpreter: solde disponible=%.2f EUR + capital à recevoir=%.2f EUR = %.2f EUR",
         balances["available_balance"], balances["capital_to_receive"], total,
@@ -423,7 +407,10 @@ def run(headless: bool = True) -> None:
         interest_totals["gross_interest_received"], interest_totals["net_interest_received"], interest_totals["withholding_tax"],
     )
 
-    update_google_sheet(total, interest_totals)
+    fill_current_month_amounts(
+        platform="Bienprêter",
+        amounts=interest_totals
+    )
 
 
 if __name__ == "__main__":

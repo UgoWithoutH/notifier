@@ -9,8 +9,8 @@ every active investment per originator. It also fetches this calendar
 month's "Total des interets payes" / "Total des recompenses" from the
 "Releve de compte" (https://loanch.com/fr/dashboard/statement) API - see
 fetch_current_month_statement_totals() below. No email is sent - the
-amounts are just logged and handed to update_google_sheet() (currently a
-skeleton, see its docstring) so they can be filled into a Google Sheet,
+amounts are just logged and handed to fill_current_month_amounts() (see
+google_sheet.py) so they can be filled into a Google Sheet,
 mirroring afranga_diversification.py / peerberry_diversification.py /
 lendermarket_diversification.py.
 
@@ -56,8 +56,10 @@ Optional:
     LOANCH_TOTP_SECRET                 -> base32 secret used to set up
                                            Google Authenticator, needed if
                                            2FA is enabled on the account
-    GOOGLE_SHEET_ID, GOOGLE_CREDENTIALS -> only needed once update_google_sheet()
-                                           below is filled in (see google_sheet.py)
+    GOOGLE_SHEET_ID, GOOGLE_CREDENTIALS -> used to write this month's totals to
+                                           the Google Sheet via
+                                           fill_current_month_amounts() (see
+                                           google_sheet.py)
 """
 
 import calendar
@@ -71,6 +73,8 @@ from zoneinfo import ZoneInfo
 
 import pyotp
 from dotenv import load_dotenv
+
+from google_sheet import fill_current_month_amounts
 
 load_dotenv()
 
@@ -352,30 +356,6 @@ def fetch_current_month_statement_totals(page) -> dict:
     }
 
 
-def update_google_sheet(originators: list, statement_totals: dict) -> None:
-    """Skeleton: write the per-originator invested amounts and this
-    month's statement totals (interest paid, rewards) into the Google
-    Sheet. Mirrors afranga_diversification.update_google_sheet() /
-    peerberry_diversification.update_google_sheet() - not implemented yet
-    on purpose, fill in the actual cell/row mapping once you know which
-    cells should hold which value, e.g.:
-
-        from google_sheet import get_latest_dashboard_worksheet, SPREADSHEET_ID
-        worksheet = get_latest_dashboard_worksheet(SPREADSHEET_ID)
-        for o in originators:
-            ...  # look up the right cell for o["originator"] and write o["amount"]
-        ...  # look up the right cells for statement_totals["interest_paid"] / ["rewards"]
-
-    Left as a no-op for now so running this script never requires
-    GOOGLE_SHEET_ID/GOOGLE_CREDENTIALS to be set.
-    """
-    log.info(
-        "update_google_sheet() is not implemented yet - skipping (%d originator(s), "
-        "interest_paid=%.2f, rewards=%.2f available).",
-        len(originators), statement_totals.get("interest_paid", 0.0), statement_totals.get("rewards", 0.0),
-    )
-
-
 def run(headless: bool = True) -> None:
     if not LOANCH_EMAIL or not LOANCH_PASSWORD:
         log.error("LOANCH_EMAIL and LOANCH_PASSWORD environment variables are required.")
@@ -425,7 +405,24 @@ def run(headless: bool = True) -> None:
         statement_totals["interest_paid"], statement_totals["rewards"],
     )
 
-    update_google_sheet(originators, statement_totals)
+    # Loanch's statement-report API has no gross/net/withholding-tax
+    # breakdown (unlike Afranga/Bienpreter) - interest_paid is mapped to
+    # both gross_interest_received/net_interest_received since it's the
+    # only real figure on hand, withholding_tax defaults to 0.0. Same
+    # standardized dict shape as every other *_diversification.py, plus the
+    # platform-specific interest_paid/rewards fields kept alongside it.
+    amounts = {
+        "total": sum(o["amount"] for o in originators),
+        "gross_interest_received": statement_totals["interest_paid"],
+        "net_interest_received": statement_totals["interest_paid"],
+        "withholding_tax": 0.0,
+        "interest_paid": statement_totals["interest_paid"],
+        "rewards": statement_totals["rewards"],
+    }
+    fill_current_month_amounts(
+        platform="Loanch",
+        amounts=amounts
+    )
 
 
 if __name__ == "__main__":

@@ -6,7 +6,8 @@ Monefit SmartSaver is a single savings product (not a marketplace split
 across many loan originators), so there's nothing to group/aggregate - this
 just logs into https://smartsaver.monefit.com, reads the account balance
 shown on the summary page (https://smartsaver.monefit.com/en/summary), and
-hands it to update_google_sheet() as a single-entry list using "monefit" as
+hands it to fill_current_month_amounts() (see google_sheet.py) as a
+single-entry list using "monefit" as
 the loan originator label, mirroring the {"originator", "outstanding"} shape
 used by afranga_diversification.py. No email is sent - same as the other
 diversification scripts.
@@ -38,8 +39,10 @@ Optional:
     MONEFIT_TOTP_SECRET                 -> base32 secret used to set up
                                             Google Authenticator, only used if
                                             a 2FA prompt is actually detected
-    GOOGLE_SHEET_ID, GOOGLE_CREDENTIALS  -> only needed once update_google_sheet()
-                                            below is filled in (see google_sheet.py)
+    GOOGLE_SHEET_ID, GOOGLE_CREDENTIALS  -> used to write this month's totals
+                                            to the Google Sheet via
+                                            fill_current_month_amounts() (see
+                                            google_sheet.py)
 
 Also fetches this calendar month's "From daily returns" / "Rewards & bonuses"
 / "Matured Vaults" totals from the Account Statement page
@@ -63,6 +66,8 @@ from pathlib import Path
 
 import pyotp
 from dotenv import load_dotenv
+
+from google_sheet import fill_current_month_amounts
 
 load_dotenv()
 
@@ -311,28 +316,6 @@ def fetch_current_month_statement_totals(page) -> dict:
     }
 
 
-def update_google_sheet(originators: list, statement_totals: dict) -> None:
-    """Skeleton: write the balance and this month's statement totals into
-    the Google Sheet. Mirrors the other *_diversification.py scripts - not
-    implemented yet on purpose, fill in the actual cell/row mapping once
-    you know which cell should hold which value, e.g.:
-
-        from google_sheet import get_latest_dashboard_worksheet, SPREADSHEET_ID
-        worksheet = get_latest_dashboard_worksheet(SPREADSHEET_ID)
-        for o in originators:
-            ...  # look up the right cell for o["originator"] (== "monefit") and write o["outstanding"]
-        ...  # look up the right cells for statement_totals["daily_returns"] / ["rewards_bonuses"] / ["matured_vaults"]
-
-    Left as a no-op for now so running this script never requires
-    GOOGLE_SHEET_ID/GOOGLE_CREDENTIALS to be set.
-    """
-    log.info(
-        "update_google_sheet() is not implemented yet - skipping (%d entry(ies), "
-        "statement_totals=%s available).",
-        len(originators), statement_totals,
-    )
-
-
 def run(headless: bool = True) -> None:
     if not MONEFIT_EMAIL or not MONEFIT_PASSWORD:
         log.error("MONEFIT_EMAIL and MONEFIT_PASSWORD environment variables are required.")
@@ -381,7 +364,22 @@ def run(headless: bool = True) -> None:
         statement_totals["daily_returns"], statement_totals["rewards_bonuses"], statement_totals["matured_vaults"],
     )
 
-    update_google_sheet(originators, statement_totals)
+    # Monefit's account/summary API has no gross/net/withholding-tax
+    # breakdown (unlike Afranga/Bienpreter) - "From daily returns" is
+    # mapped to both gross_interest_received/net_interest_received since
+    # it's the closest equivalent figure on hand, withholding_tax defaults
+    # to 0.0. Same standardized dict shape as every other
+    # *_diversification.py, plus the platform-specific daily_returns/
+    # rewards_bonuses/matured_vaults fields kept alongside it.
+    amounts = {
+        "total": balance,
+        "gross_interest_received": statement_totals["daily_returns"],
+        "net_interest_received": statement_totals["daily_returns"],
+        "withholding_tax": 0.0,
+        "daily_returns": statement_totals["daily_returns"],
+        "rewards_bonuses": statement_totals["rewards_bonuses"],
+        "matured_vaults": statement_totals["matured_vaults"],
+    }
 
 
 if __name__ == "__main__":
