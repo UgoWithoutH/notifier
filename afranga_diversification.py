@@ -52,6 +52,8 @@ Optional:
                                            google_sheet.py)
 """
 
+from browser_stealth import get_context_options, apply_stealth, human_pause, human_mouse_wander, human_type
+from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
 import os
 import re
 import sys
@@ -63,15 +65,13 @@ from zoneinfo import ZoneInfo
 import pyotp
 from dotenv import load_dotenv
 
-from google_sheet import fill_current_month_amounts
+from google_sheet import fill_current_month_amounts, fill_geographic_repartition_amounts
 
 load_dotenv()
 
-from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
 
-from browser_stealth import get_context_options, apply_stealth, human_pause, human_mouse_wander, human_type
-
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+logging.basicConfig(level=logging.INFO,
+                    format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger("afranga_diversification")
 
 LOGIN_URL = "https://afranga.com/login"
@@ -79,7 +79,8 @@ MY_INVESTMENTS_URL = "https://afranga.com/profile/my-investments"
 REFRESH_URL = "https://afranga.com/profile/my-investments/refresh"
 STATEMENT_PAGE_URL = "https://afranga.com/profile/account-statement"
 STATEMENT_REFRESH_URL = "https://afranga.com/profile/account-statement/refresh"
-STORAGE_STATE_FILE = Path(__file__).parent / "afranga_diversification_storage_state.json"
+STORAGE_STATE_FILE = Path(__file__).parent / \
+    "afranga_diversification_storage_state.json"
 MAX_LIMIT = 250  # largest value offered by the page's own rows-per-page dropdown
 # Afranga's own "Current Month" quick filter on the Account Statement page
 # (verified 2026-07-10 by capturing its request) uses the CURRENT calendar
@@ -110,10 +111,18 @@ def handle_two_factor(page) -> None:
     generate one from AFRANGA_TOTP_SECRET and fill it in.
 
     Verified against the real 2FA screen on 2026-07-09: a single text field
-    ("Enter the code from Google Authenticator:") and a "Verify" button -
-    unlike the multi-box inputs used by Swaper/Lendermarket/PeerBerry.
+    and a "Verify" button - unlike the multi-box inputs used by
+    Swaper/Lendermarket/PeerBerry. Originally located via the accessible
+    name "Enter the code from Google Authenticator:" (the heading text
+    above the field), but re-verified on 2026-07-15 that this heading is
+    NOT actually associated with the input as its accessible name - the
+    input's real accessible name is its "Verification code" placeholder.
+    The old locator silently never matched (get_by_role() timed out and
+    handle_two_factor() treated that as "no 2FA prompt shown"), leaving the
+    code never submitted and the login stuck on /login. Located by
+    placeholder instead, which matches the real DOM.
     """
-    otp_input = page.get_by_role("textbox", name="Enter the code from Google Authenticator:")
+    otp_input = page.get_by_placeholder("Verification code")
     try:
         otp_input.wait_for(timeout=8000)
     except PlaywrightTimeoutError:
@@ -136,7 +145,8 @@ def handle_two_factor(page) -> None:
         # this click would otherwise race against the navigation and hang.
         page.get_by_role("button", name="Verify").click(timeout=5000)
     except PlaywrightTimeoutError:
-        log.info("'Verify' button not found/clickable - the code likely auto-submitted already.")
+        log.info(
+            "'Verify' button not found/clickable - the code likely auto-submitted already.")
 
 
 def login(page) -> None:
@@ -180,7 +190,8 @@ def login(page) -> None:
             break
         page.wait_for_timeout(500)
     else:
-        raise RuntimeError(f"Still on the login page after submitting credentials/2FA: {page.url}")
+        raise RuntimeError(
+            f"Still on the login page after submitting credentials/2FA: {page.url}")
     log.info("Logged in successfully, current URL: %s", page.url)
 
 
@@ -191,9 +202,11 @@ def fetch_investments(page) -> list:
     own DOMParser and returns a list of {"originator", "outstanding"} dicts
     (amounts as floats), skipping the trailing "Total:" summary row.
     """
-    csrf_token = page.locator("input[name='_token']").first.get_attribute("value")
+    csrf_token = page.locator(
+        "input[name='_token']").first.get_attribute("value")
     if not csrf_token:
-        raise RuntimeError("Could not find the CSRF _token on the My investments page.")
+        raise RuntimeError(
+            "Could not find the CSRF _token on the My investments page.")
     log.info("Requesting My investments refresh endpoint (limit=%d)...", MAX_LIMIT)
 
     result = page.evaluate(
@@ -229,15 +242,19 @@ def fetch_investments(page) -> list:
         [REFRESH_URL, csrf_token, MAX_LIMIT],
     )
 
-    log.info("My investments refresh endpoint response: ok=%s status=%s", result.get("ok"), result.get("status"))
+    log.info("My investments refresh endpoint response: ok=%s status=%s",
+             result.get("ok"), result.get("status"))
     if not result.get("ok"):
-        raise RuntimeError(f"My investments refresh endpoint returned status {result.get('status')}")
+        raise RuntimeError(
+            f"My investments refresh endpoint returned status {result.get('status')}")
 
     rows = result.get("rows") or []
     log.info("Parsed %d raw row(s) from the My investments table (before filtering the Total row).", len(rows))
     # The trailing "Total:" row has no loan ID / originator - skip it.
-    investments = [r for r in rows if r.get("loanIdText") and r.get("originator")]
-    log.info("%d row(s) remain after filtering out the trailing Total row.", len(investments))
+    investments = [r for r in rows if r.get(
+        "loanIdText") and r.get("originator")]
+    log.info("%d row(s) remain after filtering out the trailing Total row.", len(
+        investments))
 
     if len(investments) >= MAX_LIMIT:
         log.warning(
@@ -253,7 +270,8 @@ def _parse_amount(text: str) -> float:
     """Parse a "€ 1 234.56"-formatted amount into a float."""
     if not text:
         return 0.0
-    cleaned = text.replace("€", "").replace("\xa0", "").replace(" ", "").strip()
+    cleaned = text.replace("€", "").replace(
+        "\xa0", "").replace(" ", "").strip()
     cleaned = re.sub(r"[^\d.]", "", cleaned)
     try:
         return float(cleaned)
@@ -267,11 +285,13 @@ def aggregate_by_originator(investments: list) -> list:
     sorted by amount descending."""
     totals = {}
     for inv in investments:
-        originator = re.sub(r"\s*logo$", "", inv.get("originator") or "Unknown", flags=re.IGNORECASE).strip()
+        originator = re.sub(r"\s*logo$", "", inv.get("originator")
+                            or "Unknown", flags=re.IGNORECASE).strip()
         amount = _parse_amount(inv.get("outstandingText"))
         totals[originator] = totals.get(originator, 0.0) + amount
 
-    originators = [{"originator": name, "outstanding": amount} for name, amount in totals.items()]
+    originators = [{"originator": name, "outstanding": amount}
+                   for name, amount in totals.items()]
     originators.sort(key=lambda o: o["outstanding"], reverse=True)
     return originators
 
@@ -310,10 +330,13 @@ def fetch_current_month_statement_totals(page) -> dict:
     start_date = now.replace(day=1).strftime("%d.%m.%Y")
     end_date = now.strftime("%d.%m.%Y")
 
-    csrf_token = page.locator("input[name='_token']").first.get_attribute("value")
+    csrf_token = page.locator(
+        "input[name='_token']").first.get_attribute("value")
     if not csrf_token:
-        raise RuntimeError("Could not find the CSRF _token on the Account statement page.")
-    log.info("Requesting Account statement refresh endpoint for %s to %s...", start_date, end_date)
+        raise RuntimeError(
+            "Could not find the CSRF _token on the Account statement page.")
+    log.info("Requesting Account statement refresh endpoint for %s to %s...",
+             start_date, end_date)
 
     result = page.evaluate(
         """
@@ -335,12 +358,15 @@ def fetch_current_month_statement_totals(page) -> dict:
         """,
         [STATEMENT_REFRESH_URL, csrf_token, start_date, end_date],
     )
-    log.info("Account statement refresh endpoint response: ok=%s status=%s", result.get("ok"), result.get("status"))
+    log.info("Account statement refresh endpoint response: ok=%s status=%s",
+             result.get("ok"), result.get("status"))
     if not result.get("ok"):
-        raise RuntimeError(f"Account statement refresh endpoint returned status {result.get('status')}")
+        raise RuntimeError(
+            f"Account statement refresh endpoint returned status {result.get('status')}")
 
     rows = result.get("rows") or []
-    log.info("Found %d summary row(s) in the Transaction Summary panel: %r", len(rows), [r.get("label") for r in rows])
+    log.info("Found %d summary row(s) in the Transaction Summary panel: %r", len(
+        rows), [r.get("label") for r in rows])
 
     gross_interest_received = 0.0
     withholding_tax = 0.0
@@ -360,14 +386,17 @@ def fetch_current_month_statement_totals(page) -> dict:
 
 def run(headless: bool = True) -> None:
     if not AFRANGA_EMAIL or not AFRANGA_PASSWORD:
-        log.error("AFRANGA_EMAIL and AFRANGA_PASSWORD environment variables are required.")
+        log.error(
+            "AFRANGA_EMAIL and AFRANGA_PASSWORD environment variables are required.")
         sys.exit(1)
 
-    log.info("Starting Afranga diversification run (headless=%s, storage_state_exists=%s).", headless, STORAGE_STATE_FILE.exists())
+    log.info("Starting Afranga diversification run (headless=%s, storage_state_exists=%s).",
+             headless, STORAGE_STATE_FILE.exists())
 
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=headless)
-        storage_state = str(STORAGE_STATE_FILE) if STORAGE_STATE_FILE.exists() else None
+        storage_state = str(
+            STORAGE_STATE_FILE) if STORAGE_STATE_FILE.exists() else None
         context = browser.new_context(
             storage_state=storage_state,
             locale="en-US",
@@ -386,14 +415,16 @@ def run(headless: bool = True) -> None:
             sys.exit(1)
 
         try:
-            log.info("Navigating to the account statement page to fetch this month's statement totals...")
+            log.info(
+                "Navigating to the account statement page to fetch this month's statement totals...")
             page.goto(STATEMENT_PAGE_URL, wait_until="domcontentloaded")
             statement_totals = fetch_current_month_statement_totals(page)
         except Exception:
             log.exception(
                 "Failed to fetch this month's Gross interest received/Withholding Tax - defaulting both to 0.0."
             )
-            statement_totals = {"gross_interest_received": 0.0, "withholding_tax": 0.0}
+            statement_totals = {
+                "gross_interest_received": 0.0, "withholding_tax": 0.0}
 
         # Persist cookies/local storage so the next run can skip login (and
         # 2FA) while the session remains valid.
@@ -401,13 +432,15 @@ def run(headless: bool = True) -> None:
         browser.close()
 
     originators = aggregate_by_originator(investments)
-    log.info("Fetched %d active investment(s) across %d loan originator(s).", len(investments), len(originators))
+    log.info("Fetched %d active investment(s) across %d loan originator(s).", len(
+        investments), len(originators))
     for o in originators:
         log.info("  %s: %.2f EUR", o["originator"], o["outstanding"])
 
     statement_totals["total"] = sum(o["outstanding"] for o in originators)
     statement_totals["net_interest_received"] = (
-        statement_totals["gross_interest_received"] - statement_totals["withholding_tax"]
+        statement_totals["gross_interest_received"] -
+        statement_totals["withholding_tax"]
     )
     log.info(
         "This month's statement totals: total=%.2f EUR, gross_interest_received=%.2f EUR, "
@@ -420,6 +453,13 @@ def run(headless: bool = True) -> None:
         platform="Afranga",
         amounts=statement_totals
     )
+
+    loan_originators = [
+        {"name": o["originator"], "amount": o["outstanding"]}
+        for o in originators
+    ]
+
+    fill_geographic_repartition_amounts(loan_originators)
 
 
 if __name__ == "__main__":

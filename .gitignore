@@ -8,6 +8,7 @@ swaper_storage_state.json
 swaper_state.json
 lendermarket_state.json
 lendermarket_storage_state.json
+peerberry_storage_state.json
 cron_schedule_state.json
 lendermarket_cron_schedule_state.json
 peerberry_diversification_storage_state.json

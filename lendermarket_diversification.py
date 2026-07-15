@@ -54,7 +54,7 @@ from zoneinfo import ZoneInfo
 
 from dotenv import load_dotenv
 
-from google_sheet import fill_current_month_amounts
+from google_sheet import fill_current_month_amounts, fill_geographic_repartition_amounts
 
 load_dotenv()
 
@@ -277,10 +277,18 @@ def run(headless: bool = True) -> None:
         "interest_received": statement_totals["interest_received"],
         "bonuses": statement_totals["bonuses"],
     }
+    
     fill_current_month_amounts(
         platform="Lendermarket",
         amounts=amounts
     )
+
+    loan_originators = [
+        {"name": l["lender"], "amount": l["remaining_principal"]}
+        for l in lenders
+    ]
+
+    fill_geographic_repartition_amounts(loan_originators)
 
 
 if __name__ == "__main__":

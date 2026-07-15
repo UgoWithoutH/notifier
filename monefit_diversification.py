@@ -67,7 +67,7 @@ from pathlib import Path
 import pyotp
 from dotenv import load_dotenv
 
-from google_sheet import fill_current_month_amounts
+from google_sheet import fill_current_month_amounts, fill_geographic_repartition_amounts
 
 load_dotenv()
 
@@ -380,6 +380,15 @@ def run(headless: bool = True) -> None:
         "rewards_bonuses": statement_totals["rewards_bonuses"],
         "matured_vaults": statement_totals["matured_vaults"],
     }
+    fill_current_month_amounts(
+        platform="Monefit",
+        amounts=amounts,
+        section="Crowdlending savings"
+    )
+
+    loan_originators = [{"name": LOAN_ORIGINATOR_LABEL, "amount": balance}]
+
+    fill_geographic_repartition_amounts(loan_originators)
 
 
 if __name__ == "__main__":

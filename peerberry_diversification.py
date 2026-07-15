@@ -49,7 +49,7 @@ from zoneinfo import ZoneInfo
 import pyotp
 from dotenv import load_dotenv
 
-from google_sheet import fill_current_month_amounts
+from google_sheet import fill_current_month_amounts, fill_geographic_repartition_amounts
 
 load_dotenv()
 
@@ -360,6 +360,13 @@ def run(headless: bool = True) -> None:
         platform="PeerBerry",
         amounts=amounts
     )
+
+    loan_originators = [
+        {"name": o["originator"], "amount": o["amount"]}
+        for o in originators
+    ]
+
+    fill_geographic_repartition_amounts(loan_originators)
 
 
 if __name__ == "__main__":

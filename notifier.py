@@ -170,3 +170,35 @@ def send_peerberry_email(originators: list) -> None:
         log.info("PeerBerry notification email sent to %s.", EMAIL_TO)
     except Exception:
         log.exception("Failed to send PeerBerry notification email.")
+
+
+def send_peerberry_available_email(available_money: float) -> None:
+    """Notify that PeerBerry's "Available for investment" balance is >= 10 EUR.
+
+    Sent every run the condition is met (no notification gate/dedup - by
+    design, see peerberry_monitor.py).
+    """
+    if not all([SMTP_HOST, SMTP_USER, SMTP_PASSWORD, EMAIL_TO]):
+        log.error(
+            "SMTP configuration is incomplete; cannot send email. "
+            "Required env vars: SMTP_HOST, SMTP_USER, SMTP_PASSWORD, EMAIL_TO."
+        )
+        return
+
+    subject = f"[PeerBerry] {available_money:.2f}€ disponible pour investir"
+    body = f"Montant disponible pour investir sur PeerBerry : {available_money:.2f} €"
+
+    msg = MIMEMultipart()
+    msg["From"] = EMAIL_FROM
+    msg["To"] = EMAIL_TO
+    msg["Subject"] = subject
+    msg.attach(MIMEText(body, "plain"))
+
+    try:
+        with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=15) as server:
+            server.starttls()
+            server.login(SMTP_USER, SMTP_PASSWORD)
+            server.sendmail(EMAIL_FROM, [EMAIL_TO], msg.as_string())
+        log.info("PeerBerry available-balance notification email sent to %s.", EMAIL_TO)
+    except Exception:
+        log.exception("Failed to send PeerBerry available-balance notification email.")
