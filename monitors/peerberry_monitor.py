@@ -245,13 +245,6 @@ def run(headless: bool = True) -> None:
 
     log.info("Available for investment: %.2f EUR", available_money)
 
-    # Same cron-job.org speed-up/slow-down as Swaper/Lendermarket (see
-    # cron_schedule.py): poll faster while there's money to invest.
-    if available_money < MIN_AVAILABLE_TO_NOTIFY:
-        ensure_schedule("30m", cron_job_id=PEERBERRY_CRON_JOB_ID, state_file=CRON_SCHEDULE_STATE_FILE)
-    else:
-        ensure_schedule("2m", cron_job_id=PEERBERRY_CRON_JOB_ID, state_file=CRON_SCHEDULE_STATE_FILE)
-
     # Anti-spam: only send when the balance is >= 10 EUR AND its value
     # actually differs from the last one we notified for (rounded to avoid
     # float noise) - staying at the exact same balance across runs does NOT
