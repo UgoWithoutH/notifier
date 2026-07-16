@@ -192,6 +192,20 @@ def login(page) -> None:
         except PlaywrightTimeoutError:
             continue
     else:
+        # DIAGNOSTIC (added 2026-07-16 after 2 consecutive timeouts here):
+        # log what's actually on screen (URL/title/visible text, no
+        # credentials involved) so the next CI failure's log explains
+        # *why* the nav bar never showed up (still on /login with an error
+        # message? a bot-check interstitial? redirected somewhere else?)
+        # instead of just "it didn't appear".
+        try:
+            visible_text = page.evaluate("() => document.body.innerText.slice(0, 1000)")
+        except Exception:
+            visible_text = "<could not read page text>"
+        log.error(
+            "Login timeout diagnostics: url=%s title=%r visible_text=%r",
+            page.url, page.title(), visible_text,
+        )
         raise RuntimeError(
             "Still not logged in after submitting credentials (nav bar never appeared).")
     log.info("Logged in successfully, current URL: %s", page.url)
