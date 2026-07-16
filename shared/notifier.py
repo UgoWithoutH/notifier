@@ -77,35 +77,34 @@ def send_swaper_email(balance: float, loans: list) -> None:
         log.exception("Failed to send notification email.")
 
 
-def _format_lendermarket_loan(loan: dict) -> str:
-    """Format a single loan as one line: lender, identifier, available
-    amount, and yield (interest rate) - no extra fields and no URL."""
-    lender_name = (loan.get("lender") or {}).get("displayName") or "Fournisseur inconnu"
-    loan_identifier = loan.get("loanPublicId") or loan.get("uuid")
+def _format_lendermarket_lender(lender_stats: dict) -> str:
+    """Format one lender's aggregate: loan count, total investable amount,
+    and yield (min-max interest rate range) - no extra fields and no URL."""
+    lender = lender_stats["lender"]
+    count = lender_stats["count"]
+    total_amount = lender_stats["total_amount"]
+    min_rate = lender_stats["min_rate"]
+    max_rate = lender_stats["max_rate"]
 
-    amount = loan.get("investableAmount") or loan.get("loanAmount")
-    try:
-        amount_str = f"{float(amount):.2f} €"
-    except (TypeError, ValueError):
-        amount_str = "montant n/a"
-
-    rate = loan.get("interestRate")
-    try:
-        rate_str = f"{float(rate):.2f}%"
-    except (TypeError, ValueError):
+    if min_rate is None:
         rate_str = "n/a"
+    elif min_rate == max_rate:
+        rate_str = f"{min_rate:.2f}%"
+    else:
+        rate_str = f"{min_rate:.2f}%–{max_rate:.2f}%"
 
-    return f"{lender_name} - Prêt {loan_identifier} : {amount_str} | rendement {rate_str}"
+    return f"{lender} : {count} prêt(s), montant total {total_amount:.2f} € | rendement {rate_str}"
 
 
 def send_lendermarket_email(balance: float | None, segments: dict) -> None:
     """Notify about newly available Lendermarket loans.
 
-    `segments` maps a segment key to {"label", "loans"}, where "loans" is
-    the raw list of loan dicts (from the public getActiveLoans API)
-    currently active in that segment - not just the new one(s) that
-    triggered the notification. Each loan is listed individually with its
-    own available amount and yield, plus a per-segment total amount.
+    `segments` maps a segment key to {"label", "lenders"}, where "lenders"
+    is the per-lender aggregate list built by
+    lendermarket_monitor.aggregate_by_lender() (loan count, total
+    investable amount, min/max interest rate) for every loan currently
+    active in that segment - not just the new one(s) that triggered the
+    notification.
     """
     if not all([SMTP_HOST, SMTP_USER, SMTP_PASSWORD, EMAIL_TO]):
         log.error(
@@ -114,7 +113,7 @@ def send_lendermarket_email(balance: float | None, segments: dict) -> None:
         )
         return
 
-    total_loans = sum(len(s["loans"]) for s in segments.values())
+    total_loans = sum(sum(l["count"] for l in s["lenders"]) for s in segments.values())
     labels = ", ".join(s["label"] for s in segments.values())
     subject = f"[Lendermarket] {total_loans} prêt(s) disponible(s) ({labels})"
 
@@ -124,17 +123,9 @@ def send_lendermarket_email(balance: float | None, segments: dict) -> None:
     body_parts.append("")
 
     for segment in segments.values():
-        loans = segment["loans"]
-        segment_total = 0.0
-        for loan in loans:
-            amount = loan.get("investableAmount") or loan.get("loanAmount")
-            try:
-                segment_total += float(amount)
-            except (TypeError, ValueError):
-                pass
-
-        body_parts.append(f"{segment['label']} ({len(loans)} prêt(s), montant total {segment_total:.2f} €)")
-        body_parts.extend(f"  - {_format_lendermarket_loan(loan)}" for loan in loans)
+        segment_count = sum(l["count"] for l in segment["lenders"])
+        body_parts.append(f"{segment['label']} ({segment_count} prêt(s))")
+        body_parts.extend(f"  - {_format_lendermarket_lender(lender)}" for lender in segment["lenders"])
         body_parts.append("")
     body = "\n".join(body_parts)
 

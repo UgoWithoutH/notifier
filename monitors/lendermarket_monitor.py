@@ -135,6 +135,38 @@ def fetch_active_loans(segment: dict) -> list:
     return payload.get("data") or []
 
 
+def aggregate_by_lender(loans: list) -> list:
+    """Group loans by lender (fournisseur de crédit), returning one entry per
+    lender with the loan count, total investable amount, and min/max
+    interest rate - sorted by lender name."""
+    buckets = {}
+    for loan in loans:
+        lender_name = (loan.get("lender") or {}).get("displayName") or "Fournisseur inconnu"
+        bucket = buckets.setdefault(
+            lender_name,
+            {"lender": lender_name, "count": 0, "total_amount": 0.0, "min_rate": None, "max_rate": None},
+        )
+
+        bucket["count"] += 1
+
+        amount = loan.get("investableAmount") or loan.get("loanAmount")
+        try:
+            bucket["total_amount"] += float(amount)
+        except (TypeError, ValueError):
+            pass
+
+        rate = loan.get("interestRate")
+        try:
+            rate = float(rate)
+        except (TypeError, ValueError):
+            rate = None
+        if rate is not None:
+            bucket["min_rate"] = rate if bucket["min_rate"] is None else min(bucket["min_rate"], rate)
+            bucket["max_rate"] = rate if bucket["max_rate"] is None else max(bucket["max_rate"], rate)
+
+    return sorted(buckets.values(), key=lambda b: b["lender"])
+
+
 def _first_locator(page, selectors: list, timeout: int = 8000):
     """Return the first selector that actually renders (waiting for it, since
     this is a client-rendered Next.js app - the form doesn't exist in the
@@ -386,7 +418,7 @@ def run() -> None:
             log.info("Notification decision: SEND (reason=loans_available_and_gate_open). loans_count=%d", count)
             newly_available[segment["key"]] = {
                 "label": segment["label"],
-                "loans": loans,
+                "lenders": aggregate_by_lender(loans),
             }
         elif available:
             log.info("Notification decision: SKIP (reason=already_notified_for_current_cycle).")
