@@ -115,8 +115,17 @@ load_dotenv()
 
 from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
 
-from shared.browser_stealth import get_context_options, apply_stealth, human_pause, human_mouse_wander, human_type
-from shared.google_sheet import fill_current_month_amounts
+try:
+    from shared.browser_stealth import get_context_options, apply_stealth, human_pause, human_mouse_wander, human_type
+    from shared.google_sheet import fill_current_month_amounts
+except ModuleNotFoundError:
+    # Support direct execution (python diversification/bricks_diversification.py)
+    # where the project root may not be on sys.path.
+    project_root = Path(__file__).resolve().parents[1]
+    if str(project_root) not in sys.path:
+        sys.path.insert(0, str(project_root))
+    from shared.browser_stealth import get_context_options, apply_stealth, human_pause, human_mouse_wander, human_type
+    from shared.google_sheet import fill_current_month_amounts
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger("bricks_diversification")

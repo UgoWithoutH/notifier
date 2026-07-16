@@ -501,6 +501,32 @@ jobs:
           restore-keys: |
             bricks-diversification-state-
 
+      # Bricks' login endpoint (api.bricks.co/api/auth/sign-in/email) is
+      # behind Cloudflare bot-protection that blocks fresh sign-ins from
+      # GitHub Actions runners (confirmed 2026-07-16 - HTTP 403 "error code:
+      # 1010"). A valid session (cookies) obtained from a normal local
+      # login is NOT blocked by this - only the login call itself is. So if
+      # the cache above didn't restore a session (cache miss), fall back to
+      # a manually-exported one from this optional secret instead of
+      # attempting (and failing) a fresh login. No-op if the secret isn't
+      # set. See the workflow README/repo notes for how to (re)generate it
+      # when the session eventually expires: run
+      # `python -m diversification.bricks_diversification` locally once
+      # while logged in, base64-encode the resulting
+      # diversification/bricks_diversification_storage_state.json, and set
+      # it as the BRICKS_STORAGE_STATE_B64 repo secret.
+      - name: Seed session from a manually-exported storage state (fallback only)
+        if: hashFiles('diversification/bricks_diversification_storage_state.json') == ''
+        env:
+          BRICKS_STORAGE_STATE_B64: ${{ secrets.BRICKS_STORAGE_STATE_B64 }}
+        run: |
+          if [ -n "$BRICKS_STORAGE_STATE_B64" ]; then
+            echo "$BRICKS_STORAGE_STATE_B64" | base64 -d > diversification/bricks_diversification_storage_state.json
+            echo "No cached session found - seeded one from the BRICKS_STORAGE_STATE_B64 secret instead."
+          else
+            echo "No cached session and no BRICKS_STORAGE_STATE_B64 secret set - login() will attempt a fresh sign-in (may be blocked by Cloudflare)."
+          fi
+
       - name: Run Bricks diversification report
         env:
           BRICKS_EMAIL: ${{ secrets.BRICKS_EMAIL }}
