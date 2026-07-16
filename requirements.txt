@@ -2,3 +2,5 @@ playwright>=1.44.0
 python-dotenv>=1.0.0
 pyotp>=2.9.0
 tzdata>=2024.1
+gspread>=6.0.0
+google-auth>=2.29.0
