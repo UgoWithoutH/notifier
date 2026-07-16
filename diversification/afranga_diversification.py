@@ -66,6 +66,7 @@ import pyotp
 from dotenv import load_dotenv
 
 from shared.google_sheet import fill_current_month_amounts, fill_geographic_repartition_amounts
+from shared.report_date import get_report_now
 
 load_dotenv()
 
@@ -326,7 +327,7 @@ def fetch_current_month_statement_totals(page) -> dict:
        absent when fetching the empty first-10-days-of-July range during
        exploration) - a missing row is treated as 0.0, not an error.
     """
-    now = datetime.now(REPORT_TIMEZONE)
+    now = get_report_now(REPORT_TIMEZONE)
     start_date = now.replace(day=1).strftime("%d.%m.%Y")
     end_date = now.strftime("%d.%m.%Y")
 

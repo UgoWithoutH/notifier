@@ -70,6 +70,7 @@ from zoneinfo import ZoneInfo
 from dotenv import load_dotenv
 
 from shared.google_sheet import fill_current_month_amounts
+from shared.report_date import get_report_now
 
 load_dotenv()
 
@@ -312,7 +313,7 @@ def fetch_current_month_interest_totals(page) -> dict:
     Swaper's "This Month" / Afranga's "Current Month" quick filters)
     rather than the executing machine's local clock.
     """
-    now = datetime.now(REPORT_TIMEZONE)
+    now = get_report_now(REPORT_TIMEZONE)
     start_date = now.replace(day=1).strftime("%Y-%m-%d")
     end_date = now.strftime("%Y-%m-%d")
 

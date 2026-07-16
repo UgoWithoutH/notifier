@@ -118,6 +118,7 @@ from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeo
 try:
     from shared.browser_stealth import get_context_options, apply_stealth, human_pause, human_mouse_wander, human_type
     from shared.google_sheet import fill_current_month_amounts
+    from shared.report_date import get_report_now
 except ModuleNotFoundError:
     # Support direct execution (python diversification/bricks_diversification.py)
     # where the project root may not be on sys.path.
@@ -126,6 +127,7 @@ except ModuleNotFoundError:
         sys.path.insert(0, str(project_root))
     from shared.browser_stealth import get_context_options, apply_stealth, human_pause, human_mouse_wander, human_type
     from shared.google_sheet import fill_current_month_amounts
+    from shared.report_date import get_report_now
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger("bricks_diversification")
@@ -215,6 +217,28 @@ def login(page) -> None:
             "Login timeout diagnostics: url=%s title=%r visible_text=%r",
             page.url, page.title(), visible_text,
         )
+        # KNOWN ISSUE (confirmed 2026-07-16): Bricks' sign-in endpoint
+        # (api.bricks.co/api/auth/sign-in/email) is behind Cloudflare
+        # bot-protection that blocks fresh logins from at least some
+        # automated clients - when that happens, the login form itself
+        # shows "Failed to fetch" as its inline error text (visible in
+        # visible_text above). This is NOT a selector bug or wrong
+        # credentials - give an actionable message instead of a generic
+        # one, since the fix (see .github/workflows/diversification.yml's
+        # bricks job) is to re-seed the BRICKS_STORAGE_STATE_B64 secret
+        # from a fresh local login, not to change any code here.
+        if "failed to fetch" in visible_text.lower():
+            raise RuntimeError(
+                "Login blocked: Bricks' sign-in request failed at the network level "
+                "('Failed to fetch' shown on the login form) - this matches Cloudflare "
+                "blocking fresh logins from this runner (confirmed 2026-07-16, HTTP 403 "
+                "'error code: 1010' on api.bricks.co). The BRICKS_STORAGE_STATE_B64 "
+                "session secret has either expired or was never set. Fix: run "
+                "'python -m diversification.bricks_diversification' locally while able to "
+                "log in normally, base64-encode the resulting "
+                "diversification/bricks_diversification_storage_state.json, and update the "
+                "BRICKS_STORAGE_STATE_B64 GitHub repo secret with it."
+            )
         raise RuntimeError(
             "Still not logged in after submitting credentials (nav bar never appeared).")
     log.info("Logged in successfully, current URL: %s", page.url)
@@ -344,7 +368,7 @@ def fetch_current_month_revenue_totals(page) -> dict:
     obligationCoupons + referrals + boostedBalanceGain), `taxedTotal` =
     net interest received (after tax), `withholding_tax` = gross - net.
     """
-    month_str = datetime.now(REPORT_TIMEZONE).strftime("%Y-%m")
+    month_str = get_report_now(REPORT_TIMEZONE).strftime("%Y-%m")
     log.info("Requesting Bricks revenue endpoint for %s...", month_str)
 
     result = page.evaluate(

@@ -57,6 +57,7 @@ from zoneinfo import ZoneInfo
 from dotenv import load_dotenv
 
 from shared.google_sheet import fill_current_month_amounts, fill_geographic_repartition_amounts
+from shared.report_date import get_report_now
 
 load_dotenv()
 
@@ -212,7 +213,7 @@ def fetch_current_month_interest_received(page) -> float:
        it's mirrored into `localStorage['X-XSRF-TOKEN']` (a JSON-quoted
        string) by the site's own JS, read from there instead.
     """
-    now = datetime.now(REPORT_TIMEZONE)
+    now = get_report_now(REPORT_TIMEZONE)
     start_date = now.replace(day=1).strftime("%Y-%m-%d")
     end_date = now.strftime("%Y-%m-%d")
     log.info("Requesting account-entries API for booking dates %s to %s...", start_date, end_date)

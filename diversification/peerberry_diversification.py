@@ -56,6 +56,7 @@ from playwright.sync_api import sync_playwright
 
 from shared.browser_stealth import get_context_options, apply_stealth
 from shared.google_sheet import fill_current_month_amounts, fill_geographic_repartition_amounts
+from shared.report_date import get_report_now
 from monitors.peerberry_monitor import login, PEERBERRY_EMAIL, PEERBERRY_PASSWORD
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
@@ -149,7 +150,7 @@ def fetch_current_month_interest_income(page) -> float:
     `app_token` cookie sent as an `Authorization: Bearer` header (a plain
     `credentials: 'include'` fetch fails CORS).
     """
-    now = datetime.now(REPORT_TIMEZONE)
+    now = get_report_now(REPORT_TIMEZONE)
     start_date = now.replace(day=1).strftime("%Y-%m-%d")
     end_date = now.strftime("%Y-%m-%d")
     log.info("Requesting account-summary API for %s to %s...", start_date, end_date)

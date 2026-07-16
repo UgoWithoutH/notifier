@@ -55,6 +55,7 @@ from zoneinfo import ZoneInfo
 from dotenv import load_dotenv
 
 from shared.google_sheet import fill_current_month_amounts, fill_geographic_repartition_amounts
+from shared.report_date import get_report_now
 
 load_dotenv()
 
@@ -166,7 +167,7 @@ def fetch_current_month_statement_totals(page) -> dict:
     regardless of where/when (e.g. a UTC CI runner around midnight) this
     script actually runs.
     """
-    now = datetime.now(REPORT_TIMEZONE)
+    now = get_report_now(REPORT_TIMEZONE)
     start_date = now.replace(day=1).strftime("%Y-%m-%d")
     end_date = now.strftime("%Y-%m-%d")
     log.info("Requesting account statement summary API for %s to %s...", start_date, end_date)

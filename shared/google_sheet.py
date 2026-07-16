@@ -1,4 +1,3 @@
-from datetime import date
 import os
 import re
 import json
@@ -8,6 +7,8 @@ import gspread
 from dotenv import load_dotenv
 from google.oauth2.service_account import Credentials
 from gspread.utils import rowcol_to_a1
+
+from shared.report_date import get_report_date
 
 
 logging.basicConfig(
@@ -79,8 +80,11 @@ def find_cell_by_value(grid, value: str):
 
 
 def find_current_month_cell(grid, row):
-    """Recherche en mémoire dans la ligne `row` (1-based)."""
-    today = date.today()
+    """Recherche en mémoire dans la ligne `row` (1-based). Uses
+    get_report_date() (REPORT_DATE env var override, falls back to the
+    real current date) instead of a hardcoded date.today() so a manual
+    workflow run can target a specific month's column."""
+    today = get_report_date()
 
     month_names = {
         1: "janv.", 2: "févr.", 3: "mars", 4: "avr.",
