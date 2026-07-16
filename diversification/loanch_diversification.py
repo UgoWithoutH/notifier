@@ -40,7 +40,7 @@ API verified against the real account on 2026-07-09, in two steps:
 Quirk worth knowing about if this script ever starts failing 2FA silently:
 the machine this was developed on had an unsynced system clock (~55s
 ahead of Google's `Date` response header - `w32tm /query /status` showed
-"Non synchronisÃ©" / "Local CMOS Clock", and `w32tm /resync` needs admin
+"Non synchronisé" / "Local CMOS Clock", and `w32tm /resync` needs admin
 rights this account doesn't have) - large enough to push generated TOTP
 codes outside Loanch's acceptance window and get every code rejected as
 "incorrect", even though the secret itself was correct. `handle_two_factor()`
@@ -103,7 +103,7 @@ LOANCH_TOTP_SECRET = os.environ.get("LOANCH_TOTP_SECRET")
 
 
 def dismiss_overlays(page) -> None:
-    """Dismiss the cookie consent banner and the (occasional) "get your â‚¬20
+    """Dismiss the cookie consent banner and the (occasional) "get your €20
     bonus" promo modal if either shows up. Verified on 2026-07-09: the
     cookie banner's "Tout accepter" button needs a forced click (a
     subsequent overlay from the promo modal intercepts a plain click), and

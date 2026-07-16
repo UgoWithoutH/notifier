@@ -72,7 +72,7 @@ CRON_SCHEDULE_STATE_FILE = Path(__file__).parent / "lendermarket_cron_schedule_s
 LOAN_SEGMENTS = [
     {
         "key": "non_reglemente",
-        "label": "PrÃªts non rÃ©glementÃ©s",
+        "label": "Prêts non réglementés",
         "regulation_status": "UNREGULATED",
         "lenders": [
             "9babf437-5bf8-41fb-840d-6edf7012e408",
@@ -89,7 +89,7 @@ LOAN_SEGMENTS = [
     },
     {
         "key": "reglemente",
-        "label": "PrÃªts rÃ©glementÃ©s",
+        "label": "Prêts réglementés",
         "regulation_status": "REGULATED",
         "lenders": [
             "9ffdd9b6-bde3-445b-a3df-f2f57b94afe7",
@@ -384,7 +384,7 @@ def run() -> None:
     # don't let that silently gate segments closed - assume money's fine and
     # fall back to loan availability alone.
     balance = fetch_balance_via_login()
-    log.info("Account balance: %s", f"{balance:.2f} â‚¬" if balance is not None else "unavailable")
+    log.info("Account balance: %s", f"{balance:.2f} €" if balance is not None else "unavailable")
 
     # Same cron-job.org speed-up/slow-down as Swaper (see cron_schedule.py):
     # poll faster while there's money to invest. Skipped when the balance

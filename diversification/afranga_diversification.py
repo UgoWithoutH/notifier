@@ -25,7 +25,7 @@ JSON. Verified against the real account on 2026-07-09:
   cap is hit - fine for now, revisit if/when the portfolio grows that big).
 - Each `<tr>` has the loan originator as an `<img alt="X logo">` (never as
   plain text) in the 5th `<td>`, and the outstanding amount as
-  "â‚¬ 1 234.56"-formatted text in the 11th `<td>` ("Outstanding Investment"
+  "€ 1 234.56"-formatted text in the 11th `<td>` ("Outstanding Investment"
   column - the remaining/still-invested capital, as opposed to "Invested
   Amount" which is the original amount before any repayments). The last row
   is always a "Total:" summary row, not a real investment, and is skipped.
@@ -267,10 +267,10 @@ def fetch_investments(page) -> list:
 
 
 def _parse_amount(text: str) -> float:
-    """Parse a "â‚¬ 1 234.56"-formatted amount into a float."""
+    """Parse a "€ 1 234.56"-formatted amount into a float."""
     if not text:
         return 0.0
-    cleaned = text.replace("â‚¬", "").replace(
+    cleaned = text.replace("€", "").replace(
         "\xa0", "").replace(" ", "").strip()
     cleaned = re.sub(r"[^\d.]", "", cleaned)
     try:
@@ -316,8 +316,8 @@ def fetch_current_month_statement_totals(page) -> dict:
        endpoint) whose "Transaction Summary" panel has one `<div
        class="row">` per summary line, each with a `.text-18-400-gray`
        label `<div>` and a sibling `.text-18-400` value `<div>` (e.g.
-       "Deposited funds" / "â‚¬ 500.00"). The "Gross interest received" row's
-       label actually reads "Gross interest received (net â‚¬ X.XX)" (the net
+       "Deposited funds" / "€ 500.00"). The "Gross interest received" row's
+       label actually reads "Gross interest received (net € X.XX)" (the net
        amount is baked into the label itself) - matched here via
        `startswith` rather than an exact string. "Withholding Tax" matches
        exactly. Confirmed against June 2026 data: Gross interest received =

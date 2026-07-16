@@ -143,7 +143,7 @@ def fetch_current_month_interest_income(page) -> float:
     returning `{"openingBalance": "6.20", "closingBalance": "0.98",
     "operations": {"DEPOSIT": "5000.00", "INVESTMENT": "-6578.71",
     "INTEREST": "9.88", "PRINCIPAL": "1563.61"}}` - `operations.INTEREST`
-    matched the page's displayed "Interest income +â‚¬9.88" exactly (matches
+    matched the page's displayed "Interest income +€9.88" exactly (matches
     the user-supplied reference value). Like the originators endpoint (see
     module docstring), this is on api.peerberry.com so it needs the
     `app_token` cookie sent as an `Authorization: Bearer` header (a plain

@@ -14,7 +14,7 @@ bienpreter_diversification.py (which similarly sums two dashboard
 figures into one total), mirroring every other *_diversification.py.
 
 Verified against the real account on 2026-07-15:
-- Landing page (unauthenticated) shows "CrÃ©er un compte" / "Se connecter"
+- Landing page (unauthenticated) shows "Créer un compte" / "Se connecter"
   buttons - clicking "Se connecter" navigates to https://app.bricks.co/login
   (a real route change, not a modal).
 - Login form: `input#login-email-input` (type=email), `input#login-
@@ -46,13 +46,13 @@ Verified against the real account on 2026-07-15:
     Solde cadeau
     <montant>
     Revenus
-    <montant depuis le dÃ©but> (cumulative since account opening, NOT a
+    <montant depuis le début> (cumulative since account opening, NOT a
     "this month" figure like the other platforms' interest fields - not
     used here to avoid conflating the two)
   `fetch_balances()` scans all text nodes in document order (a
   React-Native-Web app has no semantic dt/dd-style markup to hook a CSS
   selector onto, unlike Bienpreter) and, for each exact label match, takes
-  the first following text node containing "â‚¬" - reliable here because
+  the first following text node containing "€" - reliable here because
   each label is immediately followed by its value in the DOM, no
   intervening unrelated amount (unlike a generic "scan the whole page"
   heuristic, which failed for Bienpreter - see that module's docstring).
@@ -70,7 +70,7 @@ itself calls: `GET api.bricks.co/investor/portfolio/revenue?startDate=
 platforms' equivalents - using the current month for both start/end
 covers month-to-date). Verified against the real account on 2026-07-15
 (cross-checked the full-history range against the Accueil page's own
-"Revenus ... perÃ§us depuis le dÃ©but" = 527.61 EUR - exact match):
+"Revenus ... perçus depuis le début" = 527.61 EUR - exact match):
 `revenuesTotal.untaxedTotal` (cents) = gross interest received (already
 includes obligationCoupons + referrals + boostedBalanceGain - referrals/
 boosted-balance gains pass through untaxed, confirmed by the full-range
@@ -198,7 +198,7 @@ def login(page) -> None:
 
 
 def _parse_amount(text: str):
-    """Parse a currency-formatted amount (e.g. "3 087,77 â‚¬", "399,76 â‚¬")
+    """Parse a currency-formatted amount (e.g. "3 087,77 €", "399,76 €")
     into a float, without assuming a fixed locale - whichever of ',' or '.'
     appears last is treated as the decimal separator, the other (or
     repeats of it, incl. narrow no-break spaces used as thousands
@@ -232,7 +232,7 @@ def _parse_amount(text: str):
 def _extract_amounts(page) -> dict:
     """Scan every text node on the Accueil page in document order and, for
     each exact label match, return the first following text node
-    containing "â‚¬" (see module docstring for why this is reliable here -
+    containing "€" (see module docstring for why this is reliable here -
     each label is immediately followed by its value, no intervening
     unrelated amount)."""
     return page.evaluate(
@@ -312,7 +312,7 @@ def fetch_current_month_revenue_totals(page) -> dict:
 
     Verified against the real account on 2026-07-15 (see module docstring
     for the full reconciliation, incl. cross-checking the full-history
-    range against the Accueil page's "Revenus ... perÃ§us depuis le dÃ©but"
+    range against the Accueil page's "Revenus ... perçus depuis le début"
     = 527.61 EUR, exact match): `GET .../investor/portfolio/revenue?
     startDate=<yyyy-mm>&endDate=<yyyy-mm>` (MONTH granularity - the current
     month for both gives month-to-date) returns `{"revenuesTotal":

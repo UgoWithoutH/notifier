@@ -8,7 +8,7 @@ Originator Breakdown" widget on the Open Investments page
 (https://swaper.com/en/investments/open-investments), which shows one
 percentage per loan originator (e.g. "Wandoo Finance Group 14.44%", "SW
 Finance 85.56%") plus the total currently allocated/invested amount (e.g.
-"5076.18 â‚¬"). The per-originator EUR amount isn't shown directly, so it's
+"5076.18 €"). The per-originator EUR amount isn't shown directly, so it's
 computed as `total_invested * percentage / 100`, per the user's own
 instructions. No email is sent - the amounts are just logged and handed to
 fill_current_month_amounts() (see google_sheet.py) so they can
@@ -24,7 +24,7 @@ pie chart + legend, both under `.statistics-pie-card`):
   `.statistics-pill-container`'s own text (after the empty colored-pill
   div), the percentage is the container's second child `<div>`.
 - The total invested amount is in a separate `.statistics-value-container`
-  widget: `<div class="amount-text">5076.18 â‚¬</div><div
+  widget: `<div class="amount-text">5076.18 €</div><div
   class="value-text">Currently Allocated</div>` - found via the
   `.value-text` div whose text is "Currently Allocated", value read from
   its previous sibling `.amount-text`.
@@ -82,7 +82,7 @@ REPORT_TIMEZONE = ZoneInfo("Europe/Paris")
 
 
 def _parse_amount(text: str):
-    """Parse a currency-formatted amount (e.g. "5076.18 â‚¬", "5 076.18 â‚¬")
+    """Parse a currency-formatted amount (e.g. "5076.18 €", "5 076.18 €")
     into a float, without assuming a fixed locale - whichever of ',' or '.'
     appears last is treated as the decimal separator, the other (or
     repeats of it) as thousands separators."""

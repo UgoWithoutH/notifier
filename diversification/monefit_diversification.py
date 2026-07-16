@@ -27,7 +27,7 @@ Verified end-to-end against the real account on 2026-07-09:
 - The summary page has no dedicated JSON API/test-id for the balance
   either, so `fetch_balance()` uses a generic heuristic instead of a
   hardcoded selector: it scans all text nodes for a currency-looking amount
-  (containing "â‚¬"/"EUR") and prefers the one whose surrounding block
+  (containing "€"/"EUR") and prefers the one whose surrounding block
   mentions "Total Wealth" (the actual label used on the real account, NOT
   "Balance") or "balance"; otherwise it falls back to the first money-looking
   amount found on the page. All candidates are logged so a mismatch is easy
@@ -171,8 +171,8 @@ def login(page) -> None:
 
 
 def _parse_amount(text: str):
-    """Parse a currency-formatted amount (e.g. "â‚¬1,234.56", "â‚¬ 1 234.56",
-    "1.234,56 â‚¬") into a float, without assuming a fixed locale - whichever
+    """Parse a currency-formatted amount (e.g. "€1,234.56", "€ 1 234.56",
+    "1.234,56 €") into a float, without assuming a fixed locale - whichever
     of ',' or '.' appears last is treated as the decimal separator, the
     other (or repeats of it) as thousands separators."""
     if not text:
@@ -206,7 +206,7 @@ def fetch_balance(page) -> float:
 
     No fixed selector is used (the real DOM couldn't be inspected without
     logging in first) - instead this scans all text nodes for a
-    currency-looking amount ("â‚¬"/"EUR"), preferring one whose surrounding
+    currency-looking amount ("€"/"EUR"), preferring one whose surrounding
     block also mentions "balance". All candidates found are logged so a
     wrong pick is easy to spot and fix with a proper selector later.
     """
@@ -216,7 +216,7 @@ def fetch_balance(page) -> float:
     candidates = page.evaluate(
         """
         () => {
-            const moneyRegex = /(â‚¬|EUR)\\s?-?[\\d][\\d.,\\s]*|-?[\\d][\\d.,\\s]*\\s?(â‚¬|EUR)/;
+            const moneyRegex = /(€|EUR)\\s?-?[\\d][\\d.,\\s]*|-?[\\d][\\d.,\\s]*\\s?(€|EUR)/;
             const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
             const seen = new Set();
             const results = [];
@@ -268,7 +268,7 @@ def fetch_current_month_statement_totals(page) -> dict:
     "0.00000240", "bonus": "0.00000000", "maturedVaults": "0", ...}}}` -
     `interestIncome`/`bonus`/`maturedVaults` match the page's "From daily
     returns"/"Rewards & bonuses"/"Matured Vaults" figures exactly (rounded
-    to 2 decimals for display - e.g. 0.0000024 shows as "â‚¬0.00").
+    to 2 decimals for display - e.g. 0.0000024 shows as "€0.00").
 
     Unlike every other *_diversification.py's API calls, this endpoint's
     auth (a bearer token returned at login) could not be located in a
