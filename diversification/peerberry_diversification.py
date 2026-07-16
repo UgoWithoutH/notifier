@@ -49,8 +49,6 @@ from zoneinfo import ZoneInfo
 import pyotp
 from dotenv import load_dotenv
 
-from shared.google_sheet import fill_current_month_amounts, fill_geographic_repartition_amounts
-
 load_dotenv()
 
 from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
@@ -349,6 +347,12 @@ def run(headless: bool = True) -> None:
     # only real figure on hand, withholding_tax defaults to 0.0. Same
     # standardized dict shape as every other *_diversification.py, plus the
     # platform-specific interest_income field kept alongside it.
+    # Imported here (not at module level) so that other modules importing
+    # login()/env vars from this file (e.g. monitors/peerberry_monitor.py)
+    # don't transitively require gspread or GOOGLE_SHEET_ID/GOOGLE_CREDENTIALS
+    # to be installed/set - only a real diversification run needs them.
+    from shared.google_sheet import fill_current_month_amounts, fill_geographic_repartition_amounts
+
     amounts = {
         "total": sum(o["amount"] for o in originators),
         "gross_interest_received": interest_income,
