@@ -51,6 +51,7 @@ jobs:
         with:
           path: |
             monitors/peerberry_storage_state.json
+            monitors/peerberry_cron_schedule_state.json
           key: peerberry-state-${{ github.run_id }}
           restore-keys: |
             peerberry-state-
@@ -60,6 +61,8 @@ jobs:
           PEERBERRY_EMAIL: ${{ secrets.PEERBERRY_EMAIL }}
           PEERBERRY_PASSWORD: ${{ secrets.PEERBERRY_PASSWORD }}
           PEERBERRY_TOTP_SECRET: ${{ secrets.PEERBERRY_TOTP_SECRET }}
+          CRON_JOB_API_KEY: ${{ secrets.CRON_JOB_API_KEY }}
+          PEERBERRY_CRON_JOB_ID: ${{ secrets.PEERBERRY_CRON_JOB_ID }}
           SMTP_HOST: ${{ secrets.SMTP_HOST }}
           SMTP_PORT: ${{ secrets.SMTP_PORT }}
           SMTP_USER: ${{ secrets.SMTP_USER }}
@@ -74,4 +77,5 @@ jobs:
         with:
           path: |
             monitors/peerberry_storage_state.json
+            monitors/peerberry_cron_schedule_state.json
           key: peerberry-state-${{ github.run_id }}

@@ -20,6 +20,10 @@ Sends an email every run where the balance is >= 10 EUR. No notification
 gate/deduplication (by explicit request): the same balance being available
 on consecutive runs will trigger an email every time.
 
+Also speeds up/slows down its own cron-job.org schedule based on that same
+10 EUR threshold, exactly like swaper_monitor.py/lendermarket_monitor.py:
+30 minutes while balance < 10 EUR, 2 minutes while balance >= 10 EUR.
+
 Required env vars:
     PEERBERRY_EMAIL, PEERBERRY_PASSWORD    -> PeerBerry account credentials
     SMTP_HOST, SMTP_USER, SMTP_PASSWORD,   -> outgoing mail server
@@ -29,8 +33,12 @@ Optional:
     PEERBERRY_TOTP_SECRET                  -> base32 secret used to set up
                                                Google Authenticator, needed
                                                if 2FA is enabled on the account
+    CRON_JOB_API_KEY, PEERBERRY_CRON_JOB_ID -> cron-job.org schedule speed-up/
+                                                slow-down (see cron_schedule.py);
+                                                skipped silently if unset
 """
 
+import os
 import sys
 import logging
 from pathlib import Path
@@ -43,6 +51,7 @@ from playwright.sync_api import sync_playwright
 
 from shared.notifier import send_peerberry_available_email
 from shared.browser_stealth import get_context_options, apply_stealth
+from shared.cron_schedule import ensure_schedule
 from diversification.peerberry_diversification import login, PEERBERRY_EMAIL, PEERBERRY_PASSWORD
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
@@ -51,6 +60,9 @@ log = logging.getLogger("peerberry_monitor")
 OVERVIEW_URL = "https://peerberry.com/en/client/overview"
 OVERVIEW_API_URL = "https://api.peerberry.com/v1/investor/overview"
 STORAGE_STATE_FILE = Path(__file__).parent / "peerberry_storage_state.json"
+CRON_SCHEDULE_STATE_FILE = Path(__file__).parent / "peerberry_cron_schedule_state.json"
+
+PEERBERRY_CRON_JOB_ID = os.environ.get("PEERBERRY_CRON_JOB_ID")
 
 MIN_AVAILABLE_TO_NOTIFY = 10.0
 
@@ -110,6 +122,13 @@ def run(headless: bool = True) -> None:
         browser.close()
 
     log.info("Available for investment: %.2f EUR", available_money)
+
+    # Same cron-job.org speed-up/slow-down as Swaper/Lendermarket (see
+    # cron_schedule.py): poll faster while there's money to invest.
+    if available_money < MIN_AVAILABLE_TO_NOTIFY:
+        ensure_schedule("30m", cron_job_id=PEERBERRY_CRON_JOB_ID, state_file=CRON_SCHEDULE_STATE_FILE)
+    else:
+        ensure_schedule("2m", cron_job_id=PEERBERRY_CRON_JOB_ID, state_file=CRON_SCHEDULE_STATE_FILE)
 
     if available_money >= MIN_AVAILABLE_TO_NOTIFY:
         log.info("Balance >= %.2f EUR - sending notification email.", MIN_AVAILABLE_TO_NOTIFY)
