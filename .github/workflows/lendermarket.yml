@@ -50,9 +50,9 @@ jobs:
         uses: actions/cache/restore@v4
         with:
           path: |
-            lendermarket_state.json
-            lendermarket_storage_state.json
-            lendermarket_cron_schedule_state.json
+            monitors/lendermarket_state.json
+            monitors/lendermarket_storage_state.json
+            monitors/lendermarket_cron_schedule_state.json
           key: lendermarket-state-${{ github.run_id }}
           restore-keys: |
             lendermarket-state-
@@ -70,14 +70,14 @@ jobs:
           SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
           EMAIL_FROM: ${{ secrets.EMAIL_FROM }}
           EMAIL_TO: ${{ secrets.EMAIL_TO }}
-        run: python lendermarket_monitor.py
+        run: python -m monitors.lendermarket_monitor
 
       - name: Save persisted state (already-notified loan IDs + session cookies + cron schedule) for the next run
         if: always()
         uses: actions/cache/save@v4
         with:
           path: |
-            lendermarket_state.json
-            lendermarket_storage_state.json
-            lendermarket_cron_schedule_state.json
+            monitors/lendermarket_state.json
+            monitors/lendermarket_storage_state.json
+            monitors/lendermarket_cron_schedule_state.json
           key: lendermarket-state-${{ github.run_id }}

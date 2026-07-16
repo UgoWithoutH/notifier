@@ -4,7 +4,7 @@ Logs into Lendermarket (reusing lendermarket_monitor.login(), which already
 handles email/password + TOTP 2FA - not duplicated here) and fetches every
 active investment via the site's own "Mes investissements"
 (https://app.lendermarket.com/fr/investissements) API, then groups them by
-loan originator ("fournisseur de crédit") and sums the remaining principal
+loan originator ("fournisseur de crÃ©dit") and sums the remaining principal
 ("capital restant") per originator. No email is sent - the amounts are just
 logged and handed to fill_current_month_amounts() (see google_sheet.py) so
 they can be filled into a Google Sheet, mirroring
@@ -22,8 +22,8 @@ the browser's own `fetch()` with `credentials: 'include'` - unlike
 PeerBerry's API, Lendermarket's doesn't reject credentialed cross-origin
 requests (no CORS error), so no manual bearer-token header is needed here.
 
-Also fetches this calendar month's "Intérêts reçus" + "Intérêts de retard
-reçus" (summed into one "interest received" figure, per explicit user
+Also fetches this calendar month's "IntÃ©rÃªts reÃ§us" + "IntÃ©rÃªts de retard
+reÃ§us" (summed into one "interest received" figure, per explicit user
 instructions) and "Primes promotionnelles et bonus" from the Account
 Statement page (https://app.lendermarket.com/fr/statement) - see
 fetch_current_month_statement_totals() below, same idea as
@@ -54,14 +54,14 @@ from zoneinfo import ZoneInfo
 
 from dotenv import load_dotenv
 
-from google_sheet import fill_current_month_amounts, fill_geographic_repartition_amounts
+from shared.google_sheet import fill_current_month_amounts, fill_geographic_repartition_amounts
 
 load_dotenv()
 
 from playwright.sync_api import sync_playwright
 
-from browser_stealth import get_context_options, apply_stealth
-from lendermarket_monitor import login, LENDERMARKET_EMAIL, LENDERMARKET_PASSWORD
+from shared.browser_stealth import get_context_options, apply_stealth
+from monitors.lendermarket_monitor import login, LENDERMARKET_EMAIL, LENDERMARKET_PASSWORD
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger("lendermarket_diversification")
@@ -116,7 +116,7 @@ def fetch_investments(page) -> list:
 
 
 def aggregate_by_lender(investments: list) -> list:
-    """Group investments by loan originator (fournisseur de crédit) and sum
+    """Group investments by loan originator (fournisseur de crÃ©dit) and sum
     the remaining principal (capital restant) for each - one entry per
     lender, sorted by remaining amount descending."""
     totals = {}
@@ -138,8 +138,8 @@ def aggregate_by_lender(investments: list) -> list:
 
 
 def fetch_current_month_statement_totals(page) -> dict:
-    """Fetch this calendar month's "Intérêts reçus", "Intérêts de retard
-    reçus" and "Primes promotionnelles et bonus", as shown in the summary
+    """Fetch this calendar month's "IntÃ©rÃªts reÃ§us", "IntÃ©rÃªts de retard
+    reÃ§us" and "Primes promotionnelles et bonus", as shown in the summary
     panel of the Account Statement page
     (https://app.lendermarket.com/fr/statement), via the same JSON API the
     page's own "Mois en cours" quick filter calls.
@@ -153,9 +153,9 @@ def fetch_current_month_statement_totals(page) -> dict:
                      "investorReceivedDelayedInterestsAmount": "0.03",
                      "investorBonusesAmount": "0.00", ...}}
 
-    which matched the page's own displayed "Intérêts reçus" (7,32 €),
-    "Intérêts de retard reçus" (0,03 €) and "Primes promotionnelles et
-    bonus" (0,00 €) figures exactly. Per explicit user instructions, the
+    which matched the page's own displayed "IntÃ©rÃªts reÃ§us" (7,32 â‚¬),
+    "IntÃ©rÃªts de retard reÃ§us" (0,03 â‚¬) and "Primes promotionnelles et
+    bonus" (0,00 â‚¬) figures exactly. Per explicit user instructions, the
     first two are summed into a single "interest received" figure; unlike
     PeerBerry/Loanch's APIs, this endpoint accepts a plain credentialed
     fetch (`credentials: 'include'`) with no CORS/bearer-token workaround

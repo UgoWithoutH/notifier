@@ -49,13 +49,13 @@ from zoneinfo import ZoneInfo
 import pyotp
 from dotenv import load_dotenv
 
-from google_sheet import fill_current_month_amounts, fill_geographic_repartition_amounts
+from shared.google_sheet import fill_current_month_amounts, fill_geographic_repartition_amounts
 
 load_dotenv()
 
 from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
 
-from browser_stealth import get_context_options, apply_stealth, human_pause, human_mouse_wander, human_type
+from shared.browser_stealth import get_context_options, apply_stealth, human_pause, human_mouse_wander, human_type
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger("peerberry_diversification")
@@ -252,7 +252,7 @@ def fetch_current_month_interest_income(page) -> float:
     returning `{"openingBalance": "6.20", "closingBalance": "0.98",
     "operations": {"DEPOSIT": "5000.00", "INVESTMENT": "-6578.71",
     "INTEREST": "9.88", "PRINCIPAL": "1563.61"}}` - `operations.INTEREST`
-    matched the page's displayed "Interest income +€9.88" exactly (matches
+    matched the page's displayed "Interest income +â‚¬9.88" exactly (matches
     the user-supplied reference value). Like the originators endpoint (see
     module docstring), this is on api.peerberry.com so it needs the
     `app_token` cookie sent as an `Authorization: Bearer` header (a plain

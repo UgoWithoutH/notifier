@@ -22,7 +22,7 @@ import os
 from pathlib import Path
 from urllib import request, error
 
-from state import load_state, save_state
+from shared.state import load_state, save_state
 
 log = logging.getLogger("cron_schedule")
 

@@ -44,11 +44,11 @@ import pyotp
 from dotenv import load_dotenv
 from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
 
-from notifier import send_lendermarket_email
-from state import load_state, save_state
-from notification_gate import should_notify
-from browser_stealth import get_context_options, apply_stealth, human_pause, human_mouse_wander, human_type
-from cron_schedule import ensure_schedule
+from shared.notifier import send_lendermarket_email
+from shared.state import load_state, save_state
+from shared.notification_gate import should_notify
+from shared.browser_stealth import get_context_options, apply_stealth, human_pause, human_mouse_wander, human_type
+from shared.cron_schedule import ensure_schedule
 
 load_dotenv()
 
@@ -72,7 +72,7 @@ CRON_SCHEDULE_STATE_FILE = Path(__file__).parent / "lendermarket_cron_schedule_s
 LOAN_SEGMENTS = [
     {
         "key": "non_reglemente",
-        "label": "Prêts non réglementés",
+        "label": "PrÃªts non rÃ©glementÃ©s",
         "regulation_status": "UNREGULATED",
         "lenders": [
             "9babf437-5bf8-41fb-840d-6edf7012e408",
@@ -89,7 +89,7 @@ LOAN_SEGMENTS = [
     },
     {
         "key": "reglemente",
-        "label": "Prêts réglementés",
+        "label": "PrÃªts rÃ©glementÃ©s",
         "regulation_status": "REGULATED",
         "lenders": [
             "9ffdd9b6-bde3-445b-a3df-f2f57b94afe7",
@@ -136,7 +136,7 @@ def fetch_active_loans(segment: dict) -> list:
 
 
 def aggregate_by_lender(loans: list) -> list:
-    """Group loans by lender (fournisseur de crédit), returning one entry per
+    """Group loans by lender (fournisseur de crÃ©dit), returning one entry per
     lender with the loan count, total investable amount, and min/max
     interest rate - sorted by lender name."""
     buckets = {}
@@ -384,7 +384,7 @@ def run() -> None:
     # don't let that silently gate segments closed - assume money's fine and
     # fall back to loan availability alone.
     balance = fetch_balance_via_login()
-    log.info("Account balance: %s", f"{balance:.2f} €" if balance is not None else "unavailable")
+    log.info("Account balance: %s", f"{balance:.2f} â‚¬" if balance is not None else "unavailable")
 
     # Same cron-job.org speed-up/slow-down as Swaper (see cron_schedule.py):
     # poll faster while there's money to invest. Skipped when the balance

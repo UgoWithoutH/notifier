@@ -50,7 +50,7 @@ jobs:
         uses: actions/cache/restore@v4
         with:
           path: |
-            peerberry_storage_state.json
+            monitors/peerberry_storage_state.json
           key: peerberry-state-${{ github.run_id }}
           restore-keys: |
             peerberry-state-
@@ -66,12 +66,12 @@ jobs:
           SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
           EMAIL_FROM: ${{ secrets.EMAIL_FROM }}
           EMAIL_TO: ${{ secrets.EMAIL_TO }}
-        run: python peerberry_monitor.py
+        run: python -m monitors.peerberry_monitor
 
       - name: Save persisted state (session cookies) for the next run
         if: always()
         uses: actions/cache/save@v4
         with:
           path: |
-            peerberry_storage_state.json
+            monitors/peerberry_storage_state.json
           key: peerberry-state-${{ github.run_id }}

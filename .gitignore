@@ -14,6 +14,12 @@ lendermarket_cron_schedule_state.json
 peerberry_diversification_storage_state.json
 lendermarket_diversification_storage_state.json
 afranga_diversification_storage_state.json
+bricks_diversification_storage_state.json
+
+# Catch-all: any current/future *_storage_state.json / *_state.json file
+# (session cookies / seen-loan-ID state) should never be committed.
+*_storage_state.json
+*_state.json
 loanch_diversification_storage_state.json
 monefit_diversification_storage_state.json
 bienpreter_diversification_storage_state.json

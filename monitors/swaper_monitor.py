@@ -30,11 +30,11 @@ import pyotp
 from dotenv import load_dotenv
 from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
 
-from notifier import send_swaper_email
-from state import load_state, save_state
-from cron_schedule import ensure_schedule
-from notification_gate import should_notify
-from browser_stealth import get_context_options, apply_stealth, human_pause, human_mouse_wander, human_type
+from shared.notifier import send_swaper_email
+from shared.state import load_state, save_state
+from shared.cron_schedule import ensure_schedule
+from shared.notification_gate import should_notify
+from shared.browser_stealth import get_context_options, apply_stealth, human_pause, human_mouse_wander, human_type
 
 DEFAULT_STATE = {
     "gates": {},

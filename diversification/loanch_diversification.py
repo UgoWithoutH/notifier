@@ -40,7 +40,7 @@ API verified against the real account on 2026-07-09, in two steps:
 Quirk worth knowing about if this script ever starts failing 2FA silently:
 the machine this was developed on had an unsynced system clock (~55s
 ahead of Google's `Date` response header - `w32tm /query /status` showed
-"Non synchronisé" / "Local CMOS Clock", and `w32tm /resync` needs admin
+"Non synchronisÃ©" / "Local CMOS Clock", and `w32tm /resync` needs admin
 rights this account doesn't have) - large enough to push generated TOTP
 codes outside Loanch's acceptance window and get every code rejected as
 "incorrect", even though the secret itself was correct. `handle_two_factor()`
@@ -74,13 +74,13 @@ from zoneinfo import ZoneInfo
 import pyotp
 from dotenv import load_dotenv
 
-from google_sheet import fill_current_month_amounts, fill_geographic_repartition_amounts
+from shared.google_sheet import fill_current_month_amounts, fill_geographic_repartition_amounts
 
 load_dotenv()
 
 from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
 
-from browser_stealth import get_context_options, apply_stealth, human_pause, human_mouse_wander, human_type
+from shared.browser_stealth import get_context_options, apply_stealth, human_pause, human_mouse_wander, human_type
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger("loanch_diversification")
@@ -103,7 +103,7 @@ LOANCH_TOTP_SECRET = os.environ.get("LOANCH_TOTP_SECRET")
 
 
 def dismiss_overlays(page) -> None:
-    """Dismiss the cookie consent banner and the (occasional) "get your €20
+    """Dismiss the cookie consent banner and the (occasional) "get your â‚¬20
     bonus" promo modal if either shows up. Verified on 2026-07-09: the
     cookie banner's "Tout accepter" button needs a forced click (a
     subsequent overlay from the promo modal intercepts a plain click), and

@@ -65,9 +65,9 @@ jobs:
         uses: actions/cache/restore@v4
         with:
           path: |
-            swaper_storage_state.json
-            swaper_state.json
-            cron_schedule_state.json
+            monitors/swaper_storage_state.json
+            monitors/swaper_state.json
+            monitors/cron_schedule_state.json
           key: swaper-state-${{ github.run_id }}
           restore-keys: |
             swaper-state-
@@ -86,14 +86,14 @@ jobs:
           EMAIL_FROM: ${{ secrets.EMAIL_FROM }}
           EMAIL_TO: ${{ secrets.EMAIL_TO }}
           FORCE_TEST_EMAIL: ${{ github.event.inputs.force_test_email }}
-        run: python swaper_monitor.py
+        run: python -m monitors.swaper_monitor
 
       - name: Save persisted state (session cookies + seen loan IDs + cron schedule) for the next run
         if: always()
         uses: actions/cache/save@v4
         with:
           path: |
-            swaper_storage_state.json
-            swaper_state.json
-            cron_schedule_state.json
+            monitors/swaper_storage_state.json
+            monitors/swaper_state.json
+            monitors/cron_schedule_state.json
           key: swaper-state-${{ github.run_id }}

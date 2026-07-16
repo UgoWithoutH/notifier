@@ -6,7 +6,7 @@ the "Available for investment" balance shown on the Overview page
 (https://peerberry.com/en/client/overview).
 
 Verified against the real account on 2026-07-15: the Overview page displays
-"Available for investment €4.25", which is sourced from
+"Available for investment â‚¬4.25", which is sourced from
 `GET https://api.peerberry.com/v1/investor/overview` ->
 `{"availableMoney": "4.25", "invested": "10023.10", ...}` - `availableMoney`
 matched the displayed figure exactly. Captured the same way
@@ -41,9 +41,9 @@ load_dotenv()
 
 from playwright.sync_api import sync_playwright
 
-from notifier import send_peerberry_available_email
-from browser_stealth import get_context_options, apply_stealth
-from peerberry_diversification import login, PEERBERRY_EMAIL, PEERBERRY_PASSWORD
+from shared.notifier import send_peerberry_available_email
+from shared.browser_stealth import get_context_options, apply_stealth
+from diversification.peerberry_diversification import login, PEERBERRY_EMAIL, PEERBERRY_PASSWORD
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger("peerberry_monitor")

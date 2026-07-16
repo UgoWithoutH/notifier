@@ -6,7 +6,7 @@ loan originator at all here - per the user's request, this just logs into
 https://www.bienpreter.com, reads two figures on the dashboard
 (https://www.bienpreter.com/u/tableau-de-bord):
   - "solde disponible" (available cash balance not yet invested)
-  - "capital à recevoir" (capital still to be repaid on active investments)
+  - "capital Ã  recevoir" (capital still to be repaid on active investments)
 sums them, and hands the single total to fill_current_month_amounts() (see
 google_sheet.py) - no per-originator dict, just one number, no email sent
 either.
@@ -20,21 +20,21 @@ if the browser's locale isn't French). No 2FA/TOTP step was observed.
 The dashboard's markup was inspected end-to-end against the real account
 on 2026-07-09, so `fetch_balances()` uses precise structural selectors
 rather than a generic heuristic:
-- "Capital à recevoir" is a proper `<dl><dt>Capital à recevoir</dt><dd
-  class="number">1 220,00 €</dd></dl>` pair - found via the `<dt>` whose
+- "Capital Ã  recevoir" is a proper `<dl><dt>Capital Ã  recevoir</dt><dd
+  class="number">1 220,00 â‚¬</dd></dl>` pair - found via the `<dt>` whose
   text contains "recevoir", value read from its `nextElementSibling`
   (`<dd>`).
 - "Solde disponible" is NOT a dt/dd pair - it's a `<p>Solde
-  disponible<br><span class="number big">955,25 €</span></p>` block found
+  disponible<br><span class="number big">955,25 â‚¬</span></p>` block found
   via the `<p>` whose text starts with "solde disponible", value read from
   the nested `<span>`.
-  Note: "955,25 €" (this exact balance) also appears twice more elsewhere
+  Note: "955,25 â‚¬" (this exact balance) also appears twice more elsewhere
   on the page with NO nearby label at all - once in the top nav ("Solde :
-  955,25 €") and once in a bare `<span class="number big">` - so a
+  955,25 â‚¬") and once in a bare `<span class="number big">` - so a
   generic "scan every currency-looking text node and guess by nearby
   keyword" approach (as used in monefit_diversification.py) doesn't work
   reliably here: the account-summary panel groups multiple unrelated
-  labeled values (Capital, Capital remboursé, Capital à recevoir, Intérêts
+  labeled values (Capital, Capital remboursÃ©, Capital Ã  recevoir, IntÃ©rÃªts
   ...) together in one shared container, so a same-ancestor-mentions-the-
   keyword heuristic matches multiple candidates ambiguously. Hence the
   precise selectors above instead.
@@ -43,7 +43,7 @@ Also fetches this calendar month's interest received (like
 loanch_diversification.fetch_current_month_statement_totals() /
 swaper_diversification.fetch_current_month_interest_received() /
 afranga_diversification.fetch_current_month_statement_totals()) from the
-"Toutes mes opérations" page (https://www.bienpreter.com/u/operations) -
+"Toutes mes opÃ©rations" page (https://www.bienpreter.com/u/operations) -
 see fetch_current_month_interest_totals() below for exactly how gross/net/
 withholding tax are obtained (Bienpreter has no single labeled "net
 interest" figure anywhere, unlike Afranga/Loanch/Swaper, so this is
@@ -69,13 +69,13 @@ from zoneinfo import ZoneInfo
 
 from dotenv import load_dotenv
 
-from google_sheet import fill_current_month_amounts
+from shared.google_sheet import fill_current_month_amounts
 
 load_dotenv()
 
 from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
 
-from browser_stealth import get_context_options, apply_stealth, human_pause, human_mouse_wander, human_type
+from shared.browser_stealth import get_context_options, apply_stealth, human_pause, human_mouse_wander, human_type
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger("bienpreter_diversification")
@@ -146,8 +146,8 @@ def login(page) -> None:
 
 
 def _parse_amount(text: str):
-    """Parse a currency-formatted amount (e.g. "955,25 €", "1 220 €",
-    "€1,234.56") into a float, without assuming a fixed locale - whichever
+    """Parse a currency-formatted amount (e.g. "955,25 â‚¬", "1 220 â‚¬",
+    "â‚¬1,234.56") into a float, without assuming a fixed locale - whichever
     of ',' or '.' appears last is treated as the decimal separator, the
     other (or repeats of it) as thousands separators."""
     if not text:
@@ -177,7 +177,7 @@ def _parse_amount(text: str):
 
 
 def _extract_amounts(page) -> dict:
-    """Read "Solde disponible" and "Capital à recevoir" off the dashboard
+    """Read "Solde disponible" and "Capital Ã  recevoir" off the dashboard
     via the precise selectors verified on 2026-07-09 (see module
     docstring). Returns the raw (unparsed) text of each, or None if not
     found."""
@@ -207,7 +207,7 @@ def _extract_amounts(page) -> dict:
 
 def fetch_balances(page) -> dict:
     """Navigate to the dashboard and read "solde disponible" and "capital
-    à recevoir", returning both as floats. See module docstring for the
+    Ã  recevoir", returning both as floats. See module docstring for the
     verified selectors."""
     page.goto(DASHBOARD_URL, wait_until="domcontentloaded")
     page.wait_for_timeout(2000)  # let the SPA render the dashboard widgets
@@ -218,14 +218,14 @@ def fetch_balances(page) -> dict:
     if not raw.get("soldeDisponible"):
         raise RuntimeError("Could not find 'Solde disponible' on the Bienpreter dashboard.")
     if not raw.get("capitalARecevoir"):
-        raise RuntimeError("Could not find 'Capital à recevoir' on the Bienpreter dashboard.")
+        raise RuntimeError("Could not find 'Capital Ã  recevoir' on the Bienpreter dashboard.")
 
     available_balance = _parse_amount(raw["soldeDisponible"])
     capital_to_receive = _parse_amount(raw["capitalARecevoir"])
     if available_balance is None:
         raise RuntimeError(f"Could not parse 'Solde disponible' out of {raw['soldeDisponible']!r}.")
     if capital_to_receive is None:
-        raise RuntimeError(f"Could not parse 'Capital à recevoir' out of {raw['capitalARecevoir']!r}.")
+        raise RuntimeError(f"Could not parse 'Capital Ã  recevoir' out of {raw['capitalARecevoir']!r}.")
 
     return {"available_balance": available_balance, "capital_to_receive": capital_to_receive}
 
@@ -236,14 +236,14 @@ def _fetch_operations_page(page, start_date: str, end_date: str, page_number: in
     Loanch/Swaper/Afranga's statement endpoints) filtered to the given
     date range (`startDate`/`endDate` query params, "yyyy-mm-dd", verified
     against the real account on 2026-07-10 to correctly narrow the
-    "X résultats au total" count), and extract each transaction row.
+    "X rÃ©sultats au total" count), and extract each transaction row.
 
     Verified table markup on 2026-07-10: each `<tr>` has a
-    `.transaction__name` label (e.g. "Remboursement mensuel", "Prélèvements
+    `.transaction__name` label (e.g. "Remboursement mensuel", "PrÃ©lÃ¨vements
     fiscaux") and a `.transaction__amount` (the total booked amount, e.g.
-    "0,13 €" or "-1,43 €"). Crucially, "Remboursement mensuel" rows also
+    "0,13 â‚¬" or "-1,43 â‚¬"). Crucially, "Remboursement mensuel" rows also
     contain one `.transaction__interests` span PER underlying project
-    (e.g. "0,13 €") giving the INTEREST-ONLY portion of that repayment,
+    (e.g. "0,13 â‚¬") giving the INTEREST-ONLY portion of that repayment,
     separate from the row's total amount - this matters because Bienpreter
     loans are "In Fine" (capital is repaid entirely at the loan's closing
     date, interest paid periodically before that) and a row's total
@@ -280,7 +280,7 @@ def _fetch_operations_page(page, start_date: str, end_date: str, page_number: in
 
 def fetch_current_month_interest_totals(page) -> dict:
     """Fetch this calendar month's interest received, split into net/gross/
-    withholding tax, from the "Toutes mes opérations" page
+    withholding tax, from the "Toutes mes opÃ©rations" page
     (https://www.bienpreter.com/u/operations) - Bienpreter has no single
     page/endpoint exposing a ready-made "gross interest received" figure
     like Loanch/Swaper/Afranga do, so this reconstructs it from two real
@@ -296,9 +296,9 @@ def fetch_current_month_interest_totals(page) -> dict:
       "net" here, which silently double-counted tax in the "gross" total
       below.
     - `withholding_tax`: sum of the (absolute) `.transaction__amount` of
-      every row labeled "Prélèvements fiscaux" (covers both "Prélèvements
-      sociaux" and "Impôts sur le revenu" sub-lines, verified 2026-07-10:
-      -1,43 € and -0,98 € respectively) - the actual tax withheld at
+      every row labeled "PrÃ©lÃ¨vements fiscaux" (covers both "PrÃ©lÃ¨vements
+      sociaux" and "ImpÃ´ts sur le revenu" sub-lines, verified 2026-07-10:
+      -1,43 â‚¬ and -0,98 â‚¬ respectively) - the actual tax withheld at
       source on interest income, always negative/deducted.
     - `net_interest_received` = gross_interest_received - withholding_tax
       (interest income tax is only ever withheld on interest, never on
@@ -337,7 +337,7 @@ def fetch_current_month_interest_totals(page) -> dict:
             for interest_text in row.get("interestTexts") or []:
                 gross_interest_received += _parse_amount(interest_text) or 0.0
 
-            if (row.get("label") or "") == "Prélèvements fiscaux":
+            if (row.get("label") or "") == "PrÃ©lÃ¨vements fiscaux":
                 withholding_tax += abs(_parse_amount(row.get("amountText")) or 0.0)
     else:
         log.warning(
@@ -398,7 +398,7 @@ def run(headless: bool = True) -> None:
     total = balances["available_balance"] + balances["capital_to_receive"]
     interest_totals["total"] = total
     log.info(
-        "Bienpreter: solde disponible=%.2f EUR + capital à recevoir=%.2f EUR = %.2f EUR",
+        "Bienpreter: solde disponible=%.2f EUR + capital Ã  recevoir=%.2f EUR = %.2f EUR",
         balances["available_balance"], balances["capital_to_receive"], total,
     )
     log.info(
@@ -408,7 +408,7 @@ def run(headless: bool = True) -> None:
     )
 
     fill_current_month_amounts(
-        platform="Bienprêter",
+        platform="BienprÃªter",
         amounts=interest_totals
     )
 
