@@ -17,26 +17,24 @@ EMAIL_TO = os.environ.get("EMAIL_TO")
 
 
 def _format_loan(loan: dict) -> str:
-    loan_id = loan.get("id")
-    number = loan.get("number")
-    amount = loan.get("amount")
-    interest = loan.get("interestRatePerYear")
-    status = loan.get("status")
-    term = loan.get("term") or {}
-    term_str = f"{term.get('value')} {term.get('unit')}" if term else None
+    """Format a single loan as one line: identifier, available amount, and
+    yield (interest rate) - the only 3 things asked for, no extra fields
+    and no URL."""
+    number = loan.get("number") or loan.get("id")
 
-    parts = [f"Loan #{loan_id}"]
-    if number:
-        parts.append(number)
-    if amount is not None:
-        parts.append(f"amount: {amount}")
-    if interest is not None:
-        parts.append(f"interest: {interest}%")
-    if term_str:
-        parts.append(f"term: {term_str}")
-    if status:
-        parts.append(f"status: {status}")
-    return " | ".join(parts)
+    amount = loan.get("amount")
+    try:
+        amount_str = f"{float(amount):.2f} €"
+    except (TypeError, ValueError):
+        amount_str = "montant n/a"
+
+    interest = loan.get("interestRatePerYear")
+    try:
+        interest_str = f"{float(interest):.2f}%"
+    except (TypeError, ValueError):
+        interest_str = "n/a"
+
+    return f"Prêt {number} : {amount_str} | rendement {interest_str}"
 
 
 def send_swaper_email(balance: float, loans: list) -> None:
@@ -47,9 +45,21 @@ def send_swaper_email(balance: float, loans: list) -> None:
         )
         return
 
+    total_amount = 0.0
+    for loan in loans:
+        try:
+            total_amount += float(loan.get("amount"))
+        except (TypeError, ValueError):
+            pass
+
     subject = f"[Swaper] {balance:.2f}€ dispo + {len(loans)} prêt(s) manuel(s) disponible(s)"
-    header = f"Solde non investi : {balance:.2f} €\n\n"
-    body = header + "\n".join(_format_loan(loan) for loan in loans)
+    body_parts = [
+        f"Solde non investi : {balance:.2f} €",
+        f"Montant total disponible : {total_amount:.2f} €",
+        "",
+    ]
+    body_parts.extend(_format_loan(loan) for loan in loans)
+    body = "\n".join(body_parts)
 
     msg = MIMEMultipart()
     msg["From"] = EMAIL_FROM
@@ -67,31 +77,35 @@ def send_swaper_email(balance: float, loans: list) -> None:
         log.exception("Failed to send notification email.")
 
 
-def _format_lendermarket_lender(lender_stats: dict) -> str:
-    lender = lender_stats["lender"]
-    count = lender_stats["count"]
-    total_amount = lender_stats["total_amount"]
-    min_rate = lender_stats["min_rate"]
-    max_rate = lender_stats["max_rate"]
+def _format_lendermarket_loan(loan: dict) -> str:
+    """Format a single loan as one line: lender, identifier, available
+    amount, and yield (interest rate) - no extra fields and no URL."""
+    lender_name = (loan.get("lender") or {}).get("displayName") or "Fournisseur inconnu"
+    loan_identifier = loan.get("loanPublicId") or loan.get("uuid")
 
-    if min_rate is None:
-        rate_str = "taux: n/a"
-    elif min_rate == max_rate:
-        rate_str = f"taux: {min_rate:.2f}%"
-    else:
-        rate_str = f"taux: {min_rate:.2f}%–{max_rate:.2f}%"
+    amount = loan.get("investableAmount") or loan.get("loanAmount")
+    try:
+        amount_str = f"{float(amount):.2f} €"
+    except (TypeError, ValueError):
+        amount_str = "montant n/a"
 
-    return f"{lender} : {count} prêt(s), montant total {total_amount:.2f} € | {rate_str}"
+    rate = loan.get("interestRate")
+    try:
+        rate_str = f"{float(rate):.2f}%"
+    except (TypeError, ValueError):
+        rate_str = "n/a"
+
+    return f"{lender_name} - Prêt {loan_identifier} : {amount_str} | rendement {rate_str}"
 
 
 def send_lendermarket_email(balance: float | None, segments: dict) -> None:
     """Notify about newly available Lendermarket loans.
 
-    `segments` maps a segment key to {"label", "page_url", "lenders"}, where
-    "lenders" is the per-lender aggregate list built by
-    lendermarket_monitor.aggregate_by_lender() (count, total investable
-    amount, min/max interest rate) for every loan currently active in that
-    segment - not just the new one(s) that triggered the notification.
+    `segments` maps a segment key to {"label", "loans"}, where "loans" is
+    the raw list of loan dicts (from the public getActiveLoans API)
+    currently active in that segment - not just the new one(s) that
+    triggered the notification. Each loan is listed individually with its
+    own available amount and yield, plus a per-segment total amount.
     """
     if not all([SMTP_HOST, SMTP_USER, SMTP_PASSWORD, EMAIL_TO]):
         log.error(
@@ -100,7 +114,7 @@ def send_lendermarket_email(balance: float | None, segments: dict) -> None:
         )
         return
 
-    total_loans = sum(sum(l["count"] for l in s["lenders"]) for s in segments.values())
+    total_loans = sum(len(s["loans"]) for s in segments.values())
     labels = ", ".join(s["label"] for s in segments.values())
     subject = f"[Lendermarket] {total_loans} prêt(s) disponible(s) ({labels})"
 
@@ -110,9 +124,17 @@ def send_lendermarket_email(balance: float | None, segments: dict) -> None:
     body_parts.append("")
 
     for segment in segments.values():
-        segment_count = sum(l["count"] for l in segment["lenders"])
-        body_parts.append(f"{segment['label']} ({segment_count} prêt(s)) - {segment['page_url']}")
-        body_parts.extend(f"  - {_format_lendermarket_lender(lender)}" for lender in segment["lenders"])
+        loans = segment["loans"]
+        segment_total = 0.0
+        for loan in loans:
+            amount = loan.get("investableAmount") or loan.get("loanAmount")
+            try:
+                segment_total += float(amount)
+            except (TypeError, ValueError):
+                pass
+
+        body_parts.append(f"{segment['label']} ({len(loans)} prêt(s), montant total {segment_total:.2f} €)")
+        body_parts.extend(f"  - {_format_lendermarket_loan(loan)}" for loan in loans)
         body_parts.append("")
     body = "\n".join(body_parts)
 
