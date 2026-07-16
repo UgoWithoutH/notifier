@@ -52,6 +52,7 @@ jobs:
           path: |
             monitors/peerberry_storage_state.json
             monitors/peerberry_cron_schedule_state.json
+            monitors/peerberry_state.json
           key: peerberry-state-${{ github.run_id }}
           restore-keys: |
             peerberry-state-
@@ -78,4 +79,5 @@ jobs:
           path: |
             monitors/peerberry_storage_state.json
             monitors/peerberry_cron_schedule_state.json
+            monitors/peerberry_state.json
           key: peerberry-state-${{ github.run_id }}
