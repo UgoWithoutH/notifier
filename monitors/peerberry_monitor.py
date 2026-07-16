@@ -1,8 +1,12 @@
 """PeerBerry "Available for investment" balance monitor.
 
-Logs into peerberry.com (reusing peerberry_diversification.login(), which
-already handles email/password + TOTP 2FA - not duplicated here) and fetches
-the "Available for investment" balance shown on the Overview page
+Logs into peerberry.com (login()/handle_two_factor()/dismiss_cookie_banner()
+live here - moved from diversification/peerberry_diversification.py on
+2026-07-16 so that module can import them from this one instead of the
+reverse, same dependency direction as swaper/lendermarket: this monitor has
+no need for shared.google_sheet, so it must not import anything from a
+*_diversification.py module, which does) and fetches the "Available for
+investment" balance shown on the Overview page
 (https://peerberry.com/en/client/overview).
 
 Verified against the real account on 2026-07-15: the Overview page displays
@@ -48,31 +52,141 @@ import sys
 import logging
 from pathlib import Path
 
+import pyotp
 from dotenv import load_dotenv
 
 load_dotenv()
 
-from playwright.sync_api import sync_playwright
+from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
 
 from shared.notifier import send_peerberry_available_email
-from shared.browser_stealth import get_context_options, apply_stealth
+from shared.browser_stealth import get_context_options, apply_stealth, human_pause, human_mouse_wander, human_type
 from shared.cron_schedule import ensure_schedule
 from shared.state import load_state, save_state
-from diversification.peerberry_diversification import login, PEERBERRY_EMAIL, PEERBERRY_PASSWORD
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger("peerberry_monitor")
 
+LOGIN_URL = "https://peerberry.com/en/client/"
 OVERVIEW_URL = "https://peerberry.com/en/client/overview"
 OVERVIEW_API_URL = "https://api.peerberry.com/v1/investor/overview"
 STORAGE_STATE_FILE = Path(__file__).parent / "peerberry_storage_state.json"
 CRON_SCHEDULE_STATE_FILE = Path(__file__).parent / "peerberry_cron_schedule_state.json"
 STATE_FILE = Path(__file__).parent / "peerberry_state.json"
+
+PEERBERRY_EMAIL = os.environ.get("PEERBERRY_EMAIL")
+PEERBERRY_PASSWORD = os.environ.get("PEERBERRY_PASSWORD")
+PEERBERRY_TOTP_SECRET = os.environ.get("PEERBERRY_TOTP_SECRET")
 DEFAULT_STATE = {"last_notified_balance": None}
 
 PEERBERRY_CRON_JOB_ID = os.environ.get("PEERBERRY_CRON_JOB_ID")
 
 MIN_AVAILABLE_TO_NOTIFY = 10.0
+
+
+def dismiss_cookie_banner(page) -> None:
+    """Dismiss the Cookiebot consent dialog if it shows up.
+
+    Verified on 2026-07-09: a normal Playwright click on the "Allow all"
+    button can silently no-op (the dialog stays in the DOM, still
+    intercepting clicks on the login form underneath it), so this falls
+    back to removing the dialog element outright via JS if it's still
+    present a moment after the click.
+    """
+    try:
+        page.locator("#CybotCookiebotDialogBodyLevelButtonLevelOptinAllowAll").click(timeout=5000, force=True)
+    except PlaywrightTimeoutError:
+        return  # banner never appeared, nothing to do
+
+    page.wait_for_timeout(500)
+    page.evaluate(
+        """
+        () => {
+            const dialog = document.getElementById('CybotCookiebotDialog');
+            if (dialog) dialog.remove();
+        }
+        """
+    )
+
+
+def handle_two_factor(page) -> None:
+    """If PeerBerry prompts for a TOTP code after submitting credentials,
+    generate one from PEERBERRY_TOTP_SECRET and fill it in.
+
+    Verified against the real 2FA screen on 2026-07-09: 6 separate one-digit
+    inputs named `s1`..`s6`; filling the last one auto-submits the form (no
+    explicit "verify" button to click).
+    """
+    first_box = page.locator("input[name='s1']")
+    try:
+        first_box.wait_for(timeout=8000)
+    except PlaywrightTimeoutError:
+        return  # no 2FA prompt shown, nothing to do
+
+    if not PEERBERRY_TOTP_SECRET:
+        raise RuntimeError(
+            "PeerBerry is asking for a 2FA code but PEERBERRY_TOTP_SECRET is not set. "
+            "Set it to the base32 secret used to configure Google Authenticator."
+        )
+
+    log.info("2FA prompt detected, generating and submitting TOTP code...")
+    code = pyotp.TOTP(PEERBERRY_TOTP_SECRET).now()
+    for i, digit in enumerate(code, start=1):
+        human_type(page.locator(f"input[name='s{i}']"), digit)
+
+    page.wait_for_timeout(1500)
+    error_text = page.locator("text=Auth code is invalid")
+    if error_text.count() > 0:
+        raise RuntimeError("PeerBerry rejected the TOTP code (invalid/expired).")
+
+
+def login(page) -> None:
+    """Log in to PeerBerry using PEERBERRY_EMAIL/PASSWORD (and
+    PEERBERRY_TOTP_SECRET if 2FA is enabled).
+
+    Selectors verified against the real login form on 2026-07-09:
+    `input[name='email']` / `input[name='password']` and a
+    `button[type='submit']` labeled "Log in". The submit button is clicked
+    via JS (`element.click()` through `page.evaluate`) rather than
+    Playwright's normal click - the latter's actionability check
+    ("visible, enabled and stable") kept timing out, apparently because of
+    an overlapping chat-widget element, even though the button is genuinely
+    clickable.
+    """
+    log.info("Navigating to login page...")
+    page.goto(LOGIN_URL, wait_until="domcontentloaded")
+    dismiss_cookie_banner(page)
+    human_mouse_wander(page)
+
+    # If a previous session was restored (see STORAGE_STATE_FILE) and is
+    # still valid, PeerBerry redirects straight to /overview - nothing else
+    # to do.
+    page.wait_for_timeout(1000)
+    if page.url.rstrip("/") != LOGIN_URL.rstrip("/"):
+        log.info("Reused a previous session, already logged in at %s", page.url)
+        return
+
+    log.info("Filling in credentials...")
+    human_type(page.locator("input[name='email']"), PEERBERRY_EMAIL)
+    human_pause()
+    human_type(page.locator("input[name='password']"), PEERBERRY_PASSWORD)
+    human_pause()
+    page.evaluate("document.querySelector(\"button[type='submit']\").click()")
+
+    handle_two_factor(page)
+
+    # This is a client-rendered SPA: the redirect away from the login URL
+    # happens via client-side routing (pushState), not always a real
+    # navigation event, and by the time we get here it may have already
+    # happened - so poll the current URL instead of using
+    # page.wait_for_url(), which can miss/outlast it.
+    for _ in range(40):
+        if page.url.rstrip("/") != LOGIN_URL.rstrip("/"):
+            break
+        page.wait_for_timeout(500)
+    else:
+        raise RuntimeError(f"Still on the login page after submitting credentials/2FA: {page.url}")
+    log.info("Logged in successfully, current URL: %s", page.url)
 
 
 def fetch_available_money(page) -> float:
