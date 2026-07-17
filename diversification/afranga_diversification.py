@@ -76,7 +76,8 @@ import re
 import sys
 import logging
 import time
-from datetime import datetime
+from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 from zoneinfo import ZoneInfo
 
 import pyotp
@@ -161,27 +162,30 @@ def login(session: requests.Session) -> None:
     log.info("2FA prompt detected, generating and submitting TOTP code...")
     token = _extract_csrf_token(r.text)
     totp = pyotp.TOTP(AFRANGA_TOTP_SECRET)
-    # Guard against submitting a code right as its 30s window is about to
-    # roll over - the network round-trip can push the server-side check
-    # past the boundary and reject an otherwise-valid code (this exact
-    # failure shape - "still on the login page" with no other error - was
-    # seen in a real GitHub Actions run, matching a known rollover issue
-    # already worked around in swaper_monitor.py/lendermarket_monitor.py).
-    remaining = 30 - (int(time.time()) % 30)
-    if remaining < 5:
-        time.sleep(remaining + 1)
-    code = totp.now()
-    r = session.post(
-        TWO_FA_URL,
-        data={"_token": token, "one_time_password": code},
-        headers={**_HEADERS, "Referer": LOGIN_URL, "Origin": "https://afranga.com"},
-        timeout=20,
-    )
-    r.raise_for_status()
 
-    if r.url.rstrip("/") == LOGIN_URL.rstrip("/"):
-        log.info("TOTP code rejected (likely rolled over), retrying once with a fresh code...")
-        code = totp.now()
+    # Diagnostic only (no secret/code values logged): compare Afranga's
+    # server-reported clock (Date response header) to our local clock. A
+    # real GitHub Actions run rejected the code AND its immediate retry
+    # (< 1s apart, i.e. same 30s window both times - see repo memory for
+    # details), proving this wasn't a boundary-rollover flake but either a
+    # wrong AFRANGA_TOTP_SECRET or clock skew between us and the server.
+    server_date_header = r.headers.get("Date")
+    if server_date_header:
+        try:
+            server_time = parsedate_to_datetime(server_date_header)
+            skew = (datetime.now(timezone.utc) - server_time).total_seconds()
+            log.info("Clock check: local vs. Afranga server Date header skew = %.1fs", skew)
+        except Exception:
+            pass
+
+    # Try the current 30s window first, then the previous and next ones.
+    # A same-window retry is a no-op (proven by the GH Actions log above),
+    # so genuine resilience against clock skew requires trying adjacent
+    # windows with distinct code values, not re-calling totp.now().
+    now = time.time()
+    candidates = [totp.at(now), totp.at(now - 30), totp.at(now + 30)]
+    r = None
+    for attempt, code in enumerate(candidates, start=1):
         r = session.post(
             TWO_FA_URL,
             data={"_token": token, "one_time_password": code},
@@ -189,8 +193,11 @@ def login(session: requests.Session) -> None:
             timeout=20,
         )
         r.raise_for_status()
-        if r.url.rstrip("/") == LOGIN_URL.rstrip("/"):
-            raise RuntimeError("Afranga rejected the TOTP code (still on the login page).")
+        if r.url.rstrip("/") != LOGIN_URL.rstrip("/"):
+            break
+        log.info("TOTP code rejected (attempt %d/%d)...", attempt, len(candidates))
+    else:
+        raise RuntimeError("Afranga rejected the TOTP code (still on the login page).")
 
     log.info("Logged in successfully, current URL: %s", r.url)
 
