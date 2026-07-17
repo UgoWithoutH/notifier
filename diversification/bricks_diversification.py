@@ -3,109 +3,106 @@
 Same family as bienpreter_diversification.py / monefit_diversification.py:
 Bricks is a French real-estate crowdfunding platform (immobilier), not
 broken down by loan originator here - per the user's request this just
-logs in, reads two figures shown in the "Patrimoine" widget on the
-Accueil (home) page (https://app.bricks.co/):
+logs in and reads two figures:
   - "Investissements en cours" (currently invested capital)
-  - "Solde total" (cash wallet balance, itself the sum of "Solde
-    principal" + "Solde cadeau" shown right below it)
+  - "Solde total" (cash wallet balance = "Solde principal" + "Solde
+    cadeau")
 and hands total = investissements_en_cours + solde_total to
 fill_current_month_amounts() - same pattern as
 bienpreter_diversification.py (which similarly sums two dashboard
 figures into one total), mirroring every other *_diversification.py.
 
-Verified against the real account on 2026-07-15:
-- Landing page (unauthenticated) shows "Créer un compte" / "Se connecter"
-  buttons - clicking "Se connecter" navigates to https://app.bricks.co/login
-  (a real route change, not a modal).
-- Login form: `input#login-email-input` (type=email), `input#login-
-  password-input` (type=password), submit button "Se connecter" (same
-  accessible name as the landing page's nav button - not ambiguous since
-  each is clicked on its own page/route). No 2FA/OTP step was observed.
-- Login is SLOW (~15-20s observed): the backend chains `POST
-  api.bricks.co/api/auth/sign-in/email` -> `GET .../auth/get-session` ->
-  `GET .../customers/me` before the SPA (a heavy Expo/React-Native-Web app,
-  uses react-native-skia canvases for charts) finishes re-rendering the
-  logged-in Accueil page - poll for the nav bar's "Accueil" button rather
-  than a single short wait.
-- Once on the Accueil page, its "Patrimoine" widget (found further down
-  the page, no need to scroll/click anything - the whole widget is present
-  in the DOM, `document.body.innerText` just needs enough time to include
-  it) has this exact structure (verified: investissements en cours =
-  3087.77 EUR, solde total = 399.76 EUR = solde principal 399.49 + solde
-  cadeau 0.27 EUR, user-supplied reference values, exact match):
-    Patrimoine
-    <valeur du compte>
-    Valeur de votre compte
-    Investissements en cours
-    <montant>
-    Bricks en cours / Projets en cours (counts, not amounts)
-    Solde total
-    <montant>
-    Solde principal
-    <montant>
-    Solde cadeau
-    <montant>
-    Revenus
-    <montant depuis le début> (cumulative since account opening, NOT a
-    "this month" figure like the other platforms' interest fields - not
-    used here to avoid conflating the two)
-  `fetch_balances()` scans all text nodes in document order (a
-  React-Native-Web app has no semantic dt/dd-style markup to hook a CSS
-  selector onto, unlike Bienpreter) and, for each exact label match, takes
-  the first following text node containing "€" - reliable here because
-  each label is immediately followed by its value in the DOM, no
-  intervening unrelated amount (unlike a generic "scan the whole page"
-  heuristic, which failed for Bienpreter - see that module's docstring).
+REWRITTEN 2026-07-17 to use plain `requests` instead of Playwright (no
+browser at all), the same technique used for
+goandgrow_diversification.py. Historical context (kept for anyone reading
+this later): earlier testing (2026-07-16) found that a plain non-browser
+HTTP client (urllib) hitting api.bricks.co got blocked by Cloudflare (HTTP
+403, "error code: 1010", Bot Fight Mode) on an OPTIONS CORS-preflight
+request specifically - this led to a whole workaround (BRICKS_STORAGE_
+STATE_B64: seed a Playwright storage_state exported from a real manual
+login, since Playwright itself worked fine from the user's home network
+but NOT from GitHub Actions' sign-in attempt, which also got "Failed to
+fetch" errors matching that same Cloudflare block). Re-tested 2026-07-17
+with a real Python `requests` session (not urllib, not an OPTIONS
+preflight - a direct POST, which is what actually matters since browsers
+only send an OPTIONS preflight for genuinely cross-origin requests, not
+what a same-machine non-browser script needs to send) and it went through
+cleanly: `POST api.bricks.co/api/auth/sign-in/email` returned a normal 200
+with a real session cookie (`__Secure-better-auth.session_token`, 7-day
+`Max-Age`), and every authenticated endpoint tested worked immediately
+after. Whatever was blocking the OPTIONS preflight either doesn't apply to
+a direct POST, or Cloudflare's rule has changed/relaxed since - either way,
+this is now CONFIRMED working end-to-end against the real account, so the
+Playwright + BRICKS_STORAGE_STATE_B64 workaround is no longer needed and
+has been removed (see .github/workflows/diversification.yml). If this
+platform ever gets blocked again for the plain HTTP approach too, revisit
+this docstring before assuming a Playwright-based fix is the only option -
+try a plain `requests` session again first, it may just work.
 
-Also fetches this calendar month's gross/net interest received and
-withholding tax (like every other *_diversification.py's equivalent) from
-the "Suivi" > "Revenus" page (https://app.bricks.co/portfolio/revenues) -
-see fetch_current_month_revenue_totals() below. Unlike every other
-platform, that page's whole UI (chart + detail panel) is rendered on a
-react-native-skia canvas (via a canvaskit WASM build) - there is NO
-accessible DOM text at all to scrape (`document.body.innerText` is empty
-besides the nav bar), so this instead calls the same JSON API the page
-itself calls: `GET api.bricks.co/investor/portfolio/revenue?startDate=
-<yyyy-mm>&endDate=<yyyy-mm>` (MONTH granularity, not day-level like other
-platforms' equivalents - using the current month for both start/end
-covers month-to-date). Verified against the real account on 2026-07-15
-(cross-checked the full-history range against the Accueil page's own
-"Revenus ... perçus depuis le début" = 527.61 EUR - exact match):
-`revenuesTotal.untaxedTotal` (cents) = gross interest received (already
-includes obligationCoupons + referrals + boostedBalanceGain - referrals/
-boosted-balance gains pass through untaxed, confirmed by the full-range
-response's totals reconciling exactly), `revenuesTotal.taxedTotal` (cents)
-= net interest received (after tax), `withholding_tax` = gross - net.
+Auth mechanism: `POST https://api.bricks.co/api/auth/sign-in/email` with
+JSON body `{"email": ..., "password": ...}` sets a
+`__Secure-better-auth.session_token` cookie (a "better-auth" library
+session, HttpOnly/Secure/SameSite=None) - `requests.Session()`'s cookie
+jar carries it automatically on every subsequent request to
+api.bricks.co, no bearer-token/header wiring needed. No session
+persistence across runs is implemented (same design choice as
+goandgrow_diversification.py) - logging in fresh every run is cheap and
+avoids ever needing to think about cookie/session expiry.
 
-IMPORTANT (2026-07-15): fill_current_month_amounts() IS called, despite a
-known Sheet layout issue the user was made aware of and chose to accept:
-the "Bricks" row (under the "Crowdfunding immobilier" section) has NO
-blank spacer row below it like every other platform - the very next row
-is "Bourse" (a different, unrelated section). fill_current_month_amounts()
-always writes the platform's own row (total) AND the row directly below
-it (gross_interest_received) at the current-month column - here that
-second write lands on Bourse's row instead of a spacer. The user was
-asked twice whether to insert a blank row first and explicitly said not
-to worry about it and to just call the Sheet function anyway - don't
-"fix" this by skipping the Sheet call again without being asked.
+Data sources (both real JSON APIs, found 2026-07-17 by downloading the
+Expo/React-Native-Web SPA's JS bundles - `https://app.bricks.co/` links to
+`/_expo/static/js/web/index-<hash>.js`, filename may change on future
+redeploys, re-fetch the homepage HTML to find the current one if this
+404s later - and grepping for `investor/` API path string literals):
+  - `GET https://api.bricks.co/investor/portfolio/wealth/home-metrics` ->
+    `{"portfolioCurrentValue": <cents>, "balanceAvailable": <cents>,
+    "giftBalance": <cents>}` - this is exactly the "Patrimoine" widget's
+    data (verified 2026-07-17 against the real account: portfolioCurrentValue
+    = 308753 cents = 3087.53 EUR "Investissements en cours",
+    balanceAvailable = 39973 cents = 399.73 EUR "Solde principal",
+    giftBalance = 27 cents = 0.27 EUR "Solde cadeau" - total =
+    3087.53 + 399.73 + 0.27 = 3487.53 EUR, matching the exact total
+    verified via DOM-scraping in an earlier session). `solde_total` =
+    balanceAvailable + giftBalance (mirrors the DOM widget's own "Solde
+    total" = "Solde principal" + "Solde cadeau" breakdown).
+  - `GET https://api.bricks.co/investor/portfolio/revenue?startDate=
+    <yyyy-mm>&endDate=<yyyy-mm>` (MONTH granularity, unlike every other
+    platform's day-level "1st of month to today" - using the current
+    month for both start/end gives month-to-date) - same endpoint/shape
+    already verified in earlier sessions (see fetch_current_month_revenue_totals()
+    below), now just called directly via `requests` instead of through
+    `page.evaluate(fetch(...))`.
+
+Login is a real 401 (`{"message": "Invalid email or password", "code":
+"INVALID_EMAIL_OR_PASSWORD"}`) on wrong credentials, not a Cloudflare
+block page - handled as a normal auth failure.
+
+IMPORTANT (2026-07-15, still applies): fill_current_month_amounts() IS
+called, despite a known Sheet layout issue the user was made aware of and
+chose to accept: the "Bricks" row (under the "Crowdfunding immobilier"
+section) has NO blank spacer row below it like every other platform - the
+very next row is "Bourse" (a different, unrelated section).
+fill_current_month_amounts() always writes the platform's own row (total)
+AND the row directly below it (gross_interest_received) at the
+current-month column - here that second write lands on Bourse's row
+instead of a spacer. The user was asked twice whether to insert a blank
+row first and explicitly said not to worry about it and to just call the
+Sheet function anyway - don't "fix" this by skipping the Sheet call again
+without being asked.
 
 Required env vars:
     BRICKS_EMAIL, BRICKS_PASSWORD       -> Bricks account credentials
 Optional:
-    GOOGLE_SHEET_ID, GOOGLE_CREDENTIALS  -> will be used to write this
-                                            month's totals to the Google
-                                            Sheet via
-                                            fill_current_month_amounts()
-                                            (see google_sheet.py) once the
-                                            Sheet's row layout issue above
-                                            is resolved
+    GOOGLE_SHEET_ID, GOOGLE_CREDENTIALS  -> used to write this month's
+                                            totals to the Google Sheet via
+                                            fill_current_month_amounts()/
+                                            fill_current_month_bonus_breakdown()
+                                            (see google_sheet.py)
 """
 
 import os
-import re
 import sys
 import logging
-from datetime import datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -113,11 +110,10 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
+import requests
 
 try:
-    from shared.browser_stealth import get_context_options, apply_stealth, human_pause, human_mouse_wander, human_type
-    from shared.google_sheet import fill_current_month_amounts
+    from shared.google_sheet import fill_current_month_amounts, fill_current_month_bonus_breakdown
     from shared.report_date import get_report_now
 except ModuleNotFoundError:
     # Support direct execution (python diversification/bricks_diversification.py)
@@ -125,16 +121,15 @@ except ModuleNotFoundError:
     project_root = Path(__file__).resolve().parents[1]
     if str(project_root) not in sys.path:
         sys.path.insert(0, str(project_root))
-    from shared.browser_stealth import get_context_options, apply_stealth, human_pause, human_mouse_wander, human_type
-    from shared.google_sheet import fill_current_month_amounts
+    from shared.google_sheet import fill_current_month_amounts, fill_current_month_bonus_breakdown
     from shared.report_date import get_report_now
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger("bricks_diversification")
 
-HOME_URL = "https://app.bricks.co/"
+SIGNIN_URL = "https://api.bricks.co/api/auth/sign-in/email"
+HOME_METRICS_URL = "https://api.bricks.co/investor/portfolio/wealth/home-metrics"
 REVENUE_API_URL = "https://api.bricks.co/investor/portfolio/revenue"
-STORAGE_STATE_FILE = Path(__file__).parent / "bricks_diversification_storage_state.json"
 # Bricks' revenue endpoint is aggregated by MONTH (not day like every other
 # platform's equivalent) - using the current month for both startDate/endDate
 # gives month-to-date totals. Pinned explicitly rather than relying on the
@@ -146,200 +141,54 @@ BRICKS_EMAIL = os.environ.get("BRICKS_EMAIL")
 BRICKS_PASSWORD = os.environ.get("BRICKS_PASSWORD")
 
 
-def dismiss_cookie_banner(page) -> None:
-    """Dismiss a cookie consent dialog if one shows up (defensive - none
-    was observed while building this, but kept for safety/consistency with
-    the other *_diversification.py scripts)."""
-    for label in ["Accepter", "Tout accepter", "Accepter et fermer", "J'accepte"]:
-        try:
-            page.get_by_role("button", name=label).click(timeout=3000)
-            return
-        except PlaywrightTimeoutError:
-            continue
-
-
-def login(page) -> None:
-    """Log in to Bricks using BRICKS_EMAIL/BRICKS_PASSWORD.
-
-    Selectors verified against the real login form on 2026-07-15 (see
-    module docstring). No 2FA step was observed.
-    """
-    log.info("Navigating to the home page...")
-    page.goto(HOME_URL, wait_until="domcontentloaded")
-    dismiss_cookie_banner(page)
-    human_mouse_wander(page)
-    page.wait_for_timeout(3000)
-
-    # If a previous session was restored (see STORAGE_STATE_FILE) and is
-    # still valid, the home page already shows the logged-in dashboard
-    # (nav bar with "Accueil"/"Projets"/"Suivi") instead of the marketing
-    # landing page - nothing else to do.
-    try:
-        page.get_by_role("button", name="Accueil").wait_for(timeout=5000)
-        log.info("Reused a previous session, already logged in.")
-        return
-    except PlaywrightTimeoutError:
-        pass
-
-    log.info("Not logged in yet, navigating to the login form...")
-    page.get_by_role("button", name="Se connecter").click()
-    page.wait_for_url("**/login", timeout=10000)
-
-    log.info("Filling in credentials...")
-    human_type(page.locator("#login-email-input"), BRICKS_EMAIL)
-    human_pause()
-    human_type(page.locator("#login-password-input"), BRICKS_PASSWORD)
-    human_pause()
-    page.get_by_role("button", name="Se connecter").click()
-
-    # Login is slow (verified ~15-20s: sign-in/email -> get-session ->
-    # customers/me chain, plus the heavy Expo/React-Native-Web bundle
-    # re-rendering) - poll for the nav bar rather than a single fixed wait.
-    log.info("Waiting for the logged-in dashboard to appear (can take up to ~30s)...")
-    for _ in range(60):
-        try:
-            page.get_by_role("button", name="Accueil").wait_for(timeout=1000)
-            break
-        except PlaywrightTimeoutError:
-            continue
-    else:
-        # DIAGNOSTIC (added 2026-07-16 after 2 consecutive timeouts here):
-        # log what's actually on screen (URL/title/visible text, no
-        # credentials involved) so the next CI failure's log explains
-        # *why* the nav bar never showed up (still on /login with an error
-        # message? a bot-check interstitial? redirected somewhere else?)
-        # instead of just "it didn't appear".
-        try:
-            visible_text = page.evaluate("() => document.body.innerText.slice(0, 1000)")
-        except Exception:
-            visible_text = "<could not read page text>"
-        log.error(
-            "Login timeout diagnostics: url=%s title=%r visible_text=%r",
-            page.url, page.title(), visible_text,
-        )
-        # KNOWN ISSUE (confirmed 2026-07-16): Bricks' sign-in endpoint
-        # (api.bricks.co/api/auth/sign-in/email) is behind Cloudflare
-        # bot-protection that blocks fresh logins from at least some
-        # automated clients - when that happens, the login form itself
-        # shows "Failed to fetch" as its inline error text (visible in
-        # visible_text above). This is NOT a selector bug or wrong
-        # credentials - give an actionable message instead of a generic
-        # one, since the fix (see .github/workflows/diversification.yml's
-        # bricks job) is to re-seed the BRICKS_STORAGE_STATE_B64 secret
-        # from a fresh local login, not to change any code here.
-        if "failed to fetch" in visible_text.lower():
-            raise RuntimeError(
-                "Login blocked: Bricks' sign-in request failed at the network level "
-                "('Failed to fetch' shown on the login form) - this matches Cloudflare "
-                "blocking fresh logins from this runner (confirmed 2026-07-16, HTTP 403 "
-                "'error code: 1010' on api.bricks.co). The BRICKS_STORAGE_STATE_B64 "
-                "session secret has either expired or was never set. Fix: run "
-                "'python -m diversification.bricks_diversification' locally while able to "
-                "log in normally, base64-encode the resulting "
-                "diversification/bricks_diversification_storage_state.json, and update the "
-                "BRICKS_STORAGE_STATE_B64 GitHub repo secret with it."
-            )
-        raise RuntimeError(
-            "Still not logged in after submitting credentials (nav bar never appeared).")
-    log.info("Logged in successfully, current URL: %s", page.url)
-
-
-def _parse_amount(text: str):
-    """Parse a currency-formatted amount (e.g. "3 087,77 €", "399,76 €")
-    into a float, without assuming a fixed locale - whichever of ',' or '.'
-    appears last is treated as the decimal separator, the other (or
-    repeats of it, incl. narrow no-break spaces used as thousands
-    separators) as thousands separators."""
-    if not text:
-        return None
-    cleaned = text.replace("\xa0", " ").replace("\u202f", " ").strip()
-    cleaned = re.sub(r"[^\d.,\s-]", "", cleaned).replace(" ", "")
-    if not cleaned:
-        return None
-
-    has_comma, has_dot = "," in cleaned, "." in cleaned
-    if has_comma and has_dot:
-        if cleaned.rfind(",") > cleaned.rfind("."):
-            cleaned = cleaned.replace(".", "").replace(",", ".")
-        else:
-            cleaned = cleaned.replace(",", "")
-    elif has_comma:
-        last_part = cleaned.rsplit(",", 1)[-1]
-        if len(last_part) == 2:
-            cleaned = cleaned.replace(",", "", cleaned.count(",") - 1).replace(",", ".")
-        else:
-            cleaned = cleaned.replace(",", "")
-
-    try:
-        return float(cleaned)
-    except ValueError:
-        return None
-
-
-def _extract_amounts(page) -> dict:
-    """Scan every text node on the Accueil page in document order and, for
-    each exact label match, return the first following text node
-    containing "€" (see module docstring for why this is reliable here -
-    each label is immediately followed by its value, no intervening
-    unrelated amount)."""
-    return page.evaluate(
-        """
-        () => {
-            const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
-            const texts = [];
-            let node;
-            while ((node = walker.nextNode())) {
-                const t = node.textContent.trim();
-                if (t) texts.push(t);
-            }
-
-            const valueAfterLabel = (label) => {
-                const idx = texts.findIndex((t) => t === label);
-                if (idx === -1) return null;
-                for (let i = idx + 1; i < texts.length; i++) {
-                    if (texts[i].includes('\u20ac')) return texts[i];
-                }
-                return null;
-            };
-
-            return {
-                investissementsEnCours: valueAfterLabel('Investissements en cours'),
-                soldeTotal: valueAfterLabel('Solde total'),
-                soldePrincipal: valueAfterLabel('Solde principal'),
-                soldeCadeau: valueAfterLabel('Solde cadeau'),
-            };
-        }
-        """
+def login(session: requests.Session) -> None:
+    """Log in to Bricks via a direct POST to its sign-in API (no browser -
+    see module docstring). Sets the `__Secure-better-auth.session_token`
+    cookie on `session` for all subsequent authenticated requests."""
+    log.info("Signing in to Bricks as %s...", BRICKS_EMAIL)
+    resp = session.post(
+        SIGNIN_URL,
+        json={"email": BRICKS_EMAIL, "password": BRICKS_PASSWORD},
+        headers={"Origin": "https://app.bricks.co", "Referer": "https://app.bricks.co/"},
+        timeout=15,
     )
+    log.info("Sign-in response: status=%s", resp.status_code)
+    if resp.status_code != 200:
+        raise RuntimeError(f"Bricks login failed: HTTP {resp.status_code} - {resp.text[:300]}")
+    if "__Secure-better-auth.session_token" not in session.cookies.get_dict():
+        raise RuntimeError("Bricks login did not return a session cookie - response: " + resp.text[:300])
+    log.info("Logged in successfully.")
 
 
-def fetch_balances(page) -> dict:
-    """Navigate to the Accueil (home) page and read "Investissements en
-    cours" / "Solde total" (and, as a bonus, its "Solde principal"/"Solde
-    cadeau" breakdown) from the "Patrimoine" widget, returning all four as
-    floats. See module docstring for the verified structure."""
-    page.goto(HOME_URL, wait_until="domcontentloaded")
-    # Heavy Expo/React-Native-Web SPA (uses react-native-skia canvases) -
-    # verified it needs ~15s to fully render the Patrimoine widget.
-    page.wait_for_timeout(15000)
+def fetch_balances(session: requests.Session) -> dict:
+    """Fetch "Investissements en cours" / "Solde total" (and its "Solde
+    principal"/"Solde cadeau" breakdown) via the portfolio wealth
+    home-metrics API - see module docstring for the verified field
+    mapping."""
+    log.info("Requesting Bricks portfolio wealth home-metrics...")
+    resp = session.get(HOME_METRICS_URL, timeout=15)
+    log.info("Home-metrics response: status=%s", resp.status_code)
+    if resp.status_code != 200:
+        raise RuntimeError(f"Bricks home-metrics endpoint returned status {resp.status_code}")
 
-    raw = _extract_amounts(page)
-    log.info("Raw values read from the Patrimoine widget: %r", raw)
+    data = resp.json()
+    log.info("Raw home-metrics payload: %r", data)
 
-    if not raw.get("investissementsEnCours"):
-        raise RuntimeError("Could not find 'Investissements en cours' on the Bricks Accueil page.")
-    if not raw.get("soldeTotal"):
-        raise RuntimeError("Could not find 'Solde total' on the Bricks Accueil page.")
+    try:
+        investments_en_cours = round(float(data.get("portfolioCurrentValue") or 0) / 100, 2)
+    except (TypeError, ValueError):
+        raise RuntimeError(f"Could not parse 'portfolioCurrentValue' out of {data.get('portfolioCurrentValue')!r}.")
+    try:
+        solde_principal = round(float(data.get("balanceAvailable") or 0) / 100, 2)
+    except (TypeError, ValueError):
+        raise RuntimeError(f"Could not parse 'balanceAvailable' out of {data.get('balanceAvailable')!r}.")
+    try:
+        solde_cadeau = round(float(data.get("giftBalance") or 0) / 100, 2)
+    except (TypeError, ValueError):
+        log.warning("Could not parse 'giftBalance' %r - defaulting to 0.0.", data.get("giftBalance"))
+        solde_cadeau = 0.0
 
-    investments_en_cours = _parse_amount(raw["investissementsEnCours"])
-    solde_total = _parse_amount(raw["soldeTotal"])
-    solde_principal = _parse_amount(raw.get("soldePrincipal")) or 0.0
-    solde_cadeau = _parse_amount(raw.get("soldeCadeau")) or 0.0
-
-    if investments_en_cours is None:
-        raise RuntimeError(f"Could not parse 'Investissements en cours' out of {raw['investissementsEnCours']!r}.")
-    if solde_total is None:
-        raise RuntimeError(f"Could not parse 'Solde total' out of {raw['soldeTotal']!r}.")
+    solde_total = round(solde_principal + solde_cadeau, 2)
 
     return {
         "investments_en_cours": investments_en_cours,
@@ -349,7 +198,7 @@ def fetch_balances(page) -> dict:
     }
 
 
-def fetch_current_month_revenue_totals(page) -> dict:
+def fetch_current_month_revenue_totals(session: requests.Session) -> dict:
     """Fetch this calendar month's gross/net interest received and
     withholding tax from the same JSON API the "Suivi" > "Revenus" page
     (https://app.bricks.co/portfolio/revenues) itself calls - that page's
@@ -363,97 +212,113 @@ def fetch_current_month_revenue_totals(page) -> dict:
     = 527.61 EUR, exact match): `GET .../investor/portfolio/revenue?
     startDate=<yyyy-mm>&endDate=<yyyy-mm>` (MONTH granularity - the current
     month for both gives month-to-date) returns `{"revenuesTotal":
-    {"untaxedTotal": <cents>, "taxedTotal": <cents>, ...}}` -
-    `untaxedTotal` = gross interest received (already includes
-    obligationCoupons + referrals + boostedBalanceGain), `taxedTotal` =
-    net interest received (after tax), `withholding_tax` = gross - net.
+    {"untaxedTotal": <cents>, "taxedTotal": <cents>, "revenues": {
+    "referrals": {"total": <cents>}, "boostedBalanceGain": {"total":
+    <cents>}, "obligationCoupons": {"untaxedTotal": <cents>, "taxedTotal":
+    <cents>, ...}, ...}}}`.
+
+    Per explicit user request (2026-07-17), interest is now dissociated
+    from bonus/cashback/referral income instead of folding everything into
+    one figure: `revenuesTotal.revenues.obligationCoupons.untaxedTotal`/
+    `.taxedTotal` are the REAL rent-coupon-only interest (excludes
+    referrals/boosted-balance gains), while `bonus_cashback_contest` =
+    `referrals.total + boostedBalanceGain.total` (both pass through
+    untaxed, verified 2026-07-17: this month's referrals=0,
+    boostedBalanceGain=0, obligationCoupons.untaxedTotal=2248==
+    revenuesTotal.untaxedTotal=2248, confirming the identity
+    untaxedTotal = obligationCoupons.untaxedTotal + referrals.total +
+    boostedBalanceGain.total holds and obligationCoupons alone can safely
+    be used as the "real" gross/net interest going forward).
+    `withholding_tax` = obligationCoupons gross - net (interest-only tax,
+    referrals/boosted-balance gains being untaxed have none to subtract).
     """
     month_str = get_report_now(REPORT_TIMEZONE).strftime("%Y-%m")
     log.info("Requesting Bricks revenue endpoint for %s...", month_str)
 
-    result = page.evaluate(
-        """
-        async ([monthStr, apiUrl]) => {
-            const params = new URLSearchParams({ startDate: monthStr, endDate: monthStr });
-            const res = await fetch(`${apiUrl}?${params.toString()}`, { credentials: 'include' });
-            const json = await res.json();
-            return { ok: res.ok, status: res.status, json };
-        }
-        """,
-        [month_str, REVENUE_API_URL],
+    resp = session.get(
+        REVENUE_API_URL,
+        params={"startDate": month_str, "endDate": month_str},
+        timeout=15,
     )
-    log.info("Bricks revenue endpoint response: ok=%s status=%s", result.get("ok"), result.get("status"))
-    if not result.get("ok"):
-        raise RuntimeError(f"Bricks revenue endpoint returned status {result.get('status')}")
+    log.info("Revenue endpoint response: status=%s", resp.status_code)
+    if resp.status_code != 200:
+        raise RuntimeError(f"Bricks revenue endpoint returned status {resp.status_code}")
 
-    revenues_total = (result.get("json") or {}).get("revenuesTotal") or {}
+    revenues_total = (resp.json() or {}).get("revenuesTotal") or {}
+    revenues_detail = revenues_total.get("revenues") or {}
+    obligation_coupons = revenues_detail.get("obligationCoupons") or {}
     log.info("Raw revenuesTotal for %s: %r", month_str, revenues_total)
 
     try:
-        gross_interest_received = round(float(revenues_total.get("untaxedTotal") or 0) / 100, 2)
+        gross_interest_received = round(float(obligation_coupons.get("untaxedTotal") or 0) / 100, 2)
     except (TypeError, ValueError):
-        log.warning("Could not parse 'untaxedTotal' %r - defaulting to 0.0.", revenues_total.get("untaxedTotal"))
+        log.warning("Could not parse obligationCoupons 'untaxedTotal' %r - defaulting to 0.0.", obligation_coupons.get("untaxedTotal"))
         gross_interest_received = 0.0
     try:
-        net_interest_received = round(float(revenues_total.get("taxedTotal") or 0) / 100, 2)
+        net_interest_received = round(float(obligation_coupons.get("taxedTotal") or 0) / 100, 2)
     except (TypeError, ValueError):
-        log.warning("Could not parse 'taxedTotal' %r - defaulting to 0.0.", revenues_total.get("taxedTotal"))
+        log.warning("Could not parse obligationCoupons 'taxedTotal' %r - defaulting to 0.0.", obligation_coupons.get("taxedTotal"))
         net_interest_received = 0.0
 
     withholding_tax = round(gross_interest_received - net_interest_received, 2)
 
+    try:
+        referrals_total = float((revenues_detail.get("referrals") or {}).get("total") or 0) / 100
+    except (TypeError, ValueError):
+        log.warning("Could not parse 'referrals.total' %r - defaulting to 0.0.", (revenues_detail.get("referrals") or {}).get("total"))
+        referrals_total = 0.0
+    try:
+        boosted_balance_gain_total = float((revenues_detail.get("boostedBalanceGain") or {}).get("total") or 0) / 100
+    except (TypeError, ValueError):
+        log.warning("Could not parse 'boostedBalanceGain.total' %r - defaulting to 0.0.", (revenues_detail.get("boostedBalanceGain") or {}).get("total"))
+        boosted_balance_gain_total = 0.0
+    bonus_cashback_contest = round(referrals_total + boosted_balance_gain_total, 2)
+
     log.info(
-        "Parsed revenue totals for %s: gross_interest_received=%.2f, net_interest_received=%.2f, withholding_tax=%.2f",
+        "Parsed revenue totals for %s: gross_interest_received=%.2f, net_interest_received=%.2f, "
+        "withholding_tax=%.2f, bonus_cashback_contest=%.2f (referrals=%.2f, boosted_balance_gain=%.2f)",
         month_str, gross_interest_received, net_interest_received, withholding_tax,
+        bonus_cashback_contest, referrals_total, boosted_balance_gain_total,
     )
     return {
         "gross_interest_received": gross_interest_received,
         "net_interest_received": net_interest_received,
         "withholding_tax": withholding_tax,
+        "bonus_cashback_contest": bonus_cashback_contest,
+        "referrals": referrals_total,
+        "boosted_balance_gain": boosted_balance_gain_total,
     }
 
 
-def run(headless: bool = True) -> None:
+def run() -> None:
     if not BRICKS_EMAIL or not BRICKS_PASSWORD:
         log.error("BRICKS_EMAIL and BRICKS_PASSWORD environment variables are required.")
         sys.exit(1)
 
-    log.info("Starting Bricks diversification run (headless=%s, storage_state_exists=%s).",
-              headless, STORAGE_STATE_FILE.exists())
+    log.info("Starting Bricks diversification run (pure-HTTP, no browser).")
 
-    with sync_playwright() as p:
-        browser = p.chromium.launch(headless=headless)
-        storage_state = str(STORAGE_STATE_FILE) if STORAGE_STATE_FILE.exists() else None
-        context = browser.new_context(
-            storage_state=storage_state,
-            locale="fr-FR",
-            **get_context_options(),
+    session = requests.Session()
+
+    try:
+        login(session)
+        balances = fetch_balances(session)
+    except Exception:
+        log.exception("Failed to log in or fetch Bricks balances.")
+        sys.exit(1)
+
+    try:
+        log.info("Fetching this month's revenue totals...")
+        revenue_totals = fetch_current_month_revenue_totals(session)
+    except Exception:
+        log.exception(
+            "Failed to fetch this month's gross/net interest received/withholding tax/bonus - "
+            "defaulting all four to 0.0."
         )
-        apply_stealth(context, languages="['fr-FR', 'fr']")
-        page = context.new_page()
-
-        try:
-            login(page)
-            balances = fetch_balances(page)
-        except Exception:
-            log.exception("Failed to log in or fetch Bricks balances.")
-            browser.close()
-            sys.exit(1)
-
-        try:
-            log.info("Fetching this month's revenue totals...")
-            revenue_totals = fetch_current_month_revenue_totals(page)
-        except Exception:
-            log.exception(
-                "Failed to fetch this month's gross/net interest received/withholding tax - "
-                "defaulting all three to 0.0."
-            )
-            revenue_totals = {"gross_interest_received": 0.0, "net_interest_received": 0.0, "withholding_tax": 0.0}
-
-        # Persist cookies/local storage so the next run can skip login
-        # while the session remains valid.
-        context.storage_state(path=str(STORAGE_STATE_FILE))
-        browser.close()
+        revenue_totals = {
+            "gross_interest_received": 0.0, "net_interest_received": 0.0,
+            "withholding_tax": 0.0, "bonus_cashback_contest": 0.0,
+            "referrals": 0.0, "boosted_balance_gain": 0.0,
+        }
 
     total = round(balances["investments_en_cours"] + balances["solde_total"], 2)
     log.info(
@@ -468,6 +333,7 @@ def run(headless: bool = True) -> None:
         "gross_interest_received": revenue_totals["gross_interest_received"],
         "net_interest_received": revenue_totals["net_interest_received"],
         "withholding_tax": revenue_totals["withholding_tax"],
+        "bonus_cashback_contest": revenue_totals["bonus_cashback_contest"],
         "investments_en_cours": balances["investments_en_cours"],
         "solde_total": balances["solde_total"],
         "solde_principal": balances["solde_principal"],
@@ -492,8 +358,19 @@ def run(headless: bool = True) -> None:
         section="Crowdfunding immobilier",
     )
 
+    # Bricks' block uses its own distinct sub-row labels ("parrainages" /
+    # "soldes boostés"), not the generic prime/cashback/concours trio used
+    # elsewhere - map referrals/boostedBalanceGain to them directly, never
+    # touching the "Bonus" row itself (a SUM formula over those sub-rows).
+    fill_current_month_bonus_breakdown(
+        platform="Bricks",
+        breakdown={
+            "parrainages": revenue_totals["referrals"],
+            "soldes boost\u00e9s": revenue_totals["boosted_balance_gain"],
+        },
+        section="Crowdfunding immobilier",
+    )
+
 
 if __name__ == "__main__":
-    # Set headless=False locally (e.g. via `python bricks_diversification.py --show`)
-    # to watch the browser and debug the login flow if selectors need adjusting.
-    run(headless="--show" not in sys.argv)
+    run()

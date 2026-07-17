@@ -65,7 +65,7 @@ from zoneinfo import ZoneInfo
 import pyotp
 from dotenv import load_dotenv
 
-from shared.google_sheet import fill_current_month_amounts, fill_geographic_repartition_amounts
+from shared.google_sheet import fill_current_month_amounts, fill_current_month_bonus_breakdown, fill_geographic_repartition_amounts
 from shared.report_date import get_report_now
 
 load_dotenv()
@@ -80,6 +80,7 @@ MY_INVESTMENTS_URL = "https://afranga.com/profile/my-investments"
 REFRESH_URL = "https://afranga.com/profile/my-investments/refresh"
 STATEMENT_PAGE_URL = "https://afranga.com/profile/account-statement"
 STATEMENT_REFRESH_URL = "https://afranga.com/profile/account-statement/refresh"
+BONUS_CASHBACK_HISTORY_URL = "https://afranga.com/profile/bonus-cashback/history"
 STORAGE_STATE_FILE = Path(__file__).parent / \
     "afranga_diversification_storage_state.json"
 MAX_LIMIT = 250  # largest value offered by the page's own rows-per-page dropdown
@@ -385,6 +386,72 @@ def fetch_current_month_statement_totals(page) -> dict:
     return {"gross_interest_received": gross_interest_received, "withholding_tax": withholding_tax}
 
 
+def fetch_current_month_bonus_cashback(page) -> float:
+    """Fetch this calendar month's paid Bonus Cashback total, by scraping
+    the "Recent Completed Campaigns" table on
+    https://afranga.com/profile/bonus-cashback/history and summing the
+    "Bonus Paid" amount of every row whose "Payout Date" falls within the
+    current calendar month (1st of the month through today).
+
+    Discovered on 2026-07-17 via a deeper nav-link crawl (going beyond the
+    Account Statement page previously checked) - completely missed before:
+    a dedicated "Bonus Cashback Campaigns" page (linked from the profile
+    overview page), with lifetime totals ("Total Earned"/"Total Paid"/
+    "Pending") plus a per-campaign history table. No JSON API backs this
+    page (only marketing/analytics beacons were seen in a network capture)
+    - it's server-rendered HTML, so the table itself is scraped here, same
+    general approach as afranga_diversification's Transaction Summary
+    panel above.
+
+    Unlike Swaper's referral bonus page (a single lifetime total with no
+    per-event date), each completed campaign here DOES have its own real
+    "Payout Date" (e.g. "2025-09-24"), so a genuine "this month" figure can
+    be computed by filtering on it - no lifetime-vs-monthly ambiguity here.
+    Verified against the real account on 2026-07-17: only one completed
+    campaign exists so far (Lendivo, paid out 2025-09-24, 5.00 EUR), so this
+    month's total is correctly 0.00 - a real computed result, not a
+    hardcoded assumption.
+    """
+    now = get_report_now(REPORT_TIMEZONE)
+    start_date = now.replace(day=1).date()
+    end_date = now.date()
+    log.info("Requesting Bonus Cashback history page to sum this month's (%s to %s) paid bonuses...", start_date, end_date)
+
+    rows = page.evaluate(
+        """
+        () => {
+            const table = document.querySelector('table');
+            if (!table) return [];
+            const headers = Array.from(table.querySelectorAll('thead th')).map(th => th.textContent.trim());
+            const bonusPaidIdx = headers.indexOf('Bonus Paid');
+            const payoutDateIdx = headers.indexOf('Payout Date');
+            return Array.from(table.querySelectorAll('tbody tr')).map((tr) => {
+                const cells = tr.querySelectorAll('td');
+                const bonusPaidCell = cells[bonusPaidIdx];
+                const payoutDateCell = cells[payoutDateIdx];
+                return {
+                    bonusPaid: bonusPaidCell ? bonusPaidCell.textContent.replace(/\\s+/g, ' ').trim() : null,
+                    payoutDate: payoutDateCell ? payoutDateCell.textContent.replace(/\\s+/g, ' ').trim() : null,
+                };
+            });
+        }
+        """
+    )
+    log.info("Found %d completed campaign row(s) in the Bonus Cashback history table: %r", len(rows), rows)
+
+    total = 0.0
+    for row in rows:
+        payout_date_match = re.search(r"\d{4}-\d{2}-\d{2}", row.get("payoutDate") or "")
+        if not payout_date_match:
+            continue
+        payout_date = datetime.strptime(payout_date_match.group(), "%Y-%m-%d").date()
+        if start_date <= payout_date <= end_date:
+            total += _parse_amount(row.get("bonusPaid"))
+
+    log.info("This month's paid Bonus Cashback total: %.2f EUR", total)
+    return total
+
+
 def run(headless: bool = True) -> None:
     if not AFRANGA_EMAIL or not AFRANGA_PASSWORD:
         log.error(
@@ -427,6 +494,16 @@ def run(headless: bool = True) -> None:
             statement_totals = {
                 "gross_interest_received": 0.0, "withholding_tax": 0.0}
 
+        try:
+            log.info(
+                "Navigating to the Bonus Cashback history page to fetch this month's paid bonuses...")
+            page.goto(BONUS_CASHBACK_HISTORY_URL, wait_until="domcontentloaded")
+            bonus_cashback = fetch_current_month_bonus_cashback(page)
+        except Exception:
+            log.exception(
+                "Failed to fetch this month's Bonus Cashback total - defaulting to 0.0.")
+            bonus_cashback = 0.0
+
         # Persist cookies/local storage so the next run can skip login (and
         # 2FA) while the session remains valid.
         context.storage_state(path=str(STORAGE_STATE_FILE))
@@ -443,6 +520,12 @@ def run(headless: bool = True) -> None:
         statement_totals["gross_interest_received"] -
         statement_totals["withholding_tax"]
     )
+    # bonus_cashback_contest is now genuinely fetched (see
+    # fetch_current_month_bonus_cashback()) from the dedicated Bonus
+    # Cashback history page - previously hardcoded to 0.0 based on an
+    # insufficiently thorough check of the Transaction Summary panel only,
+    # which missed this page entirely.
+    statement_totals["bonus_cashback_contest"] = bonus_cashback
     log.info(
         "This month's statement totals: total=%.2f EUR, gross_interest_received=%.2f EUR, "
         "net_interest_received=%.2f EUR, withholding_tax=%.2f EUR",
@@ -453,6 +536,15 @@ def run(headless: bool = True) -> None:
     fill_current_month_amounts(
         platform="Afranga",
         amounts=statement_totals
+    )
+
+    # Afranga's bonus feature is literally called "Bonus Cashback
+    # Campaigns" - a "cashback", not a prime/concours - written to its own
+    # dedicated sub-row, never to the "Bonus" row itself (a SUM formula
+    # over prime/cashback/concours).
+    fill_current_month_bonus_breakdown(
+        platform="Afranga",
+        breakdown={"cashback": statement_totals["bonus_cashback_contest"]},
     )
 
     loan_originators = [

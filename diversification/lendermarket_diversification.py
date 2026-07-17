@@ -54,7 +54,7 @@ from zoneinfo import ZoneInfo
 
 from dotenv import load_dotenv
 
-from shared.google_sheet import fill_current_month_amounts, fill_geographic_repartition_amounts
+from shared.google_sheet import fill_current_month_amounts, fill_current_month_bonus_breakdown, fill_geographic_repartition_amounts
 from shared.report_date import get_report_now
 
 load_dotenv()
@@ -270,11 +270,17 @@ def run(headless: bool = True) -> None:
     # only real figure on hand, withholding_tax defaults to 0.0. Same
     # standardized dict shape as every other *_diversification.py, plus the
     # platform-specific interest_received/bonuses fields kept alongside it.
+    # "bonuses" (investorBonusesAmount, "Primes promotionnelles et bonus")
+    # was already fetched but only kept as a platform-specific extra field,
+    # never surfaced under the standardized name - dissociated here too
+    # via bonus_cashback_contest so it's ready to be written to its own
+    # Sheet cell, separate from interest.
     amounts = {
         "total": sum(l["remaining_principal"] for l in lenders),
         "gross_interest_received": statement_totals["interest_received"],
         "net_interest_received": statement_totals["interest_received"],
         "withholding_tax": 0.0,
+        "bonus_cashback_contest": statement_totals["bonuses"],
         "interest_received": statement_totals["interest_received"],
         "bonuses": statement_totals["bonuses"],
     }
@@ -282,6 +288,15 @@ def run(headless: bool = True) -> None:
     fill_current_month_amounts(
         platform="Lendermarket",
         amounts=amounts
+    )
+
+    # Lendermarket's "investorBonusesAmount" IS literally labelled "Primes
+    # promotionnelles et bonus" on the platform itself - a "prime", not a
+    # cashback/concours - written to its own dedicated sub-row, never to
+    # the "Bonus" row itself (a SUM formula over prime/cashback/concours).
+    fill_current_month_bonus_breakdown(
+        platform="Lendermarket",
+        breakdown={"prime": statement_totals["bonuses"]},
     )
 
     loan_originators = [

@@ -69,7 +69,7 @@ from zoneinfo import ZoneInfo
 
 from dotenv import load_dotenv
 
-from shared.google_sheet import fill_current_month_amounts
+from shared.google_sheet import fill_current_month_amounts, fill_current_month_bonus_breakdown
 from shared.report_date import get_report_now
 
 load_dotenv()
@@ -398,6 +398,18 @@ def run(headless: bool = True) -> None:
 
     total = balances["available_balance"] + balances["capital_to_receive"]
     interest_totals["total"] = total
+    # Verified 2026-07-17 (dumping every distinct .transaction__name label
+    # over the last 180 days): no bonus/cashback/contest TRANSACTION shows
+    # up in /u/operations (only Dépôt de fonds/Intention de prêt acceptée/
+    # Prélèvements fiscaux/Remboursement anticipé partiel-total/
+    # Remboursement mensuel/Retrait de fonds). HOWEVER this does NOT rule
+    # out a separate referral/parrainage page (/u/parrainage) the way it
+    # did for Swaper/Afranga - that page's investigation is BLOCKED by a
+    # reproducible Bienpreter-side server error on login ("DÉSOLÉ, IL
+    # SEMBLERAIT QUE NOUS AYONS RENCONTRÉ UN PROBLÈME"), not yet resolved.
+    # 0.0 here is a PLACEHOLDER pending that investigation, not a verified
+    # real value like the other platforms - revisit once the site recovers.
+    interest_totals["bonus_cashback_contest"] = 0.0
     log.info(
         "Bienpreter: solde disponible=%.2f EUR + capital à recevoir=%.2f EUR = %.2f EUR",
         balances["available_balance"], balances["capital_to_receive"], total,
@@ -411,6 +423,15 @@ def run(headless: bool = True) -> None:
     fill_current_month_amounts(
         platform="Bienprêter",
         amounts=interest_totals
+    )
+
+    # Placeholder write (see the comment above bonus_cashback_contest) -
+    # writes 0.0 into "prime" for now (a referral bonus, if one is ever
+    # confirmed, would be a "prime" - not a cashback/concours). Update the
+    # breakdown/category once /u/parrainage can actually be investigated.
+    fill_current_month_bonus_breakdown(
+        platform="Bienprêter",
+        breakdown={"prime": interest_totals["bonus_cashback_contest"]},
     )
 
 

@@ -67,7 +67,7 @@ from pathlib import Path
 import pyotp
 from dotenv import load_dotenv
 
-from shared.google_sheet import fill_current_month_amounts, fill_geographic_repartition_amounts
+from shared.google_sheet import fill_current_month_amounts, fill_current_month_bonus_breakdown, fill_geographic_repartition_amounts
 
 load_dotenv()
 
@@ -371,11 +371,17 @@ def run(headless: bool = True) -> None:
     # to 0.0. Same standardized dict shape as every other
     # *_diversification.py, plus the platform-specific daily_returns/
     # rewards_bonuses/matured_vaults fields kept alongside it.
+    # "rewards_bonuses" (the "Rewards & bonuses" figure) was already
+    # fetched but only kept as a platform-specific extra field, never
+    # surfaced under the standardized name - dissociated here too via
+    # bonus_cashback_contest so it's ready to be written to its own Sheet
+    # cell, separate from interest.
     amounts = {
         "total": balance,
         "gross_interest_received": statement_totals["daily_returns"],
         "net_interest_received": statement_totals["daily_returns"],
         "withholding_tax": 0.0,
+        "bonus_cashback_contest": statement_totals["rewards_bonuses"],
         "daily_returns": statement_totals["daily_returns"],
         "rewards_bonuses": statement_totals["rewards_bonuses"],
         "matured_vaults": statement_totals["matured_vaults"],
@@ -384,6 +390,20 @@ def run(headless: bool = True) -> None:
         platform="Monefit",
         amounts=amounts,
         section="Crowdlending savings"
+    )
+
+    # Monefit's "bonus" field ("Rewards & bonuses") maps to "prime" (a
+    # referral-style reward) - written to its own dedicated sub-row, never
+    # to the "Bonus" row itself (a SUM formula over prime/cashback/
+    # concours). Note: Monefit also runs a separate weekly investment-draw
+    # ("concours"-style lottery, confirmed via live page text: "5 winners
+    # ... picked at random") but the account/summary API has no distinct
+    # field for draw winnings - only "prime" is written here, "concours"
+    # is left untouched pending a dedicated data source.
+    fill_current_month_bonus_breakdown(
+        platform="Monefit",
+        breakdown={"prime": statement_totals["rewards_bonuses"]},
+        section="Crowdlending savings",
     )
 
     loan_originators = [{"name": LOAN_ORIGINATOR_LABEL, "amount": balance}]

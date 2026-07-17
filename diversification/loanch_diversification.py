@@ -74,7 +74,7 @@ from zoneinfo import ZoneInfo
 import pyotp
 from dotenv import load_dotenv
 
-from shared.google_sheet import fill_current_month_amounts, fill_geographic_repartition_amounts
+from shared.google_sheet import fill_current_month_amounts, fill_current_month_bonus_breakdown, fill_geographic_repartition_amounts
 from shared.report_date import get_report_now
 
 load_dotenv()
@@ -412,17 +412,32 @@ def run(headless: bool = True) -> None:
     # only real figure on hand, withholding_tax defaults to 0.0. Same
     # standardized dict shape as every other *_diversification.py, plus the
     # platform-specific interest_paid/rewards fields kept alongside it.
+    # "rewards" (total_bonus, "Total des recompenses") was already
+    # fetched but only kept as a platform-specific extra field, never
+    # surfaced under the standardized name - dissociated here too via
+    # bonus_cashback_contest so it's ready to be written to its own Sheet
+    # cell, separate from interest.
     amounts = {
         "total": sum(o["amount"] for o in originators),
         "gross_interest_received": statement_totals["interest_paid"],
         "net_interest_received": statement_totals["interest_paid"],
         "withholding_tax": 0.0,
+        "bonus_cashback_contest": statement_totals["rewards"],
         "interest_paid": statement_totals["interest_paid"],
         "rewards": statement_totals["rewards"],
     }
     fill_current_month_amounts(
         platform="Loanch",
         amounts=amounts
+    )
+
+    # Loanch's "total_bonus" ("rewards") is a promotional/referral reward -
+    # a "prime", not a cashback/concours - written to its own dedicated
+    # sub-row, never to the "Bonus" row itself (a SUM formula over
+    # prime/cashback/concours).
+    fill_current_month_bonus_breakdown(
+        platform="Loanch",
+        breakdown={"prime": statement_totals["rewards"]},
     )
 
     loan_originators = [

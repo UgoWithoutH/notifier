@@ -194,17 +194,103 @@ def fill_current_month_amounts(platform: str, amounts: dict, section: str = "Cro
 
     logger.info("Mise à jour terminée pour %s", platform)
 
-def find_rows_by_texts_below(grid, start_row, start_col, texts: list):
+
+def fill_current_month_bonus_breakdown(platform: str, breakdown: dict, section: str = "Crowdlending"):
+    """Write this month's bonus/cashback/contest figures to their own
+    dedicated sub-rows under a platform's block, instead of the merged
+    "Bonus" row (which is a SUM formula over those sub-rows in the Sheet
+    itself - deliberately never written to here).
+
+    `breakdown` : dict mapping the exact sub-row label (case-insensitive,
+    substring-matched, same convention as find_rows_by_texts_below) to the
+    amount to write, e.g. {"prime": 12.3} or {"cashback": 5.0} or, for
+    Bricks' differently-labelled block, {"parrainages": 1.0, "soldes
+    boostés": 2.0}. Only the labels present in `breakdown` are looked up/
+    written - a platform whose bonus feature maps to a single category
+    (the common case) only ever touches that one row, leaving the other
+    sibling rows (and "Bonus" itself) untouched.
+
+    The search for each label is bounded to the 6 rows directly below the
+    platform's own row (covers "intérêts brut" / "Bonus" / up to 3 category
+    rows / "Rendements %" in every verified block layout) so it can never
+    cross into the next platform's block below and misattribute a value
+    (e.g. writing into a different platform's "cashback" row just because
+    this platform doesn't have one).
+    """
+    logger.info("Début mise à jour de la répartition bonus/cashback/concours pour %s (section '%s')", platform, section)
+
+    worksheet = get_latest_dashboard_worksheet(SPREADSHEET_ID)
+
+    # 1 seul appel API pour charger toute la feuille
+    grid = worksheet.get_all_values()
+
+    section_pos = find_cell_by_value(grid, section)
+    if not section_pos:
+        raise RuntimeError(f"La section '{section}' n'a pas été trouvée.")
+
+    section_row, section_col = section_pos
+
+    current_month_cell = find_current_month_cell(grid, section_row)
+    if not current_month_cell:
+        raise RuntimeError("La colonne du mois courant n'a pas été trouvée.")
+
+    current_month_col = current_month_cell["col"]
+
+    platform_row = find_first_cell_containing_below(
+        grid, section_row, section_col, platform
+    )
+    if not platform_row:
+        raise RuntimeError(
+            f"La plateforme '{platform}' n'a pas été trouvée sous '{section}'."
+        )
+
+    labels = list(breakdown.keys())
+    rows_by_label = find_rows_by_texts_below(
+        grid, platform_row, section_col, labels, max_rows=6
+    )
+
+    missing = [label for label in labels if label not in rows_by_label]
+    if missing:
+        logger.warning(
+            "Ligne(s) non trouvée(s) pour %s (ignorée(s), pas de valeur écrite) : %s",
+            platform, missing
+        )
+
+    updates = []
+    for label, row in rows_by_label.items():
+        amount = breakdown.get(label, 0)
+        address = rowcol_to_a1(row, current_month_col)
+        updates.append({"range": address, "values": [[amount]]})
+        logger.info("Préparation écriture : %s / %s = %s (%s)", platform, label, amount, address)
+
+    if not updates:
+        logger.warning("Aucune ligne trouvée pour %s, rien à écrire.", platform)
+        return
+
+    worksheet.batch_update(updates, value_input_option="USER_ENTERED")
+
+    logger.info("Mise à jour de la répartition bonus/cashback/concours terminée pour %s.", platform)
+
+
+def find_rows_by_texts_below(grid, start_row, start_col, texts: list, max_rows: int = None):
     """
     Cherche plusieurs textes en une seule passe (en mémoire) sous `start_row`,
     dans la colonne `start_col` (1-based). Recherche insensible à la casse,
     par sous-chaîne (comme find_first_cell_containing_below).
     Retourne un dict {texte_original: row_idx} pour les textes trouvés.
+
+    `max_rows` : si fourni, borne la recherche aux `max_rows` lignes situées
+    juste sous `start_row` (pour ne jamais déborder sur un bloc suivant qui
+    contiendrait par coïncidence un texte similaire plus bas dans la
+    feuille). Sans borne (comportement historique), la recherche continue
+    jusqu'à la fin de la feuille.
     """
     remaining = {t.lower().strip(): t for t in texts}
     found = {}
 
-    for row_idx in range(start_row + 1, len(grid) + 1):
+    last_row = len(grid) if max_rows is None else min(len(grid), start_row + max_rows)
+
+    for row_idx in range(start_row + 1, last_row + 1):
         if not remaining:
             break
 

@@ -465,3 +465,69 @@ jobs:
           path: |
             diversification/peerberry_diversification_storage_state.json
           key: peerberry-diversification-state-${{ github.run_id }}
+
+  goandgrow:
+    runs-on: ubuntu-22.04
+    concurrency:
+      group: goandgrow-diversification
+      cancel-in-progress: false
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Python dependencies
+        run: pip install -r requirements.txt
+
+      # No Playwright/Chromium install needed - Go & Grow's Cloudflare
+      # bot-management blocks Playwright/CDP-driven navigation
+      # unconditionally, so this platform logs in via a pure-HTTP replay
+      # of its Keycloak/OIDC login flow instead (see
+      # diversification/goandgrow_diversification.py's module docstring)
+      # - just `requests`, already in requirements.txt. No session/cookie
+      # persistence either (that login flow is lightweight enough to run
+      # fresh every time).
+      - name: Run Go & Grow diversification report
+        env:
+          GOANDGROW_EMAIL: ${{ secrets.GOANDGROW_EMAIL }}
+          GOANDGROW_PASSWORD: ${{ secrets.GOANDGROW_PASSWORD }}
+          GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
+          GOOGLE_CREDENTIALS: ${{ secrets.GOOGLE_CREDENTIALS }}
+          REPORT_DATE: ${{ github.event.inputs.report_date }}
+        run: python -m diversification.goandgrow_diversification
+
+  bricks:
+    runs-on: ubuntu-22.04
+    concurrency:
+      group: bricks-diversification
+      cancel-in-progress: false
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Python dependencies
+        run: pip install -r requirements.txt
+
+      # No Playwright/Chromium install needed - Bricks logs in via a
+      # pure-HTTP replay of its sign-in API instead (see
+      # diversification/bricks_diversification.py's module docstring) -
+      # just `requests`, already in requirements.txt. No session/cookie
+      # persistence either (that login flow is lightweight enough to run
+      # fresh every time).
+      - name: Run Bricks diversification report
+        env:
+          BRICKS_EMAIL: ${{ secrets.BRICKS_EMAIL }}
+          BRICKS_PASSWORD: ${{ secrets.BRICKS_PASSWORD }}
+          GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
+          GOOGLE_CREDENTIALS: ${{ secrets.GOOGLE_CREDENTIALS }}
+          REPORT_DATE: ${{ github.event.inputs.report_date }}
+        run: python -m diversification.bricks_diversification

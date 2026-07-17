@@ -241,11 +241,17 @@ def run(headless: bool = True) -> None:
     # only real figure on hand, withholding_tax defaults to 0.0. Same
     # standardized dict shape as every other *_diversification.py, plus the
     # platform-specific interest_income field kept alongside it.
+    # Verified 2026-07-17 (dumping the raw account-summary API response
+    # over the last 180 days): PeerBerry's `operations` block only ever has
+    # DEPOSIT/INVESTMENT/INTEREST/PRINCIPAL keys, no bonus/cashback/contest
+    # category - bonus_cashback_contest defaults to 0.0, not a placeholder
+    # for a future fetch.
     amounts = {
         "total": sum(o["amount"] for o in originators),
         "gross_interest_received": interest_income,
         "net_interest_received": interest_income,
         "withholding_tax": 0.0,
+        "bonus_cashback_contest": 0.0,
         "interest_income": interest_income,
     }
     fill_current_month_amounts(
