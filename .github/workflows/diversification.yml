@@ -94,36 +94,12 @@ jobs:
       - name: Install Python dependencies
         run: pip install -r requirements.txt
 
-      - name: Remove broken third-party apt repos (Azure CLI / Microsoft)
-        run: |
-          sudo find /etc/apt/sources.list.d -maxdepth 1 -type f \( -name "*microsoft*" -o -name "*azure*" \) -print -delete || true
-          sudo sed -i '/packages.microsoft.com/d;/azure-cli/d' /etc/apt/sources.list || true
-          sudo apt-get update
-
-      - name: Cache Playwright browsers
-        uses: actions/cache@v4
-        id: playwright-cache
-        with:
-          path: ~/.cache/ms-playwright
-          key: ${{ runner.os }}-playwright-${{ hashFiles('requirements.txt') }}
-
-      - name: Install Playwright Chromium (cache miss only)
-        if: steps.playwright-cache.outputs.cache-hit != 'true'
-        run: playwright install --with-deps chromium
-
-      - name: Install Playwright OS dependencies (cache hit)
-        if: steps.playwright-cache.outputs.cache-hit == 'true'
-        run: playwright install-deps chromium
-
-      - name: Restore persisted state (session cookies)
-        uses: actions/cache/restore@v4
-        with:
-          path: |
-            diversification/afranga_diversification_storage_state.json
-          key: afranga-diversification-state-${{ github.run_id }}
-          restore-keys: |
-            afranga-diversification-state-
-
+      # No Playwright/Chromium install needed - Afranga logs in via a
+      # pure-HTTP replay of its Laravel CSRF `_token` + TOTP login flow
+      # instead (see diversification/afranga_diversification.py's module
+      # docstring) - just `requests`/`pyotp`, already in requirements.txt.
+      # No session/cookie persistence either (that login flow is
+      # lightweight enough to run fresh every time).
       - name: Run Afranga diversification report
         env:
           AFRANGA_EMAIL: ${{ secrets.AFRANGA_EMAIL }}
@@ -133,14 +109,6 @@ jobs:
           GOOGLE_CREDENTIALS: ${{ secrets.GOOGLE_CREDENTIALS }}
           REPORT_DATE: ${{ github.event.inputs.report_date }}
         run: python -m diversification.afranga_diversification
-
-      - name: Save persisted state (session cookies) for the next run
-        if: always()
-        uses: actions/cache/save@v4
-        with:
-          path: |
-            diversification/afranga_diversification_storage_state.json
-          key: afranga-diversification-state-${{ github.run_id }}
 
   bienpreter:
     runs-on: ubuntu-22.04
@@ -159,36 +127,12 @@ jobs:
       - name: Install Python dependencies
         run: pip install -r requirements.txt
 
-      - name: Remove broken third-party apt repos (Azure CLI / Microsoft)
-        run: |
-          sudo find /etc/apt/sources.list.d -maxdepth 1 -type f \( -name "*microsoft*" -o -name "*azure*" \) -print -delete || true
-          sudo sed -i '/packages.microsoft.com/d;/azure-cli/d' /etc/apt/sources.list || true
-          sudo apt-get update
-
-      - name: Cache Playwright browsers
-        uses: actions/cache@v4
-        id: playwright-cache
-        with:
-          path: ~/.cache/ms-playwright
-          key: ${{ runner.os }}-playwright-${{ hashFiles('requirements.txt') }}
-
-      - name: Install Playwright Chromium (cache miss only)
-        if: steps.playwright-cache.outputs.cache-hit != 'true'
-        run: playwright install --with-deps chromium
-
-      - name: Install Playwright OS dependencies (cache hit)
-        if: steps.playwright-cache.outputs.cache-hit == 'true'
-        run: playwright install-deps chromium
-
-      - name: Restore persisted state (session cookies)
-        uses: actions/cache/restore@v4
-        with:
-          path: |
-            diversification/bienpreter_diversification_storage_state.json
-          key: bienpreter-diversification-state-${{ github.run_id }}
-          restore-keys: |
-            bienpreter-diversification-state-
-
+      # No Playwright/Chromium install needed - Bienpreter logs in via a
+      # pure-HTTP replay of its login form instead (see
+      # diversification/bienpreter_diversification.py's module docstring) -
+      # just `requests`, already in requirements.txt. No session/cookie
+      # persistence either (that login flow is lightweight enough to run
+      # fresh every time).
       - name: Run Bienpreter diversification report
         env:
           BIENPRETER_EMAIL: ${{ secrets.BIENPRETER_EMAIL }}
@@ -197,14 +141,6 @@ jobs:
           GOOGLE_CREDENTIALS: ${{ secrets.GOOGLE_CREDENTIALS }}
           REPORT_DATE: ${{ github.event.inputs.report_date }}
         run: python -m diversification.bienpreter_diversification
-
-      - name: Save persisted state (session cookies) for the next run
-        if: always()
-        uses: actions/cache/save@v4
-        with:
-          path: |
-            diversification/bienpreter_diversification_storage_state.json
-          key: bienpreter-diversification-state-${{ github.run_id }}
 
   lendermarket:
     runs-on: ubuntu-22.04
@@ -223,36 +159,12 @@ jobs:
       - name: Install Python dependencies
         run: pip install -r requirements.txt
 
-      - name: Remove broken third-party apt repos (Azure CLI / Microsoft)
-        run: |
-          sudo find /etc/apt/sources.list.d -maxdepth 1 -type f \( -name "*microsoft*" -o -name "*azure*" \) -print -delete || true
-          sudo sed -i '/packages.microsoft.com/d;/azure-cli/d' /etc/apt/sources.list || true
-          sudo apt-get update
-
-      - name: Cache Playwright browsers
-        uses: actions/cache@v4
-        id: playwright-cache
-        with:
-          path: ~/.cache/ms-playwright
-          key: ${{ runner.os }}-playwright-${{ hashFiles('requirements.txt') }}
-
-      - name: Install Playwright Chromium (cache miss only)
-        if: steps.playwright-cache.outputs.cache-hit != 'true'
-        run: playwright install --with-deps chromium
-
-      - name: Install Playwright OS dependencies (cache hit)
-        if: steps.playwright-cache.outputs.cache-hit == 'true'
-        run: playwright install-deps chromium
-
-      - name: Restore persisted state (session cookies)
-        uses: actions/cache/restore@v4
-        with:
-          path: |
-            diversification/lendermarket_diversification_storage_state.json
-          key: lendermarket-diversification-state-${{ github.run_id }}
-          restore-keys: |
-            lendermarket-diversification-state-
-
+      # No Playwright/Chromium install needed - Lendermarket logs in via a
+      # pure-HTTP replay of its CSRF/XSRF + TOTP login flow instead (see
+      # monitors/lendermarket_monitor.py's module docstring) - just
+      # `requests`/`pyotp`, already in requirements.txt. No session/cookie
+      # persistence either (that login flow is lightweight enough to run
+      # fresh every time).
       - name: Run Lendermarket diversification report
         env:
           LENDERMARKET_EMAIL: ${{ secrets.LENDERMARKET_EMAIL }}
@@ -262,14 +174,6 @@ jobs:
           GOOGLE_CREDENTIALS: ${{ secrets.GOOGLE_CREDENTIALS }}
           REPORT_DATE: ${{ github.event.inputs.report_date }}
         run: python -m diversification.lendermarket_diversification
-
-      - name: Save persisted state (session cookies) for the next run
-        if: always()
-        uses: actions/cache/save@v4
-        with:
-          path: |
-            diversification/lendermarket_diversification_storage_state.json
-          key: lendermarket-diversification-state-${{ github.run_id }}
 
   loanch:
     runs-on: ubuntu-22.04
@@ -288,36 +192,15 @@ jobs:
       - name: Install Python dependencies
         run: pip install -r requirements.txt
 
-      - name: Remove broken third-party apt repos (Azure CLI / Microsoft)
-        run: |
-          sudo find /etc/apt/sources.list.d -maxdepth 1 -type f \( -name "*microsoft*" -o -name "*azure*" \) -print -delete || true
-          sudo sed -i '/packages.microsoft.com/d;/azure-cli/d' /etc/apt/sources.list || true
-          sudo apt-get update
-
-      - name: Cache Playwright browsers
-        uses: actions/cache@v4
-        id: playwright-cache
-        with:
-          path: ~/.cache/ms-playwright
-          key: ${{ runner.os }}-playwright-${{ hashFiles('requirements.txt') }}
-
-      - name: Install Playwright Chromium (cache miss only)
-        if: steps.playwright-cache.outputs.cache-hit != 'true'
-        run: playwright install --with-deps chromium
-
-      - name: Install Playwright OS dependencies (cache hit)
-        if: steps.playwright-cache.outputs.cache-hit == 'true'
-        run: playwright install-deps chromium
-
-      - name: Restore persisted state (session cookies)
-        uses: actions/cache/restore@v4
-        with:
-          path: |
-            diversification/loanch_diversification_storage_state.json
-          key: loanch-diversification-state-${{ github.run_id }}
-          restore-keys: |
-            loanch-diversification-state-
-
+      # No Playwright/Chromium install needed - Loanch logs in via a
+      # pure-HTTP replay of its login/2FA API flow instead (see
+      # diversification/loanch_diversification.py's module docstring) -
+      # just `requests`/`pyotp`, already in requirements.txt. No
+      # session/cookie persistence either. IMPORTANT: login()'s exact
+      # endpoint paths/field names are UNVERIFIED (couldn't reach
+      # loanch.com from the dev machine to capture a real login) - if this
+      # job fails, check the logs for the RuntimeError from login() (it
+      # includes the full response) and fix the guessed URLs/field names.
       - name: Run Loanch diversification report
         env:
           LOANCH_EMAIL: ${{ secrets.LOANCH_EMAIL }}
@@ -327,14 +210,6 @@ jobs:
           GOOGLE_CREDENTIALS: ${{ secrets.GOOGLE_CREDENTIALS }}
           REPORT_DATE: ${{ github.event.inputs.report_date }}
         run: python -m diversification.loanch_diversification
-
-      - name: Save persisted state (session cookies) for the next run
-        if: always()
-        uses: actions/cache/save@v4
-        with:
-          path: |
-            diversification/loanch_diversification_storage_state.json
-          key: loanch-diversification-state-${{ github.run_id }}
 
   monefit:
     runs-on: ubuntu-22.04
@@ -353,53 +228,21 @@ jobs:
       - name: Install Python dependencies
         run: pip install -r requirements.txt
 
-      - name: Remove broken third-party apt repos (Azure CLI / Microsoft)
-        run: |
-          sudo find /etc/apt/sources.list.d -maxdepth 1 -type f \( -name "*microsoft*" -o -name "*azure*" \) -print -delete || true
-          sudo sed -i '/packages.microsoft.com/d;/azure-cli/d' /etc/apt/sources.list || true
-          sudo apt-get update
-
-      - name: Cache Playwright browsers
-        uses: actions/cache@v4
-        id: playwright-cache
-        with:
-          path: ~/.cache/ms-playwright
-          key: ${{ runner.os }}-playwright-${{ hashFiles('requirements.txt') }}
-
-      - name: Install Playwright Chromium (cache miss only)
-        if: steps.playwright-cache.outputs.cache-hit != 'true'
-        run: playwright install --with-deps chromium
-
-      - name: Install Playwright OS dependencies (cache hit)
-        if: steps.playwright-cache.outputs.cache-hit == 'true'
-        run: playwright install-deps chromium
-
-      - name: Restore persisted state (session cookies)
-        uses: actions/cache/restore@v4
-        with:
-          path: |
-            diversification/monefit_diversification_storage_state.json
-          key: monefit-diversification-state-${{ github.run_id }}
-          restore-keys: |
-            monefit-diversification-state-
-
+      # No Playwright/Chromium install needed - Monefit logs in via a
+      # pure-HTTP replay of its login API instead (see
+      # diversification/monefit_diversification.py's module docstring) -
+      # just `requests`, already in requirements.txt. No session/cookie
+      # persistence either (that login flow is lightweight enough to run
+      # fresh every time). No 2FA on this account, so MONEFIT_TOTP_SECRET
+      # is no longer needed.
       - name: Run Monefit diversification report
         env:
           MONEFIT_EMAIL: ${{ secrets.MONEFIT_EMAIL }}
           MONEFIT_PASSWORD: ${{ secrets.MONEFIT_PASSWORD }}
-          MONEFIT_TOTP_SECRET: ${{ secrets.MONEFIT_TOTP_SECRET }}
           GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
           GOOGLE_CREDENTIALS: ${{ secrets.GOOGLE_CREDENTIALS }}
           REPORT_DATE: ${{ github.event.inputs.report_date }}
         run: python -m diversification.monefit_diversification
-
-      - name: Save persisted state (session cookies) for the next run
-        if: always()
-        uses: actions/cache/save@v4
-        with:
-          path: |
-            diversification/monefit_diversification_storage_state.json
-          key: monefit-diversification-state-${{ github.run_id }}
 
   peerberry:
     runs-on: ubuntu-22.04
@@ -418,36 +261,12 @@ jobs:
       - name: Install Python dependencies
         run: pip install -r requirements.txt
 
-      - name: Remove broken third-party apt repos (Azure CLI / Microsoft)
-        run: |
-          sudo find /etc/apt/sources.list.d -maxdepth 1 -type f \( -name "*microsoft*" -o -name "*azure*" \) -print -delete || true
-          sudo sed -i '/packages.microsoft.com/d;/azure-cli/d' /etc/apt/sources.list || true
-          sudo apt-get update
-
-      - name: Cache Playwright browsers
-        uses: actions/cache@v4
-        id: playwright-cache
-        with:
-          path: ~/.cache/ms-playwright
-          key: ${{ runner.os }}-playwright-${{ hashFiles('requirements.txt') }}
-
-      - name: Install Playwright Chromium (cache miss only)
-        if: steps.playwright-cache.outputs.cache-hit != 'true'
-        run: playwright install --with-deps chromium
-
-      - name: Install Playwright OS dependencies (cache hit)
-        if: steps.playwright-cache.outputs.cache-hit == 'true'
-        run: playwright install-deps chromium
-
-      - name: Restore persisted state (session cookies)
-        uses: actions/cache/restore@v4
-        with:
-          path: |
-            diversification/peerberry_diversification_storage_state.json
-          key: peerberry-diversification-state-${{ github.run_id }}
-          restore-keys: |
-            peerberry-diversification-state-
-
+      # No Playwright/Chromium install needed - PeerBerry logs in via a
+      # pure-HTTP replay of its login/2FA API flow instead (see
+      # monitors/peerberry_monitor.py's module docstring) - just
+      # `requests`/`pyotp`, already in requirements.txt. No session/cookie
+      # persistence either (that login flow is lightweight enough to run
+      # fresh every time).
       - name: Run PeerBerry diversification report
         env:
           PEERBERRY_EMAIL: ${{ secrets.PEERBERRY_EMAIL }}
@@ -457,14 +276,6 @@ jobs:
           GOOGLE_CREDENTIALS: ${{ secrets.GOOGLE_CREDENTIALS }}
           REPORT_DATE: ${{ github.event.inputs.report_date }}
         run: python -m diversification.peerberry_diversification
-
-      - name: Save persisted state (session cookies) for the next run
-        if: always()
-        uses: actions/cache/save@v4
-        with:
-          path: |
-            diversification/peerberry_diversification_storage_state.json
-          key: peerberry-diversification-state-${{ github.run_id }}
 
   goandgrow:
     runs-on: ubuntu-22.04

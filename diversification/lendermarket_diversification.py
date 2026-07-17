@@ -1,34 +1,32 @@
 """Lendermarket portfolio diversification (by loan originator) fetcher.
 
 Logs into Lendermarket (reusing lendermarket_monitor.login(), which already
-handles email/password + TOTP 2FA - not duplicated here) and fetches every
-active investment via the site's own "Mes investissements"
-(https://app.lendermarket.com/fr/investissements) API, then groups them by
-loan originator ("fournisseur de crédit") and sums the remaining principal
-("capital restant") per originator. No email is sent - the amounts are just
-logged and handed to fill_current_month_amounts() (see google_sheet.py) so
-they can be filled into a Google Sheet, mirroring
+handles email/password + TOTP 2FA over pure HTTP - not duplicated here) and
+fetches every active investment via the site's own "Mes investissements"
+API, then groups them by loan originator ("fournisseur de crédit") and sums
+the remaining principal ("capital restant") per originator. No email is
+sent - the amounts are just logged and handed to fill_current_month_amounts()
+(see google_sheet.py) so they can be filled into a Google Sheet, mirroring
 peerberry_diversification.py.
 
-API verified against the real account on 2026-07-09:
+API verified against the real account on 2026-07-09 (and re-verified via
+pure HTTP on 2026-07-18):
 `GET https://api.lendermarket.com/claims/v1/investor/getInvestorInvestments?activeInvestments=1&currency=EUR&page=N`
 -> `{"data": [...], "meta": {"current_page", "last_page", ...}}`, one entry
 per active investment:
 `{"remainingPrincipal": "42.42", "lender": {"displayName": "Creditstar Sweden", ...}, "loan": {"lender": {...}, ...}, ...}`
 (the top-level `lender` and `loan.lender` are the same originator, kept as a
-fallback). 73 active investments fit on a single page (per_page=100) at the
-time of writing, but this paginates via `meta.last_page` defensively. Uses
-the browser's own `fetch()` with `credentials: 'include'` - unlike
-PeerBerry's API, Lendermarket's doesn't reject credentialed cross-origin
-requests (no CORS error), so no manual bearer-token header is needed here.
+fallback). Paginates via `meta.last_page` defensively. Requires the same
+`x-xsrf-token` + `X-INVESTOR-ID` headers as every other authenticated
+Lendermarket call (see lendermarket_monitor.py's module docstring for the
+full auth flow).
 
 Also fetches this calendar month's "Intérêts reçus" + "Intérêts de retard
 reçus" (summed into one "interest received" figure, per explicit user
 instructions) and "Primes promotionnelles et bonus" from the Account
-Statement page (https://app.lendermarket.com/fr/statement) - see
-fetch_current_month_statement_totals() below, same idea as
-loanch_diversification.fetch_current_month_statement_totals() /
-swaper_diversification.fetch_current_month_interest_received() /
+Statement summary API - see fetch_current_month_statement_totals() below,
+same idea as loanch_diversification.fetch_current_month_statement_totals()
+/ swaper_diversification.fetch_current_month_interest_received() /
 afranga_diversification.fetch_current_month_statement_totals() /
 bienpreter_diversification.fetch_current_month_interest_totals(). Unlike
 Bienpreter, Lendermarket has a clean, ready-made JSON summary endpoint for
@@ -48,10 +46,9 @@ Optional:
 
 import logging
 import sys
-from datetime import datetime
-from pathlib import Path
 from zoneinfo import ZoneInfo
 
+import requests
 from dotenv import load_dotenv
 
 from shared.google_sheet import fill_current_month_amounts, fill_current_month_bonus_breakdown, fill_geographic_repartition_amounts
@@ -59,19 +56,13 @@ from shared.report_date import get_report_now
 
 load_dotenv()
 
-from playwright.sync_api import sync_playwright
-
-from shared.browser_stealth import get_context_options, apply_stealth
-from monitors.lendermarket_monitor import login, LENDERMARKET_EMAIL, LENDERMARKET_PASSWORD
+from monitors.lendermarket_monitor import login, LENDERMARKET_EMAIL, LENDERMARKET_PASSWORD, _xsrf_headers
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger("lendermarket_diversification")
 
-INVESTMENTS_PAGE_URL = "https://app.lendermarket.com/fr/investissements"
 INVESTMENTS_API_URL = "https://api.lendermarket.com/claims/v1/investor/getInvestorInvestments"
-STATEMENT_PAGE_URL = "https://app.lendermarket.com/fr/statement"
 STATEMENT_SUMMARY_API_URL = "https://api.lendermarket.com/ledger/v1/investor/getInvestorAccountStatementSummary"
-STORAGE_STATE_FILE = Path(__file__).parent / "lendermarket_diversification_storage_state.json"
 # Lendermarket is a French-facing platform (app.lendermarket.com/fr/...);
 # "this month" below means the current calendar month up to TODAY (1st of
 # the month through today, NOT the full month) - same semantics as the
@@ -82,28 +73,24 @@ STORAGE_STATE_FILE = Path(__file__).parent / "lendermarket_diversification_stora
 REPORT_TIMEZONE = ZoneInfo("Europe/Paris")
 
 
-def fetch_investments(page) -> list:
+def fetch_investments(session: requests.Session, investor_id: str) -> list:
     """Fetch every active investment across all pages of the investments API
-    (see module docstring for the verified response shape and why a plain
-    credentialed fetch works here, unlike PeerBerry's)."""
+    (see module docstring for the verified response shape)."""
     investments = []
     page_number = 1
     while True:
         log.info("Requesting investments API page %d...", page_number)
-        result = page.evaluate(
-            """
-            async ([url, pageNumber]) => {
-                const res = await fetch(`${url}?activeInvestments=1&currency=EUR&page=${pageNumber}`, { credentials: 'include' });
-                return { ok: res.ok, status: res.status, body: await res.json().catch(() => null) };
-            }
-            """,
-            [INVESTMENTS_API_URL, page_number],
+        r = session.get(
+            INVESTMENTS_API_URL,
+            params={"activeInvestments": 1, "currency": "EUR", "page": page_number},
+            headers=_xsrf_headers(session, investor_id),
+            timeout=20,
         )
-        log.info("Investments API page %d response: ok=%s status=%s", page_number, result.get("ok"), result.get("status"))
-        if not result.get("ok"):
-            raise RuntimeError(f"Investments API returned status {result.get('status')} on page {page_number}")
+        log.info("Investments API page %d response: status=%s", page_number, r.status_code)
+        if not r.ok:
+            raise RuntimeError(f"Investments API returned status {r.status_code} on page {page_number}")
 
-        body = result.get("body") or {}
+        body = r.json() or {}
         page_investments = body.get("data") or []
         investments.extend(page_investments)
         log.info("Page %d: %d investment(s) found (running total: %d).", page_number, len(page_investments), len(investments))
@@ -138,16 +125,15 @@ def aggregate_by_lender(investments: list) -> list:
     return lenders
 
 
-def fetch_current_month_statement_totals(page) -> dict:
+def fetch_current_month_statement_totals(session: requests.Session, investor_id: str) -> dict:
     """Fetch this calendar month's "Intérêts reçus", "Intérêts de retard
     reçus" and "Primes promotionnelles et bonus", as shown in the summary
     panel of the Account Statement page
     (https://app.lendermarket.com/fr/statement), via the same JSON API the
     page's own "Mois en cours" quick filter calls.
 
-    Verified against the real account on 2026-07-10 (network capture while
-    the statement page loaded with its default date range, which already
-    matches "Mois en cours" - 1st of the current month through TODAY):
+    Verified against the real account on 2026-07-10 (and re-verified via
+    pure HTTP on 2026-07-18):
 
         GET https://api.lendermarket.com/ledger/v1/investor/getInvestorAccountStatementSummary?currency=EUR&startDate=2026-07-01&endDate=2026-07-10
         -> {"data": {"investorReceivedInterestsAmount": "7.32",
@@ -157,10 +143,7 @@ def fetch_current_month_statement_totals(page) -> dict:
     which matched the page's own displayed "Intérêts reçus" (7,32 €),
     "Intérêts de retard reçus" (0,03 €) and "Primes promotionnelles et
     bonus" (0,00 €) figures exactly. Per explicit user instructions, the
-    first two are summed into a single "interest received" figure; unlike
-    PeerBerry/Loanch's APIs, this endpoint accepts a plain credentialed
-    fetch (`credentials: 'include'`) with no CORS/bearer-token workaround
-    needed, same as fetch_investments() above.
+    first two are summed into a single "interest received" figure.
 
     Uses REPORT_TIMEZONE (Europe/Paris) rather than the executing machine's
     local clock to decide what "this month" means, so this stays correct
@@ -172,21 +155,17 @@ def fetch_current_month_statement_totals(page) -> dict:
     end_date = now.strftime("%Y-%m-%d")
     log.info("Requesting account statement summary API for %s to %s...", start_date, end_date)
 
-    result = page.evaluate(
-        """
-        async ([url, startDate, endDate]) => {
-            const params = new URLSearchParams({ currency: 'EUR', startDate, endDate });
-            const res = await fetch(`${url}?${params.toString()}`, { credentials: 'include' });
-            return { ok: res.ok, status: res.status, body: await res.json().catch(() => null) };
-        }
-        """,
-        [STATEMENT_SUMMARY_API_URL, start_date, end_date],
+    r = session.get(
+        STATEMENT_SUMMARY_API_URL,
+        params={"currency": "EUR", "startDate": start_date, "endDate": end_date},
+        headers=_xsrf_headers(session, investor_id),
+        timeout=20,
     )
-    log.info("Account statement summary API response: ok=%s status=%s", result.get("ok"), result.get("status"))
-    if not result.get("ok"):
-        raise RuntimeError(f"Account statement summary API returned status {result.get('status')}")
+    log.info("Account statement summary API response: status=%s", r.status_code)
+    if not r.ok:
+        raise RuntimeError(f"Account statement summary API returned status {r.status_code}")
 
-    data = (result.get("body") or {}).get("data") or {}
+    data = (r.json() or {}).get("data") or {}
     log.info("Raw statement summary data: %r", data)
     try:
         interest_received = float(data.get("investorReceivedInterestsAmount") or 0.0)
@@ -214,45 +193,26 @@ def fetch_current_month_statement_totals(page) -> dict:
     }
 
 
-def run(headless: bool = True) -> None:
+def run() -> None:
     if not LENDERMARKET_EMAIL or not LENDERMARKET_PASSWORD:
         log.error("LENDERMARKET_EMAIL and LENDERMARKET_PASSWORD environment variables are required.")
         sys.exit(1)
 
-    log.info("Starting Lendermarket diversification run (headless=%s, storage_state_exists=%s).", headless, STORAGE_STATE_FILE.exists())
+    log.info("Starting Lendermarket diversification run (pure HTTP, no browser).")
 
-    with sync_playwright() as p:
-        browser = p.chromium.launch(headless=headless)
-        storage_state = str(STORAGE_STATE_FILE) if STORAGE_STATE_FILE.exists() else None
-        context = browser.new_context(
-            storage_state=storage_state,
-            locale="fr-FR",
-            **get_context_options(),
-        )
-        apply_stealth(context, languages="['fr-FR', 'fr']")
-        page = context.new_page()
+    session = requests.Session()
+    try:
+        investor_id = login(session)
+        investments = fetch_investments(session, investor_id)
+    except Exception:
+        log.exception("Failed to log in or fetch Lendermarket investments.")
+        sys.exit(1)
 
-        try:
-            login(page)
-            page.goto(INVESTMENTS_PAGE_URL, wait_until="domcontentloaded")
-            investments = fetch_investments(page)
-        except Exception:
-            log.exception("Failed to log in or fetch Lendermarket investments.")
-            browser.close()
-            sys.exit(1)
-
-        try:
-            log.info("Navigating to the account statement page to fetch this month's statement totals...")
-            page.goto(STATEMENT_PAGE_URL, wait_until="domcontentloaded")
-            statement_totals = fetch_current_month_statement_totals(page)
-        except Exception:
-            log.exception("Failed to fetch this month's interest received/bonuses - defaulting both to 0.0.")
-            statement_totals = {"interest_received": 0.0, "bonuses": 0.0}
-
-        # Persist cookies/local storage so the next run can skip login (and
-        # 2FA) while the session remains valid.
-        context.storage_state(path=str(STORAGE_STATE_FILE))
-        browser.close()
+    try:
+        statement_totals = fetch_current_month_statement_totals(session, investor_id)
+    except Exception:
+        log.exception("Failed to fetch this month's interest received/bonuses - defaulting both to 0.0.")
+        statement_totals = {"interest_received": 0.0, "bonuses": 0.0}
 
     lenders = aggregate_by_lender(investments)
     log.info("Fetched %d active investment(s) across %d loan originator(s).", len(investments), len(lenders))
@@ -284,7 +244,7 @@ def run(headless: bool = True) -> None:
         "interest_received": statement_totals["interest_received"],
         "bonuses": statement_totals["bonuses"],
     }
-    
+
     fill_current_month_amounts(
         platform="Lendermarket",
         amounts=amounts
@@ -308,6 +268,4 @@ def run(headless: bool = True) -> None:
 
 
 if __name__ == "__main__":
-    # Set headless=False locally (e.g. via `python lendermarket_diversification.py --show`)
-    # to watch the browser and debug the login flow if selectors need adjusting.
-    run(headless="--show" not in sys.argv)
+    run()

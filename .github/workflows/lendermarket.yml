@@ -25,33 +25,18 @@ jobs:
       - name: Install Python dependencies
         run: pip install -r requirements.txt
 
-      - name: Remove broken third-party apt repos (Azure CLI / Microsoft)
-        run: |
-          sudo find /etc/apt/sources.list.d -maxdepth 1 -type f \( -name "*microsoft*" -o -name "*azure*" \) -print -delete || true
-          sudo sed -i '/packages.microsoft.com/d;/azure-cli/d' /etc/apt/sources.list || true
-          sudo apt-get update
-
-      - name: Cache Playwright browsers
-        uses: actions/cache@v4
-        id: playwright-cache
-        with:
-          path: ~/.cache/ms-playwright
-          key: ${{ runner.os }}-playwright-${{ hashFiles('requirements.txt') }}
-
-      - name: Install Playwright Chromium (cache miss only)
-        if: steps.playwright-cache.outputs.cache-hit != 'true'
-        run: playwright install --with-deps chromium
-
-      - name: Install Playwright OS dependencies (cache hit)
-        if: steps.playwright-cache.outputs.cache-hit == 'true'
-        run: playwright install-deps chromium
-
-      - name: Restore persisted state (already-notified loan IDs + session cookies + cron schedule)
+      # No Playwright/Chromium install needed - Lendermarket logs in via a
+      # pure-HTTP replay of its CSRF/XSRF + TOTP login flow instead (see
+      # monitors/lendermarket_monitor.py's module docstring) - just
+      # `requests`/`pyotp`, already in requirements.txt. No session/cookie
+      # persistence needed either (that login flow is lightweight enough to
+      # run fresh every time) - only the notification-gate state and cron
+      # schedule state are still persisted below.
+      - name: Restore persisted state (already-notified loan IDs + cron schedule)
         uses: actions/cache/restore@v4
         with:
           path: |
             monitors/lendermarket_state.json
-            monitors/lendermarket_storage_state.json
             monitors/lendermarket_cron_schedule_state.json
           key: lendermarket-state-${{ github.run_id }}
           restore-keys: |
@@ -72,12 +57,11 @@ jobs:
           EMAIL_TO: ${{ secrets.EMAIL_TO }}
         run: python -m monitors.lendermarket_monitor
 
-      - name: Save persisted state (already-notified loan IDs + session cookies + cron schedule) for the next run
+      - name: Save persisted state (already-notified loan IDs + cron schedule) for the next run
         if: always()
         uses: actions/cache/save@v4
         with:
           path: |
             monitors/lendermarket_state.json
-            monitors/lendermarket_storage_state.json
             monitors/lendermarket_cron_schedule_state.json
           key: lendermarket-state-${{ github.run_id }}

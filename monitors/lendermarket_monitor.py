@@ -12,11 +12,26 @@ account balance as the same outer gate:
     above 0 do NOT re-open the gate (avoids spamming on every small change)
     - only an actual return to 0 does, exactly like Swaper's balance.
 
-Since the balance now needs to be known up front to apply that outer gate,
-this logs into Lendermarket (email/password + TOTP, same idea as
-swaper_monitor.py) on every run to fetch it from
-`ledger/v1/investor/getInvestorAccountSummary`, which requires an
-authenticated session (verified: HTTP 401 "Unauthenticated" without one).
+Login + balance lookup is pure HTTP (no browser needed) - verified
+2026-07-18 via a real browser network capture that the whole auth flow
+(including the TOTP 2FA challenge) has NO reCAPTCHA or other client-side-JS
+requirement, unlike Swaper:
+  1. GET  /users/v1/auth/getCsrfToken   -> sets XSRF-TOKEN + users_session
+     cookies (Laravel/Sanctum-style CSRF).
+  2. POST /users/v1/auth/login          json={"email","password"}, header
+     `x-xsrf-token: unquote(cookies["XSRF-TOKEN"])`. Response may require a
+     TOTP_CHALLENGE step. The XSRF-TOKEN cookie is refreshed on every
+     response - always re-read it from the session right before the next
+     call, never reuse a stale value.
+  3. POST /users/v1/auth/submitTotpChallenge  json={"code": <TOTP>}, same
+     xsrf header pattern. Response contains `data.currentInvestor.investorId`
+     - required as an `X-INVESTOR-ID` header on every authenticated call
+     below (without it: 401 "Unauthenticated" even with valid cookies/xsrf -
+     this was the non-obvious missing piece, found via the response's
+     `access-control-allow-headers` listing `X-INVESTOR-ID`).
+  4. Authenticated GETs (e.g. the account summary balance) need
+     x-xsrf-token (refreshed again) + X-INVESTOR-ID.
+
 Checking loan availability itself only needs the public, unauthenticated
 `claims/v1/public/getActiveLoans` endpoint - verified on 2026-07-08 by
 comparing its JSON output against the real filtered listing pages:
@@ -37,17 +52,18 @@ Optional:
 import json
 import logging
 import os
+import time
 from pathlib import Path
 from urllib import request, parse, error
+from urllib.parse import unquote
 
 import pyotp
+import requests
 from dotenv import load_dotenv
-from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
 
 from shared.notifier import send_lendermarket_email
 from shared.state import load_state, save_state
 from shared.notification_gate import should_notify
-from shared.browser_stealth import get_context_options, apply_stealth, human_pause, human_mouse_wander, human_type
 from shared.cron_schedule import ensure_schedule
 
 load_dotenv()
@@ -60,13 +76,22 @@ LENDERMARKET_PASSWORD = os.environ.get("LENDERMARKET_PASSWORD")
 LENDERMARKET_TOTP_SECRET = os.environ.get("LENDERMARKET_TOTP_SECRET")
 LENDERMARKET_CRON_JOB_ID = os.environ.get("LENDERMARKET_CRON_JOB_ID")
 
-LOANS_API_URL = "https://api.lendermarket.com/claims/v1/public/getActiveLoans"
-BALANCE_API_URL = "https://api.lendermarket.com/ledger/v1/investor/getInvestorAccountSummary?currency=EUR"
-LOGIN_URL = "https://app.lendermarket.com/fr/connexion"
+API_BASE = "https://api.lendermarket.com"
+CSRF_URL = f"{API_BASE}/users/v1/auth/getCsrfToken"
+LOGIN_URL = f"{API_BASE}/users/v1/auth/login"
+TOTP_URL = f"{API_BASE}/users/v1/auth/submitTotpChallenge"
+LOANS_API_URL = f"{API_BASE}/claims/v1/public/getActiveLoans"
+BALANCE_API_URL = f"{API_BASE}/ledger/v1/investor/getInvestorAccountSummary"
 
 STATE_FILE = Path(__file__).parent / "lendermarket_state.json"
-STORAGE_STATE_FILE = Path(__file__).parent / "lendermarket_storage_state.json"
 CRON_SCHEDULE_STATE_FILE = Path(__file__).parent / "lendermarket_cron_schedule_state.json"
+
+_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+    "Referer": "https://app.lendermarket.com/",
+    "Accept": "application/json",
+    "Content-Type": "application/json",
+}
 
 # Verified against the real filtered listing pages on 2026-07-08.
 LOAN_SEGMENTS = [
@@ -167,178 +192,88 @@ def aggregate_by_lender(loans: list) -> list:
     return sorted(buckets.values(), key=lambda b: b["lender"])
 
 
-def _first_locator(page, selectors: list, timeout: int = 8000):
-    """Return the first selector that actually renders (waiting for it, since
-    this is a client-rendered Next.js app - the form doesn't exist in the
-    initial HTML, only after client-side hydration)."""
-    for selector in selectors:
-        locator = page.locator(selector)
-        try:
-            locator.first.wait_for(state="visible", timeout=timeout)
-            return locator.first
-        except PlaywrightTimeoutError:
-            continue
-    return None
+def _xsrf_headers(session: requests.Session, investor_id: str | None = None) -> dict:
+    headers = dict(_HEADERS)
+    xsrf = session.cookies.get("XSRF-TOKEN")
+    if xsrf:
+        headers["x-xsrf-token"] = unquote(xsrf)
+    if investor_id:
+        headers["X-INVESTOR-ID"] = investor_id
+    return headers
 
 
-def login(page) -> None:
-    """Log into Lendermarket using LENDERMARKET_EMAIL/PASSWORD (and
-    LENDERMARKET_TOTP_SECRET if 2FA is enabled).
+def login(session: requests.Session) -> str:
+    """Log into Lendermarket via pure HTTP (email/password + TOTP 2FA if
+    enabled) and return the authenticated `investorId`, needed as an
+    `X-INVESTOR-ID` header on every subsequent authenticated call.
 
-    Selectors verified against the real login form on 2026-07-08 via manual
-    browser automation: `input[type='email']` / `input[type='password']` and
-    a "Se connecter" submit button; the 2FA prompt uses 6 separate one-digit
-    boxes (accessible name "Please enter OTP character N") and a "Continuer"
-    button.
+    See the module docstring for the full CSRF/XSRF + TOTP flow, verified
+    2026-07-18 via a real browser network capture.
     """
-    page.goto(LOGIN_URL, wait_until="domcontentloaded")
-    human_mouse_wander(page)
+    if not LENDERMARKET_EMAIL or not LENDERMARKET_PASSWORD:
+        raise RuntimeError("LENDERMARKET_EMAIL/LENDERMARKET_PASSWORD environment variables are required.")
 
-    for label in ["Tout accepter", "Accepter tout", "Refuser"]:
-        try:
-            page.get_by_role("button", name=label).click(timeout=3000)
-            break
-        except PlaywrightTimeoutError:
-            continue
+    r = session.get(CSRF_URL, headers=_HEADERS, timeout=20)
+    r.raise_for_status()
 
-    if "/connexion" not in page.url and "/otp" not in page.url:
-        log.info("Reused a previous session, already logged in at %s", page.url)
-        return
+    r = session.post(
+        LOGIN_URL,
+        json={"email": LENDERMARKET_EMAIL, "password": LENDERMARKET_PASSWORD},
+        headers=_xsrf_headers(session),
+        timeout=20,
+    )
+    r.raise_for_status()
+    data = r.json().get("data") or {}
+    mandatory_steps = (data.get("person") or {}).get("mandatorySteps") or []
+    needs_totp = any(step.get("stepName") == "TOTP_CHALLENGE" for step in mandatory_steps)
 
-    # This is a client-rendered Next.js app: right after domcontentloaded the
-    # auth check (and a possible redirect away from /connexion) hasn't run
-    # yet. Give it a short grace period before assuming a login form is
-    # actually needed.
-    try:
-        page.wait_for_url(lambda url: "/connexion" not in url and "/otp" not in url, timeout=4000)
-        log.info("Reused a previous session, already logged in at %s", page.url)
-        return
-    except PlaywrightTimeoutError:
-        pass
-
-    if "/connexion" in page.url:
-        email_input = _first_locator(page, ["input[type='email']", "input[name='email']"])
-        password_input = _first_locator(page, ["input[type='password']", "input[name='password']"])
-        if email_input is None or password_input is None:
-            raise RuntimeError("Could not locate the Lendermarket login form fields.")
-
-        email_input.click()
-        human_type(email_input, LENDERMARKET_EMAIL)
-        human_pause()
-        password_input.click()
-        human_type(password_input, LENDERMARKET_PASSWORD)
-        human_pause()
-
-        submitted = False
-        for label in ["Se connecter", "Connexion", "Login"]:
-            try:
-                page.get_by_role("button", name=label).click(timeout=3000)
-                submitted = True
-                break
-            except PlaywrightTimeoutError:
-                continue
-        if not submitted:
-            raise RuntimeError("Could not find the Lendermarket login submit button.")
-
-    handle_two_factor(page)
-
-    page.wait_for_url(lambda url: "/connexion" not in url and "/otp" not in url, timeout=20000)
-    # The redirect fires before the session is fully established server-side
-    # (the balance API can still 401 right after) - wait for the dashboard to
-    # actually render authenticated content before considering login done.
-    try:
-        page.get_by_text("Solde disponible", exact=True).wait_for(timeout=10000)
-    except PlaywrightTimeoutError:
-        log.warning("Did not see the authenticated dashboard content after login - session may not be ready yet.")
-    log.info("Logged in successfully, current URL: %s", page.url)
-
-
-def handle_two_factor(page) -> None:
-    otp_input = page.get_by_role("textbox", name="Please enter OTP character 1")
-    try:
-        otp_input.wait_for(timeout=8000)
-    except PlaywrightTimeoutError:
-        return  # no 2FA prompt shown, nothing to do
-
-    if not LENDERMARKET_TOTP_SECRET:
-        raise RuntimeError(
-            "Lendermarket is asking for a 2FA code but LENDERMARKET_TOTP_SECRET is not set. "
-            "Set it to the base32 secret used to configure Google Authenticator."
-        )
-
-    log.info("2FA prompt detected, generating and submitting TOTP code...")
-    totp = pyotp.TOTP(LENDERMARKET_TOTP_SECRET)
-    code = totp.now()
-    otp_input.click()
-    otp_input.type(code, delay=80)
-
-    # Guard against the 30s TOTP window rolling over while typing (same fix
-    # applied to swaper_monitor.py after a 2026-07-09 GitHub Actions failure
-    # where the whole 2FA sequence completed with no Playwright error, but
-    # the page never left the login/otp URL - suspected stale-code rejection).
-    fresh_code = totp.now()
-    if fresh_code != code:
-        log.info("TOTP code rolled over to a new 30s window while typing, retyping the fresh code.")
-        otp_input.fill("")
-        otp_input.type(fresh_code, delay=80)
-
-    human_pause()
-    try:
-        # Verified against the real 2FA screen on 2026-07-09: filling in all
-        # 6 digits can auto-submit the form on its own (same behavior as
-        # PeerBerry's 2FA) - by the time we try to click "Continuer" the
-        # page may have already navigated away, so this click racing against
-        # that navigation would otherwise hang for the full default timeout
-        # waiting for a button that's never coming back.
-        page.get_by_role("button", name="Continuer").click(timeout=5000)
-    except PlaywrightTimeoutError:
-        log.info("'Continuer' button not found/clickable - the code likely auto-submitted already.")
-
-
-def fetch_account_balance(page) -> float | None:
-    """Fetch the investor's available balance (EUR).
-
-    Uses the browser's own `fetch()` (via page.evaluate), not Playwright's
-    separate `APIRequestContext` - the latter has its own TLS trust store and
-    can fail with "self-signed certificate in certificate chain" behind
-    corporate TLS-inspecting proxies, while the real browser correctly trusts
-    the OS certificate store. This endpoint requires authentication
-    (verified: HTTP 401 without a session), which the browser's cookies
-    provide automatically.
-
-    Retries a couple of times on HTTP 401: verified in production
-    (2026-07-08) that right after a fresh 2FA login, the session can still
-    return 401 here for a moment before becoming fully usable server-side
-    (a backend-side race, not something controllable from here) - the same
-    request succeeds a couple of minutes later on the next run.
-    """
-    result = None
-    for attempt in range(3):
-        try:
-            result = page.evaluate(
-                """
-                async (url) => {
-                    const res = await fetch(url, { credentials: 'include' });
-                    return { ok: res.ok, status: res.status, body: await res.json().catch(() => null) };
-                }
-                """,
-                BALANCE_API_URL,
+    if needs_totp:
+        if not LENDERMARKET_TOTP_SECRET:
+            raise RuntimeError(
+                "Lendermarket is asking for a 2FA code but LENDERMARKET_TOTP_SECRET is not set. "
+                "Set it to the base32 secret used to configure Google Authenticator."
             )
-        except Exception:
-            log.exception("Failed to fetch the Lendermarket account balance.")
-            return None
+        log.info("2FA prompt detected, generating and submitting TOTP code...")
+        totp = pyotp.TOTP(LENDERMARKET_TOTP_SECRET)
+        # Guard against submitting a code right as its 30s window is about
+        # to roll over - the network round-trip can push the server-side
+        # check past the boundary and get rejected as "Invalid code
+        # provided" even though the code was valid when generated.
+        remaining = 30 - (int(time.time()) % 30)
+        if remaining < 5:
+            time.sleep(remaining + 1)
+        code = totp.now()
+        r = session.post(TOTP_URL, json={"code": code}, headers=_xsrf_headers(session), timeout=20)
+        if r.status_code == 422:
+            log.info("TOTP code rejected (likely rolled over), retrying once with a fresh code.")
+            code = totp.now()
+            r = session.post(TOTP_URL, json={"code": code}, headers=_xsrf_headers(session), timeout=20)
+        r.raise_for_status()
+        data = r.json().get("data") or {}
 
-        if result["ok"]:
-            break
-        log.warning("Balance API returned HTTP %s (attempt %d/3).", result["status"], attempt + 1)
-        if attempt < 2:
-            page.wait_for_timeout(2000)
+    investor_id = (data.get("currentInvestor") or {}).get("investorId")
+    if not investor_id:
+        raise RuntimeError("Lendermarket login succeeded but no investorId was returned.")
+    log.info("Logged in successfully, investorId=%s", investor_id)
+    return investor_id
 
-    if result is None or not result["ok"]:
+
+def fetch_account_balance(session: requests.Session, investor_id: str) -> float | None:
+    """Fetch the investor's available balance (EUR)."""
+    try:
+        r = session.get(
+            BALANCE_API_URL,
+            params={"currency": "EUR"},
+            headers=_xsrf_headers(session, investor_id),
+            timeout=20,
+        )
+        r.raise_for_status()
+    except Exception:
+        log.exception("Failed to fetch the Lendermarket account balance.")
         return None
 
-    payload = result["body"]
-    balance = (payload.get("data") or {}).get("investorAvailableBalanceAmount")
+    data = r.json().get("data") or {}
+    balance = data.get("investorAvailableBalanceAmount")
     try:
         return float(balance)
     except (TypeError, ValueError):
@@ -350,28 +285,13 @@ def fetch_balance_via_login() -> float | None:
         log.warning("LENDERMARKET_EMAIL/PASSWORD not set, skipping account balance lookup.")
         return None
 
-    with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True)
-        storage_state = str(STORAGE_STATE_FILE) if STORAGE_STATE_FILE.exists() else None
-        context = browser.new_context(
-            storage_state=storage_state,
-            locale="fr-FR",
-            **get_context_options(),
-        )
-        apply_stealth(context, languages="['fr-FR', 'fr']")
-        page = context.new_page()
-
-        balance = None
-        try:
-            login(page)
-            balance = fetch_account_balance(page)
-        except Exception:
-            log.exception("Failed to log into Lendermarket to fetch the account balance.")
-        finally:
-            context.storage_state(path=str(STORAGE_STATE_FILE))
-            browser.close()
-
-    return balance
+    session = requests.Session()
+    try:
+        investor_id = login(session)
+        return fetch_account_balance(session, investor_id)
+    except Exception:
+        log.exception("Failed to log into Lendermarket to fetch the account balance.")
+        return None
 
 
 def run() -> None:

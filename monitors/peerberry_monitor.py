@@ -1,24 +1,35 @@
 """PeerBerry "Available for investment" balance monitor.
 
-Logs into peerberry.com (login()/handle_two_factor()/dismiss_cookie_banner()
-live here - moved from diversification/peerberry_diversification.py on
-2026-07-16 so that module can import them from this one instead of the
-reverse, same dependency direction as swaper/lendermarket: this monitor has
-no need for shared.google_sheet, so it must not import anything from a
+Logs into peerberry.com via pure HTTP (login()/exchange_2fa_code() live here
+- moved from diversification/peerberry_diversification.py on 2026-07-16 so
+that module can import them from this one instead of the reverse, same
+dependency direction as swaper/lendermarket: this monitor has no need for
+shared.google_sheet, so it must not import anything from a
 *_diversification.py module, which does) and fetches the "Available for
-investment" balance shown on the Overview page
-(https://peerberry.com/en/client/overview).
+investment" balance shown on the Overview page.
 
-Verified against the real account on 2026-07-15: the Overview page displays
-"Available for investment €4.25", which is sourced from
+Auth flow verified 2026-07-18 via a real browser network capture - NO
+reCAPTCHA, NO CSRF cookie dance needed (much simpler than Lendermarket):
+  1. POST https://api.peerberry.com/v1/investor/login  json=
+     {"email", "password", "params": null} -> `{"tfa_is_active": true,
+     "tfa_token": "<token>"}` if 2FA is enabled (or a direct
+     `{"access_token": ...}` if it isn't - not observed on this account,
+     tfa_is_active is always true here, so that path is untested).
+  2. POST https://api.peerberry.com/v1/investor/login/2fa  json=
+     {"code": <TOTP>, "tfa_token": <token from step 1>} -> `{"access_token":
+     "<JWT>"}`.
+  3. Every subsequent authenticated call just needs `Authorization: Bearer
+     <access_token>` - this is the same JWT the real browser also stores in
+     an `app_token` cookie via client-side JS, but sending it as a bearer
+     header directly (as this module already did before, when reading it out
+     of Playwright's cookie jar) works identically and skips the cookie
+     entirely.
+
+Balance verified against the real account on 2026-07-15: the Overview page
+displays "Available for investment €4.25", sourced from
 `GET https://api.peerberry.com/v1/investor/overview` ->
 `{"availableMoney": "4.25", "invested": "10023.10", ...}` - `availableMoney`
-matched the displayed figure exactly. Captured the same way
-swaper_monitor.fetch_loans() captures its own API call: by navigating to the
-real page and waiting for its own request/response, so auth headers/cookies
-are exactly what the browser itself sends (no need to reconstruct a bearer
-token like peerberry_diversification.py does for the originators/account
-summary endpoints).
+matched the displayed figure exactly.
 
 Sends an email whenever the balance is >= 10 EUR, but only once per
 distinct balance value (anti-spam): if the balance stays exactly the same
@@ -53,24 +64,22 @@ import logging
 from pathlib import Path
 
 import pyotp
+import requests
 from dotenv import load_dotenv
 
 load_dotenv()
 
-from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
-
 from shared.notifier import send_peerberry_available_email
-from shared.browser_stealth import get_context_options, apply_stealth, human_pause, human_mouse_wander, human_type
 from shared.cron_schedule import ensure_schedule
 from shared.state import load_state, save_state
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger("peerberry_monitor")
 
-LOGIN_URL = "https://peerberry.com/en/client/"
-OVERVIEW_URL = "https://peerberry.com/en/client/overview"
-OVERVIEW_API_URL = "https://api.peerberry.com/v1/investor/overview"
-STORAGE_STATE_FILE = Path(__file__).parent / "peerberry_storage_state.json"
+API_BASE = "https://api.peerberry.com"
+LOGIN_URL = f"{API_BASE}/v1/investor/login"
+TFA_URL = f"{API_BASE}/v1/investor/login/2fa"
+OVERVIEW_API_URL = f"{API_BASE}/v1/investor/overview"
 CRON_SCHEDULE_STATE_FILE = Path(__file__).parent / "peerberry_cron_schedule_state.json"
 STATE_FILE = Path(__file__).parent / "peerberry_state.json"
 
@@ -83,128 +92,67 @@ PEERBERRY_CRON_JOB_ID = os.environ.get("PEERBERRY_CRON_JOB_ID")
 
 MIN_AVAILABLE_TO_NOTIFY = 10.0
 
+_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+    "Content-Type": "application/json",
+    "Accept": "application/json",
+    "Referer": "https://peerberry.com/",
+    "Origin": "https://peerberry.com",
+}
 
-def dismiss_cookie_banner(page) -> None:
-    """Dismiss the Cookiebot consent dialog if it shows up.
 
-    Verified on 2026-07-09: a normal Playwright click on the "Allow all"
-    button can silently no-op (the dialog stays in the DOM, still
-    intercepting clicks on the login form underneath it), so this falls
-    back to removing the dialog element outright via JS if it's still
-    present a moment after the click.
+def login(session: requests.Session) -> str:
+    """Log into PeerBerry via pure HTTP (email/password + TOTP 2FA if
+    enabled) and return the `access_token` JWT, used as an `Authorization:
+    Bearer <token>` header on every subsequent authenticated call.
+
+    See the module docstring for the full auth flow, verified 2026-07-18 via
+    a real browser network capture.
     """
-    try:
-        page.locator("#CybotCookiebotDialogBodyLevelButtonLevelOptinAllowAll").click(timeout=5000, force=True)
-    except PlaywrightTimeoutError:
-        return  # banner never appeared, nothing to do
+    if not PEERBERRY_EMAIL or not PEERBERRY_PASSWORD:
+        raise RuntimeError("PEERBERRY_EMAIL/PEERBERRY_PASSWORD environment variables are required.")
 
-    page.wait_for_timeout(500)
-    page.evaluate(
-        """
-        () => {
-            const dialog = document.getElementById('CybotCookiebotDialog');
-            if (dialog) dialog.remove();
-        }
-        """
+    r = session.post(
+        LOGIN_URL,
+        json={"email": PEERBERRY_EMAIL, "password": PEERBERRY_PASSWORD, "params": None},
+        headers=_HEADERS,
+        timeout=20,
     )
+    r.raise_for_status()
+    data = r.json() or {}
 
-
-def handle_two_factor(page) -> None:
-    """If PeerBerry prompts for a TOTP code after submitting credentials,
-    generate one from PEERBERRY_TOTP_SECRET and fill it in.
-
-    Verified against the real 2FA screen on 2026-07-09: 6 separate one-digit
-    inputs named `s1`..`s6`; filling the last one auto-submits the form (no
-    explicit "verify" button to click).
-    """
-    first_box = page.locator("input[name='s1']")
-    try:
-        first_box.wait_for(timeout=8000)
-    except PlaywrightTimeoutError:
-        return  # no 2FA prompt shown, nothing to do
-
-    if not PEERBERRY_TOTP_SECRET:
-        raise RuntimeError(
-            "PeerBerry is asking for a 2FA code but PEERBERRY_TOTP_SECRET is not set. "
-            "Set it to the base32 secret used to configure Google Authenticator."
+    if data.get("tfa_is_active"):
+        if not PEERBERRY_TOTP_SECRET:
+            raise RuntimeError(
+                "PeerBerry is asking for a 2FA code but PEERBERRY_TOTP_SECRET is not set. "
+                "Set it to the base32 secret used to configure Google Authenticator."
+            )
+        log.info("2FA prompt detected, generating and submitting TOTP code...")
+        code = pyotp.TOTP(PEERBERRY_TOTP_SECRET).now()
+        r = session.post(
+            TFA_URL,
+            json={"code": code, "tfa_token": data["tfa_token"]},
+            headers=_HEADERS,
+            timeout=20,
         )
+        if not r.ok:
+            raise RuntimeError(f"PeerBerry rejected the TOTP code (status={r.status_code}): {r.text[:200]}")
+        data = r.json() or {}
 
-    log.info("2FA prompt detected, generating and submitting TOTP code...")
-    code = pyotp.TOTP(PEERBERRY_TOTP_SECRET).now()
-    for i, digit in enumerate(code, start=1):
-        human_type(page.locator(f"input[name='s{i}']"), digit)
-
-    page.wait_for_timeout(1500)
-    error_text = page.locator("text=Auth code is invalid")
-    if error_text.count() > 0:
-        raise RuntimeError("PeerBerry rejected the TOTP code (invalid/expired).")
-
-
-def login(page) -> None:
-    """Log in to PeerBerry using PEERBERRY_EMAIL/PASSWORD (and
-    PEERBERRY_TOTP_SECRET if 2FA is enabled).
-
-    Selectors verified against the real login form on 2026-07-09:
-    `input[name='email']` / `input[name='password']` and a
-    `button[type='submit']` labeled "Log in". The submit button is clicked
-    via JS (`element.click()` through `page.evaluate`) rather than
-    Playwright's normal click - the latter's actionability check
-    ("visible, enabled and stable") kept timing out, apparently because of
-    an overlapping chat-widget element, even though the button is genuinely
-    clickable.
-    """
-    log.info("Navigating to login page...")
-    page.goto(LOGIN_URL, wait_until="domcontentloaded")
-    dismiss_cookie_banner(page)
-    human_mouse_wander(page)
-
-    # If a previous session was restored (see STORAGE_STATE_FILE) and is
-    # still valid, PeerBerry redirects straight to /overview - nothing else
-    # to do.
-    page.wait_for_timeout(1000)
-    if page.url.rstrip("/") != LOGIN_URL.rstrip("/"):
-        log.info("Reused a previous session, already logged in at %s", page.url)
-        return
-
-    log.info("Filling in credentials...")
-    human_type(page.locator("input[name='email']"), PEERBERRY_EMAIL)
-    human_pause()
-    human_type(page.locator("input[name='password']"), PEERBERRY_PASSWORD)
-    human_pause()
-    page.evaluate("document.querySelector(\"button[type='submit']\").click()")
-
-    handle_two_factor(page)
-
-    # This is a client-rendered SPA: the redirect away from the login URL
-    # happens via client-side routing (pushState), not always a real
-    # navigation event, and by the time we get here it may have already
-    # happened - so poll the current URL instead of using
-    # page.wait_for_url(), which can miss/outlast it.
-    for _ in range(40):
-        if page.url.rstrip("/") != LOGIN_URL.rstrip("/"):
-            break
-        page.wait_for_timeout(500)
-    else:
-        raise RuntimeError(f"Still on the login page after submitting credentials/2FA: {page.url}")
-    log.info("Logged in successfully, current URL: %s", page.url)
+    access_token = data.get("access_token")
+    if not access_token:
+        raise RuntimeError("PeerBerry login succeeded but no access_token was returned.")
+    session.headers["Authorization"] = f"Bearer {access_token}"
+    log.info("Logged in successfully.")
+    return access_token
 
 
-def fetch_available_money(page) -> float:
-    """Navigate to the Overview page and capture its own overview API
-    response to read the "Available for investment" balance
-    (`availableMoney`, EUR - see module docstring)."""
-    log.info("Navigating to the overview page and capturing the overview API response...")
-    with page.expect_response(
-        # Exact match only - matching by prefix would also catch sibling
-        # endpoints like ".../overview/originators" or ".../overview/profit/...".
-        lambda r: r.url.split("?", 1)[0] == OVERVIEW_API_URL and r.request.method == "GET"
-    ) as response_info:
-        page.goto(OVERVIEW_URL, wait_until="domcontentloaded")
-    response = response_info.value
-    if not response.ok:
-        raise RuntimeError(f"Overview API returned status {response.status}")
-
-    payload = response.json()
+def fetch_available_money(session: requests.Session) -> float:
+    """Fetch the "Available for investment" balance (`availableMoney`, EUR -
+    see module docstring)."""
+    r = session.get(OVERVIEW_API_URL, headers=_HEADERS, timeout=20)
+    r.raise_for_status()
+    payload = r.json() or {}
     try:
         available_money = float(payload.get("availableMoney"))
     except (TypeError, ValueError):
@@ -212,36 +160,20 @@ def fetch_available_money(page) -> float:
     return available_money
 
 
-def run(headless: bool = True) -> None:
+def run() -> None:
     if not PEERBERRY_EMAIL or not PEERBERRY_PASSWORD:
         log.error("PEERBERRY_EMAIL and PEERBERRY_PASSWORD environment variables are required.")
         sys.exit(1)
 
-    log.info("Starting PeerBerry monitor run (headless=%s, storage_state_exists=%s).", headless, STORAGE_STATE_FILE.exists())
+    log.info("Starting PeerBerry monitor run (pure HTTP, no browser).")
 
-    with sync_playwright() as p:
-        browser = p.chromium.launch(headless=headless)
-        storage_state = str(STORAGE_STATE_FILE) if STORAGE_STATE_FILE.exists() else None
-        context = browser.new_context(
-            storage_state=storage_state,
-            locale="en-US",
-            **get_context_options(),
-        )
-        apply_stealth(context)
-        page = context.new_page()
-
-        try:
-            login(page)
-            available_money = fetch_available_money(page)
-        except Exception:
-            log.exception("Failed to log in or fetch the available-for-investment balance.")
-            browser.close()
-            sys.exit(1)
-
-        # Persist cookies/local storage so the next run can skip login (and
-        # 2FA) while the session remains valid.
-        context.storage_state(path=str(STORAGE_STATE_FILE))
-        browser.close()
+    session = requests.Session()
+    try:
+        login(session)
+        available_money = fetch_available_money(session)
+    except Exception:
+        log.exception("Failed to log in or fetch the available-for-investment balance.")
+        sys.exit(1)
 
     log.info("Available for investment: %.2f EUR", available_money)
 
@@ -270,6 +202,4 @@ def run(headless: bool = True) -> None:
 
 
 if __name__ == "__main__":
-    # Set headless=False locally (e.g. via `python peerberry_monitor.py --show`)
-    # to watch the browser and debug the login flow if selectors need adjusting.
-    run(headless="--show" not in sys.argv)
+    run()

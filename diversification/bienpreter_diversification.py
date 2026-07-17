@@ -11,44 +11,62 @@ sums them, and hands the single total to fill_current_month_amounts() (see
 google_sheet.py) - no per-originator dict, just one number, no email sent
 either.
 
-Login form verified against the real page on 2026-07-09: a textbox with
-accessible name "Email*", a textbox with accessible name "Mot de passe*",
-and a "Se connecter" button (French locale is forced via the browser
-context - the same page renders in English, with a "Login" button instead,
-if the browser's locale isn't French). No 2FA/TOTP step was observed.
+REWRITTEN 2026-07-17 to use plain `requests` instead of Playwright (no
+browser at all), same technique as bricks_diversification.py /
+goandgrow_diversification.py - much faster in GitHub Actions (no Chromium
+download/launch). Verified live: Bienpreter is a plain Symfony
+(server-rendered) site with NO Cloudflare/bot-protection at all on the
+login form or the dashboard/operations pages - a vanilla `requests.Session()`
+sails through with zero issues, no cookie-seeding/storage_state workaround
+needed like Bricks briefly required.
 
-The dashboard's markup was inspected end-to-end against the real account
-on 2026-07-09, so `fetch_balances()` uses precise structural selectors
-rather than a generic heuristic:
+Login mechanism (Symfony CSRF-protected form, verified 2026-07-17):
+`GET https://www.bienpreter.com/connexion` returns an HTML form (name=
+"user_login", method="post", NO `action` attribute - posts back to the same
+`/connexion` URL) with hidden inputs `_csrf_token` and `user_login[_token]`
+(both must be read fresh from that GET and POSTed back verbatim - they're
+per-session/per-request Symfony CSRF tokens, not static). POST fields:
+`user_login[email]`, `user_login[password]`, `user_login[remember_me]=1`,
+plus the two token fields above. A successful login response is a 200
+whose final URL (`requests` follows the redirect chain automatically) is
+`/u/tableau-de-bord` - the dashboard IS the login response body itself (no
+extra navigation needed), so `fetch_balances()` just parses that same
+response's HTML directly instead of a second GET. No 2FA/TOTP step exists
+on this account (confirmed in the original 2026-07-09 Playwright build
+too).
+
+The dashboard's markup was inspected end-to-end against the real account,
+so `fetch_balances()` uses precise regex patterns (mirroring the original
+Playwright DOM-scraping selectors) rather than a generic heuristic:
 - "Capital à recevoir" is a proper `<dl><dt>Capital à recevoir</dt><dd
-  class="number">1 220,00 €</dd></dl>` pair - found via the `<dt>` whose
-  text contains "recevoir", value read from its `nextElementSibling`
-  (`<dd>`).
-- "Solde disponible" is NOT a dt/dd pair - it's a `<p>Solde
-  disponible<br><span class="number big">955,25 €</span></p>` block found
-  via the `<p>` whose text starts with "solde disponible", value read from
-  the nested `<span>`.
-  Note: "955,25 €" (this exact balance) also appears twice more elsewhere
-  on the page with NO nearby label at all - once in the top nav ("Solde :
-  955,25 €") and once in a bare `<span class="number big">` - so a
-  generic "scan every currency-looking text node and guess by nearby
-  keyword" approach (as used in monefit_diversification.py) doesn't work
-  reliably here: the account-summary panel groups multiple unrelated
-  labeled values (Capital, Capital remboursé, Capital à recevoir, Intérêts
-  ...) together in one shared container, so a same-ancestor-mentions-the-
-  keyword heuristic matches multiple candidates ambiguously. Hence the
-  precise selectors above instead.
+  class="...">1 220,00 €</dd></dl>` pair - found via a regex anchored on
+  the `<dt>` text containing "recevoir", value from the following `<dd>`.
+- "Solde disponible" is a `<div class="useroffice-box"><p>Solde
+  disponible<br><span class="number big">955,25 €</span></p>...</div>`
+  block - found via a regex anchored on the `<p>` text starting with
+  "Solde disponible", value from the nested `<span>`.
+  Note: this exact balance value also appears elsewhere on the page with
+  no nearby label (top nav "Solde : ...", a bare `<span class="number
+  big">`) - a generic "scan every currency-looking string and guess by
+  nearby keyword" approach does NOT work reliably here (the account-
+  summary panel groups several different labeled values - Capital,
+  Capital remboursé, Capital à recevoir, Intérêts bruts/nets... - inside
+  one shared container, so several candidates' surrounding text
+  legitimately contains unrelated keywords). Hence the precise anchored
+  regexes above instead.
 
-Also fetches this calendar month's interest received (like
-loanch_diversification.fetch_current_month_statement_totals() /
-swaper_diversification.fetch_current_month_interest_received() /
-afranga_diversification.fetch_current_month_statement_totals()) from the
-"Toutes mes opérations" page (https://www.bienpreter.com/u/operations) -
-see fetch_current_month_interest_totals() below for exactly how gross/net/
+Also fetches this calendar month's interest received (like every other
+*_diversification.py's equivalent) from the "Toutes mes opérations" page
+(https://www.bienpreter.com/u/operations) - see
+fetch_current_month_interest_totals() below for exactly how gross/net/
 withholding tax are obtained (Bienpreter has no single labeled "net
-interest" figure anywhere, unlike Afranga/Loanch/Swaper, so this is
-reconstructed from NET = GROSS - TAX using two real figures read off the
-page, not a guessed/configured flat tax rate).
+interest" figure anywhere, so this is reconstructed from NET = GROSS - TAX
+using two real figures read off the page, not a guessed/configured flat
+tax rate). Verified this page is ALSO plain server-rendered HTML reachable
+via a normal `session.get(...)` with the same date-range/page query params
+used in the original Playwright build - same row markup
+(`.transaction__name`/`.transaction__amount`/`.transaction__interests`),
+same "one placeholder row on out-of-range pages" pagination quirk.
 
 Required env vars:
     BIENPRETER_EMAIL, BIENPRETER_PASSWORD -> Bienpreter account credentials
@@ -63,10 +81,8 @@ import re
 import os
 import sys
 import logging
-from datetime import datetime
-from pathlib import Path
-from zoneinfo import ZoneInfo
 
+import requests
 from dotenv import load_dotenv
 
 from shared.google_sheet import fill_current_month_amounts, fill_current_month_bonus_breakdown
@@ -74,17 +90,13 @@ from shared.report_date import get_report_now
 
 load_dotenv()
 
-from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
-
-from shared.browser_stealth import get_context_options, apply_stealth, human_pause, human_mouse_wander, human_type
+from zoneinfo import ZoneInfo
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger("bienpreter_diversification")
 
 LOGIN_URL = "https://www.bienpreter.com/connexion"
-DASHBOARD_URL = "https://www.bienpreter.com/u/tableau-de-bord"
 OPERATIONS_URL = "https://www.bienpreter.com/u/operations"
-STORAGE_STATE_FILE = Path(__file__).parent / "bienpreter_diversification_storage_state.json"
 MAX_OPERATIONS_PAGES = 300  # safety cap against an infinite loop if pagination ever misbehaves
 # Bienpreter is a French platform; "this month" below means the current
 # calendar month up to TODAY (1st of the month through today, NOT the full
@@ -96,54 +108,44 @@ REPORT_TIMEZONE = ZoneInfo("Europe/Paris")
 BIENPRETER_EMAIL = os.environ.get("BIENPRETER_EMAIL")
 BIENPRETER_PASSWORD = os.environ.get("BIENPRETER_PASSWORD")
 
-
-def dismiss_cookie_banner(page) -> None:
-    """Dismiss a cookie consent dialog if one shows up (defensive - none
-    was observed while building this, but kept for safety/consistency with
-    the other *_diversification.py scripts)."""
-    for label in ["Accepter", "Tout accepter", "Accepter et fermer"]:
-        try:
-            page.get_by_role("button", name=label).click(timeout=3000)
-            return
-        except PlaywrightTimeoutError:
-            continue
+_HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
 
 
-def login(page) -> None:
-    """Log in to Bienpreter using BIENPRETER_EMAIL/BIENPRETER_PASSWORD.
+def login(session: requests.Session) -> str:
+    """Log in to Bienpreter using BIENPRETER_EMAIL/BIENPRETER_PASSWORD via
+    a plain HTTP POST (no browser). Returns the dashboard HTML (the login
+    response's body IS the dashboard page - see module docstring).
 
-    Selectors verified against the real login form on 2026-07-09 (French
-    locale): a textbox with accessible name "Email*", a textbox with
-    accessible name "Mot de passe*", and a "Se connecter" button. No 2FA
-    step was observed.
+    Raises RuntimeError if the login form's CSRF tokens can't be found, or
+    if the post-login response doesn't land on /u/tableau-de-bord (wrong
+    credentials show the same /connexion form again with an error banner).
     """
-    log.info("Navigating to login page...")
-    page.goto(LOGIN_URL, wait_until="domcontentloaded")
-    dismiss_cookie_banner(page)
-    human_mouse_wander(page)
+    log.info("GET %s (fetching login form + CSRF tokens)...", LOGIN_URL)
+    r = session.get(LOGIN_URL, timeout=30)
+    log.info("GET login page: status=%s", r.status_code)
+    r.raise_for_status()
 
-    # If a previous session was restored (see STORAGE_STATE_FILE) and is
-    # still valid, Bienpreter redirects away from /connexion immediately -
-    # nothing else to do.
-    page.wait_for_timeout(1000)
-    if "/connexion" not in page.url:
-        log.info("Reused a previous session, already logged in at %s", page.url)
-        return
+    csrf_match = re.search(r'name="_csrf_token" value="([^"]*)"', r.text)
+    token_match = re.search(r'name="user_login\[_token\]" value="([^"]*)"', r.text)
+    if not csrf_match or not token_match:
+        raise RuntimeError("Could not find Bienpreter login CSRF tokens on the /connexion page.")
 
-    log.info("Filling in credentials...")
-    human_type(page.get_by_role("textbox", name="Email*"), BIENPRETER_EMAIL)
-    human_pause()
-    human_type(page.get_by_role("textbox", name="Mot de passe*"), BIENPRETER_PASSWORD)
-    human_pause()
-    page.get_by_role("button", name="Se connecter").click()
+    payload = {
+        "user_login[email]": BIENPRETER_EMAIL,
+        "user_login[password]": BIENPRETER_PASSWORD,
+        "user_login[remember_me]": "1",
+        "_csrf_token": csrf_match.group(1),
+        "user_login[_token]": token_match.group(1),
+    }
+    log.info("POST %s (submitting credentials)...", LOGIN_URL)
+    r2 = session.post(LOGIN_URL, data=payload, timeout=30)
+    log.info("POST login: status=%s, final_url=%s", r2.status_code, r2.url)
+    r2.raise_for_status()
 
-    for _ in range(40):
-        if "/connexion" not in page.url:
-            break
-        page.wait_for_timeout(500)
-    else:
-        raise RuntimeError(f"Still on the login page after submitting credentials: {page.url}")
-    log.info("Logged in successfully, current URL: %s", page.url)
+    if "/u/tableau-de-bord" not in r2.url:
+        raise RuntimeError(f"Login did not reach the dashboard (still on {r2.url}) - check credentials.")
+    log.info("Logged in successfully.")
+    return r2.text
 
 
 def _parse_amount(text: str):
@@ -153,7 +155,7 @@ def _parse_amount(text: str):
     other (or repeats of it) as thousands separators."""
     if not text:
         return None
-    cleaned = text.replace("\xa0", " ").strip()
+    cleaned = text.replace("\xa0", " ").replace("&nbsp;", " ").strip()
     cleaned = re.sub(r"[^\d.,\s-]", "", cleaned).replace(" ", "")
     if not cleaned:
         return None
@@ -177,141 +179,84 @@ def _parse_amount(text: str):
         return None
 
 
-def _extract_amounts(page) -> dict:
-    """Read "Solde disponible" and "Capital à recevoir" off the dashboard
-    via the precise selectors verified on 2026-07-09 (see module
-    docstring). Returns the raw (unparsed) text of each, or None if not
-    found."""
-    return page.evaluate(
-        """
-        () => {
-            const norm = (s) => (s || '').replace(/\\s+/g, ' ').trim().toLowerCase();
+def _strip_tags(html_fragment: str) -> str:
+    return re.sub(r"\s+", " ", re.sub(r"<[^>]*>", "", html_fragment or "")).strip()
 
-            let soldeDisponible = null;
-            const soldeP = Array.from(document.querySelectorAll('p')).find((p) => norm(p.textContent).startsWith('solde disponible'));
-            if (soldeP) {
-                const span = soldeP.querySelector('span');
-                soldeDisponible = span ? span.textContent.trim() : null;
-            }
 
-            let capitalARecevoir = null;
-            const dt = Array.from(document.querySelectorAll('dt')).find((d) => norm(d.textContent).includes('recevoir'));
-            if (dt && dt.nextElementSibling) {
-                capitalARecevoir = dt.nextElementSibling.textContent.trim();
-            }
-
-            return { soldeDisponible, capitalARecevoir };
-        }
-        """
+def fetch_balances(dashboard_html: str) -> dict:
+    """Parse "solde disponible" and "capital à recevoir" out of the
+    dashboard HTML (the login() response body), returning both as floats.
+    See module docstring for the verified regex anchors."""
+    solde_match = re.search(
+        r"Solde disponible.*?<span[^>]*>(.*?)</span>", dashboard_html, re.DOTALL | re.IGNORECASE
+    )
+    recevoir_match = re.search(
+        r"<dt>[^<]*[Rr]ecevoir</dt>\s*<dd[^>]*>(.*?)</dd>", dashboard_html, re.DOTALL
     )
 
-
-def fetch_balances(page) -> dict:
-    """Navigate to the dashboard and read "solde disponible" and "capital
-    à recevoir", returning both as floats. See module docstring for the
-    verified selectors."""
-    page.goto(DASHBOARD_URL, wait_until="domcontentloaded")
-    page.wait_for_timeout(2000)  # let the SPA render the dashboard widgets
-
-    raw = _extract_amounts(page)
-    log.info("Raw values read from the dashboard: %r", raw)
-
-    if not raw.get("soldeDisponible"):
+    if not solde_match:
         raise RuntimeError("Could not find 'Solde disponible' on the Bienpreter dashboard.")
-    if not raw.get("capitalARecevoir"):
+    if not recevoir_match:
         raise RuntimeError("Could not find 'Capital à recevoir' on the Bienpreter dashboard.")
 
-    available_balance = _parse_amount(raw["soldeDisponible"])
-    capital_to_receive = _parse_amount(raw["capitalARecevoir"])
+    raw_solde = _strip_tags(solde_match.group(1))
+    raw_recevoir = _strip_tags(recevoir_match.group(1))
+    log.info("Raw values found on the dashboard: solde=%r, capital_a_recevoir=%r", raw_solde, raw_recevoir)
+
+    available_balance = _parse_amount(raw_solde)
+    capital_to_receive = _parse_amount(raw_recevoir)
     if available_balance is None:
-        raise RuntimeError(f"Could not parse 'Solde disponible' out of {raw['soldeDisponible']!r}.")
+        raise RuntimeError(f"Could not parse 'Solde disponible' out of {raw_solde!r}.")
     if capital_to_receive is None:
-        raise RuntimeError(f"Could not parse 'Capital à recevoir' out of {raw['capitalARecevoir']!r}.")
+        raise RuntimeError(f"Could not parse 'Capital à recevoir' out of {raw_recevoir!r}.")
 
     return {"available_balance": available_balance, "capital_to_receive": capital_to_receive}
 
 
-def _fetch_operations_page(page, start_date: str, end_date: str, page_number: int) -> list:
-    """Fetch one page of https://www.bienpreter.com/u/operations (a
-    server-rendered, non-JSON page - there is no JSON API here, unlike
-    Loanch/Swaper/Afranga's statement endpoints) filtered to the given
-    date range (`startDate`/`endDate` query params, "yyyy-mm-dd", verified
-    against the real account on 2026-07-10 to correctly narrow the
-    "X résultats au total" count), and extract each transaction row.
-
-    Verified table markup on 2026-07-10: each `<tr>` has a
-    `.transaction__name` label (e.g. "Remboursement mensuel", "Prélèvements
-    fiscaux") and a `.transaction__amount` (the total booked amount, e.g.
-    "0,13 €" or "-1,43 €"). Crucially, "Remboursement mensuel" rows also
-    contain one `.transaction__interests` span PER underlying project
-    (e.g. "0,13 €") giving the INTEREST-ONLY portion of that repayment,
-    separate from the row's total amount - this matters because Bienpreter
-    loans are "In Fine" (capital is repaid entirely at the loan's closing
-    date, interest paid periodically before that) and a row's total
-    `.transaction__amount` would silently include the bundled capital
-    for any loan reaching maturity within the reporting window otherwise.
-    Some rows bundle several projects repaid together on the same day
-    (e.g. one row can list 3 different "Noces d'or - Facture ..." project
-    links) - each has its own `.transaction__interests` span, so all of
-    them are summed, not just the first.
-    """
+def _fetch_operations_page(session: requests.Session, start_date: str, end_date: str, page_number: int) -> list:
+    """Fetch one page of https://www.bienpreter.com/u/operations (plain
+    server-rendered HTML, no JSON API) filtered to the given date range,
+    and extract each transaction row. See module docstring for the
+    verified row markup (`.transaction__name`/`.transaction__amount`/
+    `.transaction__interests`)."""
     url = f"{OPERATIONS_URL}?selected-tab=1&startDate={start_date}&endDate={end_date}&page={page_number}"
-    log.info("Requesting operations page %d for %s to %s...", page_number, start_date, end_date)
-    page.goto(url, wait_until="domcontentloaded")
-    page.wait_for_timeout(1500)
+    log.info("GET operations page %d for %s to %s...", page_number, start_date, end_date)
+    r = session.get(url, timeout=30)
+    log.info("GET operations page %d: status=%s", page_number, r.status_code)
+    r.raise_for_status()
 
-    return page.evaluate(
-        """
-        () => {
-            const rows = Array.from(document.querySelectorAll('table tbody tr'));
-            return rows.map((tr) => {
-                const nameEl = tr.querySelector('.transaction__name');
-                const amountEl = tr.querySelector('.transaction__amount');
-                const interestEls = Array.from(tr.querySelectorAll('.transaction__interests'));
-                return {
-                    label: nameEl ? nameEl.textContent.replace(/\\s+/g, ' ').trim() : null,
-                    amountText: amountEl ? amountEl.textContent.trim() : null,
-                    interestTexts: interestEls.map((e) => e.textContent.trim()),
-                };
-            });
-        }
-        """
-    )
+    rows_html = re.findall(r"<tr[^>]*>.*?</tr>", r.text, re.DOTALL)
+    rows = []
+    for row_html in rows_html:
+        name_match = re.search(r'transaction__name">(.*?)</p>', row_html, re.DOTALL)
+        amount_match = re.search(r'transaction__amount[^"]*">(.*?)</', row_html, re.DOTALL)
+        interest_matches = re.findall(r'transaction__interests[^"]*">(.*?)</', row_html, re.DOTALL)
+        rows.append(
+            {
+                "label": _strip_tags(name_match.group(1)) if name_match else None,
+                "amountText": _strip_tags(amount_match.group(1)) if amount_match else None,
+                "interestTexts": [_strip_tags(t) for t in interest_matches],
+            }
+        )
+    return rows
 
 
-def fetch_current_month_interest_totals(page) -> dict:
+def fetch_current_month_interest_totals(session: requests.Session) -> dict:
     """Fetch this calendar month's interest received, split into net/gross/
-    withholding tax, from the "Toutes mes opérations" page
-    (https://www.bienpreter.com/u/operations) - Bienpreter has no single
-    page/endpoint exposing a ready-made "gross interest received" figure
-    like Loanch/Swaper/Afranga do, so this reconstructs it from two real
-    (not estimated/guessed) figures read off the page:
-
-    - `gross_interest_received`: sum of every `.transaction__interests`
-      value found across all "Remboursement mensuel" (and any other) rows
-      in the date range - the interest-only portion of each repayment,
-      immune to the capital-at-maturity contamination risk described in
-      `_fetch_operations_page()`'s docstring. CONFIRMED 2026-07-12 (by the
-      user, against their real account) that this figure is the GROSS
-      amount, i.e. BEFORE withholding tax - it was originally mislabeled
-      "net" here, which silently double-counted tax in the "gross" total
-      below.
-    - `withholding_tax`: sum of the (absolute) `.transaction__amount` of
-      every row labeled "Prélèvements fiscaux" (covers both "Prélèvements
-      sociaux" and "Impôts sur le revenu" sub-lines, verified 2026-07-10:
-      -1,43 € and -0,98 € respectively) - the actual tax withheld at
-      source on interest income, always negative/deducted.
-    - `net_interest_received` = gross_interest_received - withholding_tax
-      (interest income tax is only ever withheld on interest, never on
-      capital, so this identity holds regardless of any capital bundled
-      into a "Remboursement mensuel" row's total amount).
+    withholding tax, from the "Toutes mes opérations" page. See module
+    docstring / historical Playwright-version docstring (kept in repo
+    memory) for the full reasoning behind reconstructing gross/net from
+    `.transaction__interests` + "Prélèvements fiscaux" rows instead of
+    `.transaction__amount` directly (Bienpreter loans are "In Fine" -
+    capital bundled into a repayment row's total would otherwise
+    contaminate the interest figure).
 
     Paginates via the `page` query param, stopping once a page returns no
-    rows (bounded by MAX_OPERATIONS_PAGES as a safety net). Uses
-    REPORT_TIMEZONE (Europe/Paris) to decide "this month" (1st of the
-    current month through TODAY, not the full month - same semantics as
-    Swaper's "This Month" / Afranga's "Current Month" quick filters)
-    rather than the executing machine's local clock.
+    real rows (bounded by MAX_OPERATIONS_PAGES as a safety net; out-of-
+    range pages render exactly one placeholder row with no `.transaction__name`,
+    filtered out before checking emptiness). Uses REPORT_TIMEZONE
+    (Europe/Paris) to decide "this month" (1st of the current month
+    through TODAY, not the full month).
     """
     now = get_report_now(REPORT_TIMEZONE)
     start_date = now.replace(day=1).strftime("%Y-%m-%d")
@@ -321,16 +266,9 @@ def fetch_current_month_interest_totals(page) -> dict:
     withholding_tax = 0.0
 
     for page_number in range(1, MAX_OPERATIONS_PAGES + 1):
-        rows = _fetch_operations_page(page, start_date, end_date, page_number)
-        # BUG FOUND 2026-07-10: out-of-range pages don't return a genuinely
-        # empty <tbody> - they render one placeholder <tr> with no
-        # .transaction__name/.transaction__amount at all (label=None,
-        # amountText=None, interestTexts=[]). Filter those out before
-        # deciding a page is "empty" - otherwise `if not rows: break` never
-        # fires (len is 1, not 0) and every run used to waste ~47 extra
-        # requests hitting MAX_OPERATIONS_PAGES every single time.
+        rows = _fetch_operations_page(session, start_date, end_date, page_number)
         rows = [r for r in rows if r.get("label")]
-        log.info("Operations page %d: %d real row(s) found (placeholder rows filtered out).", page_number, len(rows))
+        log.info("Operations page %d: %d real row(s) found.", page_number, len(rows))
         if not rows:
             break
 
@@ -358,43 +296,29 @@ def fetch_current_month_interest_totals(page) -> dict:
     }
 
 
-def run(headless: bool = True) -> None:
+def run() -> None:
     if not BIENPRETER_EMAIL or not BIENPRETER_PASSWORD:
         log.error("BIENPRETER_EMAIL and BIENPRETER_PASSWORD environment variables are required.")
         sys.exit(1)
 
-    log.info("Starting Bienpreter diversification run (headless=%s, storage_state_exists=%s).", headless, STORAGE_STATE_FILE.exists())
+    log.info("Starting Bienpreter diversification run (pure HTTP, no browser).")
 
-    with sync_playwright() as p:
-        browser = p.chromium.launch(headless=headless)
-        storage_state = str(STORAGE_STATE_FILE) if STORAGE_STATE_FILE.exists() else None
-        context = browser.new_context(
-            storage_state=storage_state,
-            locale="fr-FR",
-            **get_context_options(),
-        )
-        apply_stealth(context, languages="['fr-FR', 'fr']")
-        page = context.new_page()
+    session = requests.Session()
+    session.headers.update(_HEADERS)
 
-        try:
-            login(page)
-            balances = fetch_balances(page)
-        except Exception:
-            log.exception("Failed to log in or fetch Bienpreter balances.")
-            browser.close()
-            sys.exit(1)
+    try:
+        dashboard_html = login(session)
+        balances = fetch_balances(dashboard_html)
+    except Exception:
+        log.exception("Failed to log in or fetch Bienpreter balances.")
+        sys.exit(1)
 
-        try:
-            log.info("Fetching this month's interest totals from the operations page...")
-            interest_totals = fetch_current_month_interest_totals(page)
-        except Exception:
-            log.exception("Failed to fetch this month's interest totals - defaulting all figures to 0.0.")
-            interest_totals = {"net_interest_received": 0.0, "withholding_tax": 0.0, "gross_interest_received": 0.0}
-
-        # Persist cookies/local storage so the next run can skip login
-        # while the session remains valid.
-        context.storage_state(path=str(STORAGE_STATE_FILE))
-        browser.close()
+    try:
+        log.info("Fetching this month's interest totals from the operations page...")
+        interest_totals = fetch_current_month_interest_totals(session)
+    except Exception:
+        log.exception("Failed to fetch this month's interest totals - defaulting all figures to 0.0.")
+        interest_totals = {"net_interest_received": 0.0, "withholding_tax": 0.0, "gross_interest_received": 0.0}
 
     total = balances["available_balance"] + balances["capital_to_receive"]
     interest_totals["total"] = total
@@ -436,6 +360,4 @@ def run(headless: bool = True) -> None:
 
 
 if __name__ == "__main__":
-    # Set headless=False locally (e.g. via `python bienpreter_diversification.py --show`)
-    # to watch the browser and debug the login flow if selectors need adjusting.
-    run(headless="--show" not in sys.argv)
+    run()

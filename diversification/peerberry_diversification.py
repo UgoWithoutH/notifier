@@ -1,33 +1,26 @@
 """PeerBerry portfolio "distribution by loan originators" fetcher.
 
-Logs into peerberry.com by reusing monitors.peerberry_monitor.login() (not
-duplicated here - same dependency direction as swaper/lendermarket:
-login()/handle_two_factor()/dismiss_cookie_banner() live in the monitor
-module, which has no google_sheet dependency, and this module imports from
-it, not the other way around) and fetches the per-loan-originator investment
-breakdown that's shown on the Overview page
-under Investments > "Loan originators" (amount invested + % of the
-portfolio, one row per originator). No email is sent - the amounts are just
-logged and handed to fill_current_month_amounts() (see google_sheet.py) so
-they can be filled into a Google Sheet.
+Logs into peerberry.com via pure HTTP by reusing
+monitors.peerberry_monitor.login() (not duplicated here - same dependency
+direction as swaper/lendermarket: login() lives in the monitor module,
+which has no google_sheet dependency, and this module imports from it, not
+the other way around) and fetches the per-loan-originator investment
+breakdown that's shown on the Overview page under Investments > "Loan
+originators" (amount invested + % of the portfolio, one row per
+originator). No email is sent - the amounts are just logged and handed to
+fill_current_month_amounts() (see google_sheet.py) so they can be filled
+into a Google Sheet.
 
-The breakdown itself is NOT re-fetched via a dedicated API call when
-switching that dropdown on the site - it's already loaded once and only
-becomes visible via `GET https://api.peerberry.com/v1/investor/overview/originators`,
-which fires the first time that view is selected. Verified against the real
-account on 2026-07-09: response is a JSON array of
+`GET https://api.peerberry.com/v1/investor/overview/originators` (using the
+`access_token` returned by monitors.peerberry_monitor.login() as an
+`Authorization: Bearer` header, same as every other authenticated call).
+Verified against the real account on 2026-07-09 (and re-verified via pure
+HTTP on 2026-07-18): response is a JSON array of
 `{"originator": "Lendplus ZA", "originatorId": 56, "company": "Aventus Group",
-"companyId": 1, "iso2": "ZA", "amount": "1091.02", "part": "10.90"}`. This is
-called directly (via the browser's own `fetch()`, so it reuses the
-authenticated session) instead of clicking through the dropdown, using an
-`Authorization: Bearer <token>` header built from the `app_token` cookie set
-at login - a plain `credentials: 'include'` fetch gets rejected by CORS (the
-API's `Access-Control-Allow-Origin` is a wildcard, which browsers refuse to
-pair with credentialed requests).
+"companyId": 1, "iso2": "ZA", "amount": "1091.02", "part": "10.90"}`.
 
 Also fetches this calendar month's "Interest income" from the Account
-Summary page (https://peerberry.com/en/client/statement/account-summary) -
-see fetch_current_month_interest_income() below, same idea as
+Summary API - see fetch_current_month_interest_income() below, same idea as
 swaper_diversification.fetch_current_month_interest_received().
 
 Required env vars:
@@ -44,28 +37,22 @@ Optional:
 
 import sys
 import logging
-from datetime import datetime
-from pathlib import Path
 from zoneinfo import ZoneInfo
 
+import requests
 from dotenv import load_dotenv
 
 load_dotenv()
 
-from playwright.sync_api import sync_playwright
-
-from shared.browser_stealth import get_context_options, apply_stealth
 from shared.google_sheet import fill_current_month_amounts, fill_geographic_repartition_amounts
 from shared.report_date import get_report_now
-from monitors.peerberry_monitor import login, PEERBERRY_EMAIL, PEERBERRY_PASSWORD
+from monitors.peerberry_monitor import login, PEERBERRY_EMAIL, PEERBERRY_PASSWORD, _HEADERS
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger("peerberry_diversification")
 
 ORIGINATORS_API_URL = "https://api.peerberry.com/v1/investor/overview/originators"
-STATEMENT_URL = "https://peerberry.com/en/client/statement/account-summary"
 ACCOUNT_SUMMARY_API_URL = "https://api.peerberry.com/v2/investor/account-summary"
-STORAGE_STATE_FILE = Path(__file__).parent / "peerberry_diversification_storage_state.json"
 # The Account Summary page's default "This month" period (verified 2026-07-10
 # by capturing its own request) = 1st of the current month through TODAY, not
 # the full calendar month - same semantics as Swaper/Afranga/Lendermarket's
@@ -74,34 +61,16 @@ STORAGE_STATE_FILE = Path(__file__).parent / "peerberry_diversification_storage_
 REPORT_TIMEZONE = ZoneInfo("Europe/Paris")
 
 
-def fetch_originator_distribution(page) -> list:
+def fetch_originator_distribution(session: requests.Session) -> list:
     """Fetch the per-loan-originator investment breakdown via PeerBerry's own
-    API, using the `app_token` JWT cookie set at login as a bearer token
-    (see module docstring for why a plain cookie-based fetch doesn't work).
-    """
+    API (see module docstring)."""
     log.info("Requesting originators API...")
-    result = page.evaluate(
-        """
-        async (url) => {
-            const match = document.cookie.match(/(?:^|; )app_token=([^;]+)/);
-            const token = match ? decodeURIComponent(match[1]) : null;
-            if (!token) {
-                return { ok: false, status: 0, body: null, error: 'app_token cookie not found' };
-            }
-            const res = await fetch(url, { headers: { Authorization: 'Bearer ' + token } });
-            return { ok: res.ok, status: res.status, body: await res.json().catch(() => null) };
-        }
-        """,
-        ORIGINATORS_API_URL,
-    )
+    r = session.get(ORIGINATORS_API_URL, headers=_HEADERS, timeout=20)
+    log.info("Originators API response: status=%s", r.status_code)
+    if not r.ok:
+        raise RuntimeError(f"Originators API request failed (status={r.status_code})")
 
-    log.info("Originators API response: ok=%s status=%s", result.get("ok"), result.get("status"))
-    if not result.get("ok"):
-        raise RuntimeError(
-            f"Originators API request failed (status={result.get('status')}, error={result.get('error')})"
-        )
-
-    body = result.get("body") or []
+    body = r.json() or []
     log.info("Originators API returned %d raw entry(ies).", len(body))
     return body
 
@@ -133,51 +102,37 @@ def normalize_originators(payload: list) -> list:
     return originators
 
 
-def fetch_current_month_interest_income(page) -> float:
+def fetch_current_month_interest_income(session: requests.Session) -> float:
     """Fetch this calendar month's "Interest income" total, as shown on the
     Account Summary page (https://peerberry.com/en/client/statement/account-summary).
 
-    Verified against the real account on 2026-07-10: the page's default
-    "This month" period (opening date = 1st of the current month, closing
-    date = today) triggers `GET
+    Verified against the real account on 2026-07-10 (and re-verified via
+    pure HTTP on 2026-07-18): the page's default "This month" period
+    (opening date = 1st of the current month, closing date = today)
+    triggers `GET
     https://api.peerberry.com/v2/investor/account-summary?period=&startDate=<1st>&endDate=<today>`,
     returning `{"openingBalance": "6.20", "closingBalance": "0.98",
     "operations": {"DEPOSIT": "5000.00", "INVESTMENT": "-6578.71",
     "INTEREST": "9.88", "PRINCIPAL": "1563.61"}}` - `operations.INTEREST`
     matched the page's displayed "Interest income +€9.88" exactly (matches
-    the user-supplied reference value). Like the originators endpoint (see
-    module docstring), this is on api.peerberry.com so it needs the
-    `app_token` cookie sent as an `Authorization: Bearer` header (a plain
-    `credentials: 'include'` fetch fails CORS).
+    the user-supplied reference value).
     """
     now = get_report_now(REPORT_TIMEZONE)
     start_date = now.replace(day=1).strftime("%Y-%m-%d")
     end_date = now.strftime("%Y-%m-%d")
     log.info("Requesting account-summary API for %s to %s...", start_date, end_date)
 
-    result = page.evaluate(
-        """
-        async ([url, startDate, endDate]) => {
-            const match = document.cookie.match(/(?:^|; )app_token=([^;]+)/);
-            const token = match ? decodeURIComponent(match[1]) : null;
-            if (!token) {
-                return { ok: false, status: 0, body: null, error: 'app_token cookie not found' };
-            }
-            const qs = new URLSearchParams({ period: '', startDate, endDate }).toString();
-            const res = await fetch(`${url}?${qs}`, { headers: { Authorization: 'Bearer ' + token } });
-            return { ok: res.ok, status: res.status, body: await res.json().catch(() => null) };
-        }
-        """,
-        [ACCOUNT_SUMMARY_API_URL, start_date, end_date],
+    r = session.get(
+        ACCOUNT_SUMMARY_API_URL,
+        params={"period": "", "startDate": start_date, "endDate": end_date},
+        headers=_HEADERS,
+        timeout=20,
     )
+    log.info("Account summary API response: status=%s", r.status_code)
+    if not r.ok:
+        raise RuntimeError(f"Account summary API request failed (status={r.status_code})")
 
-    log.info("Account summary API response: ok=%s status=%s", result.get("ok"), result.get("status"))
-    if not result.get("ok"):
-        raise RuntimeError(
-            f"Account summary API request failed (status={result.get('status')}, error={result.get('error')})"
-        )
-
-    operations = (result.get("body") or {}).get("operations") or {}
+    operations = (r.json() or {}).get("operations") or {}
     log.info("Raw 'operations' block from the account summary API: %r", operations)
     try:
         interest_income = float(operations.get("INTEREST") or 0.0)
@@ -189,44 +144,26 @@ def fetch_current_month_interest_income(page) -> float:
     return interest_income
 
 
-def run(headless: bool = True) -> None:
+def run() -> None:
     if not PEERBERRY_EMAIL or not PEERBERRY_PASSWORD:
         log.error("PEERBERRY_EMAIL and PEERBERRY_PASSWORD environment variables are required.")
         sys.exit(1)
 
-    log.info("Starting PeerBerry diversification run (headless=%s, storage_state_exists=%s).", headless, STORAGE_STATE_FILE.exists())
+    log.info("Starting PeerBerry diversification run (pure HTTP, no browser).")
 
-    with sync_playwright() as p:
-        browser = p.chromium.launch(headless=headless)
-        storage_state = str(STORAGE_STATE_FILE) if STORAGE_STATE_FILE.exists() else None
-        context = browser.new_context(
-            storage_state=storage_state,
-            locale="en-US",
-            **get_context_options(),
-        )
-        apply_stealth(context)
-        page = context.new_page()
+    session = requests.Session()
+    try:
+        login(session)
+        payload = fetch_originator_distribution(session)
+    except Exception:
+        log.exception("Failed to log in or fetch the loan originator distribution.")
+        sys.exit(1)
 
-        try:
-            login(page)
-            payload = fetch_originator_distribution(page)
-        except Exception:
-            log.exception("Failed to log in or fetch the loan originator distribution.")
-            browser.close()
-            sys.exit(1)
-
-        try:
-            log.info("Navigating to the account summary page to fetch this month's Interest income...")
-            page.goto(STATEMENT_URL, wait_until="domcontentloaded")
-            interest_income = fetch_current_month_interest_income(page)
-        except Exception:
-            log.exception("Failed to fetch this month's Interest income - defaulting to 0.0.")
-            interest_income = 0.0
-
-        # Persist cookies/local storage so the next run can skip login (and
-        # 2FA) while the session remains valid.
-        context.storage_state(path=str(STORAGE_STATE_FILE))
-        browser.close()
+    try:
+        interest_income = fetch_current_month_interest_income(session)
+    except Exception:
+        log.exception("Failed to fetch this month's Interest income - defaulting to 0.0.")
+        interest_income = 0.0
 
     originators = normalize_originators(payload)
     log.info("Fetched distribution for %d loan originator(s).", len(originators))
@@ -268,6 +205,4 @@ def run(headless: bool = True) -> None:
 
 
 if __name__ == "__main__":
-    # Set headless=False locally (e.g. via `python peerberry_monitor.py --show`)
-    # to watch the browser and debug the login flow if selectors need adjusting.
-    run(headless="--show" not in sys.argv)
+    run()
