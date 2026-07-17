@@ -99,12 +99,26 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(me
 log = logging.getLogger("loanch_diversification")
 
 LOGIN_PAGE_URL = "https://loanch.com/fr/login"
-# GUESS - UNVERIFIED (see module docstring): modeled after this same API's
-# /api/v1/... versioned path convention (confirmed real for the data
-# endpoints below) and this codebase's other two-step email+password ->
-# TOTP platforms (Lendermarket/PeerBerry). Adjust once a real network
-# capture is available.
-API_LOGIN_URL = "https://api.loanch.com/api/v1/auth/login"
+# GUESS - UNVERIFIED (see module docstring): loanch.com is blocked by a
+# corporate proxy on every machine available for local testing, so the
+# only way left to find the real login endpoint is to iterate from real
+# GitHub Actions run logs instead of a live network capture. login() below
+# tries each of these candidates in order (skipping ones that 404) and
+# logs the status/body of the first one that ISN'T a 404 - whatever shows
+# up in the next run's log narrows down (or confirms) the real endpoint.
+# CONFIRMED WRONG (404, GitHub Actions run 2026-07-17): .../auth/login.
+# Once the real one is confirmed working, delete this list/loop and
+# hardcode just that URL + payload shape.
+API_LOGIN_URL_CANDIDATES = [
+    "https://api.loanch.com/api/v1/auth/login",  # CONFIRMED WRONG (404, 2026-07-17)
+    "https://api.loanch.com/api/v1/login",
+    "https://api.loanch.com/api/v1/login/",
+    "https://api.loanch.com/api/v1/token",
+    "https://api.loanch.com/api/v1/token/",
+    "https://api.loanch.com/api/v1/auth/token",
+    "https://api.loanch.com/api/v1/users/login",
+    "https://api.loanch.com/api/v1/account/login",
+]
 API_2FA_URL = "https://api.loanch.com/api/v1/auth/verify-otp"
 INVESTMENTS_API_URL = "https://api.loanch.com/api/v1/investments"
 STATEMENT_API_URL = "https://api.loanch.com/api/v1/statement-report"
@@ -140,18 +154,42 @@ def login(session: requests.Session) -> None:
     if not LOANCH_EMAIL or not LOANCH_PASSWORD:
         raise RuntimeError("LOANCH_EMAIL/LOANCH_PASSWORD environment variables are required.")
 
-    log.info("Submitting credentials to %s (GUESS - unverified endpoint, see module docstring)...", API_LOGIN_URL)
-    r = session.post(
-        API_LOGIN_URL,
-        json={"email": LOANCH_EMAIL, "password": LOANCH_PASSWORD},
-        headers=_HEADERS,
-        timeout=20,
+    log.info(
+        "Trying %d candidate login endpoint(s) in order (GUESS - unverified, see module docstring)...",
+        len(API_LOGIN_URL_CANDIDATES),
     )
+    r = None
+    attempts = []
+    for candidate_url in API_LOGIN_URL_CANDIDATES:
+        log.info("Trying login endpoint: %s", candidate_url)
+        resp = session.post(
+            candidate_url,
+            json={"email": LOANCH_EMAIL, "password": LOANCH_PASSWORD},
+            headers=_HEADERS,
+            timeout=20,
+        )
+        attempts.append((candidate_url, resp.status_code, resp.text[:300]))
+        if resp.status_code == 404:
+            log.info("-> 404 Not Found, trying the next candidate...")
+            continue
+        log.info("-> status=%s (not a 404 - this is likely the real endpoint)", resp.status_code)
+        r = resp
+        break
+
+    if r is None:
+        details = "\n".join(f"  {url} -> {status}: {body!r}" for url, status, body in attempts)
+        raise RuntimeError(
+            "Every candidate login URL returned 404. None of the guessed endpoints exist.\n"
+            f"Attempts:\n{details}\n"
+            "See the module docstring for how to get a real network capture and fix this."
+        )
+
     if not r.ok:
         raise RuntimeError(
-            f"Loanch login request failed (status={r.status_code}): {r.text[:500]}\n"
-            "This endpoint/payload shape is an unverified guess - see the module docstring "
-            "for how to get a real network capture and fix it."
+            f"Loanch login request to {r.url} failed (status={r.status_code}): {r.text[:500]}\n"
+            "This endpoint got past the 404 check, so it likely exists, but the payload/field "
+            "names may still be wrong - see the module docstring for how to get a real network "
+            "capture and fix it."
         )
     data = r.json() if r.content else {}
     log.info("Login response body (truncated): %r", str(data)[:300])

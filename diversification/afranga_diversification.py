@@ -75,6 +75,7 @@ import os
 import re
 import sys
 import logging
+import time
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
@@ -159,7 +160,17 @@ def login(session: requests.Session) -> None:
 
     log.info("2FA prompt detected, generating and submitting TOTP code...")
     token = _extract_csrf_token(r.text)
-    code = pyotp.TOTP(AFRANGA_TOTP_SECRET).now()
+    totp = pyotp.TOTP(AFRANGA_TOTP_SECRET)
+    # Guard against submitting a code right as its 30s window is about to
+    # roll over - the network round-trip can push the server-side check
+    # past the boundary and reject an otherwise-valid code (this exact
+    # failure shape - "still on the login page" with no other error - was
+    # seen in a real GitHub Actions run, matching a known rollover issue
+    # already worked around in swaper_monitor.py/lendermarket_monitor.py).
+    remaining = 30 - (int(time.time()) % 30)
+    if remaining < 5:
+        time.sleep(remaining + 1)
+    code = totp.now()
     r = session.post(
         TWO_FA_URL,
         data={"_token": token, "one_time_password": code},
@@ -169,7 +180,18 @@ def login(session: requests.Session) -> None:
     r.raise_for_status()
 
     if r.url.rstrip("/") == LOGIN_URL.rstrip("/"):
-        raise RuntimeError("Afranga rejected the TOTP code (still on the login page).")
+        log.info("TOTP code rejected (likely rolled over), retrying once with a fresh code...")
+        code = totp.now()
+        r = session.post(
+            TWO_FA_URL,
+            data={"_token": token, "one_time_password": code},
+            headers={**_HEADERS, "Referer": LOGIN_URL, "Origin": "https://afranga.com"},
+            timeout=20,
+        )
+        r.raise_for_status()
+        if r.url.rstrip("/") == LOGIN_URL.rstrip("/"):
+            raise RuntimeError("Afranga rejected the TOTP code (still on the login page).")
+
     log.info("Logged in successfully, current URL: %s", r.url)
 
 
