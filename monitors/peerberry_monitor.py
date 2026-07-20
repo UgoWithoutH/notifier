@@ -93,11 +93,18 @@ PEERBERRY_CRON_JOB_ID = os.environ.get("PEERBERRY_CRON_JOB_ID")
 MIN_AVAILABLE_TO_NOTIFY = 10.0
 
 _HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+    ),
     "Content-Type": "application/json",
-    "Accept": "application/json",
+    "Accept": "application/json, text/plain, */*",
+    "Accept-Language": "en-US,en;q=0.9",
     "Referer": "https://peerberry.com/",
     "Origin": "https://peerberry.com",
+    "Sec-Fetch-Site": "same-site",
+    "Sec-Fetch-Mode": "cors",
+    "Sec-Fetch-Dest": "empty",
 }
 
 
@@ -118,6 +125,21 @@ def login(session: requests.Session) -> str:
         headers=_HEADERS,
         timeout=20,
     )
+    if not r.ok:
+        # Diagnostic-only logging (no secrets) to help tell apart a genuine
+        # credential/API-shape problem from a bot-protection block (e.g. a
+        # Cloudflare/WAF HTML challenge page instead of the expected JSON) -
+        # same technique used to diagnose the Bricks/Lande Cloudflare blocks
+        # elsewhere in this repo. Body is truncated, never logs the request.
+        log.error(
+            "Login POST to %s failed: status=%s server=%s cf-ray=%s content-type=%s body_preview=%r",
+            LOGIN_URL,
+            r.status_code,
+            r.headers.get("Server"),
+            r.headers.get("CF-RAY"),
+            r.headers.get("Content-Type"),
+            r.text[:500],
+        )
     r.raise_for_status()
     data = r.json() or {}
 
