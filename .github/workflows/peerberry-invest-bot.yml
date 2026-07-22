@@ -1,0 +1,84 @@
+name: PeerBerry Invest Bot
+
+# Manual-only: triggered externally via cron-job.org
+# (POST /repos/{owner}/{repo}/actions/workflows/peerberry-invest-bot.yml/dispatches)
+# rather than a `schedule:` trigger, so the polling window can be started on
+# demand right when the user wants to try to catch a newly-available loan.
+on:
+  workflow_dispatch:
+    inputs:
+      duration:
+        description: 'How long the bot polls before stopping on its own (e.g. 1h20, 45m, 90s, 2h)'
+        required: false
+        default: '5m'
+      poll_interval_seconds:
+        description: 'Delay between polls (seconds)'
+        required: false
+        default: '1'
+      min_investment_amount:
+        description: 'Skip investing below this remaining balance/loan amount (EUR)'
+        required: false
+        default: '10'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: peerberry-invest-bot
+  cancel-in-progress: false
+
+jobs:
+  invest-bot:
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install Python dependencies
+        run: pip install -r requirements.txt
+
+      # Diagnostics (full request/response detail for every real investment
+      # attempt, plus any error/stuck-page capture - see
+      # monitors/peerberry_invest_bot.py's module docstring) must NOT be
+      # exposed publicly. This repo has no `pull_request`-triggered workflow
+      # anywhere (verified 2026-07-22), so - unlike `actions/upload-artifact`,
+      # which has a public "Download" button visible to any visitor on a
+      # public repo - a plain `actions/cache` entry has no such public
+      # download path, and no fork/outsider-controllable workflow run exists
+      # here that could ever read it back. Restored here (if a previous run
+      # left one) purely so the file keeps accumulating history across runs.
+      - name: Restore diagnostics log (owner-only, not a public artifact)
+        uses: actions/cache/restore@v4
+        with:
+          path: monitors/peerberry_invest_bot_diagnostics.log
+          key: peerberry-invest-bot-diagnostics-${{ github.run_id }}
+          restore-keys: |
+            peerberry-invest-bot-diagnostics-
+
+      - name: Run PeerBerry invest bot
+        env:
+          PEERBERRY_EMAIL: ${{ secrets.PEERBERRY_EMAIL }}
+          PEERBERRY_PASSWORD: ${{ secrets.PEERBERRY_PASSWORD }}
+          PEERBERRY_TOTP_SECRET: ${{ secrets.PEERBERRY_TOTP_SECRET }}
+          DURATION_SECONDS: ${{ github.event.inputs.duration }}
+          POLL_INTERVAL_SECONDS: ${{ github.event.inputs.poll_interval_seconds }}
+          MIN_INVESTMENT_AMOUNT: ${{ github.event.inputs.min_investment_amount }}
+          SMTP_HOST: ${{ secrets.SMTP_HOST }}
+          SMTP_PORT: ${{ secrets.SMTP_PORT }}
+          SMTP_USER: ${{ secrets.SMTP_USER }}
+          SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
+          EMAIL_FROM: ${{ secrets.EMAIL_FROM }}
+          EMAIL_TO: ${{ secrets.EMAIL_TO }}
+        run: python -m monitors.peerberry_invest_bot
+
+      - name: Save diagnostics log for next run (owner-only, not a public artifact)
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: monitors/peerberry_invest_bot_diagnostics.log
+          key: peerberry-invest-bot-diagnostics-${{ github.run_id }}

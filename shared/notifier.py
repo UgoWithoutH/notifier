@@ -5,7 +5,6 @@ import smtplib
 import logging
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
-
 log = logging.getLogger("notifier")
 
 SMTP_HOST = os.environ.get("SMTP_HOST")
@@ -215,3 +214,115 @@ def send_peerberry_available_email(available_money: float) -> None:
         log.info("PeerBerry available-balance notification email sent to %s.", EMAIL_TO)
     except Exception:
         log.exception("Failed to send PeerBerry available-balance notification email.")
+
+
+def send_peerberry_invest_bot_summary_email(stats: dict, error: str | None = None, diagnostics_text: str | None = None) -> None:
+    """Send the end-of-run recap for monitors/peerberry_invest_bot.py.
+
+    `stats` is the dict built by peerberry_invest_bot.run(): `polls`,
+    `loans_seen` (count), `invest_attempts`, `invest_successes`,
+    `invest_failures`, `total_invested_attempted`, `stuck_events`, `errors`,
+    `final_available_money`, `selected_originators`, `originator_budgets`
+    (initial per-originator budget), `final_originator_budgets`,
+    `originator_stats` (per-originator dict with `loans_seen`, `attempts`,
+    `successes`, `failures`, `invested_amount`, `invested_loans`),
+    `redistributions` (stuck-budget reallocations that happened mid-run).
+    `error`, if set, is a short description of a fatal error that stopped
+    the run early. The email body itself never includes any diagnostic
+    request/response detail - `diagnostics_text`, if provided (this run's
+    own diagnostics-file entries, built by
+    peerberry_invest_bot._collect_run_diagnostics()), is attached instead as
+    a plain-text .log file, so the full detail is directly available by
+    email without needing to manually pull it out of the GitHub Actions
+    cache.
+    """
+    if not all([SMTP_HOST, SMTP_USER, SMTP_PASSWORD, EMAIL_TO]):
+        log.error(
+            "SMTP configuration is incomplete; cannot send email. "
+            "Required env vars: SMTP_HOST, SMTP_USER, SMTP_PASSWORD, EMAIL_TO."
+        )
+        return
+
+    status = "ÉCHEC" if error else "OK"
+    subject = f"[PeerBerry Invest Bot] {status} - {stats.get('invest_successes', 0)} investissement(s) réussi(s)"
+
+    body_parts = [
+        f"Statut : {status}" + (f" ({error})" if error else ""),
+        f"Sondages effectués : {stats.get('polls', 0)}",
+        f"Prêts distincts vus (tous originators confondus) : {stats.get('loans_seen', 0)}",
+        f"Tentatives d'investissement : {stats.get('invest_attempts', 0)}",
+        f"  - réussies : {stats.get('invest_successes', 0)}",
+        f"  - échouées : {stats.get('invest_failures', 0)}",
+        f"Montant total tenté : {stats.get('total_invested_attempted', 0.0):.2f} €",
+        f"Solde final non investi : {stats.get('final_available_money', 0.0):.2f} €",
+        f"Situations bloquées détectées : {stats.get('stuck_events', 0)}",
+        f"Erreurs rencontrées : {stats.get('errors', 0)}",
+    ]
+
+    redistributions = stats.get("redistributions") or []
+    if redistributions:
+        body_parts.append("")
+        body_parts.append(f"Reliquats redistribués en cours de run ({len(redistributions)}) :")
+        for r in redistributions:
+            body_parts.append(f"  - {r['amount']:.2f} € : '{r['from']}' -> '{r['to']}'")
+
+    originator_stats = stats.get("originator_stats") or {}
+    if originator_stats:
+        initial_budgets = stats.get("originator_budgets") or {}
+        final_budgets = stats.get("final_originator_budgets") or {}
+        body_parts.append("")
+        body_parts.append("=== Détail par loan originator ===")
+        for name, s in originator_stats.items():
+            body_parts.append("")
+            body_parts.append(f"- {name}")
+            body_parts.append(
+                f"    Budget initial : {initial_budgets.get(name, 0.0):.2f} € | "
+                f"restant : {final_budgets.get(name, 0.0):.2f} € | "
+                f"investi : {s.get('invested_amount', 0.0):.2f} €"
+            )
+            body_parts.append(
+                f"    Prêts disponibles vus : {s.get('loans_seen', 0)} | "
+                f"tentatives : {s.get('attempts', 0)} "
+                f"(réussies : {s.get('successes', 0)}, échouées : {s.get('failures', 0)})"
+            )
+            invested_loans = s.get("invested_loans") or []
+            if invested_loans:
+                details = ", ".join(f"{lo['loanId']} ({lo['amount']:.2f} €)" for lo in invested_loans)
+                body_parts.append(f"    Prêts investis : {details}")
+            else:
+                body_parts.append("    Prêts investis : aucun")
+
+    if stats.get("invest_attempts", 0) > 0:
+        body_parts.append("")
+        body_parts.append(
+            "Le détail complet (requête/réponse) de chaque tentative d'investissement "
+            "est dans le fichier de diagnostics local (non exposé publiquement)."
+        )
+    if diagnostics_text:
+        body_parts.append(
+            "Les entrées de diagnostics de ce run sont jointes à cet email "
+            "(peerberry_invest_bot_diagnostics_this_run.log)."
+        )
+    body = "\n".join(body_parts)
+
+    msg = MIMEMultipart()
+    msg["From"] = EMAIL_FROM
+    msg["To"] = EMAIL_TO
+    msg["Subject"] = subject
+    msg.attach(MIMEText(body, "plain"))
+
+    if diagnostics_text:
+        attachment = MIMEText(diagnostics_text, "plain", "utf-8")
+        attachment.add_header(
+            "Content-Disposition", "attachment", filename="peerberry_invest_bot_diagnostics_this_run.log"
+        )
+        msg.attach(attachment)
+
+    try:
+        with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=15) as server:
+            server.starttls()
+            server.login(SMTP_USER, SMTP_PASSWORD)
+            server.sendmail(EMAIL_FROM, [EMAIL_TO], msg.as_string())
+        log.info("PeerBerry invest bot summary email sent to %s.", EMAIL_TO)
+    except Exception:
+        log.exception("Failed to send PeerBerry invest bot summary email.")

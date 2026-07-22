@@ -1,0 +1,730 @@
+"""PeerBerry automated investment bot (v1).
+
+`workflow_dispatch`-only bot, externally triggered via cron-job.org, that
+repeatedly polls PeerBerry's filtered loan listing (same filters as
+https://peerberry.com/en/client/invest?loanTermId=&hideInvested=true&groupGuarantee=true&loanOriginators=53,52,74,12,67,47,43,49,73,39,63,59,69,30,55,70,72,71,57,48,56,54,33,23,68,66,45,36,51,64,62,58,75,50,65,4,41,7,76&minInterestRate=10&maxRemainingTerm=185&minRemainingTerm=1)
+and tries to invest available funds into any newly-appeared/still-available
+matching loan, as fast as possible (~1s polling), before other investors
+grab it. Within each poll, loans are attempted starting from the END of the
+listing (i.e. reversed vs. PeerBerry's own "-loanId" sort/UI order), since
+human investors using the real website naturally start clicking from the
+top of their screen - loans further down are less likely to already be
+contested. On a failed attempt, the bot does NOT wait for the next poll: it
+immediately re-fetches the balance and loan listing and keeps trying right
+away with fresh data.
+
+Reuses monitors.peerberry_monitor.login()/_HEADERS/PEERBERRY_EMAIL/
+PEERBERRY_PASSWORD (same dependency direction as every other module that
+piggybacks on the monitor - see that module's docstring) rather than
+duplicating the auth flow.
+
+Endpoints used, all pure HTTP (`requests`, no browser needed), discovered
+via one-off, read-only/network-intercepted Playwright explorations on
+2026-07-22 (see repo memory for full details):
+  - `GET /v2/investor/profile` -> `publicId` (a UUID), needed to build the
+    loans-listing URL below (NOT the same as `accountId`, also present in
+    that response).
+  - `GET /v1/{publicId}/loans` with the filters above (loanOriginators must
+    be sent as indexed array params `loanOriginators[0]=53&...`, NOT the
+    comma-joined form shown in the browser's URL bar - that's just the
+    frontend router's compact representation) -> `{"data": [...], "total":
+    N, ...}`. CONFIRMED working, but a real loan item's exact JSON was
+    never actually captured during exploration (market was empty both
+    times) - only the field names are known (from the response's own
+    `sort` mapping): `loanId`, `countryId`, `loanOriginator`, `issuedDate`,
+    `termTypeTitle`/`termType`, `interestRate`, `term`, `availableToInvest`.
+  - `GET /v1/investor/overview` -> `availableMoney` (same as
+    peerberry_monitor.fetch_available_money()) - re-fetched periodically to
+    track remaining funds across investment attempts within a single run.
+  - `POST /v1/loans/{loanId}` with `{"amount": "<string>"}` (see
+    `attempt_investment()`) - the real invest submission call, CONFIRMED via
+    a network-interception exploration (clicked Invest -> confirmed "Yes" on
+    the "Assignment Agreement" popup -> the resulting request was
+    intercepted and aborted before ever reaching the server, so no real
+    money was spent). This is NOT the previously-guessed
+    `/v1/investor/loans/{loanId}/invest` shape.
+
+Target loan originators come from the Google Sheet, NOT a hardcoded list:
+shared.google_sheet.get_selected_peerberry_loan_originators() finds the
+"Répartition géographique" cell, then the "Peerberry" cell below it (same
+column) - every row between "Peerberry" and the next "Swaper" cell (both
+excluded) is a PeerBerry loan originator, and any of those rows whose cell
+one column to the LEFT equals "x" (case-insensitive) is selected. The available
+balance is split EQUALLY across however many originators are selected
+(once, at run startup, based on the balance seen then), and each
+originator only gets invested into up to its own share - see
+`_match_selected_originator()`/`remaining_budget` in `run()`. A loan whose
+`loanOriginator` doesn't match any selected name is skipped entirely.
+
+Diagnostics (full request/response detail for every real investment
+attempt, every error case - including the real exception message AND
+traceback, not just a generic label - AND if the loan listing looks
+"stuck" unchanged for too long, AND a final "run_summary" entry with the
+complete end-of-run stats dict) are written ONLY to DIAGNOSTICS_FILE,
+never to stdout/the GitHub Actions console log, and persisted across runs
+via `actions/cache` (NOT `actions/upload-artifact`) in the workflow - see
+.github/workflows/peerberry-invest-bot.yml and repo memory
+(2026-07-22 "Design decisions confirmed with user") for why cache (not a
+public-repo-visible artifact) is the safe choice here: this repo has no
+`pull_request`-triggered workflow anywhere, so there's no fork/outsider-
+controllable code path that could ever read the cache. Since there's no
+practical way to browse `actions/cache` content by hand (unlike
+artifacts, there's no "Download" button), `run()` also collects THIS
+run's own diagnostics entries (`_collect_run_diagnostics()`, filtered by
+timestamp) and attaches them as a `.log` file directly on the end-of-run
+summary email - so the full detail is available by email without ever
+needing to touch the cache.
+
+Required env vars:
+    PEERBERRY_EMAIL, PEERBERRY_PASSWORD    -> PeerBerry account credentials
+    SMTP_HOST, SMTP_USER, SMTP_PASSWORD,   -> outgoing mail server (end-of-run
+    EMAIL_TO                                  summary email)
+    GOOGLE_SHEET_ID, GOOGLE_CREDENTIALS     -> Google Sheet holding the
+                                               "Répartition géographique"
+                                               PeerBerry loan originator
+                                               selection (see above)
+Optional:
+    PEERBERRY_TOTP_SECRET     -> base32 TOTP secret, needed if 2FA is enabled
+    SMTP_PORT (default 587), EMAIL_FROM (default SMTP_USER)
+    DURATION_SECONDS (default "5m")        -> how long this run polls before
+                                               stopping on its own. Human-
+                                               friendly duration format (see
+                                               `_parse_duration_seconds()`):
+                                               "1h20" (1h 20m), "1h20m30s",
+                                               "45m", "90s", "2h", or a plain
+                                               number of seconds ("300").
+    POLL_INTERVAL_SECONDS (default 1)      -> delay between polls
+    MIN_INVESTMENT_AMOUNT (default 10)     -> skip investing below this
+                                               remaining balance/loan amount
+    STUCK_AFTER_SECONDS (default 45)       -> log diagnostics if the loan
+                                               listing's total/ids are
+                                               unchanged for this long
+    FAILED_LOAN_COOLDOWN_SECONDS (default 3) -> after a failed investment
+                                               attempt on a loan, skip
+                                               re-attempting that same loan
+                                               for this long (other loans
+                                               are unaffected) - kept short
+                                               since the market moves fast
+                                               and a re-opened loan
+                                               shouldn't be missed for long
+"""
+
+import os
+import re
+import sys
+import json
+import time
+import logging
+import traceback
+from datetime import datetime, timezone
+from pathlib import Path
+
+import requests
+from dotenv import load_dotenv
+
+load_dotenv()
+
+from monitors.peerberry_monitor import login, PEERBERRY_EMAIL, PEERBERRY_PASSWORD, _HEADERS, API_BASE
+from shared.notifier import send_peerberry_invest_bot_summary_email
+from shared.google_sheet import get_selected_peerberry_loan_originators
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+log = logging.getLogger("peerberry_invest_bot")
+
+PROFILE_API_URL = f"{API_BASE}/v2/investor/profile"
+OVERVIEW_API_URL = f"{API_BASE}/v1/investor/overview"
+
+# Same 39 loan-originator IDs as the user's reference filtered invest URL.
+LOAN_ORIGINATORS = [
+    53, 52, 74, 12, 67, 47, 43, 49, 73, 39, 63, 59, 69, 30, 55, 70, 72, 71,
+    57, 48, 56, 54, 33, 23, 68, 66, 45, 36, 51, 64, 62, 58, 75, 50, 65, 4,
+    41, 7, 76,
+]
+
+_DURATION_SHORTHAND_RE = re.compile(r"^(?P<hours>\d+)h(?P<minutes>\d+)$")
+_DURATION_UNITS_RE = re.compile(
+    r"^(?:(?P<hours>\d+)h)?(?:(?P<minutes>\d+)m)?(?:(?P<seconds>\d+(?:\.\d+)?)s)?$"
+)
+
+
+def _parse_duration_seconds(value: str) -> float:
+    """Parse a human-friendly duration into seconds. Accepts:
+    - a plain number of seconds ("300"), for backwards compatibility;
+    - explicit unit(s) in any combination, in h/m/s order ("1h20m30s",
+      "45m", "90s", "2h");
+    - the shorthand "<hours>h<minutes>" with no unit letter after the
+      minutes ("1h20" == 1 hour 20 minutes), since that's the format the
+      user actually wants to type.
+    Raises ValueError if `value` doesn't match any of the above."""
+    value = str(value).strip()
+    if not value:
+        raise ValueError("empty duration")
+
+    try:
+        return float(value)
+    except ValueError:
+        pass
+
+    match = _DURATION_SHORTHAND_RE.match(value)
+    if match:
+        return int(match.group("hours")) * 3600 + int(match.group("minutes")) * 60
+
+    match = _DURATION_UNITS_RE.match(value)
+    if match and any(match.groups()):
+        hours = int(match.group("hours") or 0)
+        minutes = int(match.group("minutes") or 0)
+        seconds = float(match.group("seconds") or 0)
+        return hours * 3600 + minutes * 60 + seconds
+
+    raise ValueError(f"Unrecognized duration format: {value!r} (try e.g. '1h20', '45m', '90s', or a plain number of seconds)")
+
+
+DURATION_SECONDS = _parse_duration_seconds(os.environ.get("DURATION_SECONDS", "5m"))
+POLL_INTERVAL_SECONDS = float(os.environ.get("POLL_INTERVAL_SECONDS", "1"))
+MIN_INVESTMENT_AMOUNT = float(os.environ.get("MIN_INVESTMENT_AMOUNT", "10"))
+STUCK_AFTER_SECONDS = float(os.environ.get("STUCK_AFTER_SECONDS", "45"))
+# Re-fetch the real "available for investment" balance from the server every
+# this-many polls, to correct any drift from our locally-tracked running
+# total after (attempted) investments - avoids hammering the overview
+# endpoint on every single ~1s poll.
+REFRESH_BALANCE_EVERY_N_POLLS = max(1, int(30 / max(POLL_INTERVAL_SECONDS, 0.1)))
+# After a failed investment attempt on a loan (e.g. someone else grabbed it
+# first, or it's no longer actually available despite still appearing in
+# the listing due to server-side eventual consistency), skip re-attempting
+# that exact loan for this long before trying it again - avoids wasting
+# attempts hammering a loan that's likely already gone while other loans in
+# the same poll/next polls could be invested in instead.
+FAILED_LOAN_COOLDOWN_SECONDS = float(os.environ.get("FAILED_LOAN_COOLDOWN_SECONDS", "3"))
+
+DIAGNOSTICS_FILE = Path(__file__).parent / "peerberry_invest_bot_diagnostics.log"
+
+
+def _log_diagnostics(tag: str, **fields) -> None:
+    """Append one JSON line of full diagnostic detail to DIAGNOSTICS_FILE
+    (never printed to stdout/the console log - see module docstring)."""
+    entry = {
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "tag": tag,
+        **fields,
+    }
+    try:
+        with DIAGNOSTICS_FILE.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(entry, default=str, ensure_ascii=False) + "\n")
+    except OSError:
+        log.exception("Could not write to diagnostics file %s", DIAGNOSTICS_FILE)
+    log.info("Diagnostics captured (tag=%s) - see %s for full detail.", tag, DIAGNOSTICS_FILE.name)
+
+
+# Cap how much diagnostics text gets attached to the summary email, in case
+# an unusually busy run (many invest attempts, each with a full request/
+# response logged) produces an oversized attachment.
+MAX_DIAGNOSTICS_EMAIL_CHARS = 2_000_000
+
+
+def _collect_run_diagnostics(since: datetime) -> str | None:
+    """Read DIAGNOSTICS_FILE and return only the JSON lines written at/after
+    `since` (this run's own entries, since DIAGNOSTICS_FILE accumulates
+    history across every past run too) - so the full request/response
+    detail can be attached directly to the summary email, instead of the
+    user having to manually dig it out of the GitHub Actions cache. Returns
+    None if the file doesn't exist or this run added nothing to it."""
+    if not DIAGNOSTICS_FILE.exists():
+        return None
+    lines = []
+    try:
+        with DIAGNOSTICS_FILE.open("r", encoding="utf-8") as f:
+            for line in f:
+                line = line.rstrip("\n")
+                if not line:
+                    continue
+                try:
+                    entry = json.loads(line)
+                    entry_time = datetime.fromisoformat(entry["timestamp"])
+                except (json.JSONDecodeError, KeyError, ValueError):
+                    continue
+                if entry_time >= since:
+                    lines.append(line)
+    except OSError:
+        log.exception("Could not read diagnostics file %s for the summary email attachment.", DIAGNOSTICS_FILE)
+        return None
+    if not lines:
+        return None
+    text = "\n".join(lines)
+    if len(text) > MAX_DIAGNOSTICS_EMAIL_CHARS:
+        text = text[-MAX_DIAGNOSTICS_EMAIL_CHARS:]
+        text = "(truncated, showing the last part only)\n" + text
+    return text
+
+
+def build_loans_params() -> dict:
+    params = {
+        "sort": "-loanId",
+        "hideInvested": "true",
+        "groupGuarantee": "true",
+        "minInterestRate": 10,
+        "maxRemainingTerm": 185,
+        "minRemainingTerm": 1,
+        "offset": 0,
+        "pageSize": 40,
+    }
+    for i, originator_id in enumerate(LOAN_ORIGINATORS):
+        params[f"loanOriginators[{i}]"] = originator_id
+    return params
+
+
+def fetch_public_id(session: requests.Session) -> str:
+    r = session.get(PROFILE_API_URL, headers=_HEADERS, timeout=20)
+    r.raise_for_status()
+    public_id = (r.json() or {}).get("publicId")
+    if not public_id:
+        raise RuntimeError("PeerBerry profile response did not contain a publicId.")
+    return public_id
+
+
+def fetch_available_money(session: requests.Session) -> float:
+    r = session.get(OVERVIEW_API_URL, headers=_HEADERS, timeout=20)
+    r.raise_for_status()
+    try:
+        return float((r.json() or {}).get("availableMoney"))
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def fetch_loans(session: requests.Session, public_id: str) -> dict:
+    r = session.get(
+        f"{API_BASE}/v1/{public_id}/loans",
+        headers=_HEADERS,
+        params=build_loans_params(),
+        timeout=20,
+    )
+    r.raise_for_status()
+    return r.json() or {}
+
+
+def _format_amount(amount: float) -> str:
+    """Mimic the string PeerBerry's own number-input sends: whole numbers
+    with no decimals ("10"), fractional ones trimmed of trailing zeros
+    ("140.91"), matching the confirmed real request payload shape."""
+    rounded = round(float(amount), 2)
+    if rounded == int(rounded):
+        return str(int(rounded))
+    return f"{rounded:.2f}".rstrip("0").rstrip(".")
+
+
+def _match_selected_originator(loan_originator_value, selected_originators: list):
+    """Match a loan's raw `loanOriginator` field (exact shape unconfirmed -
+    could be a name or an id, see module docstring) against the loan
+    originator names selected in the Google Sheet. Tries an exact
+    case-insensitive match first, then a case-insensitive substring match
+    in either direction (in case PeerBerry's value is a longer/shorter
+    variant of the sheet's name). Returns the matching selected name (as
+    written in the sheet), or None if none matched."""
+    if loan_originator_value is None:
+        return None
+    value = str(loan_originator_value).strip().lower()
+    if not value:
+        return None
+    for name in selected_originators:
+        if name.strip().lower() == value:
+            return name
+    for name in selected_originators:
+        name_lower = name.strip().lower()
+        if name_lower in value or value in name_lower:
+            return name
+    return None
+
+
+def _compute_originator_budgets(available_money: float, selected_originators: list, block_size: float = MIN_INVESTMENT_AMOUNT) -> dict:
+    """Split `available_money` across `selected_originators` in whole
+    `block_size` (10 EUR by default, same as MIN_INVESTMENT_AMOUNT) blocks,
+    as equally as possible - NOT a raw division, which could leave every
+    (or some) originator with a budget below the platform's own minimum
+    investment amount, i.e. useless money that could never fund a single
+    loan. If there isn't enough for every selected originator to get at
+    least one full block, only as many as the money allows (one block
+    each) are funded - picked in sheet row order - and the rest get a 0
+    EUR budget (skipped entirely by `run()`'s per-originator minimum
+    check). The leftover below one block (< block_size, can't ever fund a
+    loan on its own) is added on top of the FIRST funded originator's
+    budget instead of being discarded, so `sum(budgets.values()) ==
+    available_money` - no money is left unassigned from the start (see
+    also `_redistribute_stuck_remainder()` for reallocation that happens
+    mid-run, after partial fills)."""
+    total_blocks = int(available_money // block_size)
+    budgets = {name: 0.0 for name in selected_originators}
+    n = len(selected_originators)
+    if n == 0:
+        return budgets
+
+    if total_blocks <= 0:
+        # Not even one full block for anyone - give it all to the first
+        # selected originator anyway (still below the minimum, so it won't
+        # be investable, but at least nothing is silently thrown away).
+        budgets[selected_originators[0]] = available_money
+        return budgets
+
+    if total_blocks < n:
+        # Not enough for every originator to get a full block - only fund
+        # as many originators (one block each) as the money allows.
+        for name in selected_originators[:total_blocks]:
+            budgets[name] = block_size
+    else:
+        blocks_per_originator, extra_blocks = divmod(total_blocks, n)
+        for name in selected_originators:
+            budgets[name] = blocks_per_originator * block_size
+        # Distribute the leftover whole blocks (if any) one each to the
+        # first few originators, to use up as much of the money as
+        # possible.
+        for name in selected_originators[:extra_blocks]:
+            budgets[name] += block_size
+
+    leftover = available_money - total_blocks * block_size
+    if leftover > 0:
+        funded = next((name for name in selected_originators if budgets[name] > 0), selected_originators[0])
+        budgets[funded] += leftover
+
+    return budgets
+
+
+def _redistribute_stuck_remainder(remaining_budget: dict, stuck_name: str):
+    """Called right after a successful investment: if what's left of
+    `stuck_name`'s own budget is now a nonzero amount below
+    MIN_INVESTMENT_AMOUNT (so it can never fund another loan for that
+    originator on its own), move it onto whichever OTHER selected
+    originator currently has the largest remaining budget, so it joins a
+    budget that's still usable (or gets closer to it) instead of sitting
+    unused for the rest of the run - avoids ending the run with an
+    avoidable leftover. Returns a `{"from", "to", "amount"}` dict describing
+    the move (for reporting in the summary email), or None if nothing was
+    redistributed."""
+    stuck_amount = remaining_budget.get(stuck_name, 0.0)
+    if stuck_amount <= 0 or stuck_amount >= MIN_INVESTMENT_AMOUNT:
+        return None
+
+    others = {name: budget for name, budget in remaining_budget.items() if name != stuck_name}
+    if not others:
+        return None
+
+    target_name = max(others, key=others.get)
+    remaining_budget[target_name] += stuck_amount
+    remaining_budget[stuck_name] = 0.0
+    log.info(
+        "Redistributed stuck %.2f EUR from '%s' (below the %d EUR minimum) to '%s' (now %.2f EUR).",
+        stuck_amount, stuck_name, MIN_INVESTMENT_AMOUNT, target_name, remaining_budget[target_name],
+    )
+    return {"from": stuck_name, "to": target_name, "amount": stuck_amount}
+
+
+def attempt_investment(session: requests.Session, loan: dict, amount: float) -> bool:
+    """Real invest submission call, CONFIRMED on 2026-07-22 via a one-off
+    Playwright network-interception exploration (click "Invest" -> confirm
+    "Yes" on the "Assignment Agreement" popup -> intercepted+aborted the
+    resulting request before it reached the server, so no real money was
+    ever spent). Endpoint is `POST /v1/loans/{loanId}` with
+    `{"amount": "<string>"}` - NOT the previously-guessed
+    `/v1/investor/loans/{loanId}/invest`. See module docstring and repo
+    memory for full details.
+    Always logs the full request+response to DIAGNOSTICS_FILE, whether it
+    succeeds or fails, so any remaining edge cases can be diagnosed."""
+    loan_id = loan.get("loanId")
+    url = f"{API_BASE}/v1/loans/{loan_id}"
+    payload = {"amount": _format_amount(amount)}
+    try:
+        r = session.post(url, json=payload, headers=_HEADERS, timeout=20)
+    except Exception as exc:
+        _log_diagnostics(
+            "invest_attempt_exception",
+            loan=loan,
+            url=url,
+            payload=payload,
+            error=str(exc),
+            traceback=traceback.format_exc(),
+        )
+        log.exception("Investment attempt raised an exception for loan %s.", loan_id)
+        return False
+
+    _log_diagnostics(
+        "invest_attempt",
+        loan=loan,
+        url=url,
+        payload=payload,
+        status=r.status_code,
+        response_headers=dict(r.headers),
+        response_body=r.text[:5000],
+    )
+    if r.ok:
+        log.info("Investment attempt for loan %s (%.2f EUR) returned status=%s.", loan_id, amount, r.status_code)
+        return True
+    log.warning(
+        "Investment attempt for loan %s (%.2f EUR) FAILED status=%s - full request/response saved to diagnostics.",
+        loan_id,
+        amount,
+        r.status_code,
+    )
+    return False
+
+
+def run() -> None:
+    if not PEERBERRY_EMAIL or not PEERBERRY_PASSWORD:
+        log.error("PEERBERRY_EMAIL and PEERBERRY_PASSWORD environment variables are required.")
+        sys.exit(1)
+
+    run_started_at = datetime.now(timezone.utc)
+
+    log.info(
+        "Starting PeerBerry invest bot: duration=%.0fs poll_interval=%.1fs min_investment=%.2f stuck_after=%.0fs",
+        DURATION_SECONDS,
+        POLL_INTERVAL_SECONDS,
+        MIN_INVESTMENT_AMOUNT,
+        STUCK_AFTER_SECONDS,
+    )
+
+    stats = {
+        "polls": 0,
+        "loans_seen": set(),
+        "invest_attempts": 0,
+        "invest_successes": 0,
+        "invest_failures": 0,
+        "total_invested_attempted": 0.0,
+        "stuck_events": 0,
+        "errors": 0,
+    }
+
+    session = requests.Session()
+    try:
+        login(session)
+        public_id = fetch_public_id(session)
+        available_money = fetch_available_money(session)
+    except Exception as exc:
+        log.exception("Failed to log in or fetch initial account info.")
+        _log_diagnostics("startup_error", step="login_or_initial_fetch", error=str(exc), traceback=traceback.format_exc())
+        stats["errors"] += 1
+        send_peerberry_invest_bot_summary_email(
+            stats,
+            error=f"Échec de connexion / récupération initiale du compte : {exc}",
+            diagnostics_text=_collect_run_diagnostics(run_started_at),
+        )
+        sys.exit(1)
+
+    try:
+        selected_originators = get_selected_peerberry_loan_originators()
+    except Exception as exc:
+        log.exception("Failed to read selected loan originators from the Google Sheet.")
+        _log_diagnostics("startup_error", step="google_sheet_selection", error=str(exc), traceback=traceback.format_exc())
+        stats["errors"] += 1
+        send_peerberry_invest_bot_summary_email(
+            stats,
+            error=f"Échec de lecture des loan originators sélectionnés (Google Sheet) : {exc}",
+            diagnostics_text=_collect_run_diagnostics(run_started_at),
+        )
+        sys.exit(1)
+
+    if not selected_originators:
+        log.error("No PeerBerry loan originator selected in the Google Sheet (column -1 == 'x'), nothing to invest in.")
+        _log_diagnostics("startup_error", error="no selected loan originators")
+        stats["errors"] += 1
+        send_peerberry_invest_bot_summary_email(
+            stats,
+            error="Aucun loan originator PeerBerry sélectionné dans le Google Sheet.",
+            diagnostics_text=_collect_run_diagnostics(run_started_at),
+        )
+        sys.exit(1)
+
+    # Split in whole MIN_INVESTMENT_AMOUNT blocks, computed once at startup
+    # from the balance seen then - each selected originator gets its own
+    # fixed share for this run, never rebalanced against the others as
+    # investments happen. If there isn't enough for everyone to get a full
+    # block, only as many originators as the money allows get funded (see
+    # `_compute_originator_budgets()`).
+    remaining_budget = _compute_originator_budgets(available_money, selected_originators)
+    funded_originators = [name for name, budget in remaining_budget.items() if budget > 0]
+    stats["selected_originators"] = selected_originators
+    stats["originator_budgets"] = dict(remaining_budget)
+
+    # Per-originator detail for the end-of-run email: loans seen, attempts,
+    # successes/failures, and exactly which loans got invested in for how
+    # much.
+    originator_stats = {
+        name: {
+            "loans_seen": set(),
+            "attempts": 0,
+            "successes": 0,
+            "failures": 0,
+            "invested_amount": 0.0,
+            "invested_loans": [],
+        }
+        for name in selected_originators
+    }
+    redistributions = []
+
+    log.info(
+        "publicId=%s available_money=%.2f EUR selected_originators=%s budgets=%s",
+        public_id, available_money, selected_originators, remaining_budget,
+    )
+    if len(funded_originators) < len(selected_originators):
+        log.warning(
+            "Not enough available money to fund all %d selected originator(s) in %d EUR blocks - only funding %d: %s",
+            len(selected_originators), MIN_INVESTMENT_AMOUNT, len(funded_originators), funded_originators,
+        )
+
+    start = time.monotonic()
+    last_loan_signature = None
+    last_change_at = start
+    run_error = None
+    # loan_id -> monotonic() timestamp of its last failed investment attempt.
+    recently_failed: dict = {}
+
+    try:
+        while time.monotonic() - start < DURATION_SECONDS:
+            poll_start = time.monotonic()
+            stats["polls"] += 1
+
+            if stats["polls"] % REFRESH_BALANCE_EVERY_N_POLLS == 0:
+                try:
+                    available_money = fetch_available_money(session)
+                except Exception as exc:
+                    stats["errors"] += 1
+                    _log_diagnostics("balance_refresh_error", error=str(exc), traceback=traceback.format_exc())
+                    log.exception("Failed to refresh available balance, keeping last known value (%.2f EUR).", available_money)
+
+            try:
+                body = fetch_loans(session, public_id)
+            except Exception as exc:
+                stats["errors"] += 1
+                _log_diagnostics("poll_error", error=str(exc), traceback=traceback.format_exc())
+                log.exception("Failed to fetch the loans listing, will retry next poll.")
+                time.sleep(POLL_INTERVAL_SECONDS)
+                continue
+
+            data = body.get("data") or []
+            loan_ids = tuple(sorted(loan.get("loanId") for loan in data))
+            signature = (body.get("total"), loan_ids)
+
+            if signature != last_loan_signature:
+                last_loan_signature = signature
+                last_change_at = time.monotonic()
+            elif time.monotonic() - last_change_at >= STUCK_AFTER_SECONDS:
+                stats["stuck_events"] += 1
+                _log_diagnostics(
+                    "stuck",
+                    seconds_unchanged=round(time.monotonic() - last_change_at, 1),
+                    last_response=body,
+                    public_id=public_id,
+                    available_money=available_money,
+                )
+                # Reset so we only log once per stuck period, not every poll.
+                last_change_at = time.monotonic()
+
+            # Attempt starting from the END of the listing (i.e. reversed
+            # vs. PeerBerry's own "-loanId" sort order shown in the UI):
+            # human investors using the real website naturally start
+            # clicking from the top of their screen, so loans further down
+            # the list are less likely to already be contested by the time
+            # we get to them.
+            loans_to_try = list(reversed(data))
+            while loans_to_try:
+                loan = loans_to_try.pop(0)
+                loan_id = loan.get("loanId")
+                stats["loans_seen"].add(loan_id)
+
+                matched_originator = _match_selected_originator(loan.get("loanOriginator"), selected_originators)
+                if matched_originator is None:
+                    continue
+
+                originator_stats[matched_originator]["loans_seen"].add(loan_id)
+
+                failed_at = recently_failed.get(loan_id)
+                if failed_at is not None and time.monotonic() - failed_at < FAILED_LOAN_COOLDOWN_SECONDS:
+                    continue
+
+                if available_money < MIN_INVESTMENT_AMOUNT:
+                    log.info("Remaining balance %.2f EUR is below the minimum (%.2f EUR), skipping loan %s.", available_money, MIN_INVESTMENT_AMOUNT, loan_id)
+                    continue
+
+                budget_left = remaining_budget.get(matched_originator, 0.0)
+                if budget_left < MIN_INVESTMENT_AMOUNT:
+                    log.info("Budget for '%s' (%.2f EUR left) is below the minimum (%.2f EUR), skipping loan %s.", matched_originator, budget_left, MIN_INVESTMENT_AMOUNT, loan_id)
+                    continue
+
+                try:
+                    loan_available = float(loan.get("availableToInvest"))
+                except (TypeError, ValueError):
+                    loan_available = 0.0
+                amount = min(available_money, budget_left, loan_available)
+                if amount < MIN_INVESTMENT_AMOUNT:
+                    continue
+
+                log.info("Matching loan found: loanId=%s originator=%s availableToInvest=%.2f budget_left=%.2f -> attempting %.2f EUR.", loan_id, matched_originator, loan_available, budget_left, amount)
+                stats["invest_attempts"] += 1
+                originator_stats[matched_originator]["attempts"] += 1
+                success = attempt_investment(session, loan, amount)
+                stats["total_invested_attempted"] += amount
+                if success:
+                    stats["invest_successes"] += 1
+                    originator_stats[matched_originator]["successes"] += 1
+                    originator_stats[matched_originator]["invested_amount"] += amount
+                    originator_stats[matched_originator]["invested_loans"].append({"loanId": loan_id, "amount": amount})
+                    available_money -= amount
+                    remaining_budget[matched_originator] -= amount
+                    redistribution = _redistribute_stuck_remainder(remaining_budget, matched_originator)
+                    if redistribution:
+                        redistributions.append(redistribution)
+                    continue
+
+                stats["invest_failures"] += 1
+                originator_stats[matched_originator]["failures"] += 1
+                recently_failed[loan_id] = time.monotonic()
+                # Don't wait for the next ~1s poll: a failure usually means
+                # the market just moved (amounts/listing are now stale), so
+                # immediately refresh the real balance + loan listing and
+                # keep trying right away with the fresh (still reversed)
+                # list, instead of continuing to work off stale data.
+                try:
+                    available_money = fetch_available_money(session)
+                except Exception as exc:
+                    stats["errors"] += 1
+                    _log_diagnostics("balance_refresh_error", error=str(exc), traceback=traceback.format_exc())
+                    log.exception("Failed to refresh balance after a failed attempt, keeping last known value (%.2f EUR).", available_money)
+                try:
+                    body = fetch_loans(session, public_id)
+                    data = body.get("data") or []
+                    loans_to_try = list(reversed(data))
+                except Exception as exc:
+                    stats["errors"] += 1
+                    _log_diagnostics("poll_error", error=str(exc), traceback=traceback.format_exc())
+                    log.exception("Failed to refresh the loans listing after a failed attempt, continuing with the remaining stale list.")
+
+            elapsed_poll = time.monotonic() - poll_start
+            remaining_sleep = POLL_INTERVAL_SECONDS - elapsed_poll
+            if remaining_sleep > 0:
+                time.sleep(remaining_sleep)
+    except Exception as exc:
+        run_error = str(exc)
+        stats["errors"] += 1
+        _log_diagnostics("run_error", error=run_error, traceback=traceback.format_exc())
+        log.exception("Unhandled error during the poll loop.")
+
+    stats["loans_seen"] = len(stats["loans_seen"])
+    stats["final_available_money"] = available_money
+    stats["final_originator_budgets"] = dict(remaining_budget)
+    stats["redistributions"] = redistributions
+    for name, s in originator_stats.items():
+        s["loans_seen"] = len(s["loans_seen"])
+    stats["originator_stats"] = originator_stats
+    # Persisted to the cached diagnostics file too (not just emailed/console-
+    # logged), so the full end-of-run stats for every past run remain
+    # available to inspect later even without the email.
+    _log_diagnostics("run_summary", stats=stats, run_error=run_error)
+    log.info("Run finished: %s", stats)
+    send_peerberry_invest_bot_summary_email(
+        stats,
+        error=run_error,
+        diagnostics_text=_collect_run_diagnostics(run_started_at),
+    )
+
+    if run_error:
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    run()

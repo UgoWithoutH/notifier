@@ -403,6 +403,70 @@ def fill_geographic_repartition_amounts(loan_originators: list):
         len(missing),
     )
 
+
+def get_selected_peerberry_loan_originators() -> list:
+    """
+    Cherche la cellule "Répartition géographique", puis la cellule
+    "Peerberry" en dessous (même colonne) : les lignes entre "Peerberry" et
+    la cellule "Swaper" suivante (exclues toutes les deux) sont les loan
+    originators du bloc PeerBerry. Pour chacune de ces lignes ayant un nom
+    de loan non vide dans la colonne "Répartition géographique", si la
+    cellule juste à gauche (colonne - 1) vaut "x" (insensible à la casse),
+    ce loan originator est sélectionné.
+
+    Retourne la liste des noms de loan originators sélectionnés (tels
+    qu'écrits dans la feuille, dans l'ordre des lignes).
+    """
+    logger.info("Recherche des loan originators PeerBerry sélectionnés (colonne -1 = 'x')")
+
+    worksheet = get_latest_dashboard_worksheet(SPREADSHEET_ID)
+
+    # 1 seul appel API pour charger toute la feuille
+    grid = worksheet.get_all_values()
+
+    geo_pos = find_cell_by_value(grid, "Répartition géographique")
+    if not geo_pos:
+        raise RuntimeError(
+            "La section 'Répartition géographique' n'a pas été trouvée."
+        )
+
+    geo_row, geo_col = geo_pos
+
+    if geo_col < 2:
+        raise RuntimeError(
+            "Impossible de lire la colonne à gauche des loans : "
+            "'Répartition géographique' est dans la première colonne."
+        )
+
+    peerberry_row = find_first_cell_containing_below(grid, geo_row, geo_col, "Peerberry")
+    if not peerberry_row:
+        raise RuntimeError(
+            "La cellule 'Peerberry' n'a pas été trouvée sous 'Répartition géographique'."
+        )
+
+    swaper_row = find_first_cell_containing_below(grid, peerberry_row, geo_col, "Swaper")
+    if not swaper_row:
+        raise RuntimeError(
+            "La cellule 'Swaper' n'a pas été trouvée sous 'Peerberry' "
+            "(elle délimite la fin du bloc PeerBerry)."
+        )
+
+    selected = []
+    for row_idx in range(peerberry_row + 1, swaper_row):
+        row = grid[row_idx - 1]
+
+        name = row[geo_col - 1].strip() if geo_col - 1 < len(row) else ""
+        if not name:
+            continue
+
+        flag = row[geo_col - 2].strip() if geo_col - 2 < len(row) else ""
+        if flag.lower() == "x":
+            selected.append(name)
+            logger.info("Loan originator PeerBerry sélectionné : '%s' (ligne %s)", name, row_idx)
+
+    logger.info("Loan originators PeerBerry sélectionnés : %s", selected)
+    return selected
+
 if __name__ == "__main__":
     fill_current_month_amounts(
         platform="Bienprêter",
