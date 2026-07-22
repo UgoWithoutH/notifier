@@ -10,7 +10,7 @@ on:
       duration:
         description: 'How long the bot polls before stopping on its own (e.g. 1h20, 45m, 90s, 2h)'
         required: false
-        default: '5m'
+        default: '1h30'
       poll_interval_seconds:
         description: 'Delay between polls (seconds)'
         required: false
