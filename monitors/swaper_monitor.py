@@ -17,20 +17,42 @@ Optional:
     SWAPER_TOTP_SECRET                     -> base32 secret used to set up
                                                Google Authenticator, needed
                                                if 2FA is enabled on the account
+
+Invest-structure exploration (added 2026-07-23): whenever loans are available
+(same condition that triggers the normal notification email above), this
+module ALSO captures diagnostic data meant to help figure out, later, how to
+auto-invest on Swaper (mirroring monitors/peerberry_invest_bot.py, which does
+this for real already) - the real invest HTTP request/HTML structure is NOT
+known yet, and can't be explored right now since no loans are available at
+the time this was written. `capture_invest_exploration_state()`'s response/
+request listeners (registered on the already-logged-in Playwright `page`,
+only AFTER login() has fully completed - see the security lesson in repo
+memory about not registering broad interceptors during a login flow) collect
+every `/rest/` API call observed while browsing the loans page, plus a
+truncated HTML dump of that page. NO invest/confirm button is ever clicked -
+purely passive capture, same real-money safety boundary already established
+for the PeerBerry exploration (see repo memory: don't click a real invest/
+confirm control without the user explicitly accepting that risk). The result
+is emailed (see shared.notifier.send_swaper_invest_exploration_email()) as a
+JSON attachment whenever the normal notification email is also sent, so the
+user can pass that file back to build the real auto-invest bot once genuine
+loan/invest markup has actually been observed.
 """
 
+import json
 import os
 import random
 import sys
 import time
 import logging
+from datetime import datetime, timezone
 from pathlib import Path
 
 import pyotp
 from dotenv import load_dotenv
 from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
 
-from shared.notifier import send_swaper_email
+from shared.notifier import send_swaper_email, send_swaper_invest_exploration_email
 from shared.state import load_state, save_state
 from shared.cron_schedule import ensure_schedule
 from shared.notification_gate import should_notify
@@ -54,6 +76,7 @@ SWAPER_EMAIL = os.environ.get("SWAPER_EMAIL")
 SWAPER_PASSWORD = os.environ.get("SWAPER_PASSWORD")
 SWAPER_TOTP_SECRET = os.environ.get("SWAPER_TOTP_SECRET")
 SWAPER_CRON_JOB_ID = os.environ.get("SWAPER_CRON_JOB_ID")
+
 
 
 def handle_two_factor(page) -> None:
@@ -198,6 +221,40 @@ def extract_balance(payload) -> float:
     return 0.0
 
 
+# Caps how large the JSON exploration diagnostics attachment can get (a
+# runaway/huge loans page HTML dump or a chatty set of captured API calls
+# shouldn't produce an unreasonably large email).
+MAX_INVEST_EXPLORATION_CHARS = 500_000
+# How much of the loans page's main HTML is kept - enough to see a loan
+# row's real markup (any Invest button/form) without dumping unrelated
+# <head>/script/style bytes.
+MAX_LOANS_PAGE_HTML_CHARS = 200_000
+
+
+def _record_api_response(captured: list, response) -> None:
+    """`page.on("response", ...)` handler used by run() to passively capture
+    Swaper's own `/rest/` API traffic while browsing the loans page, for the
+    invest-structure exploration diagnostics (see module docstring). Only
+    ever registered AFTER login() has fully completed; also explicitly
+    skips anything login/auth-related as a second safety layer (belt-and-
+    braces, per the repo's security lesson about page.route()/page.on()
+    interceptors and credentials) even though that should never happen at
+    this point in the flow.
+    """
+    url = response.url
+    if "swaper.com" not in url or "/rest/" not in url:
+        return
+    lower_url = url.lower()
+    if any(keyword in lower_url for keyword in ("login", "auth", "password")):
+        return
+    entry = {"method": response.request.method, "url": url, "status": response.status}
+    try:
+        entry["body"] = response.text()[:20000]
+    except Exception:
+        entry["body"] = None
+    captured.append(entry)
+
+
 def run(headless: bool = True) -> None:
     if not SWAPER_EMAIL or not SWAPER_PASSWORD:
         log.error("SWAPER_EMAIL and SWAPER_PASSWORD environment variables are required.")
@@ -223,9 +280,23 @@ def run(headless: bool = True) -> None:
         apply_stealth(context)
         page = context.new_page()
 
+        captured_api_calls = []
+        loans_page_html = None
+
         try:
             login(page)
+            # Registered only AFTER login() has fully completed (see
+            # _record_api_response()'s docstring) - passively captures the
+            # /rest/ API traffic fired while fetch_loans() navigates to the
+            # loans page, for the invest-structure exploration diagnostics.
+            page.on("response", lambda response: _record_api_response(captured_api_calls, response))
             payload = fetch_loans(page)
+            try:
+                loans_page_html = page.evaluate(
+                    "() => (document.querySelector('main') || document.body).outerHTML"
+                )
+            except Exception:
+                log.exception("Could not capture the loans page HTML for the invest-exploration diagnostics.")
         except Exception:
             log.exception("Failed to log in or fetch loans.")
             browser.close()
@@ -240,6 +311,26 @@ def run(headless: bool = True) -> None:
     loans = extract_loans(payload)
     balance = extract_balance(payload)
 
+    # Build the invest-structure exploration diagnostics (only meaningful
+    # when there's actually at least one loan to look at) - see module
+    # docstring. Cheap to build unconditionally (data already fetched/
+    # captured above); only actually emailed below if loans exist AND the
+    # normal notification email also fires this run.
+    invest_exploration_text = None
+    if loans:
+        if loans_page_html and len(loans_page_html) > MAX_LOANS_PAGE_HTML_CHARS:
+            loans_page_html = loans_page_html[:MAX_LOANS_PAGE_HTML_CHARS] + "\n... (truncated)"
+        diagnostics = {
+            "captured_at": datetime.now(timezone.utc).isoformat(),
+            "loans_count": len(loans),
+            "loans_api_payload": payload,
+            "captured_api_calls": captured_api_calls,
+            "loans_page_html": loans_page_html,
+        }
+        invest_exploration_text = json.dumps(diagnostics, indent=2, ensure_ascii=False, default=str)
+        if len(invest_exploration_text) > MAX_INVEST_EXPLORATION_CHARS:
+            invest_exploration_text = invest_exploration_text[:MAX_INVEST_EXPLORATION_CHARS] + "\n... (truncated)"
+
     log.info("Balance %s, %d loan(s) available.", "positive" if balance > 0 else "zero/unavailable", len(loans))
 
     # TEMPORARY DEBUG: force-send a recap email regardless of balance/new
@@ -249,6 +340,8 @@ def run(headless: bool = True) -> None:
     if force_test_email:
         log.info("FORCE_TEST_EMAIL is set - sending a forced test recap email.")
         send_swaper_email(balance, loans)
+        if invest_exploration_text:
+            send_swaper_invest_exploration_email(len(loans), invest_exploration_text)
 
     if balance < 10:
         ensure_schedule("30m", cron_job_id=SWAPER_CRON_JOB_ID, state_file=CRON_SCHEDULE_STATE_FILE)
@@ -274,6 +367,9 @@ def run(headless: bool = True) -> None:
     if send and not force_test_email:
         log.info("Notification decision: SEND (reason=balance >= 10 and loans available and gate open).")
         send_swaper_email(balance, loans)
+        if invest_exploration_text:
+            log.info("Sending Swaper invest-structure exploration diagnostics email (%d loan(s) available).", len(loans))
+            send_swaper_invest_exploration_email(len(loans), invest_exploration_text)
     elif available:
         if force_test_email:
             log.info("Notification decision: SKIP normal cycle send (reason=force_test_email_already_sent).")

@@ -76,6 +76,65 @@ def send_swaper_email(balance: float, loans: list) -> None:
         log.exception("Failed to send notification email.")
 
 
+def send_swaper_invest_exploration_email(loans_count: int, diagnostics_text: str) -> None:
+    """Send the Swaper "invest-structure exploration" diagnostics email.
+
+    Sent alongside send_swaper_email() (same run, same "loans became
+    available" trigger) whenever swaper_monitor.py's exploration capture
+    produced something - see that module's docstring/`capture_invest_
+    exploration()` for what's collected: the raw loans-listing API
+    response, any other `/rest/` API calls observed while on the loans
+    page (method/url/status/truncated body), and a truncated HTML dump of
+    the loans page. NO invest/confirm button is ever clicked to gather
+    this (same real-money safety boundary as documented in repo memory for
+    the PeerBerry exploration) - purely passive capture of an authenticated,
+    already-logged-in Playwright session. `diagnostics_text` (a JSON
+    string) is attached as a `.json` file; the email body itself never
+    contains the raw detail, only a short explanation of what to do with
+    the attachment (send it back so the real invest HTTP request/HTML
+    structure can be figured out).
+    """
+    if not all([SMTP_HOST, SMTP_USER, SMTP_PASSWORD, EMAIL_TO]):
+        log.error(
+            "SMTP configuration is incomplete; cannot send email. "
+            "Required env vars: SMTP_HOST, SMTP_USER, SMTP_PASSWORD, EMAIL_TO."
+        )
+        return
+
+    subject = f"[Swaper] Diagnostic structure d'investissement ({loans_count} prêt(s) dispo)"
+    body = (
+        f"{loans_count} pr\u00eat(s) manuel(s) sont disponibles sur Swaper.\n\n"
+        "Le fichier joint contient : la r\u00e9ponse brute de l'API de listing des "
+        "pr\u00eats, les autres appels HTTP /rest/ observ\u00e9s pendant la navigation "
+        "sur la page, et un extrait du HTML de la page des pr\u00eats. Aucun clic "
+        "d'investissement/confirmation n'a \u00e9t\u00e9 effectu\u00e9 (aucun risque "
+        "d'argent r\u00e9el) - c'est juste de la capture passive.\n\n"
+        "Renvoie ce fichier pour permettre de comprendre la structure HTML/API "
+        "n\u00e9cessaire pour investir automatiquement sur Swaper."
+    )
+
+    msg = MIMEMultipart()
+    msg["From"] = EMAIL_FROM
+    msg["To"] = EMAIL_TO
+    msg["Subject"] = subject
+    msg.attach(MIMEText(body, "plain"))
+
+    attachment = MIMEText(diagnostics_text, "plain", "utf-8")
+    attachment.add_header(
+        "Content-Disposition", "attachment", filename="swaper_invest_exploration_diagnostics.json"
+    )
+    msg.attach(attachment)
+
+    try:
+        with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=15) as server:
+            server.starttls()
+            server.login(SMTP_USER, SMTP_PASSWORD)
+            server.sendmail(EMAIL_FROM, [EMAIL_TO], msg.as_string())
+        log.info("Swaper invest-exploration diagnostics email sent to %s.", EMAIL_TO)
+    except Exception:
+        log.exception("Failed to send Swaper invest-exploration diagnostics email.")
+
+
 def _format_lendermarket_lender(lender_stats: dict) -> str:
     """Format one lender's aggregate: loan count, total investable amount,
     and yield (min-max interest rate range) - no extra fields and no URL."""
