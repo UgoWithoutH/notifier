@@ -18,6 +18,16 @@ PEERBERRY_PASSWORD (same dependency direction as every other module that
 piggybacks on the monitor - see that module's docstring) rather than
 duplicating the auth flow.
 
+PeerBerry's access_token is a short-lived JWT (login() is only ever called
+ONCE at startup) - a real run on 2026-07-23 showed it expiring mid-run,
+after which EVERY poll got HTTP 401 for the rest of that run (1621/5167
+polls errored, all in one unbroken tail once the token expired, 0
+investments possible). Fixed via `_call_with_reauth()`: fetch_loans()/
+fetch_available_money() calls are wrapped so a 401 triggers exactly one
+re-login() (fresh token) + one retry before being treated as a real error;
+attempt_investment()'s POST does the same inline (re-login + retry once on
+a 401 response) before counting it as a failed investment attempt.
+
 Endpoints used, all pure HTTP (`requests`, no browser needed), discovered
 via one-off, read-only/network-intercepted Playwright explorations on
 2026-07-22 (see repo memory for full details):
@@ -56,11 +66,23 @@ originator only gets invested into up to its own share - see
 `_match_selected_originator()`/`remaining_budget` in `run()`. A loan whose
 `loanOriginator` doesn't match any selected name is skipped entirely.
 
+If the available balance seen at startup is already below
+MIN_INVESTMENT_AMOUNT, `run()` stops right away (no polling at all, not
+even reading the Google Sheet) instead of burning the whole
+DURATION_SECONDS window for nothing - this is a normal/expected state
+(e.g. right after a previous run already invested everything), NOT an
+error: the usual summary email is still sent (0 polls, 0 attempts, exit
+code 0), just so this is visible/confirmed rather than silent. The same
+early-stop applies mid-run: if the balance drops below
+MIN_INVESTMENT_AMOUNT at any point (e.g. it just got fully invested
+across all funded originators), the poll loop exits right after that
+poll instead of continuing to burn the rest of DURATION_SECONDS with no
+possible investment left to make.
+
 Diagnostics (full request/response detail for every real investment
 attempt, every error case - including the real exception message AND
-traceback, not just a generic label - AND if the loan listing looks
-"stuck" unchanged for too long, AND a final "run_summary" entry with the
-complete end-of-run stats dict) are written ONLY to DIAGNOSTICS_FILE,
+traceback, not just a generic label - AND a final "run_summary" entry with
+the complete end-of-run stats dict) are written ONLY to DIAGNOSTICS_FILE,
 never to stdout/the GitHub Actions console log, and persisted across runs
 via `actions/cache` (NOT `actions/upload-artifact`) in the workflow - see
 .github/workflows/peerberry-invest-bot.yml and repo memory
@@ -73,7 +95,13 @@ artifacts, there's no "Download" button), `run()` also collects THIS
 run's own diagnostics entries (`_collect_run_diagnostics()`, filtered by
 timestamp) and attaches them as a `.log` file directly on the end-of-run
 summary email - so the full detail is available by email without ever
-needing to touch the cache.
+needing to touch the cache. The loan listing looking "stuck"
+(unchanged/empty for STUCK_AFTER_SECONDS) is only tallied in
+`stats["stuck_events"]` (shown in the summary email) - NOT written to
+DIAGNOSTICS_FILE, since it's a normal/expected condition (no matching
+loans right now, not a bug) and logging the full loan listing response
+every single time it fires would only bloat the accumulating diagnostics
+file for no real diagnostic value.
 
 Required env vars:
     PEERBERRY_EMAIL, PEERBERRY_PASSWORD    -> PeerBerry account credentials
@@ -301,6 +329,26 @@ def fetch_loans(session: requests.Session, public_id: str) -> dict:
     return r.json() or {}
 
 
+def _call_with_reauth(session: requests.Session, func, *args, **kwargs):
+    """Call an authenticated API function (fetch_loans/fetch_available_money/
+    ...); if it fails with HTTP 401, PeerBerry's access_token (a short-lived
+    JWT, see module/monitor docstrings - observed expiring well before a
+    long poll run finishes, e.g. a real run on 2026-07-23 got 401 on every
+    single poll for the last ~11 minutes of an ~11.5 minute run) has
+    expired or been invalidated - re-login once to get a fresh token and
+    retry the call exactly once before giving up. Any other exception (or a
+    second 401 after the retry) propagates normally to the caller's own
+    error handling."""
+    try:
+        return func(session, *args, **kwargs)
+    except requests.exceptions.HTTPError as exc:
+        if exc.response is not None and exc.response.status_code == 401:
+            log.warning("Got 401 Unauthorized calling %s - access token likely expired, re-authenticating and retrying once.", getattr(func, "__name__", func))
+            login(session)
+            return func(session, *args, **kwargs)
+        raise
+
+
 def _format_amount(amount: float) -> str:
     """Mimic the string PeerBerry's own number-input sends: whole numbers
     with no decimals ("10"), fractional ones trimmed of trailing zeros
@@ -431,6 +479,13 @@ def attempt_investment(session: requests.Session, loan: dict, amount: float) -> 
     payload = {"amount": _format_amount(amount)}
     try:
         r = session.post(url, json=payload, headers=_HEADERS, timeout=20)
+        if r.status_code == 401:
+            # Same expired-access-token situation as _call_with_reauth
+            # handles for the read-only endpoints - re-login once and retry
+            # this POST before treating it as a real investment failure.
+            log.warning("Investment attempt for loan %s got 401 Unauthorized - re-authenticating and retrying once.", loan_id)
+            login(session)
+            r = session.post(url, json=payload, headers=_HEADERS, timeout=20)
     except Exception as exc:
         _log_diagnostics(
             "invest_attempt_exception",
@@ -506,6 +561,26 @@ def run() -> None:
         )
         sys.exit(1)
 
+    log.info("Solde disponible au début du run : %.2f EUR", available_money)
+
+    if available_money < MIN_INVESTMENT_AMOUNT:
+        # Not a failure - just nothing to do this run (a common, expected
+        # state, e.g. right after a previous run already invested
+        # everything) - stop right away instead of polling for the full
+        # DURATION_SECONDS for no reason, but still send the usual summary
+        # email so this is visible/confirmed rather than silent.
+        log.info(
+            "Available balance (%.2f EUR) is below the minimum investment amount (%.2f EUR) - nothing to do, stopping without polling.",
+            available_money, MIN_INVESTMENT_AMOUNT,
+        )
+        _log_diagnostics("insufficient_balance", available_money=available_money, min_investment_amount=MIN_INVESTMENT_AMOUNT)
+        stats["final_available_money"] = available_money
+        send_peerberry_invest_bot_summary_email(
+            stats,
+            diagnostics_text=_collect_run_diagnostics(run_started_at),
+        )
+        return
+
     try:
         selected_originators = get_selected_peerberry_loan_originators()
     except Exception as exc:
@@ -580,15 +655,18 @@ def run() -> None:
             stats["polls"] += 1
 
             if stats["polls"] % REFRESH_BALANCE_EVERY_N_POLLS == 0:
+                previous_available_money = available_money
                 try:
-                    available_money = fetch_available_money(session)
+                    available_money = _call_with_reauth(session, fetch_available_money)
+                    if available_money != previous_available_money:
+                        log.info("Solde disponible actualisé : %.2f EUR -> %.2f EUR.", previous_available_money, available_money)
                 except Exception as exc:
                     stats["errors"] += 1
                     _log_diagnostics("balance_refresh_error", error=str(exc), traceback=traceback.format_exc())
                     log.exception("Failed to refresh available balance, keeping last known value (%.2f EUR).", available_money)
 
             try:
-                body = fetch_loans(session, public_id)
+                body = _call_with_reauth(session, fetch_loans, public_id)
             except Exception as exc:
                 stats["errors"] += 1
                 _log_diagnostics("poll_error", error=str(exc), traceback=traceback.format_exc())
@@ -604,15 +682,15 @@ def run() -> None:
                 last_loan_signature = signature
                 last_change_at = time.monotonic()
             elif time.monotonic() - last_change_at >= STUCK_AFTER_SECONDS:
+                # Just a count for the summary email (how much of the run
+                # saw no matching loans/change) - NOT written to the
+                # diagnostics log file: this is normal/expected (the market
+                # is simply empty right now, not a bug), and logging the
+                # full loan listing response every time it fires would just
+                # bloat the accumulating diagnostics file for no real
+                # diagnostic value.
                 stats["stuck_events"] += 1
-                _log_diagnostics(
-                    "stuck",
-                    seconds_unchanged=round(time.monotonic() - last_change_at, 1),
-                    last_response=body,
-                    public_id=public_id,
-                    available_money=available_money,
-                )
-                # Reset so we only log once per stuck period, not every poll.
+                # Reset so we only count once per stuck period, not every poll.
                 last_change_at = time.monotonic()
 
             # Attempt starting from the END of the listing (i.e. reversed
@@ -666,6 +744,7 @@ def run() -> None:
                     originator_stats[matched_originator]["invested_loans"].append({"loanId": loan_id, "amount": amount})
                     available_money -= amount
                     remaining_budget[matched_originator] -= amount
+                    log.info("Solde disponible actualisé après investissement : %.2f EUR (investi %.2f EUR dans le prêt %s).", available_money, amount, loan_id)
                     redistribution = _redistribute_stuck_remainder(remaining_budget, matched_originator)
                     if redistribution:
                         redistributions.append(redistribution)
@@ -680,19 +759,38 @@ def run() -> None:
                 # keep trying right away with the fresh (still reversed)
                 # list, instead of continuing to work off stale data.
                 try:
-                    available_money = fetch_available_money(session)
+                    previous_available_money = available_money
+                    available_money = _call_with_reauth(session, fetch_available_money)
+                    if available_money != previous_available_money:
+                        log.info("Solde disponible actualisé après tentative : %.2f EUR -> %.2f EUR.", previous_available_money, available_money)
                 except Exception as exc:
                     stats["errors"] += 1
                     _log_diagnostics("balance_refresh_error", error=str(exc), traceback=traceback.format_exc())
                     log.exception("Failed to refresh balance after a failed attempt, keeping last known value (%.2f EUR).", available_money)
                 try:
-                    body = fetch_loans(session, public_id)
+                    body = _call_with_reauth(session, fetch_loans, public_id)
                     data = body.get("data") or []
                     loans_to_try = list(reversed(data))
                 except Exception as exc:
                     stats["errors"] += 1
                     _log_diagnostics("poll_error", error=str(exc), traceback=traceback.format_exc())
                     log.exception("Failed to refresh the loans listing after a failed attempt, continuing with the remaining stale list.")
+
+            if available_money < MIN_INVESTMENT_AMOUNT:
+                # Same reasoning as the startup check: once the balance
+                # drops below the minimum (e.g. fully invested across all
+                # originators), no further investment is possible for the
+                # rest of the run regardless of remaining per-originator
+                # budgets - stop polling right away instead of wasting the
+                # remaining DURATION_SECONDS. Not an error: the run simply
+                # exits the loop normally, run_summary/the email still get
+                # sent as usual just below.
+                log.info(
+                    "Available balance (%.2f EUR) dropped below the minimum investment amount (%.2f EUR) - stopping the poll loop early.",
+                    available_money, MIN_INVESTMENT_AMOUNT,
+                )
+                _log_diagnostics("balance_exhausted", available_money=available_money, min_investment_amount=MIN_INVESTMENT_AMOUNT, poll=stats["polls"])
+                break
 
             elapsed_poll = time.monotonic() - poll_start
             remaining_sleep = POLL_INTERVAL_SECONDS - elapsed_poll
