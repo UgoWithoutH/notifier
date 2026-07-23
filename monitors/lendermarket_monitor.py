@@ -47,12 +47,48 @@ Optional:
     LENDERMARKET_TOTP_SECRET                   -> base32 secret used to set up
                                                    Google Authenticator, needed
                                                    if 2FA is enabled on the account
+
+Invest-structure exploration (added 2026-07-23): for each lender selected in
+the Google Sheet (shared.google_sheet.get_selected_lendermarket_lenders() -
+same "Répartition géographique" block convention as PeerBerry's own
+get_selected_peerberry_loan_originators(), but starting at the
+"Lendermarket" cell and stopping at "Loanch"), this module ALSO checks that
+lender's own availability using the exact filters (minInterestRate,
+minRemainingTermInDays, maxRemainingTermInDays, single lender ID) from the
+user's own filtered listing URLs - see LENDER_INVEST_FILTERS below - and, for
+any lender with newly-available loans, captures diagnostic data meant to
+help figure out, later, how to auto-invest on Lendermarket (mirroring
+swaper_monitor.py's own exploration, added the same day, for the same
+reason: the real invest HTTP request/HTML structure is unknown, and hasn't
+been able to be explored live/interactively since no matching loans were up
+at the time this was written).
+
+`capture_lendermarket_invest_exploration()` reuses the already-working
+pure-HTTP login() (see above: Laravel/Sanctum-style CSRF cookies) rather
+than reimplementing the login UI in Playwright (its selectors have never
+been verified, unlike Swaper's) - it injects the same session cookies into
+a fresh Playwright browser context (`context.add_cookies()`), assuming
+they're set on the shared `.lendermarket.com` parent domain so the
+app.lendermarket.com frontend picks them up too. This assumption is NOT
+confirmed - if wrong, the captured page will just show a login redirect
+instead of the real listing, which is reported as
+`frontend_session_established: false` in the diagnostics rather than
+failing the whole run. Response listeners only ever get registered on that
+freshly-authenticated page (nothing during the HTTP login itself). NO
+invest/confirm button is ever clicked - purely passive capture, same
+real-money safety boundary as Swaper's/PeerBerry's explorations. The result
+is emailed (see shared.notifier.send_lendermarket_invest_exploration_
+email()) as a JSON attachment whenever at least one selected lender has
+newly-available loans, so the user can pass that file back to build the
+real auto-invest bot once genuine loan/invest markup has actually been
+observed.
 """
 
 import json
 import logging
 import os
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 from urllib import request, parse, error
 from urllib.parse import unquote
@@ -60,8 +96,10 @@ from urllib.parse import unquote
 import pyotp
 import requests
 from dotenv import load_dotenv
+from playwright.sync_api import sync_playwright
 
-from shared.notifier import send_lendermarket_email
+from shared.notifier import send_lendermarket_email, send_lendermarket_invest_exploration_email
+from shared.google_sheet import get_selected_lendermarket_lenders
 from shared.state import load_state, save_state
 from shared.notification_gate import should_notify
 from shared.cron_schedule import ensure_schedule
@@ -134,6 +172,81 @@ LOAN_SEGMENTS = [
 # it drops back to 0 (fluctuations while staying above 0 don't re-open it).
 DEFAULT_STATE = {"gates": {}}
 
+# Per-lender filter configs for the invest-structure exploration (added
+# 2026-07-23) - one entry per lender the user actually watches for a future
+# auto-invest bot, selected via the Google Sheet (see
+# get_selected_lendermarket_lenders()). Verified 2026-07-23 against the
+# user's own filtered listing URLs - the `lender_id`s reuse the same UUIDs
+# already in LOAN_SEGMENTS above, but each has its own (stricter)
+# minInterestRate cutoff the aggregate segments above don't apply.
+LENDER_INVEST_FILTERS = {
+    "Dineo": {
+        "lender_id": "9d501521-54f8-4aa2-b975-6b34f8aac5a0",
+        "regulation_status": "REGULATED",
+        "min_interest_rate": 8,
+        "min_remaining_term_in_days": 1,
+        "max_remaining_term_in_days": 360,
+        "page_url": (
+            "https://app.lendermarket.com/fr/listes-des-prets/reglemente"
+            "?minInterestRate=8&minRemainingTermInDays=1&maxRemainingTermInDays=360"
+            "&lenders=9d501521-54f8-4aa2-b975-6b34f8aac5a0"
+        ),
+    },
+    "Creditstar Spain": {
+        "lender_id": "9babf437-637c-47b4-b0e7-937c30fa587c",
+        "regulation_status": "UNREGULATED",
+        "min_interest_rate": 10,
+        "min_remaining_term_in_days": 1,
+        "max_remaining_term_in_days": 360,
+        "page_url": (
+            "https://app.lendermarket.com/fr/listes-des-prets/non-reglemente"
+            "?minInterestRate=10&minRemainingTermInDays=1&maxRemainingTermInDays=360"
+            "&lenders=9babf437-637c-47b4-b0e7-937c30fa587c"
+        ),
+    },
+    "Creditstar Sweden": {
+        "lender_id": "9babf437-6ccb-4ae2-a22f-c887e9e3696c",
+        "regulation_status": "UNREGULATED",
+        "min_interest_rate": 9,
+        "min_remaining_term_in_days": 1,
+        "max_remaining_term_in_days": 360,
+        "page_url": (
+            "https://app.lendermarket.com/fr/listes-des-prets/non-reglemente"
+            "?minInterestRate=9&minRemainingTermInDays=1&maxRemainingTermInDays=360"
+            "&lenders=9babf437-6ccb-4ae2-a22f-c887e9e3696c"
+        ),
+    },
+    "Creditstar Denmark": {
+        "lender_id": "9babf437-6970-48e6-8175-62ef53465eba",
+        "regulation_status": "UNREGULATED",
+        "min_interest_rate": 9,
+        "min_remaining_term_in_days": 1,
+        "max_remaining_term_in_days": 360,
+        "page_url": (
+            "https://app.lendermarket.com/fr/listes-des-prets/non-reglemente"
+            "?minInterestRate=9&minRemainingTermInDays=1&maxRemainingTermInDays=360"
+            "&lenders=9babf437-6970-48e6-8175-62ef53465eba"
+        ),
+    },
+    "Creditstar Czech": {
+        "lender_id": "9babf437-5bf8-41fb-840d-6edf7012e408",
+        "regulation_status": "UNREGULATED",
+        "min_interest_rate": 9,
+        "min_remaining_term_in_days": 1,
+        "max_remaining_term_in_days": 360,
+        "page_url": (
+            "https://app.lendermarket.com/fr/listes-des-prets/non-reglemente"
+            "?minInterestRate=9&minRemainingTermInDays=1&maxRemainingTermInDays=360"
+            "&lenders=9babf437-5bf8-41fb-840d-6edf7012e408"
+        ),
+    },
+}
+
+# Caps for the invest-exploration diagnostics JSON attachment/HTML dump,
+# same idea and same values as swaper_monitor.py's equivalents.
+MAX_INVEST_EXPLORATION_CHARS = 500_000
+MAX_LISTING_PAGE_HTML_CHARS = 200_000
+
 
 def fetch_active_loans(segment: dict) -> list:
     """Fetch the currently active loans for one segment via the public API,
@@ -190,6 +303,171 @@ def aggregate_by_lender(loans: list) -> list:
             bucket["max_rate"] = rate if bucket["max_rate"] is None else max(bucket["max_rate"], rate)
 
     return sorted(buckets.values(), key=lambda b: b["lender"])
+
+
+def fetch_active_loans_for_lender(config: dict) -> list:
+    """Same public API as fetch_active_loans(), but for a single lender
+    with its own minInterestRate/minRemainingTermInDays cutoffs (one entry
+    of LENDER_INVEST_FILTERS) - used by the invest-exploration capture
+    below to check availability exactly like the user's own filtered
+    listing URLs (see module docstring, added 2026-07-23)."""
+    params = [
+        ("minInterestRate", str(config["min_interest_rate"])),
+        ("minRemainingTermInDays", str(config["min_remaining_term_in_days"])),
+        ("maxRemainingTermInDays", str(config["max_remaining_term_in_days"])),
+        ("regulationStatus", config["regulation_status"]),
+        ("lenders[]", config["lender_id"]),
+    ]
+    url = f"{LOANS_API_URL}?{parse.urlencode(params)}"
+
+    req = request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+    try:
+        with request.urlopen(req, timeout=20) as resp:
+            payload = json.loads(resp.read())
+    except error.HTTPError as exc:
+        log.error("Lendermarket API returned HTTP %s while checking lender availability.", exc.code)
+        return []
+    except Exception:
+        log.exception("Failed to fetch active loans for a specific lender.")
+        return []
+
+    return payload.get("data") or []
+
+
+def _match_lender_filter(sheet_name: str, filters: dict) -> str | None:
+    """Match a lender name as written in the Google Sheet against
+    LENDER_INVEST_FILTERS' keys - same exact/substring, case-insensitive
+    matching idea as peerberry_invest_bot._match_selected_originator(), in
+    case spelling isn't 100% identical between the sheet and this file.
+    Returns the matching filter key, or None if none matched."""
+    value = sheet_name.strip().lower()
+    if not value:
+        return None
+    for key in filters:
+        if key.strip().lower() == value:
+            return key
+    for key in filters:
+        key_lower = key.strip().lower()
+        if key_lower in value or value in key_lower:
+            return key
+    return None
+
+
+def _record_lendermarket_api_response(captured: list, response) -> None:
+    """`page.on("response", ...)` handler used by
+    capture_lendermarket_invest_exploration() to passively capture
+    Lendermarket's own API traffic while Playwright browses a filtered
+    listing page - see that function's docstring. Belt-and-braces skips
+    anything login/auth/password/totp-related in the URL too (same
+    precaution as swaper_monitor.py's equivalent), even though nothing
+    login-related should ever happen at this point in the flow.
+    """
+    url = response.url
+    if "lendermarket.com" not in url:
+        return
+    lower_url = url.lower()
+    if any(keyword in lower_url for keyword in ("login", "auth", "password", "totp")):
+        return
+    entry = {"method": response.request.method, "url": url, "status": response.status}
+    try:
+        entry["body"] = response.text()[:20000]
+    except Exception:
+        entry["body"] = None
+    captured.append(entry)
+
+
+def capture_lendermarket_invest_exploration(lenders_with_loans: list) -> dict | None:
+    """Best-effort Playwright-based capture of the invest-structure
+    diagnostics for the Google-Sheet-selected Lendermarket lenders that
+    currently have newly-available loans - see module docstring for the
+    full rationale/safety boundary (mirrors swaper_monitor.py's own
+    exploration: NO invest/confirm button is ever clicked here either).
+
+    `lenders_with_loans`: list of (lender_name, loans) tuples, `lender_name`
+    being a key of LENDER_INVEST_FILTERS.
+
+    UNVERIFIED cookie-sharing assumption (see module docstring): reuses the
+    already-working pure-HTTP login() and injects those same session
+    cookies into a fresh Playwright browser context, assuming they're set
+    on the shared `.lendermarket.com` parent domain rather than scoped to
+    api.lendermarket.com only. If that assumption is wrong, the listing
+    page will redirect to /login instead of showing the real content -
+    detected here and reported per-lender as
+    `frontend_session_established: false` rather than failing loudly.
+
+    Returns the diagnostics dict, or None if the HTTP login itself failed
+    (nothing to capture in that case).
+    """
+    try:
+        session = requests.Session()
+        investor_id = login(session)
+    except Exception:
+        log.exception("Invest-exploration: failed to log in via HTTP, skipping capture.")
+        return None
+
+    cookies_for_playwright = [
+        {
+            "name": cookie.name,
+            "value": cookie.value,
+            "domain": cookie.domain,
+            "path": cookie.path or "/",
+        }
+        for cookie in session.cookies
+    ]
+
+    diagnostics = {
+        "captured_at": datetime.now(timezone.utc).isoformat(),
+        "investor_id": investor_id,
+        "lenders": {},
+    }
+
+    try:
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=True)
+            context = browser.new_context(locale="fr-FR")
+            if cookies_for_playwright:
+                context.add_cookies(cookies_for_playwright)
+            page = context.new_page()
+
+            for lender_name, loans in lenders_with_loans:
+                config = LENDER_INVEST_FILTERS[lender_name]
+                captured_calls = []
+                handler = lambda response: _record_lendermarket_api_response(captured_calls, response)
+                page.on("response", handler)
+
+                frontend_logged_in = False
+                listing_html = None
+                try:
+                    page.goto(config["page_url"], wait_until="domcontentloaded", timeout=30000)
+                    frontend_logged_in = "/login" not in page.url
+                    try:
+                        listing_html = page.evaluate(
+                            "() => (document.querySelector('main') || document.body).outerHTML"
+                        )
+                    except Exception:
+                        log.exception("Could not capture the listing page HTML for lender '%s'.", lender_name)
+                except Exception:
+                    log.exception("Failed to navigate to the listing page for lender '%s'.", lender_name)
+                finally:
+                    page.remove_listener("response", handler)
+
+                if listing_html and len(listing_html) > MAX_LISTING_PAGE_HTML_CHARS:
+                    listing_html = listing_html[:MAX_LISTING_PAGE_HTML_CHARS] + "\n... (truncated)"
+
+                diagnostics["lenders"][lender_name] = {
+                    "loans_count": len(loans),
+                    "loans_api_payload": loans,
+                    "listing_page_url": config["page_url"],
+                    "frontend_session_established": frontend_logged_in,
+                    "captured_api_calls": captured_calls,
+                    "listing_page_html": listing_html,
+                }
+
+            browser.close()
+    except Exception:
+        log.exception("Invest-exploration: Playwright capture failed.")
+
+    return diagnostics
 
 
 def _xsrf_headers(session: requests.Session, investor_id: str | None = None) -> dict:
@@ -350,6 +628,51 @@ def run() -> None:
         send_lendermarket_email(balance, newly_available)
     else:
         log.info("Nothing new to notify.")
+
+    # Invest-structure exploration (added 2026-07-23) - see module
+    # docstring. Independent of the segment-level notification above: uses
+    # its own per-lender filters/notification gates (namespaced
+    # "lender_invest_<name>" so they never collide with the segment gates).
+    try:
+        selected_lender_names = get_selected_lendermarket_lenders()
+    except Exception:
+        log.exception("Could not read selected Lendermarket lenders from the Google Sheet, skipping invest-exploration.")
+        selected_lender_names = []
+
+    lenders_needing_exploration = []
+    for sheet_name in selected_lender_names:
+        filter_key = _match_lender_filter(sheet_name, LENDER_INVEST_FILTERS)
+        if filter_key is None:
+            log.warning(
+                "Selected Lendermarket lender '%s' from the Google Sheet doesn't match any known filter config, skipping.",
+                sheet_name,
+            )
+            continue
+
+        config = LENDER_INVEST_FILTERS[filter_key]
+        loans = fetch_active_loans_for_lender(config)
+        count = len(loans)
+        log.info("Lender '%s' (invest-exploration filters): %d loan(s) currently available.", filter_key, count)
+
+        gate_key = f"lender_invest_{filter_key}"
+        send_flag, was_reset = should_notify(gates, gate_key, count > 0)
+        if was_reset:
+            log.info("Lender '%s': resetting invest-exploration notification gate.", filter_key)
+
+        if send_flag:
+            lenders_needing_exploration.append((filter_key, loans))
+
+    if lenders_needing_exploration:
+        log.info(
+            "Capturing Lendermarket invest-structure exploration diagnostics for: %s",
+            [name for name, _ in lenders_needing_exploration],
+        )
+        diagnostics = capture_lendermarket_invest_exploration(lenders_needing_exploration)
+        if diagnostics:
+            invest_exploration_text = json.dumps(diagnostics, indent=2, ensure_ascii=False, default=str)
+            if len(invest_exploration_text) > MAX_INVEST_EXPLORATION_CHARS:
+                invest_exploration_text = invest_exploration_text[:MAX_INVEST_EXPLORATION_CHARS] + "\n... (truncated)"
+            send_lendermarket_invest_exploration_email(len(lenders_needing_exploration), invest_exploration_text)
 
     save_state(STATE_FILE, state)
 

@@ -467,6 +467,74 @@ def get_selected_peerberry_loan_originators() -> list:
     logger.info("Loan originators PeerBerry sélectionnés : %s", selected)
     return selected
 
+
+def get_selected_lendermarket_lenders() -> list:
+    """
+    Cherche la cellule "Répartition géographique", puis la cellule
+    "Lendermarket" en dessous (même colonne) : les lignes entre
+    "Lendermarket" et la cellule "Loanch" suivante (exclues toutes les
+    deux) sont les lenders du bloc Lendermarket. Pour chacune de ces
+    lignes ayant un nom de loan non vide dans la colonne "Répartition
+    géographique", si la cellule juste à gauche (colonne - 1) vaut "x"
+    (insensible à la casse), ce lender est sélectionné.
+
+    Même logique exacte que get_selected_peerberry_loan_originators(), pour
+    monitors/lendermarket_monitor.py's invest-structure exploration capture
+    (ajoutée le 2026-07-23).
+
+    Retourne la liste des noms de lenders sélectionnés (tels qu'écrits dans
+    la feuille, dans l'ordre des lignes).
+    """
+    logger.info("Recherche des lenders Lendermarket sélectionnés (colonne -1 = 'x')")
+
+    worksheet = get_latest_dashboard_worksheet(SPREADSHEET_ID)
+
+    # 1 seul appel API pour charger toute la feuille
+    grid = worksheet.get_all_values()
+
+    geo_pos = find_cell_by_value(grid, "Répartition géographique")
+    if not geo_pos:
+        raise RuntimeError(
+            "La section 'Répartition géographique' n'a pas été trouvée."
+        )
+
+    geo_row, geo_col = geo_pos
+
+    if geo_col < 2:
+        raise RuntimeError(
+            "Impossible de lire la colonne à gauche des loans : "
+            "'Répartition géographique' est dans la première colonne."
+        )
+
+    lendermarket_row = find_first_cell_containing_below(grid, geo_row, geo_col, "Lendermarket")
+    if not lendermarket_row:
+        raise RuntimeError(
+            "La cellule 'Lendermarket' n'a pas été trouvée sous 'Répartition géographique'."
+        )
+
+    loanch_row = find_first_cell_containing_below(grid, lendermarket_row, geo_col, "Loanch")
+    if not loanch_row:
+        raise RuntimeError(
+            "La cellule 'Loanch' n'a pas été trouvée sous 'Lendermarket' "
+            "(elle délimite la fin du bloc Lendermarket)."
+        )
+
+    selected = []
+    for row_idx in range(lendermarket_row + 1, loanch_row):
+        row = grid[row_idx - 1]
+
+        name = row[geo_col - 1].strip() if geo_col - 1 < len(row) else ""
+        if not name:
+            continue
+
+        flag = row[geo_col - 2].strip() if geo_col - 2 < len(row) else ""
+        if flag.lower() == "x":
+            selected.append(name)
+            logger.info("Lender Lendermarket sélectionné : '%s' (ligne %s)", name, row_idx)
+
+    logger.info("Lenders Lendermarket sélectionnés : %s", selected)
+    return selected
+
 if __name__ == "__main__":
     fill_current_month_amounts(
         platform="Bienprêter",

@@ -203,6 +203,64 @@ def send_lendermarket_email(balance: float | None, segments: dict) -> None:
         log.exception("Failed to send Lendermarket notification email.")
 
 
+def send_lendermarket_invest_exploration_email(lenders_count: int, diagnostics_text: str) -> None:
+    """Send the Lendermarket "invest-structure exploration" diagnostics
+    email - same idea/safety boundary as send_swaper_invest_exploration_
+    email() (see that function's docstring), added 2026-07-23 for
+    monitors/lendermarket_monitor.py's per-lender invest-exploration
+    capture: whenever a Google-Sheet-selected lender (see
+    shared.google_sheet.get_selected_lendermarket_lenders()) has newly
+    available loans matching the user's own filtered-listing criteria,
+    this emails a JSON attachment with the raw loans-listing API payload,
+    any other Lendermarket API calls observed while Playwright browsed the
+    real listing page (method/url/status/truncated body), and a truncated
+    HTML dump of that page - for every such lender in this run. NO invest/
+    confirm button is ever clicked to gather this - purely passive capture
+    of a (best-effort) authenticated session.
+    """
+    if not all([SMTP_HOST, SMTP_USER, SMTP_PASSWORD, EMAIL_TO]):
+        log.error(
+            "SMTP configuration is incomplete; cannot send email. "
+            "Required env vars: SMTP_HOST, SMTP_USER, SMTP_PASSWORD, EMAIL_TO."
+        )
+        return
+
+    subject = f"[Lendermarket] Diagnostic structure d'investissement ({lenders_count} lender(s))"
+    body = (
+        f"{lenders_count} lender(s) sélectionné(s) dans le Google Sheet ont des "
+        "pr\u00eats disponibles correspondant à tes filtres sur Lendermarket.\n\n"
+        "Le fichier joint contient, pour chacun : la r\u00e9ponse brute de l'API "
+        "de listing des pr\u00eats, les autres appels API Lendermarket observ\u00e9s "
+        "pendant la navigation sur la page de listing r\u00e9elle, et un extrait du "
+        "HTML de cette page. Aucun clic d'investissement/confirmation n'a "
+        "\u00e9t\u00e9 effectu\u00e9 (aucun risque d'argent r\u00e9el) - c'est juste de la "
+        "capture passive.\n\n"
+        "Renvoie ce fichier pour permettre de comprendre la structure HTML/API "
+        "n\u00e9cessaire pour investir automatiquement sur Lendermarket."
+    )
+
+    msg = MIMEMultipart()
+    msg["From"] = EMAIL_FROM
+    msg["To"] = EMAIL_TO
+    msg["Subject"] = subject
+    msg.attach(MIMEText(body, "plain"))
+
+    attachment = MIMEText(diagnostics_text, "plain", "utf-8")
+    attachment.add_header(
+        "Content-Disposition", "attachment", filename="lendermarket_invest_exploration_diagnostics.json"
+    )
+    msg.attach(attachment)
+
+    try:
+        with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=15) as server:
+            server.starttls()
+            server.login(SMTP_USER, SMTP_PASSWORD)
+            server.sendmail(EMAIL_FROM, [EMAIL_TO], msg.as_string())
+        log.info("Lendermarket invest-exploration diagnostics email sent to %s.", EMAIL_TO)
+    except Exception:
+        log.exception("Failed to send Lendermarket invest-exploration diagnostics email.")
+
+
 def send_peerberry_email(originators: list) -> None:
     """Send the PeerBerry "distribution by loan originators" recap.
 
