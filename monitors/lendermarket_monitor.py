@@ -81,7 +81,13 @@ is emailed (see shared.notifier.send_lendermarket_invest_exploration_
 email()) as a JSON attachment whenever at least one selected lender has
 newly-available loans, so the user can pass that file back to build the
 real auto-invest bot once genuine loan/invest markup has actually been
-observed.
+observed. Independent of account balance entirely (checks loan availability
+only), per explicit user request (2026-07-24) - the goal is just to observe
+the real structure, so it shouldn't wait for money to be available too. Sent
+AT MOST ONCE EVER (not once per notification cycle) via a persistent
+`invest_exploration_sent` flag in STATE_FILE (platform-wide, not per-lender),
+so the user is never spammed with repeat copies of the same structure once
+it's already been captured and sent.
 """
 
 import json
@@ -170,7 +176,13 @@ LOAN_SEGMENTS = [
 # Per-segment notification gate (see notification_gate.py), shared with
 # swaper_monitor.py: notify once while a segment has loans, reset only when
 # it drops back to 0 (fluctuations while staying above 0 don't re-open it).
-DEFAULT_STATE = {"gates": {}}
+DEFAULT_STATE = {
+    "gates": {},
+    # Set to True the first (and only) time the invest-structure exploration
+    # email is sent - see module docstring. Platform-wide (not per-lender),
+    # independent of "gates" above.
+    "invest_exploration_sent": False,
+}
 
 # Per-lender filter configs for the invest-structure exploration (added
 # 2026-07-23) - one entry per lender the user actually watches for a future
@@ -353,6 +365,21 @@ def _match_lender_filter(sheet_name: str, filters: dict) -> str | None:
     return None
 
 
+def _redact_sensitive_headers(headers: dict) -> dict:
+    """Same redaction rule as swaper_monitor.py's equivalent - keep header
+    names/values needed to see the request shape (content-type, custom API
+    headers like x-xsrf-token/X-INVESTOR-ID) but blank out raw cookies/auth
+    tokens before they go into an emailed diagnostics attachment.
+    """
+    redacted = {}
+    for name, value in headers.items():
+        if name.lower() in ("cookie", "authorization", "set-cookie"):
+            redacted[name] = "[REDACTED - sensitive session/auth value, not needed to see the request shape]"
+        else:
+            redacted[name] = value
+    return redacted
+
+
 def _record_lendermarket_api_response(captured: list, response) -> None:
     """`page.on("response", ...)` handler used by
     capture_lendermarket_invest_exploration() to passively capture
@@ -360,7 +387,10 @@ def _record_lendermarket_api_response(captured: list, response) -> None:
     listing page - see that function's docstring. Belt-and-braces skips
     anything login/auth/password/totp-related in the URL too (same
     precaution as swaper_monitor.py's equivalent), even though nothing
-    login-related should ever happen at this point in the flow.
+    login-related should ever happen at this point in the flow. Captures
+    both the request (method, url, headers, POST body) and the response
+    (status, body) - so there's enough detail to later reconstruct these
+    calls for a bot, per explicit user request.
     """
     url = response.url
     if "lendermarket.com" not in url:
@@ -368,7 +398,14 @@ def _record_lendermarket_api_response(captured: list, response) -> None:
     lower_url = url.lower()
     if any(keyword in lower_url for keyword in ("login", "auth", "password", "totp")):
         return
-    entry = {"method": response.request.method, "url": url, "status": response.status}
+    request = response.request
+    entry = {
+        "method": request.method,
+        "url": url,
+        "request_headers": _redact_sensitive_headers(request.headers),
+        "request_post_data": request.post_data,
+        "status": response.status,
+    }
     try:
         entry["body"] = response.text()[:20000]
     except Exception:
@@ -629,50 +666,53 @@ def run() -> None:
     else:
         log.info("Nothing new to notify.")
 
-    # Invest-structure exploration (added 2026-07-23) - see module
-    # docstring. Independent of the segment-level notification above: uses
-    # its own per-lender filters/notification gates (namespaced
-    # "lender_invest_<name>" so they never collide with the segment gates).
-    try:
-        selected_lender_names = get_selected_lendermarket_lenders()
-    except Exception:
-        log.exception("Could not read selected Lendermarket lenders from the Google Sheet, skipping invest-exploration.")
-        selected_lender_names = []
+    # Invest-structure exploration (added 2026-07-23, decoupled from balance
+    # and switched to a one-time-ever flag on 2026-07-24 per explicit user
+    # request) - see module docstring. Independent of the segment-level
+    # notification above and of account balance: checks each Google-Sheet-
+    # selected lender's availability regardless of balance, but only ever
+    # captures/sends the diagnostics ONCE for the whole platform (not once
+    # per lender, not once per cycle) - skipped entirely once
+    # `invest_exploration_sent` is already True.
+    if state.get("invest_exploration_sent"):
+        log.info("Lendermarket invest-structure exploration diagnostics were already sent previously - skipping (avoids spamming).")
+    else:
+        try:
+            selected_lender_names = get_selected_lendermarket_lenders()
+        except Exception:
+            log.exception("Could not read selected Lendermarket lenders from the Google Sheet, skipping invest-exploration.")
+            selected_lender_names = []
 
-    lenders_needing_exploration = []
-    for sheet_name in selected_lender_names:
-        filter_key = _match_lender_filter(sheet_name, LENDER_INVEST_FILTERS)
-        if filter_key is None:
-            log.warning(
-                "Selected Lendermarket lender '%s' from the Google Sheet doesn't match any known filter config, skipping.",
-                sheet_name,
+        lenders_needing_exploration = []
+        for sheet_name in selected_lender_names:
+            filter_key = _match_lender_filter(sheet_name, LENDER_INVEST_FILTERS)
+            if filter_key is None:
+                log.warning(
+                    "Selected Lendermarket lender '%s' from the Google Sheet doesn't match any known filter config, skipping.",
+                    sheet_name,
+                )
+                continue
+
+            config = LENDER_INVEST_FILTERS[filter_key]
+            loans = fetch_active_loans_for_lender(config)
+            count = len(loans)
+            log.info("Lender '%s' (invest-exploration filters): %d loan(s) currently available.", filter_key, count)
+
+            if count > 0:
+                lenders_needing_exploration.append((filter_key, loans))
+
+        if lenders_needing_exploration:
+            log.info(
+                "Capturing Lendermarket invest-structure exploration diagnostics for: %s",
+                [name for name, _ in lenders_needing_exploration],
             )
-            continue
-
-        config = LENDER_INVEST_FILTERS[filter_key]
-        loans = fetch_active_loans_for_lender(config)
-        count = len(loans)
-        log.info("Lender '%s' (invest-exploration filters): %d loan(s) currently available.", filter_key, count)
-
-        gate_key = f"lender_invest_{filter_key}"
-        send_flag, was_reset = should_notify(gates, gate_key, count > 0)
-        if was_reset:
-            log.info("Lender '%s': resetting invest-exploration notification gate.", filter_key)
-
-        if send_flag:
-            lenders_needing_exploration.append((filter_key, loans))
-
-    if lenders_needing_exploration:
-        log.info(
-            "Capturing Lendermarket invest-structure exploration diagnostics for: %s",
-            [name for name, _ in lenders_needing_exploration],
-        )
-        diagnostics = capture_lendermarket_invest_exploration(lenders_needing_exploration)
-        if diagnostics:
-            invest_exploration_text = json.dumps(diagnostics, indent=2, ensure_ascii=False, default=str)
-            if len(invest_exploration_text) > MAX_INVEST_EXPLORATION_CHARS:
-                invest_exploration_text = invest_exploration_text[:MAX_INVEST_EXPLORATION_CHARS] + "\n... (truncated)"
-            send_lendermarket_invest_exploration_email(len(lenders_needing_exploration), invest_exploration_text)
+            diagnostics = capture_lendermarket_invest_exploration(lenders_needing_exploration)
+            if diagnostics:
+                invest_exploration_text = json.dumps(diagnostics, indent=2, ensure_ascii=False, default=str)
+                if len(invest_exploration_text) > MAX_INVEST_EXPLORATION_CHARS:
+                    invest_exploration_text = invest_exploration_text[:MAX_INVEST_EXPLORATION_CHARS] + "\n... (truncated)"
+                send_lendermarket_invest_exploration_email(len(lenders_needing_exploration), invest_exploration_text)
+                state["invest_exploration_sent"] = True
 
     save_state(STATE_FILE, state)
 

@@ -34,9 +34,13 @@ purely passive capture, same real-money safety boundary already established
 for the PeerBerry exploration (see repo memory: don't click a real invest/
 confirm control without the user explicitly accepting that risk). The result
 is emailed (see shared.notifier.send_swaper_invest_exploration_email()) as a
-JSON attachment whenever the normal notification email is also sent, so the
-user can pass that file back to build the real auto-invest bot once genuine
-loan/invest markup has actually been observed.
+JSON attachment whenever loans are available - regardless of account
+balance, per explicit user request (2026-07-24): the goal is just to observe
+the real structure, so it shouldn't wait for money to be available too.
+Sent AT MOST ONCE EVER (not once per notification cycle) via a persistent
+`invest_exploration_sent` flag in STATE_FILE, separate from the "swaper"
+notification gate above, so the user is never spammed with repeat copies of
+the same structure once it's already been captured and sent.
 """
 
 import json
@@ -60,6 +64,9 @@ from shared.browser_stealth import get_context_options, apply_stealth, human_pau
 
 DEFAULT_STATE = {
     "gates": {},
+    # Set to True the first (and only) time the invest-structure exploration
+    # email is sent - see module docstring. Independent of "gates" above.
+    "invest_exploration_sent": False,
 }
 
 load_dotenv()
@@ -231,6 +238,23 @@ MAX_INVEST_EXPLORATION_CHARS = 500_000
 MAX_LOANS_PAGE_HTML_CHARS = 200_000
 
 
+def _redact_sensitive_headers(headers: dict) -> dict:
+    """Return a copy of `headers` with session/auth values (cookies,
+    bearer/auth tokens) replaced by a placeholder - everything else
+    (content-type, custom API headers, etc.) needed to replicate a call is
+    kept as-is. Avoids putting live session credentials into an emailed
+    diagnostics attachment; the shape of the request (headers present,
+    body) is what matters for building the bot later, not the live token.
+    """
+    redacted = {}
+    for name, value in headers.items():
+        if name.lower() in ("cookie", "authorization", "set-cookie"):
+            redacted[name] = "[REDACTED - sensitive session/auth value, not needed to see the request shape]"
+        else:
+            redacted[name] = value
+    return redacted
+
+
 def _record_api_response(captured: list, response) -> None:
     """`page.on("response", ...)` handler used by run() to passively capture
     Swaper's own `/rest/` API traffic while browsing the loans page, for the
@@ -239,7 +263,9 @@ def _record_api_response(captured: list, response) -> None:
     skips anything login/auth-related as a second safety layer (belt-and-
     braces, per the repo's security lesson about page.route()/page.on()
     interceptors and credentials) even though that should never happen at
-    this point in the flow.
+    this point in the flow. Captures both the request (method, url, headers,
+    POST body) and the response (status, body) - so there's enough detail to
+    later reconstruct these calls for a bot, per explicit user request.
     """
     url = response.url
     if "swaper.com" not in url or "/rest/" not in url:
@@ -247,7 +273,14 @@ def _record_api_response(captured: list, response) -> None:
     lower_url = url.lower()
     if any(keyword in lower_url for keyword in ("login", "auth", "password")):
         return
-    entry = {"method": response.request.method, "url": url, "status": response.status}
+    request = response.request
+    entry = {
+        "method": request.method,
+        "url": url,
+        "request_headers": _redact_sensitive_headers(request.headers),
+        "request_post_data": request.post_data,
+        "status": response.status,
+    }
     try:
         entry["body"] = response.text()[:20000]
     except Exception:
@@ -314,8 +347,10 @@ def run(headless: bool = True) -> None:
     # Build the invest-structure exploration diagnostics (only meaningful
     # when there's actually at least one loan to look at) - see module
     # docstring. Cheap to build unconditionally (data already fetched/
-    # captured above); only actually emailed below if loans exist AND the
-    # normal notification email also fires this run.
+    # captured above); only actually emailed below if loans exist, and only
+    # the very first time ever (independent of balance/the normal
+    # notification email - see the one-time invest_exploration_sent flag
+    # further down).
     invest_exploration_text = None
     if loans:
         if loans_page_html and len(loans_page_html) > MAX_LOANS_PAGE_HTML_CHARS:
@@ -340,8 +375,6 @@ def run(headless: bool = True) -> None:
     if force_test_email:
         log.info("FORCE_TEST_EMAIL is set - sending a forced test recap email.")
         send_swaper_email(balance, loans)
-        if invest_exploration_text:
-            send_swaper_invest_exploration_email(len(loans), invest_exploration_text)
 
     if balance < 10:
         ensure_schedule("30m", cron_job_id=SWAPER_CRON_JOB_ID, state_file=CRON_SCHEDULE_STATE_FILE)
@@ -367,9 +400,6 @@ def run(headless: bool = True) -> None:
     if send and not force_test_email:
         log.info("Notification decision: SEND (reason=balance >= 10 and loans available and gate open).")
         send_swaper_email(balance, loans)
-        if invest_exploration_text:
-            log.info("Sending Swaper invest-structure exploration diagnostics email (%d loan(s) available).", len(loans))
-            send_swaper_invest_exploration_email(len(loans), invest_exploration_text)
     elif available:
         if force_test_email:
             log.info("Notification decision: SKIP normal cycle send (reason=force_test_email_already_sent).")
@@ -377,6 +407,19 @@ def run(headless: bool = True) -> None:
             log.info("Notification decision: SKIP (reason=already_notified_for_current_cycle).")
     else:
         log.info("Notification decision: SKIP (reason=balance < 10 or no loans available).")
+
+    # Invest-structure exploration email: deliberately INDEPENDENT of the
+    # balance/notification-gate logic above - fires whenever loans are
+    # available at all, even with an empty/insufficient balance, per
+    # explicit user request (2026-07-24). Sent AT MOST ONCE EVER (not once
+    # per cycle) via a persistent flag so the user isn't spammed with
+    # repeat copies of the same structure.
+    if invest_exploration_text and not state.get("invest_exploration_sent"):
+        log.info("Sending Swaper invest-structure exploration diagnostics email (%d loan(s) available) - first and only time.", len(loans))
+        send_swaper_invest_exploration_email(len(loans), invest_exploration_text)
+        state["invest_exploration_sent"] = True
+    elif invest_exploration_text:
+        log.info("Swaper invest-structure exploration diagnostics were already sent previously - skipping (avoids spamming).")
 
     save_state(STATE_FILE, state)
 
