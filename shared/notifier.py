@@ -261,6 +261,110 @@ def send_lendermarket_invest_exploration_email(lenders_count: int, diagnostics_t
         log.exception("Failed to send Lendermarket invest-exploration diagnostics email.")
 
 
+def send_lendermarket_invest_summary_email(stats: dict, error: str | None = None, diagnostics_text: str | None = None) -> None:
+    """Send the end-of-run recap for monitors/lendermarket_monitor.py's real
+    auto-invest step (invest_selected_lenders(), added 2026-07-24). Only
+    called when at least one real investment attempt was made this run, OR
+    an unexpected error occurred (see that module's run()) - NOT on every
+    run, so this frequent scheduled monitor doesn't spam an email every
+    cycle when there was simply nothing to invest.
+
+    `stats` is the dict built by invest_selected_lenders(): `balance_before`,
+    `balance_after` (running balance decremented by every successful
+    investment), `lender_budgets` (per-lender share of the balance, 0.0 for
+    a selected lender with no loan available this run), `invest_attempts`,
+    `invest_successes`, `invest_failures`, `total_invested`, `lender_stats`
+    (per-lender dict with `budget`, `loans_seen`, `attempts`, `successes`,
+    `failures`, `invested_amount`, `invested_loans`).
+    `error`, if set, is a short description of an unexpected exception that
+    interrupted the invest step early. Same convention as
+    peerberry_invest_bot.py's summary email: the body never includes raw
+    request/response detail - `diagnostics_text` (this run's own
+    lendermarket_invest_diagnostics.log entries, built by
+    lendermarket_monitor._collect_run_invest_diagnostics()), if provided,
+    is attached instead as a plain-text .log file, so the full detail
+    (including every failed attempt's real request/response) is directly
+    available by email.
+    """
+    if not all([SMTP_HOST, SMTP_USER, SMTP_PASSWORD, EMAIL_TO]):
+        log.error(
+            "SMTP configuration is incomplete; cannot send email. "
+            "Required env vars: SMTP_HOST, SMTP_USER, SMTP_PASSWORD, EMAIL_TO."
+        )
+        return
+
+    status = "ÉCHEC" if error else "OK"
+    subject = f"[Lendermarket Invest Bot] {status} - {stats.get('invest_successes', 0)} investissement(s) réussi(s)"
+
+    balance_before = stats.get("balance_before")
+    balance_after = stats.get("balance_after")
+    body_parts = [f"Statut : {status}" + (f" ({error})" if error else "")]
+    if balance_before is not None:
+        body_parts.append(f"Solde avant : {balance_before:.2f} €")
+    if balance_after is not None:
+        body_parts.append(f"Solde après : {balance_after:.2f} €")
+    body_parts += [
+        f"Tentatives d'investissement : {stats.get('invest_attempts', 0)}",
+        f"  - réussies : {stats.get('invest_successes', 0)}",
+        f"  - échouées : {stats.get('invest_failures', 0)}",
+        f"Montant total investi : {stats.get('total_invested', 0.0):.2f} €",
+    ]
+
+    lender_stats = stats.get("lender_stats") or {}
+    if lender_stats:
+        body_parts.append("")
+        body_parts.append("=== Détail par lender ===")
+        for name, s in lender_stats.items():
+            body_parts.append("")
+            body_parts.append(f"- {name}")
+            body_parts.append(
+                f"    Budget (part du solde) : {s.get('budget', 0.0):.2f} € | "
+                f"investi : {s.get('invested_amount', 0.0):.2f} €"
+            )
+            body_parts.append(
+                f"    Prêts disponibles vus : {s.get('loans_seen', 0)} | "
+                f"tentatives : {s.get('attempts', 0)} "
+                f"(réussies : {s.get('successes', 0)}, échouées : {s.get('failures', 0)})"
+            )
+            invested_loans = s.get("invested_loans") or []
+            if invested_loans:
+                details = ", ".join(f"{lo['loanUuid']} ({lo['amount']:.2f} €)" for lo in invested_loans)
+                body_parts.append(f"    Prêts investis : {details}")
+            else:
+                body_parts.append("    Prêts investis : aucun")
+
+    if stats.get("invest_failures", 0) > 0 or error:
+        body_parts.append("")
+        body_parts.append(
+            "Le détail complet (requête/réponse) de chaque échec, et de toute "
+            "erreur inattendue, est joint à cet email."
+        )
+
+    body = "\n".join(body_parts)
+
+    msg = MIMEMultipart()
+    msg["From"] = EMAIL_FROM
+    msg["To"] = EMAIL_TO
+    msg["Subject"] = subject
+    msg.attach(MIMEText(body, "plain"))
+
+    if diagnostics_text:
+        attachment = MIMEText(diagnostics_text, "plain", "utf-8")
+        attachment.add_header(
+            "Content-Disposition", "attachment", filename="lendermarket_invest_bot_diagnostics_this_run.log"
+        )
+        msg.attach(attachment)
+
+    try:
+        with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=15) as server:
+            server.starttls()
+            server.login(SMTP_USER, SMTP_PASSWORD)
+            server.sendmail(EMAIL_FROM, [EMAIL_TO], msg.as_string())
+        log.info("Lendermarket invest bot summary email sent to %s.", EMAIL_TO)
+    except Exception:
+        log.exception("Failed to send Lendermarket invest bot summary email.")
+
+
 def send_peerberry_email(originators: list) -> None:
     """Send the PeerBerry "distribution by loan originators" recap.
 

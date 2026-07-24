@@ -94,6 +94,7 @@ import json
 import logging
 import os
 import time
+import traceback
 from datetime import datetime, timezone
 from pathlib import Path
 from urllib import request, parse, error
@@ -104,7 +105,7 @@ import requests
 from dotenv import load_dotenv
 from playwright.sync_api import sync_playwright
 
-from shared.notifier import send_lendermarket_email, send_lendermarket_invest_exploration_email
+from shared.notifier import send_lendermarket_email, send_lendermarket_invest_exploration_email, send_lendermarket_invest_summary_email
 from shared.google_sheet import get_selected_lendermarket_lenders
 from shared.state import load_state, save_state
 from shared.notification_gate import should_notify
@@ -126,9 +127,23 @@ LOGIN_URL = f"{API_BASE}/users/v1/auth/login"
 TOTP_URL = f"{API_BASE}/users/v1/auth/submitTotpChallenge"
 LOANS_API_URL = f"{API_BASE}/claims/v1/public/getActiveLoans"
 BALANCE_API_URL = f"{API_BASE}/ledger/v1/investor/getInvestorAccountSummary"
+# Real invest submission call - see module docstring/repo memory
+# ("2026-07-24 ... createInvestment") for how this was captured (safe,
+# network-intercepted click-through, no real money spent).
+INVEST_URL = f"{API_BASE}/claims/v1/investor/createInvestment"
 
 STATE_FILE = Path(__file__).parent / "lendermarket_state.json"
 CRON_SCHEDULE_STATE_FILE = Path(__file__).parent / "lendermarket_cron_schedule_state.json"
+# Diagnostics for the real auto-invest feature (added 2026-07-24) - full
+# request/response detail for every real investment attempt, same idea as
+# peerberry_invest_bot.py's DIAGNOSTICS_FILE: never printed to stdout, only
+# ever attached (this run's own entries) to the invest summary email.
+INVEST_DIAGNOSTICS_FILE = Path(__file__).parent / "lendermarket_invest_diagnostics.log"
+
+# Auto-invest is skipped below this amount per loan (same rationale/default
+# as PeerBerry's own invest bot) - the platform's own real minimum per
+# investment, confirmed by the user 2026-07-24.
+MIN_INVESTMENT_AMOUNT = float(os.environ.get("LENDERMARKET_MIN_INVESTMENT_AMOUNT", "10"))
 
 _HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
@@ -595,21 +610,329 @@ def fetch_account_balance(session: requests.Session, investor_id: str) -> float 
         return None
 
 
-def fetch_balance_via_login() -> float | None:
+def login_and_fetch_balance() -> tuple:
+    """Log in once and return `(session, investor_id, balance)` - the
+    authenticated session/investor_id are kept (unlike the old
+    fetch_balance_via_login(), which discarded them) so the SAME login can
+    also be reused for the real auto-invest step below (`invest_selected_
+    lenders()`), instead of logging in twice per run (extra network
+    round-trip + doubles the risk of a TOTP-rollover timing issue on 2FA
+    accounts). Returns `(None, None, None)` if credentials are missing or
+    login fails."""
     if not LENDERMARKET_EMAIL or not LENDERMARKET_PASSWORD:
         log.warning("LENDERMARKET_EMAIL/PASSWORD not set, skipping account balance lookup.")
-        return None
+        return None, None, None
 
     session = requests.Session()
     try:
         investor_id = login(session)
-        return fetch_account_balance(session, investor_id)
     except Exception:
         log.exception("Failed to log into Lendermarket to fetch the account balance.")
+        return None, None, None
+
+    balance = fetch_account_balance(session, investor_id)
+    return session, investor_id, balance
+
+
+def _log_invest_diagnostics(tag: str, **fields) -> None:
+    """Append one JSON line of full diagnostic detail to
+    INVEST_DIAGNOSTICS_FILE (never printed to stdout/the console log - same
+    convention as peerberry_invest_bot.py's _log_diagnostics())."""
+    entry = {
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "tag": tag,
+        **fields,
+    }
+    try:
+        with INVEST_DIAGNOSTICS_FILE.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(entry, default=str, ensure_ascii=False) + "\n")
+    except OSError:
+        log.exception("Could not write to invest diagnostics file %s", INVEST_DIAGNOSTICS_FILE)
+
+
+# Cap how much diagnostics text gets attached to the summary email, same
+# value/rationale as peerberry_invest_bot.py's equivalent.
+MAX_INVEST_DIAGNOSTICS_EMAIL_CHARS = 2_000_000
+
+
+def _collect_run_invest_diagnostics(since: datetime) -> str | None:
+    """Read INVEST_DIAGNOSTICS_FILE and return only the JSON lines written
+    at/after `since` (this run's own entries, since the file accumulates
+    history across every past run too) - same idea as
+    peerberry_invest_bot.py's `_collect_run_diagnostics()`, so the full
+    request/response detail (and any error) is attached directly to the
+    invest summary email instead of requiring manual access to the runner's
+    filesystem. Returns None if the file doesn't exist or this run added
+    nothing to it."""
+    if not INVEST_DIAGNOSTICS_FILE.exists():
         return None
+    lines = []
+    try:
+        with INVEST_DIAGNOSTICS_FILE.open("r", encoding="utf-8") as f:
+            for line in f:
+                line = line.rstrip("\n")
+                if not line:
+                    continue
+                try:
+                    entry = json.loads(line)
+                    entry_time = datetime.fromisoformat(entry["timestamp"])
+                except (json.JSONDecodeError, KeyError, ValueError):
+                    continue
+                if entry_time >= since:
+                    lines.append(line)
+    except OSError:
+        log.exception("Could not read invest diagnostics file %s for the summary email attachment.", INVEST_DIAGNOSTICS_FILE)
+        return None
+    if not lines:
+        return None
+    text = "\n".join(lines)
+    if len(text) > MAX_INVEST_DIAGNOSTICS_EMAIL_CHARS:
+        text = text[-MAX_INVEST_DIAGNOSTICS_EMAIL_CHARS:]
+        text = "(truncated, showing the last part only)\n" + text
+    return text
+
+
+def _format_amount(amount: float) -> str:
+    """Mimic the string Lendermarket's own invest-form number input sends:
+    whole numbers with no decimals ("10"), fractional ones trimmed of
+    trailing zeros ("33.33") - same convention as peerberry_invest_bot.py's
+    equivalent (real capture on 2026-07-24 showed a plain "10" string)."""
+    rounded = round(float(amount), 2)
+    if rounded == int(rounded):
+        return str(int(rounded))
+    return f"{rounded:.2f}".rstrip("0").rstrip(".")
+
+
+def _compute_loan_shares(budget: float, loans: list, min_investment: float = MIN_INVESTMENT_AMOUNT) -> dict:
+    """Split `budget` (one lender's own share of the account balance, see
+    `invest_selected_lenders()`) EQUALLY across `loans` (that same lender's
+    currently available loans), per explicit user request 2026-07-24: "2
+    prêts dispo -> divisé par 2, 3 prêts -> divisé par 3" - a raw equal
+    division, NOT PeerBerry's fixed-size-block split.
+
+    Two adjustments on top of a plain `budget / len(loans)`:
+    - If the equal share would be below `min_investment` (the platform's
+      own real per-investment minimum), fewer loans are funded instead (as
+      many as `budget // min_investment` allows, kept in listing order) so
+      every funded loan still gets at least `min_investment` - "je ne veux
+      pas de reste" (no unusable leftover below the minimum).
+    - If a loan's own `investableAmount` is smaller than its equal share
+      (there isn't `budget/n` EUR left to invest in that specific loan),
+      that loan is capped at what it can actually take and the excess is
+      redistributed across the other loans in the same pass (equal share
+      recomputed on what's left) - repeated until stable, so unused money
+      doesn't sit idle in one loan's slot while another loan could still
+      absorb it, again to avoid a leftover.
+
+    Returns `{loan_uuid: amount}` for every loan that ends up funded
+    (amount rounded to 2 decimals); loans below `min_investment` after all
+    adjustments are simply omitted.
+    """
+    caps = {}
+    for loan in loans:
+        loan_uuid = loan.get("uuid")
+        if not loan_uuid:
+            continue
+        try:
+            cap = float(loan.get("investableAmount") or loan.get("loanAmount") or 0)
+        except (TypeError, ValueError):
+            cap = 0.0
+        if cap > 0:
+            caps[loan_uuid] = cap
+
+    # Keep insertion (listing) order for deterministic drop/keep decisions below.
+    active = list(caps.keys())
+    remaining = budget
+    shares = {}
+
+    while active:
+        if remaining < min_investment:
+            break
+
+        equal_share = remaining / len(active)
+        if equal_share < min_investment:
+            max_active = int(remaining // min_investment)
+            if max_active <= 0:
+                break
+            if max_active < len(active):
+                active = active[:max_active]
+            continue
+
+        capped_any = False
+        for loan_uuid in list(active):
+            if caps[loan_uuid] < equal_share:
+                shares[loan_uuid] = caps[loan_uuid]
+                remaining -= caps[loan_uuid]
+                active.remove(loan_uuid)
+                capped_any = True
+        if capped_any:
+            continue
+
+        for loan_uuid in active:
+            shares[loan_uuid] = round(equal_share, 2)
+        break
+
+    return shares
+
+
+def attempt_investment(session: requests.Session, loan_uuid: str, amount: float) -> bool:
+    """Real invest submission call - `POST claims/v1/investor/createInvestment`,
+    see module docstring/repo memory ("2026-07-24 ... createInvestment") for
+    how this was captured (safe, network-intercepted click-through, no real
+    money ever spent during that capture). Notably NO `X-INVESTOR-ID` header
+    on this specific call (unlike other authenticated Lendermarket calls in
+    this file). Both `acceptedLimitedPurposeTerms` and
+    `acceptedLimitedRecourseTerms` are sent as `true` (the capture only had
+    the first one checked/true - the second, a "Contrat de rachat"
+    checkbox, wasn't expanded/checked - but a real bot should accept both
+    sets of terms to actually invest properly).
+    Always logs the full request+response to INVEST_DIAGNOSTICS_FILE,
+    whether it succeeds or fails."""
+    payload = {
+        "investmentAmount": _format_amount(amount),
+        "acceptedLimitedPurposeTerms": True,
+        "acceptedLimitedRecourseTerms": True,
+        "acceptRisk": "true",
+        "loanUuid": loan_uuid,
+    }
+    try:
+        r = session.post(INVEST_URL, json=payload, headers=_xsrf_headers(session), timeout=20)
+    except Exception as exc:
+        _log_invest_diagnostics(
+            "invest_attempt_exception",
+            loan_uuid=loan_uuid,
+            payload=payload,
+            error=str(exc),
+            traceback=traceback.format_exc(),
+        )
+        log.exception("Investment attempt raised an exception for loan %s.", loan_uuid)
+        return False
+
+    _log_invest_diagnostics(
+        "invest_attempt",
+        loan_uuid=loan_uuid,
+        payload=payload,
+        status=r.status_code,
+        response_headers=_redact_sensitive_headers(dict(r.headers)),
+        response_body=r.text[:5000],
+    )
+    if r.ok:
+        log.info("Investment attempt for loan %s (%.2f EUR) returned status=%s.", loan_uuid, amount, r.status_code)
+        return True
+    log.warning(
+        "Investment attempt for loan %s (%.2f EUR) FAILED status=%s - full request/response saved to diagnostics.",
+        loan_uuid, amount, r.status_code,
+    )
+    return False
+
+
+def invest_selected_lenders(session: requests.Session, balance: float, selected_lender_names: list) -> dict:
+    """Real auto-invest step (added 2026-07-24, per explicit user request):
+    for each lender selected in the Google Sheet (matched against
+    LENDER_INVEST_FILTERS via `_match_lender_filter()`), the account
+    `balance` is split EQUALLY across only the selected lenders that
+    CURRENTLY have at least one available loan (a selected lender with 0
+    loans right now doesn't consume a share of the balance for nothing -
+    explicit user request 2026-07-24), then each lender's own share is
+    split again EQUALLY across that lender's own currently available loans
+    (see `_compute_loan_shares()` for the min-investment/no-leftover
+    rules) - lenders are computed fully independently of each other (no
+    cross-lender redistribution once a share is assigned).
+
+    Returns a stats dict: `balance_before`, `balance_after` (running
+    balance decremented by every successful investment, for the summary
+    email - same idea as peerberry_invest_bot.py's `final_available_
+    money`), `lender_budgets`, `invest_attempts`, `invest_successes`,
+    `invest_failures`, `total_invested`, `lender_stats` (per-lender:
+    `budget`, `loans_seen`, `attempts`, `successes`, `failures`,
+    `invested_amount`, `invested_loans`)."""
+    stats = {
+        "balance_before": balance,
+        "balance_after": balance,
+        "lender_budgets": {},
+        "invest_attempts": 0,
+        "invest_successes": 0,
+        "invest_failures": 0,
+        "total_invested": 0.0,
+        "lender_stats": {},
+    }
+
+    matched = []
+    for sheet_name in selected_lender_names:
+        filter_key = _match_lender_filter(sheet_name, LENDER_INVEST_FILTERS)
+        if filter_key is None:
+            log.warning("Selected Lendermarket lender '%s' from the Google Sheet doesn't match any known filter config, skipping auto-invest for it.", sheet_name)
+            continue
+        matched.append(filter_key)
+
+    if not matched:
+        return stats
+
+    # Fetch each matched lender's currently available loans FIRST - the
+    # balance is only divided among lenders that actually have at least one
+    # loan right now (per explicit user request 2026-07-24: a selected
+    # lender with 0 available loans doesn't "consume" a share of the
+    # balance for nothing), not among every selected lender regardless of
+    # availability.
+    loans_by_lender = {name: fetch_active_loans_for_lender(LENDER_INVEST_FILTERS[name]) for name in matched}
+    lenders_with_loans = [name for name, loans in loans_by_lender.items() if loans]
+
+    if not lenders_with_loans:
+        log.info("None of the selected Lendermarket lenders %s currently have an available loan - nothing to invest this run.", matched)
+        for name in matched:
+            stats["lender_stats"][name] = {
+                "budget": 0.0, "loans_seen": 0, "attempts": 0, "successes": 0,
+                "failures": 0, "invested_amount": 0.0, "invested_loans": [],
+            }
+        return stats
+
+    lender_budget = balance / len(lenders_with_loans)
+    stats["lender_budgets"] = {name: (lender_budget if name in lenders_with_loans else 0.0) for name in matched}
+
+    for lender_name in matched:
+        loans = loans_by_lender[lender_name]
+        budget_for_lender = lender_budget if lender_name in lenders_with_loans else 0.0
+        lender_stat = {
+            "budget": budget_for_lender,
+            "loans_seen": len(loans),
+            "attempts": 0,
+            "successes": 0,
+            "failures": 0,
+            "invested_amount": 0.0,
+            "invested_loans": [],
+        }
+        stats["lender_stats"][lender_name] = lender_stat
+
+        if not loans:
+            log.info("Lender '%s': no loan currently available, excluded from the balance split this run.", lender_name)
+            continue
+
+        shares = _compute_loan_shares(budget_for_lender, loans, MIN_INVESTMENT_AMOUNT)
+        if not shares:
+            log.info("Lender '%s': budget=%.2f EUR, %d loan(s) available - nothing fundable (below the %.2f EUR minimum).", lender_name, budget_for_lender, len(loans), MIN_INVESTMENT_AMOUNT)
+            continue
+
+        log.info("Lender '%s': budget=%.2f EUR split across %d loan(s): %s", lender_name, budget_for_lender, len(shares), shares)
+        for loan_uuid, amount in shares.items():
+            stats["invest_attempts"] += 1
+            lender_stat["attempts"] += 1
+            success = attempt_investment(session, loan_uuid, amount)
+            if success:
+                stats["invest_successes"] += 1
+                stats["total_invested"] += amount
+                stats["balance_after"] -= amount
+                lender_stat["successes"] += 1
+                lender_stat["invested_amount"] += amount
+                lender_stat["invested_loans"].append({"loanUuid": loan_uuid, "amount": amount})
+            else:
+                stats["invest_failures"] += 1
+                lender_stat["failures"] += 1
+
+    return stats
 
 
 def run() -> None:
+    run_started_at = datetime.now(timezone.utc)
     state = load_state(STATE_FILE, DEFAULT_STATE)
     gates = state.setdefault("gates", {})
 
@@ -617,9 +940,57 @@ def run() -> None:
     # really "available" when there's money to invest AND at least one loan
     # listed. If the balance couldn't be determined (login/fetch failed),
     # don't let that silently gate segments closed - assume money's fine and
-    # fall back to loan availability alone.
-    balance = fetch_balance_via_login()
+    # fall back to loan availability alone. The session/investor_id are kept
+    # (not discarded) so the real auto-invest step below can reuse this same
+    # login instead of authenticating twice per run.
+    session, investor_id, balance = login_and_fetch_balance()
     log.info("Account balance: %s", f"{balance:.2f} €" if balance is not None else "unavailable")
+
+    # Read selected lenders once - reused by both the real auto-invest step
+    # below and the one-time-ever invest-exploration capture further down.
+    try:
+        selected_lender_names = get_selected_lendermarket_lenders()
+    except Exception:
+        log.exception("Could not read selected Lendermarket lenders from the Google Sheet.")
+        selected_lender_names = []
+
+    # Real auto-invest (added 2026-07-24, per explicit user request) - runs
+    # BEFORE the segment-availability monitor below (invest first, monitor/
+    # notify after), so a matching loan gets a real investment attempt as
+    # soon as possible each run instead of after the informational checks.
+    # See invest_selected_lenders()'s docstring for the exact budget-
+    # splitting rules. The bot stops itself (skips entirely) as soon as the
+    # balance is < MIN_INVESTMENT_AMOUNT (10 EUR by default) - explicit
+    # user request 2026-07-24, nothing left to invest below that. The
+    # summary email is only sent if something actually happened this run
+    # (an investment was attempted, or an unexpected error occurred) - NOT
+    # on every run - so this frequent scheduled monitor doesn't spam an
+    # email every cycle.
+    if session is None or balance is None:
+        log.info("Skipping auto-invest: no authenticated session/balance available this run.")
+    elif balance < MIN_INVESTMENT_AMOUNT:
+        log.info("Auto-invest bot stopping: balance (%.2f EUR) is below the minimum investment amount (%.2f EUR), nothing to invest.", balance, MIN_INVESTMENT_AMOUNT)
+    elif not selected_lender_names:
+        log.info("Skipping auto-invest: no Lendermarket lender selected in the Google Sheet.")
+    else:
+        invest_error = None
+        try:
+            invest_stats = invest_selected_lenders(session, balance, selected_lender_names)
+        except Exception as exc:
+            invest_error = str(exc)
+            invest_stats = {"balance_before": balance, "balance_after": balance, "invest_attempts": 0}
+            _log_invest_diagnostics("run_error", error=invest_error, traceback=traceback.format_exc())
+            log.exception("Unexpected error during the Lendermarket auto-invest step.")
+
+        if invest_stats.get("invest_attempts", 0) > 0 or invest_error:
+            log.info("Auto-invest run finished: %s", invest_stats)
+            send_lendermarket_invest_summary_email(
+                invest_stats,
+                error=invest_error,
+                diagnostics_text=_collect_run_invest_diagnostics(run_started_at),
+            )
+        else:
+            log.info("Auto-invest: no fundable loan found this run for the selected lenders.")
 
     # Same cron-job.org speed-up/slow-down as Swaper (see cron_schedule.py):
     # poll faster while there's money to invest. Skipped when the balance
@@ -677,12 +1048,6 @@ def run() -> None:
     if state.get("invest_exploration_sent"):
         log.info("Lendermarket invest-structure exploration diagnostics were already sent previously - skipping (avoids spamming).")
     else:
-        try:
-            selected_lender_names = get_selected_lendermarket_lenders()
-        except Exception:
-            log.exception("Could not read selected Lendermarket lenders from the Google Sheet, skipping invest-exploration.")
-            selected_lender_names = []
-
         lenders_needing_exploration = []
         for sheet_name in selected_lender_names:
             filter_key = _match_lender_filter(sheet_name, LENDER_INVEST_FILTERS)
