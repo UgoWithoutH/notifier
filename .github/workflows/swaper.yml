@@ -86,6 +86,8 @@ jobs:
           EMAIL_FROM: ${{ secrets.EMAIL_FROM }}
           EMAIL_TO: ${{ secrets.EMAIL_TO }}
           FORCE_TEST_EMAIL: ${{ github.event.inputs.force_test_email }}
+          GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
+          GOOGLE_CREDENTIALS: ${{ secrets.GOOGLE_CREDENTIALS }}
         run: python -m monitors.swaper_monitor
 
       - name: Save persisted state (session cookies + seen loan IDs + cron schedule) for the next run
