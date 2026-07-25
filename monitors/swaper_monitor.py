@@ -18,29 +18,84 @@ Optional:
                                                Google Authenticator, needed
                                                if 2FA is enabled on the account
 
-Invest-structure exploration (added 2026-07-23): whenever loans are available
-(same condition that triggers the normal notification email above), this
-module ALSO captures diagnostic data meant to help figure out, later, how to
-auto-invest on Swaper (mirroring monitors/peerberry_invest_bot.py, which does
-this for real already) - the real invest HTTP request/HTML structure is NOT
-known yet, and can't be explored right now since no loans are available at
-the time this was written. `capture_invest_exploration_state()`'s response/
-request listeners (registered on the already-logged-in Playwright `page`,
-only AFTER login() has fully completed - see the security lesson in repo
-memory about not registering broad interceptors during a login flow) collect
-every `/rest/` API call observed while browsing the loans page, plus a
-truncated HTML dump of that page. NO invest/confirm button is ever clicked -
-purely passive capture, same real-money safety boundary already established
-for the PeerBerry exploration (see repo memory: don't click a real invest/
-confirm control without the user explicitly accepting that risk). The result
-is emailed (see shared.notifier.send_swaper_invest_exploration_email()) as a
-JSON attachment whenever loans are available - regardless of account
-balance, per explicit user request (2026-07-24): the goal is just to observe
-the real structure, so it shouldn't wait for money to be available too.
-Sent AT MOST ONCE EVER (not once per notification cycle) via a persistent
-`invest_exploration_sent` flag in STATE_FILE, separate from the "swaper"
-notification gate above, so the user is never spammed with repeat copies of
-the same structure once it's already been captured and sent.
+REAL auto-invest bot (added 2026-07-25, explicit user decision - real money,
+no more click-and-abort safety net): Swaper's manual loan inventory is
+extremely transient (a single loan can appear and be grabbed by another
+investor within minutes), so there's no reliable way to interactively catch
+one via a one-off manual script - instead this run() is ALREADY re-executed
+periodically by cron-job.org (see shared/cron_schedule.py) triggering the
+GitHub Actions workflow, so whenever loans happen to be available AND the
+account balance is >= MIN_INVESTMENT_AMOUNT on a given run,
+`_invest_available_loans()` is called right there, in the same
+already-logged-in Playwright session: for each available loan (in listing
+order), it fills the row's amount input with min(money left, loan's own
+amount) and clicks its real "+" icon - a REAL click that really reaches
+Swaper's server (nothing is blocked/aborted anymore). The real request AND
+response of each investment call are passively captured by the already-
+registered `_record_api_response()` listener. A summary
+(shared.notifier.send_swaper_investment_summary_email()) is emailed every
+time at least one investment was attempted (not one-time - real money moves
+every time). If an unrecognized confirmation modal ever appears after a
+click (never observed yet on Swaper, unlike PeerBerry), investing stops
+immediately rather than guessing which button to click with real money on
+the line, and the modal's HTML is included in the summary for manual review.
+
+Per-originator filtering + budget split (added 2026-07-25, same day, per
+explicit user request - mirrors the PeerBerry/Lendermarket "x" flag
+convention in the Google Sheet): instead of investing into the aggregate/
+unfiltered loan list, only the loan originators flagged with "x" in the
+Google Sheet (shared.google_sheet.get_selected_swaper_loan_originators(),
+reading the block between the "Swaper" and "Crowdlending savings" cells)
+are considered. Each selected originator is checked individually for
+CURRENT loan availability via `fetch_loans_for_originator()`, which uses
+swaper.com's own "Loan originators" filter - NOT by driving the site's
+custom JS multiselect dropdown widget (reverse-engineering its click/
+toggle behaviour turned out to be unreliable - see repo memory), but by
+intercepting the page's own outgoing `/rest/public/loans` request via
+`page.route()` and rewriting its JSON body to add
+`"groups": [originator_name]` before letting it through unmodified
+otherwise (confirmed via real DevTools captures, provided directly by the
+user, that the endpoint accepts the originator's plain display name
+directly - not an opaque id). The available balance is then split EVENLY
+across only the originators that currently have >=1 loan available (see
+`_split_budget_across_available_originators()`: 1 originator with loans ->
+gets the full balance, 2 -> 50/50 each, etc. - per explicit user spec), and
+`_invest_available_loans()` is called once per such originator with its
+own budget cap.
+
+Per-loan share computation, no sub-minimum leftover (added 2026-07-25,
+same day, explicit user request - "je ne veux pas de reste < 10e"):
+within one originator's own budget, loans are no longer filled greedily
+in listing order (which could strand an unusable remainder below
+MIN_INVESTMENT_AMOUNT once the last loan couldn't fully absorb what was
+left). `_compute_swaper_loan_shares()` (exact same algorithm as
+monitors/lendermarket_monitor.py's `_compute_loan_shares()`) instead
+splits an originator's budget EQUALLY across its own currently available
+loans, capping any loan whose own `amount` is smaller than its equal
+share (redistributing the excess across the other loans in the same
+pass), and drops loans from consideration if the equal share would fall
+below the minimum (funding fewer loans instead, each still getting at
+least the minimum) - so a budget only goes unspent within one originator
+if that originator's own loans genuinely can't absorb it all (originators
+remain fully independent of each other, no cross-originator
+redistribution, matching the same accepted design already used for
+Lendermarket's lenders). `_invest_available_loans()` now takes this
+precomputed `{loan_id: amount}` share map directly and targets each
+loan's specific row by its visible `number` (rather than always
+`rows.first`, which assumed - only true for the old greedy-fill logic -
+that an invested loan's row always disappears/reorders predictably;
+under equal-split most loans are only PARTIALLY invested and stay
+visible, so the specific row must be targeted precisely).
+
+The earlier one-time "invest-structure exploration" capture (HTML dump of
+the loans page + a dedicated one-time email, added 2026-07-23 to help
+figure out how to build the invest bot before it existed) was removed on
+2026-07-25 once the real bot above was built and confirmed working - it
+ended up implemented via real Playwright UI clicks, not a reconstructed
+HTTP call, so that exploration data was no longer needed. The passive
+`/rest/` API call capture (`_record_api_response()`/`captured_api_calls`)
+is KEPT - it now only feeds the real investment summary email, to verify
+each real investment call actually succeeded.
 """
 
 import json
@@ -49,24 +104,21 @@ import random
 import sys
 import time
 import logging
-from datetime import datetime, timezone
 from pathlib import Path
 
 import pyotp
 from dotenv import load_dotenv
 from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
 
-from shared.notifier import send_swaper_email, send_swaper_invest_exploration_email
+from shared.notifier import send_swaper_email, send_swaper_investment_summary_email
 from shared.state import load_state, save_state
 from shared.cron_schedule import ensure_schedule
 from shared.notification_gate import should_notify
+from shared.google_sheet import get_selected_swaper_loan_originators
 from shared.browser_stealth import get_context_options, apply_stealth, human_pause, human_mouse_wander, human_type
 
 DEFAULT_STATE = {
     "gates": {},
-    # Set to True the first (and only) time the invest-structure exploration
-    # email is sent - see module docstring. Independent of "gates" above.
-    "invest_exploration_sent": False,
 }
 
 load_dotenv()
@@ -83,6 +135,11 @@ SWAPER_EMAIL = os.environ.get("SWAPER_EMAIL")
 SWAPER_PASSWORD = os.environ.get("SWAPER_PASSWORD")
 SWAPER_TOTP_SECRET = os.environ.get("SWAPER_TOTP_SECRET")
 SWAPER_CRON_JOB_ID = os.environ.get("SWAPER_CRON_JOB_ID")
+
+# Minimum amount (EUR) Swaper's manual loans accept per investment - below
+# this, don't even attempt a click (mirrors MIN_INVESTMENT_AMOUNT in
+# monitors/peerberry_invest_bot.py).
+MIN_INVESTMENT_AMOUNT = float(os.environ.get("MIN_INVESTMENT_AMOUNT", "10"))
 
 
 
@@ -228,27 +285,92 @@ def extract_balance(payload) -> float:
     return 0.0
 
 
-# Caps how large the JSON exploration diagnostics attachment can get (a
-# runaway/huge loans page HTML dump or a chatty set of captured API calls
-# shouldn't produce an unreasonably large email).
-MAX_INVEST_EXPLORATION_CHARS = 500_000
-# How much of the loans page's main HTML is kept - enough to see a loan
-# row's real markup (any Invest button/form) without dumping unrelated
-# <head>/script/style bytes.
-MAX_LOANS_PAGE_HTML_CHARS = 200_000
+def fetch_loans_for_originator(page, originator_name: str) -> dict:
+    """Fetch loans filtered to a single loan originator, without driving
+    Swaper's custom JS "Loan originators" multiselect dropdown (a fragile
+    custom widget - reverse-engineering its click/toggle behaviour turned
+    out to be unreliable). Confirmed instead via real DevTools captures
+    (2026-07-25, provided directly by the user) that `POST
+    /rest/public/loans`'s body simply takes the originator's exact display
+    name as a plain string in its `"groups"` array - e.g.
+    `{"groups": ["Wandoo Finance Group"]}` or `{"groups": ["SW Finance"]}`
+    - not an opaque id, so no name->id mapping is needed at all.
+
+    Instead of reconstructing the request from scratch (which fetch_loans()'s
+    docstring already documented gets rejected with 403 - the x-xsrf-token
+    header/cookie and referer must be exactly what the real app computes),
+    this intercepts the page's OWN outgoing request (fired by a normal
+    `page.goto` to the loans page) via `page.route()` and rewrites only its
+    JSON body to add the `groups` filter, then forwards it unmodified
+    otherwise - so every header the app itself computed (csrf token,
+    referer, cookies, ...) is preserved exactly. Because this is the
+    Angular app's own request/response cycle (just with a patched body),
+    the app renders the FILTERED results in the page itself afterwards, so
+    the visible `tr.loan-row` rows on the page match this originator right
+    after this call returns - no separate UI filtering step needed before
+    investing.
+    """
+    def _rewrite_body(route):
+        request = route.request
+        try:
+            body = json.loads(request.post_data or "{}")
+        except ValueError:
+            body = {}
+        body["groups"] = [originator_name]
+        route.continue_(post_data=json.dumps(body))
+
+    page.route("**/rest/public/loans", _rewrite_body)
+    try:
+        with page.expect_response(
+            lambda r: r.url.endswith("/rest/public/loans") and r.request.method == "POST"
+        ) as response_info:
+            page.goto("https://swaper.com/en/loans", wait_until="domcontentloaded")
+        response = response_info.value
+        if not response.ok:
+            raise RuntimeError(f"Loans API returned status {response.status} for originator {originator_name!r}")
+        human_mouse_wander(page)
+        return response.json()
+    finally:
+        page.unroute("**/rest/public/loans", _rewrite_body)
+
+
+def _split_budget_across_available_originators(available_money: float, originator_loans: dict) -> dict:
+    """Split `available_money` EVENLY across the loan originators that
+    currently have at least one loan available - per explicit user spec
+    (2026-07-25): "si un seul loan on met tout sur lui mais si deux loans
+    on divise par 2 sur les deux loans" (1 originator with loans -> gets
+    the full balance, 2 -> 50/50 each, etc.). Originators with no loans
+    currently available (empty list) get nothing and aren't counted in the
+    split.
+
+    `originator_loans`: {originator_name: [loan, ...]} - only originators
+    with a non-empty loan list are considered.
+
+    Returns {originator_name: budget} for originators that should be
+    invested into this run.
+    """
+    available_originators = [name for name, loans in originator_loans.items() if loans]
+    if not available_originators:
+        return {}
+    share = round(available_money / len(available_originators), 2)
+    return {name: share for name in available_originators}
 
 
 def _redact_sensitive_headers(headers: dict) -> dict:
     """Return a copy of `headers` with session/auth values (cookies,
-    bearer/auth tokens) replaced by a placeholder - everything else
-    (content-type, custom API headers, etc.) needed to replicate a call is
-    kept as-is. Avoids putting live session credentials into an emailed
+    bearer/auth tokens, the CSRF token) replaced by a placeholder -
+    everything else (content-type, custom API headers, etc.) needed to
+    replicate a call is kept as-is, INCLUDING THE HEADER NAMES of the
+    redacted ones (e.g. seeing `x-xsrf-token` is present, just not its live
+    value, is exactly what's needed to know a future pure-HTTP bot must
+    derive that header from a same-named cookie - see fetch_loans()'s
+    docstring). Avoids putting live session credentials into an emailed
     diagnostics attachment; the shape of the request (headers present,
     body) is what matters for building the bot later, not the live token.
     """
     redacted = {}
     for name, value in headers.items():
-        if name.lower() in ("cookie", "authorization", "set-cookie"):
+        if name.lower() in ("cookie", "authorization", "set-cookie", "x-xsrf-token"):
             redacted[name] = "[REDACTED - sensitive session/auth value, not needed to see the request shape]"
         else:
             redacted[name] = value
@@ -257,15 +379,24 @@ def _redact_sensitive_headers(headers: dict) -> dict:
 
 def _record_api_response(captured: list, response) -> None:
     """`page.on("response", ...)` handler used by run() to passively capture
-    Swaper's own `/rest/` API traffic while browsing the loans page, for the
-    invest-structure exploration diagnostics (see module docstring). Only
-    ever registered AFTER login() has fully completed; also explicitly
-    skips anything login/auth-related as a second safety layer (belt-and-
-    braces, per the repo's security lesson about page.route()/page.on()
-    interceptors and credentials) even though that should never happen at
-    this point in the flow. Captures both the request (method, url, headers,
-    POST body) and the response (status, body) - so there's enough detail to
-    later reconstruct these calls for a bot, per explicit user request.
+    Swaper's own `/rest/` API traffic while browsing the loans page - feeds
+    the investment summary email's attachment (see
+    `send_swaper_investment_summary_email()`), which is meant to carry
+    everything needed to later attempt building a pure-HTTP-request-based
+    bot (mirroring monitors/lendermarket_monitor.py's `requests.Session`
+    approach) instead of driving a real browser: for every captured call,
+    both the request (method, full url, ALL header NAMES - values redacted
+    for cookies/auth/csrf, see `_redact_sensitive_headers()` - and the raw
+    POST body) and the response (status, ALL header NAMES same redaction,
+    and the raw body) are kept. Only ever registered AFTER login() has
+    fully completed; also explicitly skips anything login/auth-related as
+    a second safety layer (belt-and-braces, per the repo's security lesson
+    about page.route()/page.on() interceptors and credentials) even though
+    that should never happen at this point in the flow - the login/2FA
+    request shape itself is deliberately NEVER captured this way (a future
+    pure-HTTP bot would still need `login()`/`handle_two_factor()`'s
+    already-documented browser-based flow, or its own separate careful
+    capture - not silently piggy-backed onto this listener).
     """
     url = response.url
     if "swaper.com" not in url or "/rest/" not in url:
@@ -282,10 +413,165 @@ def _record_api_response(captured: list, response) -> None:
         "status": response.status,
     }
     try:
+        entry["response_headers"] = _redact_sensitive_headers(response.headers)
+    except Exception:
+        entry["response_headers"] = None
+    try:
         entry["body"] = response.text()[:20000]
     except Exception:
         entry["body"] = None
     captured.append(entry)
+
+
+def _compute_swaper_loan_shares(budget: float, loans: list, min_investment: float = MIN_INVESTMENT_AMOUNT) -> dict:
+    """Split `budget` (one originator's own share of the account balance,
+    see `_split_budget_across_available_originators()`) EQUALLY across
+    `loans` (that same originator's currently available loans) - exact same
+    algorithm as monitors/lendermarket_monitor.py's `_compute_loan_shares()`,
+    per explicit user request 2026-07-25: "je ne veux pas de reste < 10e".
+
+    Two adjustments on top of a plain `budget / len(loans)`:
+    - If the equal share would be below `min_investment`, fewer loans are
+      funded instead (as many as `budget // min_investment` allows, kept in
+      listing order) so every funded loan still gets at least
+      `min_investment`.
+    - If a loan's own `amount` is smaller than its equal share, that loan is
+      capped at what it can actually take and the excess is redistributed
+      across the other loans in the same pass (equal share recomputed on
+      what's left) - repeated until stable.
+
+    Returns `{loan_id: amount}` for every loan that ends up funded (amount
+    rounded to 2 decimals); loans below `min_investment` after all
+    adjustments are simply omitted (that leftover stays unspent for this
+    originator this run - originators are fully independent of each other,
+    no cross-originator redistribution).
+    """
+    caps = {}
+    for loan in loans:
+        loan_id = loan.get("id")
+        if loan_id is None:
+            continue
+        try:
+            cap = float(loan.get("amount") or 0)
+        except (TypeError, ValueError):
+            cap = 0.0
+        if cap > 0:
+            caps[loan_id] = cap
+
+    # Keep insertion (listing) order for deterministic drop/keep decisions below.
+    active = list(caps.keys())
+    remaining = budget
+    shares = {}
+
+    while active:
+        if remaining < min_investment:
+            break
+
+        equal_share = remaining / len(active)
+        if equal_share < min_investment:
+            max_active = int(remaining // min_investment)
+            if max_active <= 0:
+                break
+            if max_active < len(active):
+                active = active[:max_active]
+            continue
+
+        capped_any = False
+        for loan_id in list(active):
+            if caps[loan_id] < equal_share:
+                shares[loan_id] = caps[loan_id]
+                remaining -= caps[loan_id]
+                active.remove(loan_id)
+                capped_any = True
+        if capped_any:
+            continue
+
+        for loan_id in active:
+            shares[loan_id] = round(equal_share, 2)
+        break
+
+    return shares
+
+
+def _invest_available_loans(page, loans: list, shares: dict) -> list:
+    """Actually invest into available manual loans, using the exact
+    per-loan amounts precomputed by `_compute_swaper_loan_shares()` (loans
+    with no entry in `shares`, e.g. below the minimum, are skipped).
+
+    REAL clicks, REAL money (2026-07-25, explicit user decision to make this
+    the production invest bot rather than only a safe click-and-abort
+    capture - see repo memory). For each loan with a computed share: fills
+    its amount input with that exact amount and clicks its "+" icon.
+    Nothing here blocks/intercepts the request - the real HTTP call really
+    goes to Swaper's server, and is passively captured (request+response,
+    not blocked) by the already-registered `_record_api_response()`
+    listener, so its outcome can be reviewed in the summary email.
+
+    Each loan's row is targeted by its visible `number` text (NOT always
+    `rows.first`) since a loan given only a PARTIAL share (share < loan's
+    own full amount, the normal case under equal-split) stays visible on
+    the page afterwards rather than disappearing/reordering.
+
+    Never observed a confirmation modal on Swaper yet (unlike PeerBerry,
+    which needed one) - but if one appears after a click, stops attempting
+    further loans immediately and reports the modal's HTML rather than
+    guessing which button to click with real money on the line. Also stops
+    on any exception while interacting with a row.
+
+    Returns a list of attempt dicts: {loan_id, loan_number, amount,
+    modal_html, error}.
+    """
+    attempts = []
+    for loan in loans:
+        loan_id = loan.get("id")
+        amount = shares.get(loan_id)
+        loan_label = loan.get("number") or loan_id
+        if not amount or amount < MIN_INVESTMENT_AMOUNT:
+            continue
+
+        row = page.locator("tr.loan-row", has_text=str(loan_label))
+        if row.count() == 0:
+            log.warning("Could not find the row for loan %s on the page - skipping it.", loan_label)
+            continue
+        row = row.first
+
+        log.info("Investing %.2f EUR into loan %s (REAL money, real click).", amount, loan_label)
+        try:
+            amount_input = row.locator(".field.currency input").first
+            amount_input.click()
+            amount_input.fill(f"{amount:.2f}")
+            row.locator(".icon-plus").first.click(timeout=10000)
+            page.wait_for_timeout(3000)  # let the real request/response complete
+        except Exception:
+            log.exception("Exception while attempting to invest in loan %s - stopping.", loan_label)
+            attempts.append({"loan_id": loan.get("id"), "loan_number": loan.get("number"), "amount": amount, "error": True})
+            break
+
+        modal_html = None
+        try:
+            modal_html = page.evaluate(
+                "() => { const m = document.querySelector('.modal, [class*=modal], [role=dialog]'); "
+                "return m && m.offsetParent !== null ? m.outerHTML : null; }"
+            )
+        except Exception:
+            pass
+
+        attempts.append({
+            "loan_id": loan.get("id"),
+            "loan_number": loan.get("number"),
+            "amount": amount,
+            "modal_html": modal_html,
+        })
+
+        if modal_html:
+            log.warning(
+                "A confirmation modal appeared after investing in loan %s - stopping here "
+                "(unrecognized extra step, needs manual review) rather than guessing which button to click.",
+                loan_label,
+            )
+            break
+
+    return attempts
 
 
 def run(headless: bool = True) -> None:
@@ -314,22 +600,99 @@ def run(headless: bool = True) -> None:
         page = context.new_page()
 
         captured_api_calls = []
-        loans_page_html = None
+        investment_attempts = []
 
         try:
             login(page)
             # Registered only AFTER login() has fully completed (see
             # _record_api_response()'s docstring) - passively captures the
             # /rest/ API traffic fired while fetch_loans() navigates to the
-            # loans page, for the invest-structure exploration diagnostics.
+            # loans page (and later, any real investment calls - see below),
+            # for the investment summary email.
             page.on("response", lambda response: _record_api_response(captured_api_calls, response))
             payload = fetch_loans(page)
+
+            # REAL investment attempt (2026-07-25, explicit user decision -
+            # see module docstring). Per-originator investing (added later
+            # the same day, per explicit user request): rather than
+            # investing into the aggregate/unfiltered loan list, only the
+            # loan originators flagged with "x" in the Google Sheet (see
+            # shared.google_sheet.get_selected_swaper_loan_originators(),
+            # mirroring the PeerBerry/Lendermarket sheet convention) are
+            # considered, and each is checked individually for CURRENT loan
+            # availability via fetch_loans_for_originator() (the site's
+            # "Loan originators" filter, driven through the API's "groups"
+            # field rather than the fragile custom JS dropdown widget - see
+            # that function's docstring). The available balance is then
+            # split EVENLY across only the originators that currently have
+            # >=1 loan available (see
+            # _split_budget_across_available_originators()'s docstring for
+            # the exact rule), and _invest_available_loans() is called once
+            # per such originator with its own budget cap - reusing the
+            # existing real-click investing logic, just scoped to whichever
+            # originator's rows are currently visible on the page (each
+            # fetch_loans_for_originator() call leaves the page showing that
+            # originator's filtered rows only, since it's the real Angular
+            # app rendering the real - filtered - API response).
+            loans_now = extract_loans(payload)
+            balance_now = extract_balance(payload)
+
             try:
-                loans_page_html = page.evaluate(
-                    "() => (document.querySelector('main') || document.body).outerHTML"
-                )
+                selected_originators = get_selected_swaper_loan_originators()
             except Exception:
-                log.exception("Could not capture the loans page HTML for the invest-exploration diagnostics.")
+                log.exception("Could not read selected Swaper loan originators from the Google Sheet.")
+                selected_originators = []
+
+            if not selected_originators:
+                log.info("No Swaper loan originator is flagged with 'x' in the Google Sheet - skipping auto-invest.")
+            elif balance_now < MIN_INVESTMENT_AMOUNT:
+                log.info(
+                    "Balance %.2f EUR is below the minimum (%.2f EUR) - skipping auto-invest.",
+                    balance_now, MIN_INVESTMENT_AMOUNT,
+                )
+            else:
+                log.info(
+                    "%d loan originator(s) selected in the Google Sheet (%s) - checking current "
+                    "availability for each.",
+                    len(selected_originators), ", ".join(selected_originators),
+                )
+                originator_loans = {}
+                for name in selected_originators:
+                    try:
+                        originator_payload = fetch_loans_for_originator(page, name)
+                    except Exception:
+                        log.exception("Failed to fetch filtered loans for originator %r - skipping it.", name)
+                        continue
+                    loans_for_name = extract_loans(originator_payload)
+                    if loans_for_name:
+                        originator_loans[name] = loans_for_name
+                        log.info("Originator %r currently has %d loan(s) available.", name, len(loans_for_name))
+                    else:
+                        log.info("Originator %r currently has no loans available.", name)
+
+                budgets = _split_budget_across_available_originators(balance_now, originator_loans)
+                for name, budget in budgets.items():
+                    log.info("Investing up to %.2f EUR into originator %r's loan(s).", budget, name)
+                    try:
+                        # Re-apply the filter so the page's visible rows
+                        # match THIS originator right before investing (the
+                        # discovery loop above left the page showing
+                        # whichever originator was fetched last).
+                        fetch_loans_for_originator(page, name)
+                    except Exception:
+                        log.exception("Failed to re-apply the filter for originator %r before investing - skipping it.", name)
+                        continue
+                    shares = _compute_swaper_loan_shares(budget, originator_loans[name])
+                    attempts = _invest_available_loans(page, originator_loans[name], shares)
+                    for attempt in attempts:
+                        attempt["originator"] = name
+                    investment_attempts.extend(attempts)
+
+                if investment_attempts:
+                    # Refresh the snapshot used for the rest of this run
+                    # (notification email etc.) to reflect what's actually
+                    # left AFTER investing, not the stale pre-invest numbers.
+                    payload = fetch_loans(page)
         except Exception:
             log.exception("Failed to log in or fetch loans.")
             browser.close()
@@ -344,44 +707,16 @@ def run(headless: bool = True) -> None:
     loans = extract_loans(payload)
     balance = extract_balance(payload)
 
-    # Build the invest-structure exploration diagnostics (only meaningful
-    # when there's actually at least one loan to look at) - see module
-    # docstring. Cheap to build unconditionally (data already fetched/
-    # captured above); only actually emailed below if loans exist, and only
-    # the very first time ever (independent of balance/the normal
-    # notification email - see the one-time invest_exploration_sent flag
-    # further down).
-    invest_exploration_text = None
-    if loans:
-        if loans_page_html and len(loans_page_html) > MAX_LOANS_PAGE_HTML_CHARS:
-            loans_page_html = loans_page_html[:MAX_LOANS_PAGE_HTML_CHARS] + "\n... (truncated)"
-        diagnostics = {
-            "captured_at": datetime.now(timezone.utc).isoformat(),
-            "loans_count": len(loans),
-            "loans_api_payload": payload,
-            "captured_api_calls": captured_api_calls,
-            "loans_page_html": loans_page_html,
-        }
-        invest_exploration_text = json.dumps(diagnostics, indent=2, ensure_ascii=False, default=str)
-        if len(invest_exploration_text) > MAX_INVEST_EXPLORATION_CHARS:
-            invest_exploration_text = invest_exploration_text[:MAX_INVEST_EXPLORATION_CHARS] + "\n... (truncated)"
-
     log.info("Balance %s, %d loan(s) available.", "positive" if balance > 0 else "zero/unavailable", len(loans))
 
-    # Invest-structure exploration email (moved BEFORE the monitor/
-    # notification part below, per explicit user request 2026-07-24 - same
-    # "bot runs before the monitor" ordering already applied to
-    # lendermarket_monitor.py): deliberately INDEPENDENT of the balance/
-    # notification-gate logic further down - fires whenever loans are
-    # available at all, even with an empty/insufficient balance. Sent AT
-    # MOST ONCE EVER (not once per cycle) via a persistent flag so the user
-    # isn't spammed with repeat copies of the same structure.
-    if invest_exploration_text and not state.get("invest_exploration_sent"):
-        log.info("Sending Swaper invest-structure exploration diagnostics email (%d loan(s) available) - first and only time.", len(loans))
-        send_swaper_invest_exploration_email(len(loans), invest_exploration_text)
-        state["invest_exploration_sent"] = True
-    elif invest_exploration_text:
-        log.info("Swaper invest-structure exploration diagnostics were already sent previously - skipping (avoids spamming).")
+    # Real investment summary email (see module docstring/
+    # _invest_available_loans()'s docstring) - independent of the passive
+    # exploration email above. Sent EVERY time at least one investment was
+    # actually attempted this run (not one-time - real money moves every
+    # time), so successes/failures/modals are always visible.
+    if investment_attempts:
+        log.info("Sending Swaper investment summary email (%d attempt(s) this run).", len(investment_attempts))
+        send_swaper_investment_summary_email(investment_attempts, captured_api_calls)
 
     # TEMPORARY DEBUG: force-send a recap email regardless of balance/new
     # loans, to validate the SMTP pipeline end-to-end. Triggered via the

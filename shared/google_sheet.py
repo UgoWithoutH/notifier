@@ -535,6 +535,79 @@ def get_selected_lendermarket_lenders() -> list:
     logger.info("Lenders Lendermarket sélectionnés : %s", selected)
     return selected
 
+
+def get_selected_swaper_loan_originators() -> list:
+    """
+    Cherche la cellule "Répartition géographique", puis la cellule
+    "Swaper" en dessous (même colonne) : les lignes entre "Swaper" et la
+    cellule "Crowdlending savings" suivante (exclues toutes les deux) sont
+    les loan originators du bloc Swaper. Pour chacune de ces lignes ayant
+    un nom de loan non vide dans la colonne "Répartition géographique", si
+    la cellule juste à gauche (colonne - 1) vaut "x" (insensible à la
+    casse), ce loan originator est sélectionné.
+
+    Même logique exacte que get_selected_peerberry_loan_originators() /
+    get_selected_lendermarket_lenders(), pour
+    monitors/swaper_monitor.py's per-originator auto-invest (ajouté le
+    2026-07-25) : les noms retournés ici sont utilisés tels quels comme
+    valeur du filtre "Loan originators" de swaper.com (confirmé via
+    DevTools que l'API `/rest/public/loans` accepte directement le nom
+    affiché dans son champ `"groups"`, ex. `"groups": ["Wandoo Finance
+    Group"]` - pas un id opaque).
+
+    Retourne la liste des noms de loan originators sélectionnés (tels
+    qu'écrits dans la feuille, dans l'ordre des lignes).
+    """
+    logger.info("Recherche des loan originators Swaper sélectionnés (colonne -1 = 'x')")
+
+    worksheet = get_latest_dashboard_worksheet(SPREADSHEET_ID)
+
+    # 1 seul appel API pour charger toute la feuille
+    grid = worksheet.get_all_values()
+
+    geo_pos = find_cell_by_value(grid, "Répartition géographique")
+    if not geo_pos:
+        raise RuntimeError(
+            "La section 'Répartition géographique' n'a pas été trouvée."
+        )
+
+    geo_row, geo_col = geo_pos
+
+    if geo_col < 2:
+        raise RuntimeError(
+            "Impossible de lire la colonne à gauche des loans : "
+            "'Répartition géographique' est dans la première colonne."
+        )
+
+    swaper_row = find_first_cell_containing_below(grid, geo_row, geo_col, "Swaper")
+    if not swaper_row:
+        raise RuntimeError(
+            "La cellule 'Swaper' n'a pas été trouvée sous 'Répartition géographique'."
+        )
+
+    crowdlending_row = find_first_cell_containing_below(grid, swaper_row, geo_col, "Crowdlending savings")
+    if not crowdlending_row:
+        raise RuntimeError(
+            "La cellule 'Crowdlending savings' n'a pas été trouvée sous 'Swaper' "
+            "(elle délimite la fin du bloc Swaper)."
+        )
+
+    selected = []
+    for row_idx in range(swaper_row + 1, crowdlending_row):
+        row = grid[row_idx - 1]
+
+        name = row[geo_col - 1].strip() if geo_col - 1 < len(row) else ""
+        if not name:
+            continue
+
+        flag = row[geo_col - 2].strip() if geo_col - 2 < len(row) else ""
+        if flag.lower() == "x":
+            selected.append(name)
+            logger.info("Loan originator Swaper sélectionné : '%s' (ligne %s)", name, row_idx)
+
+    logger.info("Loan originators Swaper sélectionnés : %s", selected)
+    return selected
+
 if __name__ == "__main__":
     fill_current_month_amounts(
         platform="Bienprêter",

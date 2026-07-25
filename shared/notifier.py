@@ -1,5 +1,6 @@
 """Email notification via SMTP."""
 
+import json
 import os
 import smtplib
 import logging
@@ -76,23 +77,32 @@ def send_swaper_email(balance: float, loans: list) -> None:
         log.exception("Failed to send notification email.")
 
 
-def send_swaper_invest_exploration_email(loans_count: int, diagnostics_text: str) -> None:
-    """Send the Swaper "invest-structure exploration" diagnostics email.
+def send_swaper_investment_summary_email(attempts: list, captured_api_calls: list) -> None:
+    """Send a summary of REAL Swaper investments made this run via the
+    manual "+" button (see monitors.swaper_monitor._invest_available_loans()
+    - explicit user decision 2026-07-25 to make this the actual production
+    invest bot: real money, no click-and-abort safety net anymore).
 
-    Sent alongside send_swaper_email() (same run, same "loans became
-    available" trigger) whenever swaper_monitor.py's exploration capture
-    produced something - see that module's docstring/`capture_invest_
-    exploration()` for what's collected: the raw loans-listing API
-    response, any other `/rest/` API calls observed while on the loans
-    page (method/url/status/truncated body), and a truncated HTML dump of
-    the loans page. NO invest/confirm button is ever clicked to gather
-    this (same real-money safety boundary as documented in repo memory for
-    the PeerBerry exploration) - purely passive capture of an authenticated,
-    already-logged-in Playwright session. `diagnostics_text` (a JSON
-    string) is attached as a `.json` file; the email body itself never
-    contains the raw detail, only a short explanation of what to do with
-    the attachment (send it back so the real invest HTTP request/HTML
-    structure can be figured out).
+    Sent EVERY time at least one investment was attempted this run (not
+    one-time - real money moves every time, so it should always be
+    visible), listing each attempt (loan number/id, amount, whether an
+    unrecognized confirmation modal appeared, whether an error occurred).
+    Attaches the raw captured `/rest/` API calls (added 2026-07-25, same
+    day, explicit user request: "envoie bien tout ce dont tu auras besoin
+    pour après essayer de faire en full http request le bot") as a `.json`
+    file - for every loans-listing/filter/invest call observed this run:
+    method, full url, ALL header NAMES for both request and response
+    (values redacted for cookies/auth/csrf - see `_redact_sensitive_headers()`
+    - so the shape of what's required is visible without leaking a live,
+    short-lived session token), the raw request POST body, the response
+    status and body. Together with `monitors/swaper_monitor.py`'s already-
+    documented `login()`/`handle_two_factor()` flow (NOT captured this way,
+    deliberately, to never risk logging a plaintext password/2FA code),
+    this should carry everything needed to later attempt reproducing the
+    loans-listing/filter/invest calls as plain HTTP requests (mirroring
+    monitors/lendermarket_monitor.py's `requests.Session`-based bot),
+    instead of driving a real browser - also useful right now, to confirm
+    each investment attempt actually succeeded (status code/body).
     """
     if not all([SMTP_HOST, SMTP_USER, SMTP_PASSWORD, EMAIL_TO]):
         log.error(
@@ -101,17 +111,33 @@ def send_swaper_invest_exploration_email(loans_count: int, diagnostics_text: str
         )
         return
 
-    subject = f"[Swaper] Diagnostic structure d'investissement ({loans_count} prêt(s) dispo)"
-    body = (
-        f"{loans_count} pr\u00eat(s) manuel(s) sont disponibles sur Swaper.\n\n"
-        "Le fichier joint contient : la r\u00e9ponse brute de l'API de listing des "
-        "pr\u00eats, les autres appels HTTP /rest/ observ\u00e9s pendant la navigation "
-        "sur la page, et un extrait du HTML de la page des pr\u00eats. Aucun clic "
-        "d'investissement/confirmation n'a \u00e9t\u00e9 effectu\u00e9 (aucun risque "
-        "d'argent r\u00e9el) - c'est juste de la capture passive.\n\n"
-        "Renvoie ce fichier pour permettre de comprendre la structure HTML/API "
-        "n\u00e9cessaire pour investir automatiquement sur Swaper."
+    subject = f"[Swaper] {len(attempts)} investissement(s) r\u00e9el(s) tent\u00e9(s)"
+    body_lines = [
+        f"{len(attempts)} investissement(s) r\u00e9el(s) tent\u00e9(s) automatiquement sur Swaper "
+        "(bouton '+' manuel, argent r\u00e9el) :",
+        "",
+    ]
+    for attempt in attempts:
+        label = attempt.get("loan_number") or attempt.get("loan_id")
+        originator = attempt.get("originator")
+        prefix = f"[{originator}] " if originator else ""
+        line = f"- {prefix}Pr\u00eat {label} : {attempt.get('amount'):.2f} \u20ac"
+        if attempt.get("error"):
+            line += " -- ERREUR pendant le clic, voir les logs"
+        elif attempt.get("modal_html"):
+            line += " -- une fen\u00eatre de confirmation inattendue est apparue, investissement stopp\u00e9 ensuite (voir la pi\u00e8ce jointe)"
+        body_lines.append(line)
+    body_lines.append("")
+    body_lines.append(
+        "Le fichier joint contient les vraies requ\\u00eates/r\\u00e9ponses HTTP /rest/ observ\\u00e9es "
+        "pendant ce run (m\\u00e9thode/URL/toutes les en-t\\u00eates - valeurs sensibles redacted - "
+        "corps/statut), pour les appels de listing/filtre de pr\\u00eats ET d'investissement. "
+        "V\\u00e9rifie le statut de la requ\\u00eate d'investissement pour confirmer qu'elle a bien "
+        "r\\u00e9ussi. Objectif secondaire : accumuler de quoi tenter, plus tard, de reproduire "
+        "ces appels en pur HTTP (sans navigateur) - la connexion/2FA reste elle bas\\u00e9e sur "
+        "le navigateur (voir monitors/swaper_monitor.py) et n'est jamais captur\\u00e9e ici."
     )
+    body = "\n".join(body_lines)
 
     msg = MIMEMultipart()
     msg["From"] = EMAIL_FROM
@@ -119,9 +145,10 @@ def send_swaper_invest_exploration_email(loans_count: int, diagnostics_text: str
     msg["Subject"] = subject
     msg.attach(MIMEText(body, "plain"))
 
-    attachment = MIMEText(diagnostics_text, "plain", "utf-8")
+    attachment_text = json.dumps(captured_api_calls, indent=2, ensure_ascii=False, default=str)
+    attachment = MIMEText(attachment_text, "plain", "utf-8")
     attachment.add_header(
-        "Content-Disposition", "attachment", filename="swaper_invest_exploration_diagnostics.json"
+        "Content-Disposition", "attachment", filename="swaper_investment_api_calls.json"
     )
     msg.attach(attachment)
 
@@ -130,9 +157,9 @@ def send_swaper_invest_exploration_email(loans_count: int, diagnostics_text: str
             server.starttls()
             server.login(SMTP_USER, SMTP_PASSWORD)
             server.sendmail(EMAIL_FROM, [EMAIL_TO], msg.as_string())
-        log.info("Swaper invest-exploration diagnostics email sent to %s.", EMAIL_TO)
+        log.info("Swaper investment summary email sent to %s.", EMAIL_TO)
     except Exception:
-        log.exception("Failed to send Swaper invest-exploration diagnostics email.")
+        log.exception("Failed to send Swaper investment summary email.")
 
 
 def _format_lendermarket_lender(lender_stats: dict) -> str:
