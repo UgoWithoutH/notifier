@@ -106,14 +106,16 @@ balance - only the actual investing step (budget split + real clicks)
 stays gated behind `balance_now >= MIN_INVESTMENT_AMOUNT`. This means the
 passive `/rest/` capture above always has loans-listing/filter API calls
 to show, even on a run with nothing to invest. A diagnostics email
-(`shared.notifier.send_swaper_api_structure_email()`, tracked via
-`api_structure_sent_at` in STATE_FILE) ships that captured structure
-without waiting for a real investment, subject to a 24h anti-spam
-cooldown - it's skipped if a real investment summary email was sent
-instead this run (a strict superset). The real invest-call structure
-itself still can't be observed without a real investment actually
-happening (real money moving, per the 2026-07-25 decision to drop
-click-and-abort captures).
+(`shared.notifier.send_swaper_api_structure_email()`) ships that captured
+structure without waiting for a real investment, gated on there being at
+least one loan available for a selected originator AND balance >=
+MIN_INVESTMENT_AMOUNT (2026-07-26 follow-up requests) - it's skipped if a
+real investment summary email was sent instead this run (a strict
+superset). No anti-spam cooldown (removed 2026-07-26, explicit user
+request) - it's sent every run those conditions hold. The real
+invest-call structure itself still can't be observed without a real
+investment actually happening (real money moving, per the 2026-07-25
+decision to drop click-and-abort captures).
 """
 
 import json
@@ -122,7 +124,7 @@ import random
 import sys
 import time
 import logging
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone
 from pathlib import Path
 
 import pyotp
@@ -138,11 +140,6 @@ from shared.browser_stealth import get_context_options, apply_stealth, human_pau
 
 DEFAULT_STATE = {
     "gates": {},
-    # ISO timestamp of the last time the Swaper API-structure diagnostics
-    # email was sent (see send_swaper_api_structure_email() in
-    # shared/notifier.py) - platform-wide, not per-originator. Used as a
-    # simple 24h anti-spam cooldown; None means it's never been sent.
-    "api_structure_sent_at": None,
 }
 
 load_dotenv()
@@ -751,7 +748,7 @@ def run(headless: bool = True) -> None:
     if investment_attempts:
         log.info("Sending Swaper investment summary email (%d attempt(s) this run).", len(investment_attempts))
         send_swaper_investment_summary_email(investment_attempts, captured_api_calls)
-    elif captured_api_calls:
+    elif captured_api_calls and originator_loans and balance >= MIN_INVESTMENT_AMOUNT:
         # Diagnostics email (added 2026-07-26, explicit user request: get
         # the loans-listing/filter API structure right away, without
         # waiting for balance >= MIN_INVESTMENT_AMOUNT and an actual
@@ -761,23 +758,33 @@ def run(headless: bool = True) -> None:
         # coming back periodically. The real invest call's own structure
         # still isn't known until a real investment actually happens, since
         # it's never captured without real money moving (2026-07-25 decision).
-        last_sent_at = state.get("api_structure_sent_at")
-        cooldown_elapsed = True
-        if last_sent_at:
-            try:
-                cooldown_elapsed = datetime.now(timezone.utc) - datetime.fromisoformat(last_sent_at) >= timedelta(hours=24)
-            except ValueError:
-                cooldown_elapsed = True
-        if cooldown_elapsed:
-            log.info(
-                "Sending Swaper API-structure diagnostics email (%d call(s) captured, no "
-                "investment attempted yet this run).",
-                len(captured_api_calls),
-            )
-            send_swaper_api_structure_email(captured_api_calls)
-            state["api_structure_sent_at"] = datetime.now(timezone.utc).isoformat()
-        else:
-            log.info("Swaper API-structure diagnostics email already sent within the last 24h, skipping.")
+        # ALSO requires `originator_loans` to be non-empty (added 2026-07-26,
+        # later follow-up: "je veux juste [ce mail] si ça investit sur des
+        # prets") - `captured_api_calls` alone is basically ALWAYS non-empty
+        # (constraints/logged-in/loans-listing/history-statistics calls fire
+        # every single run regardless of loan availability), so without this
+        # extra check the email would fire every 24h even when there's
+        # nothing at all to invest in for any selected originator. Now it
+        # only fires when at least one selected originator currently HAS
+        # loan(s) available (i.e. a real investment attempt would have
+        # happened if only the balance had been sufficient).
+        # ALSO requires `balance >= MIN_INVESTMENT_AMOUNT` (added 2026-07-26,
+        # same follow-up request: "solde >= 10 car c'est 10 mini pour
+        # investir et capturer l'appel api") - reaching this `elif` branch
+        # already means investment_attempts is empty, so if the balance is
+        # still below the minimum a real investment wouldn't have been
+        # attempted anyway (see the `balance_now < MIN_INVESTMENT_AMOUNT`
+        # skip further up) - no point sending the diagnostics email in that
+        # case since it can never capture the real invest call either way.
+        # No anti-spam cooldown (removed 2026-07-26, explicit user request:
+        # "tu peux enlever l'anti spam pour swaper ?") - sent every run the
+        # conditions above hold.
+        log.info(
+            "Sending Swaper API-structure diagnostics email (%d call(s) captured, no "
+            "investment attempted yet this run).",
+            len(captured_api_calls),
+        )
+        send_swaper_api_structure_email(captured_api_calls)
 
     # TEMPORARY DEBUG: force-send a recap email regardless of balance/new
     # loans, to validate the SMTP pipeline end-to-end. Triggered via the
