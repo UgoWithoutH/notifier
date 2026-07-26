@@ -129,13 +129,13 @@ def send_swaper_investment_summary_email(attempts: list, captured_api_calls: lis
         body_lines.append(line)
     body_lines.append("")
     body_lines.append(
-        "Le fichier joint contient les vraies requ\\u00eates/r\\u00e9ponses HTTP /rest/ observ\\u00e9es "
-        "pendant ce run (m\\u00e9thode/URL/toutes les en-t\\u00eates - valeurs sensibles redacted - "
-        "corps/statut), pour les appels de listing/filtre de pr\\u00eats ET d'investissement. "
-        "V\\u00e9rifie le statut de la requ\\u00eate d'investissement pour confirmer qu'elle a bien "
-        "r\\u00e9ussi. Objectif secondaire : accumuler de quoi tenter, plus tard, de reproduire "
-        "ces appels en pur HTTP (sans navigateur) - la connexion/2FA reste elle bas\\u00e9e sur "
-        "le navigateur (voir monitors/swaper_monitor.py) et n'est jamais captur\\u00e9e ici."
+        "Le fichier joint contient les vraies requ\u00eates/r\u00e9ponses HTTP /rest/ observ\u00e9es "
+        "pendant ce run (m\u00e9thode/URL/toutes les en-t\u00eates - valeurs sensibles redacted - "
+        "corps/statut), pour les appels de listing/filtre de pr\u00eats ET d'investissement. "
+        "V\u00e9rifie le statut de la requ\u00eate d'investissement pour confirmer qu'elle a bien "
+        "r\u00e9ussi. Objectif secondaire : accumuler de quoi tenter, plus tard, de reproduire "
+        "ces appels en pur HTTP (sans navigateur) - la connexion/2FA reste elle bas\u00e9e sur "
+        "le navigateur (voir monitors/swaper_monitor.py) et n'est jamais captur\u00e9e ici."
     )
     body = "\n".join(body_lines)
 
@@ -160,6 +160,71 @@ def send_swaper_investment_summary_email(attempts: list, captured_api_calls: lis
         log.info("Swaper investment summary email sent to %s.", EMAIL_TO)
     except Exception:
         log.exception("Failed to send Swaper investment summary email.")
+
+
+def send_swaper_api_structure_email(captured_api_calls: list) -> None:
+    """One-time-ever diagnostics email (added 2026-07-26, explicit user
+    request: "j'ai pas besoin d'attendre d'avoir des sous sur mon compte
+    pour te donner tout ce dont tu auras besoin") - sends the loans-
+    listing/per-originator-filter `/rest/` API call structure captured by
+    monitors/swaper_monitor.py's `_record_api_response()` EVEN WHEN the
+    account balance is below MIN_INVESTMENT_AMOUNT and no real investment
+    was attempted this run, so the pure-HTTP-migration groundwork doesn't
+    have to wait for money to be on the account. Same redaction rules as
+    `send_swaper_investment_summary_email()` (see `_redact_sensitive_
+    headers()`): header NAMES are kept, sensitive values (cookies/auth/csrf)
+    are not. Does NOT include the real invest-call structure - that one
+    genuinely requires a real investment to happen (real money moving) to
+    ever be observed, per the 2026-07-25 decision to drop click-and-abort
+    captures; once that happens, `send_swaper_investment_summary_email()`
+    takes over (see monitors/swaper_monitor.py's DEFAULT_STATE comment -
+    this email is only ever sent once, and skipped entirely if a real
+    investment summary email has already been sent instead).
+    """
+    if not all([SMTP_HOST, SMTP_USER, SMTP_PASSWORD, EMAIL_TO]):
+        log.error(
+            "SMTP configuration is incomplete; cannot send email. "
+            "Required env vars: SMTP_HOST, SMTP_USER, SMTP_PASSWORD, EMAIL_TO."
+        )
+        return
+
+    subject = "[Swaper] Structure des appels API (listing/filtre pr\u00eats) - aucun argent engag\u00e9"
+    body = (
+        "Aucun investissement r\u00e9el n'a encore \u00e9t\u00e9 tent\u00e9 (solde probablement < "
+        "10 \u20ac, ou aucun pr\u00eat disponible pour l'instant) - voici quand m\u00eame, sans "
+        "attendre, la structure des appels API observ\u00e9s pour lister/filtrer les pr\u00eats "
+        "par lender (m\u00e9thode/URL/toutes les en-t\u00eates - valeurs sensibles redacted - "
+        "corps/statut), en pi\u00e8ce jointe JSON.\n\n"
+        "La structure de l'appel d'investissement r\u00e9el (clic sur le '+') n'y est pas "
+        "encore - elle ne peut \u00eatre observ\u00e9e que lors d'un vrai investissement (argent "
+        "r\u00e9el). Un mail de r\u00e9sum\u00e9 d'investissement plus complet sera envoy\u00e9 "
+        "automatiquement d\u00e8s que \u00e7a arrivera, et remplacera celui-ci.\n\n"
+        "Objectif : accumuler de quoi tenter, plus tard, de reproduire ces appels en pur "
+        "HTTP (sans navigateur) - la connexion/2FA reste elle bas\u00e9e sur le navigateur "
+        "(voir monitors/swaper_monitor.py) et n'est jamais captur\u00e9e ici."
+    )
+
+    msg = MIMEMultipart()
+    msg["From"] = EMAIL_FROM
+    msg["To"] = EMAIL_TO
+    msg["Subject"] = subject
+    msg.attach(MIMEText(body, "plain"))
+
+    attachment_text = json.dumps(captured_api_calls, indent=2, ensure_ascii=False, default=str)
+    attachment = MIMEText(attachment_text, "plain", "utf-8")
+    attachment.add_header(
+        "Content-Disposition", "attachment", filename="swaper_api_structure.json"
+    )
+    msg.attach(attachment)
+
+    try:
+        with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=15) as server:
+            server.starttls()
+            server.login(SMTP_USER, SMTP_PASSWORD)
+            server.sendmail(EMAIL_FROM, [EMAIL_TO], msg.as_string())
+        log.info("Swaper API-structure diagnostics email sent to %s.", EMAIL_TO)
+    except Exception:
+        log.exception("Failed to send Swaper API-structure diagnostics email.")
 
 
 def _format_lendermarket_lender(lender_stats: dict) -> str:
@@ -229,63 +294,6 @@ def send_lendermarket_email(balance: float | None, segments: dict) -> None:
     except Exception:
         log.exception("Failed to send Lendermarket notification email.")
 
-
-def send_lendermarket_invest_exploration_email(lenders_count: int, diagnostics_text: str) -> None:
-    """Send the Lendermarket "invest-structure exploration" diagnostics
-    email - same idea/safety boundary as send_swaper_invest_exploration_
-    email() (see that function's docstring), added 2026-07-23 for
-    monitors/lendermarket_monitor.py's per-lender invest-exploration
-    capture: whenever a Google-Sheet-selected lender (see
-    shared.google_sheet.get_selected_lendermarket_lenders()) has newly
-    available loans matching the user's own filtered-listing criteria,
-    this emails a JSON attachment with the raw loans-listing API payload,
-    any other Lendermarket API calls observed while Playwright browsed the
-    real listing page (method/url/status/truncated body), and a truncated
-    HTML dump of that page - for every such lender in this run. NO invest/
-    confirm button is ever clicked to gather this - purely passive capture
-    of a (best-effort) authenticated session.
-    """
-    if not all([SMTP_HOST, SMTP_USER, SMTP_PASSWORD, EMAIL_TO]):
-        log.error(
-            "SMTP configuration is incomplete; cannot send email. "
-            "Required env vars: SMTP_HOST, SMTP_USER, SMTP_PASSWORD, EMAIL_TO."
-        )
-        return
-
-    subject = f"[Lendermarket] Diagnostic structure d'investissement ({lenders_count} lender(s))"
-    body = (
-        f"{lenders_count} lender(s) sélectionné(s) dans le Google Sheet ont des "
-        "pr\u00eats disponibles correspondant à tes filtres sur Lendermarket.\n\n"
-        "Le fichier joint contient, pour chacun : la r\u00e9ponse brute de l'API "
-        "de listing des pr\u00eats, les autres appels API Lendermarket observ\u00e9s "
-        "pendant la navigation sur la page de listing r\u00e9elle, et un extrait du "
-        "HTML de cette page. Aucun clic d'investissement/confirmation n'a "
-        "\u00e9t\u00e9 effectu\u00e9 (aucun risque d'argent r\u00e9el) - c'est juste de la "
-        "capture passive.\n\n"
-        "Renvoie ce fichier pour permettre de comprendre la structure HTML/API "
-        "n\u00e9cessaire pour investir automatiquement sur Lendermarket."
-    )
-
-    msg = MIMEMultipart()
-    msg["From"] = EMAIL_FROM
-    msg["To"] = EMAIL_TO
-    msg["Subject"] = subject
-    msg.attach(MIMEText(body, "plain"))
-
-    attachment = MIMEText(diagnostics_text, "plain", "utf-8")
-    attachment.add_header(
-        "Content-Disposition", "attachment", filename="lendermarket_invest_exploration_diagnostics.json"
-    )
-    msg.attach(attachment)
-
-    try:
-        with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=15) as server:
-            server.starttls()
-            server.login(SMTP_USER, SMTP_PASSWORD)
-            server.sendmail(EMAIL_FROM, [EMAIL_TO], msg.as_string())
-        log.info("Lendermarket invest-exploration diagnostics email sent to %s.", EMAIL_TO)
-    except Exception:
-        log.exception("Failed to send Lendermarket invest-exploration diagnostics email.")
 
 
 def send_lendermarket_invest_summary_email(stats: dict, error: str | None = None, diagnostics_text: str | None = None) -> None:

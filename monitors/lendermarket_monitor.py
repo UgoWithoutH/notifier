@@ -48,46 +48,17 @@ Optional:
                                                    Google Authenticator, needed
                                                    if 2FA is enabled on the account
 
-Invest-structure exploration (added 2026-07-23): for each lender selected in
-the Google Sheet (shared.google_sheet.get_selected_lendermarket_lenders() -
-same "Répartition géographique" block convention as PeerBerry's own
-get_selected_peerberry_loan_originators(), but starting at the
-"Lendermarket" cell and stopping at "Loanch"), this module ALSO checks that
-lender's own availability using the exact filters (minInterestRate,
-minRemainingTermInDays, maxRemainingTermInDays, single lender ID) from the
-user's own filtered listing URLs - see LENDER_INVEST_FILTERS below - and, for
-any lender with newly-available loans, captures diagnostic data meant to
-help figure out, later, how to auto-invest on Lendermarket (mirroring
-swaper_monitor.py's own exploration, added the same day, for the same
-reason: the real invest HTTP request/HTML structure is unknown, and hasn't
-been able to be explored live/interactively since no matching loans were up
-at the time this was written).
-
-`capture_lendermarket_invest_exploration()` reuses the already-working
-pure-HTTP login() (see above: Laravel/Sanctum-style CSRF cookies) rather
-than reimplementing the login UI in Playwright (its selectors have never
-been verified, unlike Swaper's) - it injects the same session cookies into
-a fresh Playwright browser context (`context.add_cookies()`), assuming
-they're set on the shared `.lendermarket.com` parent domain so the
-app.lendermarket.com frontend picks them up too. This assumption is NOT
-confirmed - if wrong, the captured page will just show a login redirect
-instead of the real listing, which is reported as
-`frontend_session_established: false` in the diagnostics rather than
-failing the whole run. Response listeners only ever get registered on that
-freshly-authenticated page (nothing during the HTTP login itself). NO
-invest/confirm button is ever clicked - purely passive capture, same
-real-money safety boundary as Swaper's/PeerBerry's explorations. The result
-is emailed (see shared.notifier.send_lendermarket_invest_exploration_
-email()) as a JSON attachment whenever at least one selected lender has
-newly-available loans, so the user can pass that file back to build the
-real auto-invest bot once genuine loan/invest markup has actually been
-observed. Independent of account balance entirely (checks loan availability
-only), per explicit user request (2026-07-24) - the goal is just to observe
-the real structure, so it shouldn't wait for money to be available too. Sent
-AT MOST ONCE EVER (not once per notification cycle) via a persistent
-`invest_exploration_sent` flag in STATE_FILE (platform-wide, not per-lender),
-so the user is never spammed with repeat copies of the same structure once
-it's already been captured and sent.
+NOTE: this module used to also have a one-time "invest-structure
+exploration" capture (added 2026-07-23, Playwright-based, emailed the raw
+HTML/API structure of a selected lender's listing page) meant to help build
+a future Lendermarket auto-invest bot. That bot was built and confirmed
+working (see the "Lendermarket real auto-invest" section further below/in
+repo memory) - the exploration email is now obsolete and was REMOVED
+2026-07-26 per explicit user request ("j'ai plus besoin de recevoir la
+structure html, je voulais juste notifier des loans qui ont des prêts et du
+solde dispo"). This module is now pure HTTP end-to-end again (no
+Playwright/browser dependency at all) - only the loan-availability
+notification email and the real auto-invest step remain.
 """
 
 import json
@@ -103,9 +74,8 @@ from urllib.parse import unquote
 import pyotp
 import requests
 from dotenv import load_dotenv
-from playwright.sync_api import sync_playwright
 
-from shared.notifier import send_lendermarket_email, send_lendermarket_invest_exploration_email, send_lendermarket_invest_summary_email
+from shared.notifier import send_lendermarket_email, send_lendermarket_invest_summary_email
 from shared.google_sheet import get_selected_lendermarket_lenders
 from shared.state import load_state, save_state
 from shared.notification_gate import should_notify
@@ -193,10 +163,6 @@ LOAN_SEGMENTS = [
 # it drops back to 0 (fluctuations while staying above 0 don't re-open it).
 DEFAULT_STATE = {
     "gates": {},
-    # Set to True the first (and only) time the invest-structure exploration
-    # email is sent - see module docstring. Platform-wide (not per-lender),
-    # independent of "gates" above.
-    "invest_exploration_sent": False,
 }
 
 # Per-lender filter configs for the invest-structure exploration (added
@@ -269,12 +235,6 @@ LENDER_INVEST_FILTERS = {
     },
 }
 
-# Caps for the invest-exploration diagnostics JSON attachment/HTML dump,
-# same idea and same values as swaper_monitor.py's equivalents.
-MAX_INVEST_EXPLORATION_CHARS = 500_000
-MAX_LISTING_PAGE_HTML_CHARS = 200_000
-
-
 def fetch_active_loans(segment: dict) -> list:
     """Fetch the currently active loans for one segment via the public API,
     with the same lenders/regulationStatus/maxRemainingTermInDays filters
@@ -335,9 +295,9 @@ def aggregate_by_lender(loans: list) -> list:
 def fetch_active_loans_for_lender(config: dict) -> list:
     """Same public API as fetch_active_loans(), but for a single lender
     with its own minInterestRate/minRemainingTermInDays cutoffs (one entry
-    of LENDER_INVEST_FILTERS) - used by the invest-exploration capture
-    below to check availability exactly like the user's own filtered
-    listing URLs (see module docstring, added 2026-07-23)."""
+    of LENDER_INVEST_FILTERS) - used by invest_selected_lenders() (the real
+    auto-invest step) to check each selected lender's own availability
+    exactly like the user's own filtered listing URLs."""
     params = [
         ("minInterestRate", str(config["min_interest_rate"])),
         ("minRemainingTermInDays", str(config["min_remaining_term_in_days"])),
@@ -393,133 +353,6 @@ def _redact_sensitive_headers(headers: dict) -> dict:
         else:
             redacted[name] = value
     return redacted
-
-
-def _record_lendermarket_api_response(captured: list, response) -> None:
-    """`page.on("response", ...)` handler used by
-    capture_lendermarket_invest_exploration() to passively capture
-    Lendermarket's own API traffic while Playwright browses a filtered
-    listing page - see that function's docstring. Belt-and-braces skips
-    anything login/auth/password/totp-related in the URL too (same
-    precaution as swaper_monitor.py's equivalent), even though nothing
-    login-related should ever happen at this point in the flow. Captures
-    both the request (method, url, headers, POST body) and the response
-    (status, body) - so there's enough detail to later reconstruct these
-    calls for a bot, per explicit user request.
-    """
-    url = response.url
-    if "lendermarket.com" not in url:
-        return
-    lower_url = url.lower()
-    if any(keyword in lower_url for keyword in ("login", "auth", "password", "totp")):
-        return
-    request = response.request
-    entry = {
-        "method": request.method,
-        "url": url,
-        "request_headers": _redact_sensitive_headers(request.headers),
-        "request_post_data": request.post_data,
-        "status": response.status,
-    }
-    try:
-        entry["body"] = response.text()[:20000]
-    except Exception:
-        entry["body"] = None
-    captured.append(entry)
-
-
-def capture_lendermarket_invest_exploration(lenders_with_loans: list) -> dict | None:
-    """Best-effort Playwright-based capture of the invest-structure
-    diagnostics for the Google-Sheet-selected Lendermarket lenders that
-    currently have newly-available loans - see module docstring for the
-    full rationale/safety boundary (mirrors swaper_monitor.py's own
-    exploration: NO invest/confirm button is ever clicked here either).
-
-    `lenders_with_loans`: list of (lender_name, loans) tuples, `lender_name`
-    being a key of LENDER_INVEST_FILTERS.
-
-    UNVERIFIED cookie-sharing assumption (see module docstring): reuses the
-    already-working pure-HTTP login() and injects those same session
-    cookies into a fresh Playwright browser context, assuming they're set
-    on the shared `.lendermarket.com` parent domain rather than scoped to
-    api.lendermarket.com only. If that assumption is wrong, the listing
-    page will redirect to /login instead of showing the real content -
-    detected here and reported per-lender as
-    `frontend_session_established: false` rather than failing loudly.
-
-    Returns the diagnostics dict, or None if the HTTP login itself failed
-    (nothing to capture in that case).
-    """
-    try:
-        session = requests.Session()
-        investor_id = login(session)
-    except Exception:
-        log.exception("Invest-exploration: failed to log in via HTTP, skipping capture.")
-        return None
-
-    cookies_for_playwright = [
-        {
-            "name": cookie.name,
-            "value": cookie.value,
-            "domain": cookie.domain,
-            "path": cookie.path or "/",
-        }
-        for cookie in session.cookies
-    ]
-
-    diagnostics = {
-        "captured_at": datetime.now(timezone.utc).isoformat(),
-        "investor_id": investor_id,
-        "lenders": {},
-    }
-
-    try:
-        with sync_playwright() as p:
-            browser = p.chromium.launch(headless=True)
-            context = browser.new_context(locale="fr-FR")
-            if cookies_for_playwright:
-                context.add_cookies(cookies_for_playwright)
-            page = context.new_page()
-
-            for lender_name, loans in lenders_with_loans:
-                config = LENDER_INVEST_FILTERS[lender_name]
-                captured_calls = []
-                handler = lambda response: _record_lendermarket_api_response(captured_calls, response)
-                page.on("response", handler)
-
-                frontend_logged_in = False
-                listing_html = None
-                try:
-                    page.goto(config["page_url"], wait_until="domcontentloaded", timeout=30000)
-                    frontend_logged_in = "/login" not in page.url
-                    try:
-                        listing_html = page.evaluate(
-                            "() => (document.querySelector('main') || document.body).outerHTML"
-                        )
-                    except Exception:
-                        log.exception("Could not capture the listing page HTML for lender '%s'.", lender_name)
-                except Exception:
-                    log.exception("Failed to navigate to the listing page for lender '%s'.", lender_name)
-                finally:
-                    page.remove_listener("response", handler)
-
-                if listing_html and len(listing_html) > MAX_LISTING_PAGE_HTML_CHARS:
-                    listing_html = listing_html[:MAX_LISTING_PAGE_HTML_CHARS] + "\n... (truncated)"
-
-                diagnostics["lenders"][lender_name] = {
-                    "loans_count": len(loans),
-                    "loans_api_payload": loans,
-                    "listing_page_url": config["page_url"],
-                    "frontend_session_established": frontend_logged_in,
-                    "captured_api_calls": captured_calls,
-                    "listing_page_html": listing_html,
-                }
-
-            browser.close()
-    except Exception:
-        log.exception("Invest-exploration: Playwright capture failed.")
-
-    return diagnostics
 
 
 def _xsrf_headers(session: requests.Session, investor_id: str | None = None) -> dict:
@@ -1036,48 +869,6 @@ def run() -> None:
         send_lendermarket_email(balance, newly_available)
     else:
         log.info("Nothing new to notify.")
-
-    # Invest-structure exploration (added 2026-07-23, decoupled from balance
-    # and switched to a one-time-ever flag on 2026-07-24 per explicit user
-    # request) - see module docstring. Independent of the segment-level
-    # notification above and of account balance: checks each Google-Sheet-
-    # selected lender's availability regardless of balance, but only ever
-    # captures/sends the diagnostics ONCE for the whole platform (not once
-    # per lender, not once per cycle) - skipped entirely once
-    # `invest_exploration_sent` is already True.
-    if state.get("invest_exploration_sent"):
-        log.info("Lendermarket invest-structure exploration diagnostics were already sent previously - skipping (avoids spamming).")
-    else:
-        lenders_needing_exploration = []
-        for sheet_name in selected_lender_names:
-            filter_key = _match_lender_filter(sheet_name, LENDER_INVEST_FILTERS)
-            if filter_key is None:
-                log.warning(
-                    "Selected Lendermarket lender '%s' from the Google Sheet doesn't match any known filter config, skipping.",
-                    sheet_name,
-                )
-                continue
-
-            config = LENDER_INVEST_FILTERS[filter_key]
-            loans = fetch_active_loans_for_lender(config)
-            count = len(loans)
-            log.info("Lender '%s' (invest-exploration filters): %d loan(s) currently available.", filter_key, count)
-
-            if count > 0:
-                lenders_needing_exploration.append((filter_key, loans))
-
-        if lenders_needing_exploration:
-            log.info(
-                "Capturing Lendermarket invest-structure exploration diagnostics for: %s",
-                [name for name, _ in lenders_needing_exploration],
-            )
-            diagnostics = capture_lendermarket_invest_exploration(lenders_needing_exploration)
-            if diagnostics:
-                invest_exploration_text = json.dumps(diagnostics, indent=2, ensure_ascii=False, default=str)
-                if len(invest_exploration_text) > MAX_INVEST_EXPLORATION_CHARS:
-                    invest_exploration_text = invest_exploration_text[:MAX_INVEST_EXPLORATION_CHARS] + "\n... (truncated)"
-                send_lendermarket_invest_exploration_email(len(lenders_needing_exploration), invest_exploration_text)
-                state["invest_exploration_sent"] = True
 
     save_state(STATE_FILE, state)
 

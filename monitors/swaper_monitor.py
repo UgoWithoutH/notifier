@@ -96,6 +96,24 @@ HTTP call, so that exploration data was no longer needed. The passive
 `/rest/` API call capture (`_record_api_response()`/`captured_api_calls`)
 is KEPT - it now only feeds the real investment summary email, to verify
 each real investment call actually succeeded.
+
+Balance-independent per-originator availability check (added 2026-07-26,
+explicit user request - "j'ai pas besoin d'attendre d'avoir des sous sur
+mon compte pour te donner tout ce dont tu auras besoin"): each selected
+originator's current loan availability is now checked via
+`fetch_loans_for_originator()` EVERY run regardless of the account
+balance - only the actual investing step (budget split + real clicks)
+stays gated behind `balance_now >= MIN_INVESTMENT_AMOUNT`. This means the
+passive `/rest/` capture above always has loans-listing/filter API calls
+to show, even on a run with nothing to invest. A diagnostics email
+(`shared.notifier.send_swaper_api_structure_email()`, tracked via
+`api_structure_sent_at` in STATE_FILE) ships that captured structure
+without waiting for a real investment, subject to a 24h anti-spam
+cooldown - it's skipped if a real investment summary email was sent
+instead this run (a strict superset). The real invest-call structure
+itself still can't be observed without a real investment actually
+happening (real money moving, per the 2026-07-25 decision to drop
+click-and-abort captures).
 """
 
 import json
@@ -104,13 +122,14 @@ import random
 import sys
 import time
 import logging
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
 import pyotp
 from dotenv import load_dotenv
 from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
 
-from shared.notifier import send_swaper_email, send_swaper_investment_summary_email
+from shared.notifier import send_swaper_email, send_swaper_investment_summary_email, send_swaper_api_structure_email
 from shared.state import load_state, save_state
 from shared.cron_schedule import ensure_schedule
 from shared.notification_gate import should_notify
@@ -119,6 +138,11 @@ from shared.browser_stealth import get_context_options, apply_stealth, human_pau
 
 DEFAULT_STATE = {
     "gates": {},
+    # ISO timestamp of the last time the Swaper API-structure diagnostics
+    # email was sent (see send_swaper_api_structure_email() in
+    # shared/notifier.py) - platform-wide, not per-originator. Used as a
+    # simple 24h anti-spam cooldown; None means it's never been sent.
+    "api_structure_sent_at": None,
 }
 
 load_dotenv()
@@ -643,20 +667,23 @@ def run(headless: bool = True) -> None:
                 log.exception("Could not read selected Swaper loan originators from the Google Sheet.")
                 selected_originators = []
 
+            originator_loans = {}
             if not selected_originators:
                 log.info("No Swaper loan originator is flagged with 'x' in the Google Sheet - skipping auto-invest.")
-            elif balance_now < MIN_INVESTMENT_AMOUNT:
-                log.info(
-                    "Balance %.2f EUR is below the minimum (%.2f EUR) - skipping auto-invest.",
-                    balance_now, MIN_INVESTMENT_AMOUNT,
-                )
             else:
+                # Availability is checked for every selected originator
+                # REGARDLESS of balance (added 2026-07-26, explicit user
+                # request: "j'ai pas besoin d'attendre d'avoir des sous sur
+                # mon compte pour te donner tout ce dont tu auras besoin") -
+                # this is what feeds the one-time API-structure diagnostics
+                # email below even when there's nothing to actually invest
+                # yet. Only the real investing step further below stays
+                # gated behind the minimum balance.
                 log.info(
                     "%d loan originator(s) selected in the Google Sheet (%s) - checking current "
                     "availability for each.",
                     len(selected_originators), ", ".join(selected_originators),
                 )
-                originator_loans = {}
                 for name in selected_originators:
                     try:
                         originator_payload = fetch_loans_for_originator(page, name)
@@ -670,29 +697,36 @@ def run(headless: bool = True) -> None:
                     else:
                         log.info("Originator %r currently has no loans available.", name)
 
-                budgets = _split_budget_across_available_originators(balance_now, originator_loans)
-                for name, budget in budgets.items():
-                    log.info("Investing up to %.2f EUR into originator %r's loan(s).", budget, name)
-                    try:
-                        # Re-apply the filter so the page's visible rows
-                        # match THIS originator right before investing (the
-                        # discovery loop above left the page showing
-                        # whichever originator was fetched last).
-                        fetch_loans_for_originator(page, name)
-                    except Exception:
-                        log.exception("Failed to re-apply the filter for originator %r before investing - skipping it.", name)
-                        continue
-                    shares = _compute_swaper_loan_shares(budget, originator_loans[name])
-                    attempts = _invest_available_loans(page, originator_loans[name], shares)
-                    for attempt in attempts:
-                        attempt["originator"] = name
-                    investment_attempts.extend(attempts)
+                if balance_now < MIN_INVESTMENT_AMOUNT:
+                    log.info(
+                        "Balance %.2f EUR is below the minimum (%.2f EUR) - availability was still "
+                        "checked above for diagnostics, but skipping the actual auto-invest step.",
+                        balance_now, MIN_INVESTMENT_AMOUNT,
+                    )
+                else:
+                    budgets = _split_budget_across_available_originators(balance_now, originator_loans)
+                    for name, budget in budgets.items():
+                        log.info("Investing up to %.2f EUR into originator %r's loan(s).", budget, name)
+                        try:
+                            # Re-apply the filter so the page's visible rows
+                            # match THIS originator right before investing (the
+                            # discovery loop above left the page showing
+                            # whichever originator was fetched last).
+                            fetch_loans_for_originator(page, name)
+                        except Exception:
+                            log.exception("Failed to re-apply the filter for originator %r before investing - skipping it.", name)
+                            continue
+                        shares = _compute_swaper_loan_shares(budget, originator_loans[name])
+                        attempts = _invest_available_loans(page, originator_loans[name], shares)
+                        for attempt in attempts:
+                            attempt["originator"] = name
+                        investment_attempts.extend(attempts)
 
-                if investment_attempts:
-                    # Refresh the snapshot used for the rest of this run
-                    # (notification email etc.) to reflect what's actually
-                    # left AFTER investing, not the stale pre-invest numbers.
-                    payload = fetch_loans(page)
+                    if investment_attempts:
+                        # Refresh the snapshot used for the rest of this run
+                        # (notification email etc.) to reflect what's actually
+                        # left AFTER investing, not the stale pre-invest numbers.
+                        payload = fetch_loans(page)
         except Exception:
             log.exception("Failed to log in or fetch loans.")
             browser.close()
@@ -717,6 +751,33 @@ def run(headless: bool = True) -> None:
     if investment_attempts:
         log.info("Sending Swaper investment summary email (%d attempt(s) this run).", len(investment_attempts))
         send_swaper_investment_summary_email(investment_attempts, captured_api_calls)
+    elif captured_api_calls:
+        # Diagnostics email (added 2026-07-26, explicit user request: get
+        # the loans-listing/filter API structure right away, without
+        # waiting for balance >= MIN_INVESTMENT_AMOUNT and an actual
+        # investment attempt). Gated by a simple 24h anti-spam cooldown
+        # (added 2026-07-26, same day, follow-up request) instead of a
+        # one-time-ever flag, so it doesn't spam every run but still keeps
+        # coming back periodically. The real invest call's own structure
+        # still isn't known until a real investment actually happens, since
+        # it's never captured without real money moving (2026-07-25 decision).
+        last_sent_at = state.get("api_structure_sent_at")
+        cooldown_elapsed = True
+        if last_sent_at:
+            try:
+                cooldown_elapsed = datetime.now(timezone.utc) - datetime.fromisoformat(last_sent_at) >= timedelta(hours=24)
+            except ValueError:
+                cooldown_elapsed = True
+        if cooldown_elapsed:
+            log.info(
+                "Sending Swaper API-structure diagnostics email (%d call(s) captured, no "
+                "investment attempted yet this run).",
+                len(captured_api_calls),
+            )
+            send_swaper_api_structure_email(captured_api_calls)
+            state["api_structure_sent_at"] = datetime.now(timezone.utc).isoformat()
+        else:
+            log.info("Swaper API-structure diagnostics email already sent within the last 24h, skipping.")
 
     # TEMPORARY DEBUG: force-send a recap email regardless of balance/new
     # loans, to validate the SMTP pipeline end-to-end. Triggered via the
