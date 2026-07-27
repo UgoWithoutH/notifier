@@ -2,6 +2,7 @@ import os
 import re
 import json
 import logging
+import time
 
 import gspread
 from dotenv import load_dotenv
@@ -26,6 +27,55 @@ SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
 SPREADSHEET_ID = os.environ["GOOGLE_SHEET_ID"]
 GOOGLE_CREDENTIALS = os.environ["GOOGLE_CREDENTIALS"]
 
+# Retry tuning for transient Google Sheets API quota errors (HTTP 429,
+# e.g. "Quota exceeded for quota metric 'Read requests' ... per minute").
+# Rather than letting the whole diversification run fail/exit(1) on a
+# transient rate limit, every gspread network call in this module goes
+# through _call_with_retry(), which waits (exponential backoff) and
+# retries instead of raising immediately.
+API_RATE_LIMIT_MAX_RETRIES = 5
+API_RATE_LIMIT_INITIAL_WAIT_SECONDS = 30
+
+
+def _is_rate_limit_error(exc: Exception) -> bool:
+    """True if `exc` looks like a Google Sheets API 429 quota-exceeded error."""
+    if isinstance(exc, gspread.exceptions.APIError):
+        try:
+            status_code = exc.response.status_code
+        except AttributeError:
+            status_code = None
+        if status_code == 429:
+            return True
+        # Belt-and-braces: also match on the error body text, in case a
+        # future gspread version doesn't set .response the same way.
+        if "429" in str(exc) or "Quota exceeded" in str(exc) or "RESOURCE_EXHAUSTED" in str(exc):
+            return True
+    return False
+
+
+def _call_with_retry(func, *args, **kwargs):
+    """Calls func(*args, **kwargs), retrying with exponential backoff
+    (30s, 60s, 120s, 240s, 480s by default) whenever it fails with a
+    Google Sheets API 429 "quota exceeded" error, instead of letting it
+    propagate and fail the whole run. Any other exception (or a 429 that
+    persists after all retries) is re-raised as-is.
+    """
+    wait_seconds = API_RATE_LIMIT_INITIAL_WAIT_SECONDS
+
+    for attempt in range(1, API_RATE_LIMIT_MAX_RETRIES + 2):
+        try:
+            return func(*args, **kwargs)
+        except Exception as exc:
+            if not _is_rate_limit_error(exc) or attempt > API_RATE_LIMIT_MAX_RETRIES:
+                raise
+            logger.warning(
+                "Quota Google Sheets API dépassé (tentative %s/%s) : %s. "
+                "Attente de %ss avant nouvelle tentative...",
+                attempt, API_RATE_LIMIT_MAX_RETRIES, exc, wait_seconds
+            )
+            time.sleep(wait_seconds)
+            wait_seconds *= 2
+
 
 def get_google_credentials():
     logger.info("Chargement des credentials Google...")
@@ -40,12 +90,12 @@ def get_latest_dashboard_worksheet(spreadsheet_id: str):
 
     credentials = get_google_credentials()
     client = gspread.authorize(credentials)
-    spreadsheet = client.open_by_key(spreadsheet_id)
+    spreadsheet = _call_with_retry(client.open_by_key, spreadsheet_id)
 
     dashboards = []
 
     # 1 seul appel API : spreadsheet.worksheets()
-    for worksheet in spreadsheet.worksheets():
+    for worksheet in _call_with_retry(spreadsheet.worksheets):
         title = worksheet.title.strip()
         match = re.match(r"(?i)^dashboard\s*(\d{4})$", title)
 
@@ -151,7 +201,7 @@ def fill_current_month_amounts(platform: str, amounts: dict, section: str = "Cro
     worksheet = get_latest_dashboard_worksheet(SPREADSHEET_ID)
 
     # 1 seul appel API pour charger toute la feuille
-    grid = worksheet.get_all_values()
+    grid = _call_with_retry(worksheet.get_all_values)
 
     section_pos = find_cell_by_value(grid, section)
     if not section_pos:
@@ -186,7 +236,8 @@ def fill_current_month_amounts(platform: str, amounts: dict, section: str = "Cro
     end_a1 = rowcol_to_a1(platform_row + 1, current_month_col)
     range_name = f"{start_a1}:{end_a1}"
 
-    worksheet.update(
+    _call_with_retry(
+        worksheet.update,
         range_name,
         [[total_amount], [gross_interest_received]],
         value_input_option="USER_ENTERED"
@@ -222,7 +273,7 @@ def fill_current_month_bonus_breakdown(platform: str, breakdown: dict, section: 
     worksheet = get_latest_dashboard_worksheet(SPREADSHEET_ID)
 
     # 1 seul appel API pour charger toute la feuille
-    grid = worksheet.get_all_values()
+    grid = _call_with_retry(worksheet.get_all_values)
 
     section_pos = find_cell_by_value(grid, section)
     if not section_pos:
@@ -267,7 +318,7 @@ def fill_current_month_bonus_breakdown(platform: str, breakdown: dict, section: 
         logger.warning("Aucune ligne trouvée pour %s, rien à écrire.", platform)
         return
 
-    worksheet.batch_update(updates, value_input_option="USER_ENTERED")
+    _call_with_retry(worksheet.batch_update, updates, value_input_option="USER_ENTERED")
 
     logger.info("Mise à jour de la répartition bonus/cashback/concours terminée pour %s.", platform)
 
@@ -341,7 +392,7 @@ def fill_geographic_repartition_amounts(loan_originators: list):
     worksheet = get_latest_dashboard_worksheet(SPREADSHEET_ID)
 
     # 1 seul appel API pour charger toute la feuille
-    grid = worksheet.get_all_values()
+    grid = _call_with_retry(worksheet.get_all_values)
 
     geo_pos = find_cell_by_value(grid, "Répartition géographique")
 
@@ -395,7 +446,7 @@ def fill_geographic_repartition_amounts(loan_originators: list):
         logger.warning("Aucun loan originator trouvé, rien à écrire.")
         return
 
-    worksheet.batch_update(updates, value_input_option="USER_ENTERED")
+    _call_with_retry(worksheet.batch_update, updates, value_input_option="USER_ENTERED")
 
     logger.info(
         "Mise à jour Répartition géographique terminée (%d trouvé(s), %d manquant(s)).",
@@ -422,7 +473,7 @@ def get_selected_peerberry_loan_originators() -> list:
     worksheet = get_latest_dashboard_worksheet(SPREADSHEET_ID)
 
     # 1 seul appel API pour charger toute la feuille
-    grid = worksheet.get_all_values()
+    grid = _call_with_retry(worksheet.get_all_values)
 
     geo_pos = find_cell_by_value(grid, "Répartition géographique")
     if not geo_pos:
@@ -490,7 +541,7 @@ def get_selected_lendermarket_lenders() -> list:
     worksheet = get_latest_dashboard_worksheet(SPREADSHEET_ID)
 
     # 1 seul appel API pour charger toute la feuille
-    grid = worksheet.get_all_values()
+    grid = _call_with_retry(worksheet.get_all_values)
 
     geo_pos = find_cell_by_value(grid, "Répartition géographique")
     if not geo_pos:
@@ -563,7 +614,7 @@ def get_selected_swaper_loan_originators() -> list:
     worksheet = get_latest_dashboard_worksheet(SPREADSHEET_ID)
 
     # 1 seul appel API pour charger toute la feuille
-    grid = worksheet.get_all_values()
+    grid = _call_with_retry(worksheet.get_all_values)
 
     geo_pos = find_cell_by_value(grid, "Répartition géographique")
     if not geo_pos:

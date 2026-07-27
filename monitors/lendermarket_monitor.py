@@ -67,6 +67,7 @@ import os
 import time
 import traceback
 from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 from pathlib import Path
 from urllib import request, parse, error
 from urllib.parse import unquote
@@ -398,19 +399,35 @@ def login(session: requests.Session) -> str:
             )
         log.info("2FA prompt detected, generating and submitting TOTP code...")
         totp = pyotp.TOTP(LENDERMARKET_TOTP_SECRET)
-        # Guard against submitting a code right as its 30s window is about
-        # to roll over - the network round-trip can push the server-side
-        # check past the boundary and get rejected as "Invalid code
-        # provided" even though the code was valid when generated.
-        remaining = 30 - (int(time.time()) % 30)
-        if remaining < 5:
-            time.sleep(remaining + 1)
-        code = totp.now()
-        r = session.post(TOTP_URL, json={"code": code}, headers=_xsrf_headers(session), timeout=20)
-        if r.status_code == 422:
-            log.info("TOTP code rejected (likely rolled over), retrying once with a fresh code.")
-            code = totp.now()
+
+        # Diagnostic only (no secret/code values logged): compare
+        # Lendermarket's server-reported clock (Date response header) to
+        # our local clock - helps distinguish a genuine clock-skew issue
+        # from a wrong LENDERMARKET_TOTP_SECRET if this still fails below.
+        server_date_header = r.headers.get("Date")
+        if server_date_header:
+            try:
+                server_time = parsedate_to_datetime(server_date_header)
+                skew = (datetime.now(timezone.utc) - server_time).total_seconds()
+                log.info("Clock check: local vs. Lendermarket server Date header skew = %.1fs", skew)
+            except Exception:
+                pass
+
+        # Retrying with a same-window code is a no-op (calling totp.now()
+        # again within under a second returns the IDENTICAL code, since
+        # it's still the same 30s window - confirmed via a real GitHub
+        # Actions failure where the initial attempt and the "retry" were
+        # only ~300ms apart and both got rejected). Genuine resilience
+        # against boundary-rollover/clock-skew requires trying distinct
+        # adjacent-window codes instead.
+        now = time.time()
+        candidates = [totp.at(now), totp.at(now - 30), totp.at(now + 30)]
+        r = None
+        for attempt, code in enumerate(candidates, start=1):
             r = session.post(TOTP_URL, json={"code": code}, headers=_xsrf_headers(session), timeout=20)
+            if r.status_code != 422:
+                break
+            log.info("TOTP code rejected (attempt %d/%d)...", attempt, len(candidates))
         r.raise_for_status()
         data = r.json().get("data") or {}
 
