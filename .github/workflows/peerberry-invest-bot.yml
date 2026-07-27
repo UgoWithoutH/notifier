@@ -14,7 +14,7 @@ on:
       poll_interval_seconds:
         description: 'Delay between polls (seconds)'
         required: false
-        default: '1'
+        default: '0.5'
       min_investment_amount:
         description: 'Skip investing below this remaining balance/loan amount (EUR)'
         required: false

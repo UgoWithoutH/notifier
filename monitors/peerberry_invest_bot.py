@@ -4,7 +4,7 @@
 repeatedly polls PeerBerry's filtered loan listing (same filters as
 https://peerberry.com/en/client/invest?loanTermId=&hideInvested=true&groupGuarantee=true&loanOriginators=53,52,74,12,67,47,43,49,73,39,63,59,69,30,55,70,72,71,57,48,56,54,33,23,68,66,45,36,51,64,62,58,75,50,65,4,41,7,76&minInterestRate=10&maxRemainingTerm=185&minRemainingTerm=1)
 and tries to invest available funds into any newly-appeared/still-available
-matching loan, as fast as possible (~1s polling), before other investors
+matching loan, as fast as possible (~0.5s polling by default), before other investors
 grab it. Within each poll, loans are attempted starting from the END of the
 listing (i.e. reversed vs. PeerBerry's own "-loanId" sort/UI order), since
 human investors using the real website naturally start clicking from the
@@ -101,7 +101,17 @@ needing to touch the cache. The loan listing looking "stuck"
 DIAGNOSTICS_FILE, since it's a normal/expected condition (no matching
 loans right now, not a bug) and logging the full loan listing response
 every single time it fires would only bloat the accumulating diagnostics
-file for no real diagnostic value.
+file for no real diagnostic value. Conversely, whenever `GET
+/v1/{publicId}/loans` DOES return >=1 loan (whether or not it ends up
+matching a selected originator), the full raw response (every loan
+object, plus the request's own round-trip duration) is written to
+DIAGNOSTICS_FILE as a `"loans_found"` entry - this is the proof that the
+request itself works and lets a real loan's exact field values (and how
+long the call took) be inspected after the fact, e.g. to check whether the
+hardcoded `LOAN_ORIGINATORS` id list / `minInterestRate` filter actually
+match what's expected, or whether request latency is why a fast-moving
+loan was missed. `poll_error`/`balance_refresh_error` entries also now
+include `request_duration_seconds` for the same latency-diagnosis reason.
 
 Required env vars:
     PEERBERRY_EMAIL, PEERBERRY_PASSWORD    -> PeerBerry account credentials
@@ -121,7 +131,7 @@ Optional:
                                                "1h20" (1h 20m), "1h20m30s",
                                                "45m", "90s", "2h", or a plain
                                                number of seconds ("300").
-    POLL_INTERVAL_SECONDS (default 1)      -> delay between polls
+    POLL_INTERVAL_SECONDS (default 0.5)    -> delay between polls
     MIN_INVESTMENT_AMOUNT (default 10)     -> skip investing below this
                                                remaining balance/loan amount
     STUCK_AFTER_SECONDS (default 45)       -> log diagnostics if the loan
@@ -208,7 +218,7 @@ def _parse_duration_seconds(value: str) -> float:
 
 
 DURATION_SECONDS = _parse_duration_seconds(os.environ.get("DURATION_SECONDS", "5m"))
-POLL_INTERVAL_SECONDS = float(os.environ.get("POLL_INTERVAL_SECONDS", "1"))
+POLL_INTERVAL_SECONDS = float(os.environ.get("POLL_INTERVAL_SECONDS", "0.5"))
 MIN_INVESTMENT_AMOUNT = float(os.environ.get("MIN_INVESTMENT_AMOUNT", "10"))
 STUCK_AFTER_SECONDS = float(os.environ.get("STUCK_AFTER_SECONDS", "45"))
 # Re-fetch the real "available for investment" balance from the server every
@@ -301,7 +311,7 @@ def build_loans_params() -> dict:
 
 
 def fetch_public_id(session: requests.Session) -> str:
-    r = session.get(PROFILE_API_URL, headers=_HEADERS, timeout=20)
+    r = session.get(PROFILE_API_URL, headers=_HEADERS, timeout=8)
     r.raise_for_status()
     public_id = (r.json() or {}).get("publicId")
     if not public_id:
@@ -310,7 +320,7 @@ def fetch_public_id(session: requests.Session) -> str:
 
 
 def fetch_available_money(session: requests.Session) -> float:
-    r = session.get(OVERVIEW_API_URL, headers=_HEADERS, timeout=20)
+    r = session.get(OVERVIEW_API_URL, headers=_HEADERS, timeout=8)
     r.raise_for_status()
     try:
         return float((r.json() or {}).get("availableMoney"))
@@ -323,7 +333,7 @@ def fetch_loans(session: requests.Session, public_id: str) -> dict:
         f"{API_BASE}/v1/{public_id}/loans",
         headers=_HEADERS,
         params=build_loans_params(),
-        timeout=20,
+        timeout=8,
     )
     r.raise_for_status()
     return r.json() or {}
@@ -478,14 +488,14 @@ def attempt_investment(session: requests.Session, loan: dict, amount: float) -> 
     url = f"{API_BASE}/v1/loans/{loan_id}"
     payload = {"amount": _format_amount(amount)}
     try:
-        r = session.post(url, json=payload, headers=_HEADERS, timeout=20)
+        r = session.post(url, json=payload, headers=_HEADERS, timeout=8)
         if r.status_code == 401:
             # Same expired-access-token situation as _call_with_reauth
             # handles for the read-only endpoints - re-login once and retry
             # this POST before treating it as a real investment failure.
             log.warning("Investment attempt for loan %s got 401 Unauthorized - re-authenticating and retrying once.", loan_id)
             login(session)
-            r = session.post(url, json=payload, headers=_HEADERS, timeout=20)
+            r = session.post(url, json=payload, headers=_HEADERS, timeout=8)
     except Exception as exc:
         _log_diagnostics(
             "invest_attempt_exception",
@@ -656,25 +666,54 @@ def run() -> None:
 
             if stats["polls"] % REFRESH_BALANCE_EVERY_N_POLLS == 0:
                 previous_available_money = available_money
+                balance_refresh_started_at = time.monotonic()
                 try:
                     available_money = _call_with_reauth(session, fetch_available_money)
                     if available_money != previous_available_money:
                         log.info("Solde disponible actualisé : %.2f EUR -> %.2f EUR.", previous_available_money, available_money)
                 except Exception as exc:
                     stats["errors"] += 1
-                    _log_diagnostics("balance_refresh_error", error=str(exc), traceback=traceback.format_exc())
+                    _log_diagnostics(
+                        "balance_refresh_error",
+                        error=str(exc),
+                        traceback=traceback.format_exc(),
+                        request_duration_seconds=round(time.monotonic() - balance_refresh_started_at, 3),
+                    )
                     log.exception("Failed to refresh available balance, keeping last known value (%.2f EUR).", available_money)
 
+            fetch_started_at = time.monotonic()
             try:
                 body = _call_with_reauth(session, fetch_loans, public_id)
             except Exception as exc:
                 stats["errors"] += 1
-                _log_diagnostics("poll_error", error=str(exc), traceback=traceback.format_exc())
+                _log_diagnostics(
+                    "poll_error",
+                    error=str(exc),
+                    traceback=traceback.format_exc(),
+                    request_duration_seconds=round(time.monotonic() - fetch_started_at, 3),
+                )
                 log.exception("Failed to fetch the loans listing, will retry next poll.")
                 time.sleep(POLL_INTERVAL_SECONDS)
                 continue
+            fetch_duration_seconds = round(time.monotonic() - fetch_started_at, 3)
 
             data = body.get("data") or []
+            if data:
+                # Only logged when the API actually returned >=1 loan (never
+                # on a legitimately-empty response, to keep the diagnostics
+                # file from being bloated with useless entries) - this is
+                # the proof that the request itself works and shows exactly
+                # what PeerBerry returned (loanId/loanOriginator/interestRate/
+                # availableToInvest/...) so it can be checked against what
+                # was expected (matching originators, real-time availability,
+                # etc.), including how long the request itself took.
+                _log_diagnostics(
+                    "loans_found",
+                    poll=stats["polls"],
+                    total=body.get("total"),
+                    request_duration_seconds=fetch_duration_seconds,
+                    loans=data,
+                )
             loan_ids = tuple(sorted(loan.get("loanId") for loan in data))
             signature = (body.get("total"), loan_ids)
 
@@ -760,20 +799,43 @@ def run() -> None:
                 # list, instead of continuing to work off stale data.
                 try:
                     previous_available_money = available_money
+                    balance_refresh_started_at = time.monotonic()
                     available_money = _call_with_reauth(session, fetch_available_money)
                     if available_money != previous_available_money:
                         log.info("Solde disponible actualisé après tentative : %.2f EUR -> %.2f EUR.", previous_available_money, available_money)
                 except Exception as exc:
                     stats["errors"] += 1
-                    _log_diagnostics("balance_refresh_error", error=str(exc), traceback=traceback.format_exc())
+                    _log_diagnostics(
+                        "balance_refresh_error",
+                        context="post_failure_refresh",
+                        error=str(exc),
+                        traceback=traceback.format_exc(),
+                        request_duration_seconds=round(time.monotonic() - balance_refresh_started_at, 3),
+                    )
                     log.exception("Failed to refresh balance after a failed attempt, keeping last known value (%.2f EUR).", available_money)
                 try:
+                    refresh_started_at = time.monotonic()
                     body = _call_with_reauth(session, fetch_loans, public_id)
                     data = body.get("data") or []
+                    if data:
+                        _log_diagnostics(
+                            "loans_found",
+                            context="post_failure_refresh",
+                            poll=stats["polls"],
+                            total=body.get("total"),
+                            request_duration_seconds=round(time.monotonic() - refresh_started_at, 3),
+                            loans=data,
+                        )
                     loans_to_try = list(reversed(data))
                 except Exception as exc:
                     stats["errors"] += 1
-                    _log_diagnostics("poll_error", error=str(exc), traceback=traceback.format_exc())
+                    _log_diagnostics(
+                        "poll_error",
+                        context="post_failure_refresh",
+                        error=str(exc),
+                        traceback=traceback.format_exc(),
+                        request_duration_seconds=round(time.monotonic() - refresh_started_at, 3),
+                    )
                     log.exception("Failed to refresh the loans listing after a failed attempt, continuing with the remaining stale list.")
 
             if available_money < MIN_INVESTMENT_AMOUNT:
