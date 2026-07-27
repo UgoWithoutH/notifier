@@ -77,6 +77,38 @@ jobs:
             diversification/swaper_diversification_storage_state.json
           key: swaper-diversification-state-${{ github.run_id }}
 
+  iuvo:
+    runs-on: ubuntu-22.04
+    concurrency:
+      group: iuvo-diversification
+      cancel-in-progress: false
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Python dependencies
+        run: pip install -r requirements.txt
+
+      # No Playwright/Chromium install needed - Iuvo logs in via a
+      # pure-HTTP replay of its legacy TeleBid/TB p2p login API instead
+      # (see diversification/iuvo_diversification.py's module docstring) -
+      # just `requests`, already in requirements.txt. No session/cookie
+      # persistence either (that login flow is lightweight enough to run
+      # fresh every time).
+      - name: Run Iuvo diversification report
+        env:
+          IUVO_EMAIL: ${{ secrets.IUVO_EMAIL }}
+          IUVO_PASSWORD: ${{ secrets.IUVO_PASSWORD }}
+          GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
+          GOOGLE_CREDENTIALS: ${{ secrets.GOOGLE_CREDENTIALS }}
+          REPORT_DATE: ${{ github.event.inputs.report_date }}
+        run: python -m diversification.iuvo_diversification
+
   afranga:
     runs-on: ubuntu-22.04
     concurrency:
