@@ -193,14 +193,12 @@ jobs:
         run: pip install -r requirements.txt
 
       # No Playwright/Chromium install needed - Loanch logs in via a
-      # pure-HTTP replay of its login/2FA API flow instead (see
-      # diversification/loanch_diversification.py's module docstring) -
-      # just `requests`/`pyotp`, already in requirements.txt. No
-      # session/cookie persistence either. IMPORTANT: login()'s exact
-      # endpoint paths/field names are UNVERIFIED (couldn't reach
-      # loanch.com from the dev machine to capture a real login) - if this
-      # job fails, check the logs for the RuntimeError from login() (it
-      # includes the full response) and fix the guessed URLs/field names.
+      # pure-HTTP replay of its django-allauth "headless" login/2FA API
+      # flow instead (see diversification/loanch_diversification.py's
+      # module docstring) - just `requests`/`pyotp`, already in
+      # requirements.txt. No session/cookie persistence either. The
+      # login endpoints were confirmed with a real network capture on
+      # 2026-07-27 (see the module docstring).
       - name: Run Loanch diversification report
         env:
           LOANCH_EMAIL: ${{ secrets.LOANCH_EMAIL }}

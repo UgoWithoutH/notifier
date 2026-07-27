@@ -408,10 +408,24 @@ def login(session: requests.Session) -> str:
         code = totp.now()
         r = session.post(TOTP_URL, json={"code": code}, headers=_xsrf_headers(session), timeout=20)
         if r.status_code == 422:
-            log.info("TOTP code rejected (likely rolled over), retrying once with a fresh code.")
+            log.info(
+                "TOTP code rejected (status=422, likely rolled over): %s. "
+                "Waiting for the next 30s window before retrying with a fresh code.",
+                r.text[:300],
+            )
+            # Regenerating immediately with totp.now() isn't reliable here:
+            # if the rejection wasn't actually due to a rollover, it would
+            # just resubmit the exact same code and fail again for the same
+            # reason. Sleep past the current window's boundary first so the
+            # retry is guaranteed to use a genuinely different code.
+            remaining = 30 - (int(time.time()) % 30)
+            time.sleep(remaining + 1)
             code = totp.now()
             r = session.post(TOTP_URL, json={"code": code}, headers=_xsrf_headers(session), timeout=20)
-        r.raise_for_status()
+        if not r.ok:
+            raise RuntimeError(
+                f"Lendermarket TOTP submission failed (status={r.status_code}): {r.text[:500]}"
+            )
         data = r.json().get("data") or {}
 
     investor_id = (data.get("currentInvestor") or {}).get("investorId")
