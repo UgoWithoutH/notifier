@@ -196,6 +196,17 @@ def login(session: requests.Session) -> None:
         if r.url.rstrip("/") != LOGIN_URL.rstrip("/"):
             break
         log.info("TOTP code rejected (attempt %d/%d)...", attempt, len(candidates))
+        # Laravel re-renders the 2FA form on every rejected submission with
+        # a FRESH `_token` - reusing the stale one on the next attempt would
+        # get rejected regardless of whether the TOTP code itself is right
+        # (confirmed root cause of a real GitHub Actions failure where all 3
+        # distinct candidate codes were rejected). Re-extract it before the
+        # next attempt, if there is one.
+        if attempt < len(candidates):
+            try:
+                token = _extract_csrf_token(r.text)
+            except RuntimeError:
+                log.warning("Could not refresh the CSRF _token after a rejected TOTP attempt; reusing the previous one.")
     else:
         raise RuntimeError("Afranga rejected the TOTP code (still on the login page).")
 
