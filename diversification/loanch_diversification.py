@@ -14,28 +14,31 @@ google_sheet.py) so they can be filled into a Google Sheet,
 mirroring afranga_diversification.py / peerberry_diversification.py /
 lendermarket_diversification.py.
 
-*** IMPORTANT - login() BELOW IS UNVERIFIED / BEST-EFFORT ***
-loanch.com is blocked at the network/proxy level on the machine this was
-written on (2026-07-18 - could not reach the site at all, not even to
-capture the real login network traffic like every other platform in this
-project was converted with). The data-fetching endpoints below
-(fetch_investments/fetch_current_month_statement_totals) ARE trustworthy -
-they were verified against the real account on 2026-07-09/07-10 (see their
-own docstrings) back when the site was reachable, and are a faithful
-line-for-line port of the working `page.evaluate(fetch(...))` calls from
-the previous Playwright version (same URLs/params/JSON field names, just
-issued via `requests` instead of the browser). ONLY login()'s exact
-endpoint path / JSON field names are a GUESS, modeled after this codebase's
-other platforms (Lendermarket/PeerBerry's two-step email+password ->
-TOTP-with-a-token pattern) and this same API's own `/api/v1/...` versioned
-path convention - marked with "GUESS" comments below. If this stops
-working, get a real login-flow network capture (e.g. from an unblocked
-network - phone hotspot, home network, etc.) the same way every other
-platform in this project was done: a throwaway Playwright script with
+login() logs in via loanch.com's django-allauth "headless" browser API
+(https://docs.allauth.org/en/latest/headless/), confirmed with a real
+network capture on 2026-07-27 (Playwright script with
 page.on("request")/page.on("response") listeners around the login form
-submission, then adjust login()'s URLs/field names to match. Test locally
-via `python -m diversification.loanch_diversification` (or a manual
-workflow_dispatch run) before trusting the scheduled job on this.
+submission, then double-checked with a plain `requests.Session()` replay -
+see git history for the throwaway capture script if this ever needs to be
+redone). The flow is:
+
+1. `GET https://api.loanch.com/_allauth/browser/v1/auth/session` - always
+   returns 401 for a logged-out session (expected, not an error), but its
+   response sets the `csrftoken` cookie needed for step 2.
+2. `POST https://api.loanch.com/_allauth/browser/v1/auth/login` with JSON
+   body `{"email": ..., "password": ...}` and header
+   `X-CSRFToken: <csrftoken cookie value>`. On success without 2FA, returns
+   `200` with `meta.is_authenticated = true`. If 2FA is enabled, returns
+   `401` with `data.flows` containing `{"id": "mfa_authenticate", "is_pending": true}`.
+3. If 2FA is pending: `POST https://api.loanch.com/_allauth/browser/v1/auth/2fa/authenticate`
+   with JSON body `{"code": "<TOTP code>"}` (same CSRF header). Returns
+   `200` with `meta.is_authenticated = true` on success.
+
+The data-fetching endpoints below (fetch_investments/
+fetch_current_month_statement_totals) are a separate, already-verified
+DRF API (`/api/v1/...`) that relies on the Django session cookie set by
+the allauth login above - verified against the real account on
+2026-07-09/07-10 (see their own docstrings).
 
 API verified against the real account on 2026-07-09, in two steps:
 
@@ -60,12 +63,12 @@ API verified against the real account on 2026-07-09, in two steps:
    trailing slash - one extra request per active investment, confirmed to
    reproduce the 529.32 EUR total exactly when summed).
 
-Since the account's cookies (set at login, presumably shared across the
-loanch.com/api.loanch.com subdomains - the exact mechanism this rewrite
-can't re-verify, see warning above) are what the browser's own `fetch(...,
-{credentials: 'include'})` calls relied on, a plain `requests.Session()`
-should carry them the same way automatically, as long as login() actually
-succeeds in setting them.
+Since the account's session cookie (set at login) is shared across the
+loanch.com/api.loanch.com subdomains (confirmed by the 2026-07-27 capture -
+the `csrftoken` cookie set by api.loanch.com is readable via
+`document.cookie` on loanch.com), a plain `requests.Session()` carries it
+the same way the browser's own `fetch(..., {credentials: 'include'})`
+calls did, as long as login() succeeds in setting it.
 
 Required env vars:
     LOANCH_EMAIL, LOANCH_PASSWORD      -> Loanch account credentials
@@ -99,27 +102,10 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(me
 log = logging.getLogger("loanch_diversification")
 
 LOGIN_PAGE_URL = "https://loanch.com/fr/login"
-# GUESS - UNVERIFIED (see module docstring): loanch.com is blocked by a
-# corporate proxy on every machine available for local testing, so the
-# only way left to find the real login endpoint is to iterate from real
-# GitHub Actions run logs instead of a live network capture. login() below
-# tries each of these candidates in order (skipping ones that 404) and
-# logs the status/body of the first one that ISN'T a 404 - whatever shows
-# up in the next run's log narrows down (or confirms) the real endpoint.
-# CONFIRMED WRONG (404, GitHub Actions run 2026-07-17): .../auth/login.
-# Once the real one is confirmed working, delete this list/loop and
-# hardcode just that URL + payload shape.
-API_LOGIN_URL_CANDIDATES = [
-    "https://api.loanch.com/api/v1/auth/login",  # CONFIRMED WRONG (404, 2026-07-17)
-    "https://api.loanch.com/api/v1/login",
-    "https://api.loanch.com/api/v1/login/",
-    "https://api.loanch.com/api/v1/token",
-    "https://api.loanch.com/api/v1/token/",
-    "https://api.loanch.com/api/v1/auth/token",
-    "https://api.loanch.com/api/v1/users/login",
-    "https://api.loanch.com/api/v1/account/login",
-]
-API_2FA_URL = "https://api.loanch.com/api/v1/auth/verify-otp"
+# Confirmed via a real network capture on 2026-07-27 - see module docstring.
+API_SESSION_URL = "https://api.loanch.com/_allauth/browser/v1/auth/session"
+API_LOGIN_URL = "https://api.loanch.com/_allauth/browser/v1/auth/login"
+API_2FA_URL = "https://api.loanch.com/_allauth/browser/v1/auth/2fa/authenticate"
 INVESTMENTS_API_URL = "https://api.loanch.com/api/v1/investments"
 STATEMENT_API_URL = "https://api.loanch.com/api/v1/statement-report"
 PAGE_SIZE = 100
@@ -142,66 +128,46 @@ _HEADERS = {
 }
 
 
+def _get_csrf_token(session: requests.Session) -> str:
+    """GET the allauth headless auth/session endpoint purely to have Django
+    set the `csrftoken` cookie (its own response body/401 status is
+    expected and irrelevant here - see module docstring). That cookie's
+    value must be sent as the `X-CSRFToken` header on every subsequent
+    unsafe (POST) request to the allauth headless API."""
+    session.get(API_SESSION_URL, headers=_HEADERS, timeout=20)
+    csrf_token = session.cookies.get("csrftoken")
+    if not csrf_token:
+        raise RuntimeError("Loanch did not set a csrftoken cookie on the auth/session request.")
+    return csrf_token
+
+
 def login(session: requests.Session) -> None:
     """Log in to Loanch using LOANCH_EMAIL/PASSWORD (and LOANCH_TOTP_SECRET
-    if 2FA is enabled).
-
-    *** UNVERIFIED - see the big warning in the module docstring. ***
-    Raises a RuntimeError with the full response status/body on any
-    unexpected shape, to make it as fast as possible to diagnose and fix
-    the real endpoint/field names once this can actually be tested.
-    """
+    if 2FA is enabled), via the confirmed django-allauth headless API flow
+    (see module docstring). Raises a RuntimeError with the full response
+    status/body on any unexpected shape."""
     if not LOANCH_EMAIL or not LOANCH_PASSWORD:
         raise RuntimeError("LOANCH_EMAIL/LOANCH_PASSWORD environment variables are required.")
 
-    log.info(
-        "Trying %d candidate login endpoint(s) in order (GUESS - unverified, see module docstring)...",
-        len(API_LOGIN_URL_CANDIDATES),
+    csrf_token = _get_csrf_token(session)
+    r = session.post(
+        API_LOGIN_URL,
+        json={"email": LOANCH_EMAIL, "password": LOANCH_PASSWORD},
+        headers={**_HEADERS, "X-CSRFToken": csrf_token},
+        timeout=20,
     )
-    r = None
-    attempts = []
-    for candidate_url in API_LOGIN_URL_CANDIDATES:
-        log.info("Trying login endpoint: %s", candidate_url)
-        resp = session.post(
-            candidate_url,
-            json={"email": LOANCH_EMAIL, "password": LOANCH_PASSWORD},
-            headers=_HEADERS,
-            timeout=20,
-        )
-        attempts.append((candidate_url, resp.status_code, resp.text[:300]))
-        if resp.status_code == 404:
-            log.info("-> 404 Not Found, trying the next candidate...")
-            continue
-        log.info("-> status=%s (not a 404 - this is likely the real endpoint)", resp.status_code)
-        r = resp
-        break
-
-    if r is None:
-        details = "\n".join(f"  {url} -> {status}: {body!r}" for url, status, body in attempts)
-        raise RuntimeError(
-            "Every candidate login URL returned 404. None of the guessed endpoints exist.\n"
-            f"Attempts:\n{details}\n"
-            "See the module docstring for how to get a real network capture and fix this."
-        )
-
-    if not r.ok:
-        raise RuntimeError(
-            f"Loanch login request to {r.url} failed (status={r.status_code}): {r.text[:500]}\n"
-            "This endpoint got past the 404 check, so it likely exists, but the payload/field "
-            "names may still be wrong - see the module docstring for how to get a real network "
-            "capture and fix it."
-        )
     data = r.json() if r.content else {}
     log.info("Login response body (truncated): %r", str(data)[:300])
 
-    # GUESS - UNVERIFIED: assume a boolean-ish flag (checked loosely under a
-    # few plausible key names) signals a pending 2FA step, same general
-    # shape as monefit's "mfa" flag / peerberry's "tfa_is_active".
-    otp_required = bool(data.get("otp_required") or data.get("tfa_required") or data.get("two_factor_required"))
-
-    if not otp_required:
-        log.info("No 2FA prompt in the login response - assuming login is complete.")
+    if r.status_code == 200 and (data.get("meta") or {}).get("is_authenticated"):
+        log.info("Logged in successfully (no 2FA prompt).")
         return
+
+    flows = (data.get("data") or {}).get("flows") or []
+    mfa_pending = any(f.get("id") == "mfa_authenticate" and f.get("is_pending") for f in flows)
+
+    if r.status_code != 401 or not mfa_pending:
+        raise RuntimeError(f"Loanch login failed (status={r.status_code}): {r.text[:500]}")
 
     if not LOANCH_TOTP_SECRET:
         raise RuntimeError(
@@ -211,22 +177,17 @@ def login(session: requests.Session) -> None:
 
     log.info("2FA prompt detected, generating and submitting TOTP code...")
     code = pyotp.TOTP(LOANCH_TOTP_SECRET).now()
-    # GUESS - UNVERIFIED: forwarding any token the first response returned
-    # (under a few plausible key names) alongside the code, same general
-    # shape as lendermarket's TOTP_CHALLENGE / peerberry's tfa_token.
-    otp_token = data.get("otp_token") or data.get("tfa_token") or data.get("token")
-    payload = {"code": code}
-    if otp_token:
-        payload["otp_token"] = otp_token
-
-    r = session.post(API_2FA_URL, json=payload, headers=_HEADERS, timeout=20)
-    if not r.ok:
-        raise RuntimeError(
-            f"Loanch rejected the TOTP code (status={r.status_code}): {r.text[:500]}\n"
-            "This endpoint/payload shape is an unverified guess - see the module docstring "
-            "for how to get a real network capture and fix it."
-        )
-    log.info("Logged in successfully.")
+    csrf_token = session.cookies.get("csrftoken") or csrf_token
+    r = session.post(
+        API_2FA_URL,
+        json={"code": code},
+        headers={**_HEADERS, "X-CSRFToken": csrf_token},
+        timeout=20,
+    )
+    data = r.json() if r.content else {}
+    if r.status_code != 200 or not (data.get("meta") or {}).get("is_authenticated"):
+        raise RuntimeError(f"Loanch rejected the TOTP code (status={r.status_code}): {r.text[:500]}")
+    log.info("Logged in successfully (with 2FA).")
 
 
 def fetch_investments(session: requests.Session) -> list:
@@ -357,7 +318,7 @@ def run() -> None:
         log.error("LOANCH_EMAIL and LOANCH_PASSWORD environment variables are required.")
         sys.exit(1)
 
-    log.info("Starting Loanch diversification run (pure HTTP, no browser - login() is UNVERIFIED, see module docstring).")
+    log.info("Starting Loanch diversification run (pure HTTP, no browser - see module docstring for the login() flow).")
 
     session = requests.Session()
     try:

@@ -399,6 +399,7 @@ def login(session: requests.Session) -> str:
             )
         log.info("2FA prompt detected, generating and submitting TOTP code...")
         totp = pyotp.TOTP(LENDERMARKET_TOTP_SECRET)
+<<<<<<< HEAD
 
         # Diagnostic only (no secret/code values logged): compare
         # Lendermarket's server-reported clock (Date response header) to
@@ -429,6 +430,36 @@ def login(session: requests.Session) -> str:
                 break
             log.info("TOTP code rejected (attempt %d/%d)...", attempt, len(candidates))
         r.raise_for_status()
+=======
+        # Guard against submitting a code right as its 30s window is about
+        # to roll over - the network round-trip can push the server-side
+        # check past the boundary and get rejected as "Invalid code
+        # provided" even though the code was valid when generated.
+        remaining = 30 - (int(time.time()) % 30)
+        if remaining < 5:
+            time.sleep(remaining + 1)
+        code = totp.now()
+        r = session.post(TOTP_URL, json={"code": code}, headers=_xsrf_headers(session), timeout=20)
+        if r.status_code == 422:
+            log.info(
+                "TOTP code rejected (status=422, likely rolled over): %s. "
+                "Waiting for the next 30s window before retrying with a fresh code.",
+                r.text[:300],
+            )
+            # Regenerating immediately with totp.now() isn't reliable here:
+            # if the rejection wasn't actually due to a rollover, it would
+            # just resubmit the exact same code and fail again for the same
+            # reason. Sleep past the current window's boundary first so the
+            # retry is guaranteed to use a genuinely different code.
+            remaining = 30 - (int(time.time()) % 30)
+            time.sleep(remaining + 1)
+            code = totp.now()
+            r = session.post(TOTP_URL, json={"code": code}, headers=_xsrf_headers(session), timeout=20)
+        if not r.ok:
+            raise RuntimeError(
+                f"Lendermarket TOTP submission failed (status={r.status_code}): {r.text[:500]}"
+            )
+>>>>>>> 7b1de0001f94f127249b0975f313b473b3da4b8a
         data = r.json().get("data") or {}
 
     investor_id = (data.get("currentInvestor") or {}).get("investorId")
