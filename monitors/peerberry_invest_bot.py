@@ -34,15 +34,20 @@ via one-off, read-only/network-intercepted Playwright explorations on
   - `GET /v2/investor/profile` -> `publicId` (a UUID), needed to build the
     loans-listing URL below (NOT the same as `accountId`, also present in
     that response).
-  - `GET /v1/{publicId}/loans` with the filters above (loanOriginators must
-    be sent as indexed array params `loanOriginators[0]=53&...`, NOT the
-    comma-joined form shown in the browser's URL bar - that's just the
-    frontend router's compact representation) -> `{"data": [...], "total":
-    N, ...}`. CONFIRMED working, but a real loan item's exact JSON was
-    never actually captured during exploration (market was empty both
-    times) - only the field names are known (from the response's own
-    `sort` mapping): `loanId`, `countryId`, `loanOriginator`, `issuedDate`,
+  - `GET /v1/{publicId}/loans` with `hideInvested`/`groupGuarantee`/
+    `minInterestRate`/`maxRemainingTerm`/`minRemainingTerm` filters (see
+    `build_loans_params()`) -> `{"data": [...], "total": N, ...}`. Only the
+    field names are known (from the response's own `sort` mapping):
+    `loanId`, `countryId`, `loanOriginator`, `issuedDate`,
     `termTypeTitle`/`termType`, `interestRate`, `term`, `availableToInvest`.
+    IMPORTANT (fixed 2026-07-28): this request does NOT filter by
+    `loanOriginators[]` server-side anymore - an earlier version DID (a
+    fixed 39-ID list from the user's original reference URL), but that was
+    completely disconnected from the Google-Sheet-driven originator
+    SELECTION below and silently guaranteed 0 matches for any
+    sheet-selected originator whose id wasn't in that stale list,
+    regardless of real market activity. See `build_loans_params()`'s own
+    docstring for the full story.
   - `GET /v1/investor/overview` -> `availableMoney` (same as
     peerberry_monitor.fetch_available_money()) - re-fetched periodically to
     track remaining funds across investment attempts within a single run.
@@ -54,7 +59,11 @@ via one-off, read-only/network-intercepted Playwright explorations on
     money was spent). This is NOT the previously-guessed
     `/v1/investor/loans/{loanId}/invest` shape.
 
-Target loan originators come from the Google Sheet, NOT a hardcoded list:
+Target loan originators come from the Google Sheet, NOT a hardcoded list -
+and (since 2026-07-28) the ACTUAL API REQUEST is no longer restricted by
+originator id either, only by the generic constraints in
+`build_loans_params()` - so there is exactly ONE place that decides which
+originators matter (the Sheet), not two potentially-conflicting ones.
 shared.google_sheet.get_selected_peerberry_loan_originators() finds the
 "Répartition géographique" cell, then the "Peerberry" cell below it (same
 column) - every row between "Peerberry" and the next "Swaper" cell (both
@@ -96,19 +105,24 @@ run's own diagnostics entries (`_collect_run_diagnostics()`, filtered by
 timestamp) and attaches them as a `.log` file directly on the end-of-run
 summary email - so the full detail is available by email without ever
 needing to touch the cache. The loan listing looking "stuck"
-(unchanged/empty for STUCK_AFTER_SECONDS) is only tallied in
-`stats["stuck_events"]` (shown in the summary email) - NOT written to
-DIAGNOSTICS_FILE, since it's a normal/expected condition (no matching
-loans right now, not a bug) and logging the full loan listing response
-every single time it fires would only bloat the accumulating diagnostics
-file for no real diagnostic value. Conversely, whenever `GET
+(unchanged/empty for STUCK_AFTER_SECONDS) is tallied in
+`stats["stuck_events"]` (shown in the summary email) AND, since 2026-07-28,
+also gets a LIGHTWEIGHT `"stuck"` diagnostics entry (poll number, total,
+request duration, how long it's been stuck) written to DIAGNOSTICS_FILE -
+NOT the full loan listing response, just enough to prove the request kept
+succeeding (200 OK, genuinely empty/unchanged) throughout a long
+"nothing matches" stretch, rather than a silent hang/broken loop. (Earlier
+versions of this module wrote nothing at all for "stuck" - removed after a
+real run showed 119 stuck_events with a totally empty diagnostics file,
+leaving no way to confirm the polls were actually running vs. silently
+broken.) Conversely, whenever `GET
 /v1/{publicId}/loans` DOES return >=1 loan (whether or not it ends up
 matching a selected originator), the full raw response (every loan
 object, plus the request's own round-trip duration) is written to
 DIAGNOSTICS_FILE as a `"loans_found"` entry - this is the proof that the
 request itself works and lets a real loan's exact field values (and how
 long the call took) be inspected after the fact, e.g. to check whether the
-hardcoded `LOAN_ORIGINATORS` id list / `minInterestRate` filter actually
+`selected_originators`/`minInterestRate`/`maxRemainingTerm` filters actually
 match what's expected, or whether request latency is why a fast-moving
 loan was missed. `poll_error`/`balance_refresh_error` entries also now
 include `request_duration_seconds` for the same latency-diagnosis reason.
@@ -171,13 +185,6 @@ log = logging.getLogger("peerberry_invest_bot")
 
 PROFILE_API_URL = f"{API_BASE}/v2/investor/profile"
 OVERVIEW_API_URL = f"{API_BASE}/v1/investor/overview"
-
-# Same 39 loan-originator IDs as the user's reference filtered invest URL.
-LOAN_ORIGINATORS = [
-    53, 52, 74, 12, 67, 47, 43, 49, 73, 39, 63, 59, 69, 30, 55, 70, 72, 71,
-    57, 48, 56, 54, 33, 23, 68, 66, 45, 36, 51, 64, 62, 58, 75, 50, 65, 4,
-    41, 7, 76,
-]
 
 _DURATION_SHORTHAND_RE = re.compile(r"^(?P<hours>\d+)h(?P<minutes>\d+)$")
 _DURATION_UNITS_RE = re.compile(
@@ -304,7 +311,24 @@ def _collect_run_diagnostics(since: datetime) -> str | None:
 
 
 def build_loans_params() -> dict:
-    params = {
+    """Deliberately does NOT filter by `loanOriginators[]` server-side (that
+    param existed in an earlier version, hardcoded to a fixed 39-ID list
+    captured from the user's original 2026-07-22 reference URL) - FIXED
+    2026-07-28 after a real run showed 0 loans_seen across ~90 minutes of
+    polling while the user was manually seeing/investing in matching loans
+    on the site at the same time. Root cause: that hardcoded ID list was
+    completely disconnected from the Google-Sheet-driven originator
+    SELECTION (`selected_originators`, matched by NAME client-side in
+    `_match_selected_originator()`) - if a sheet-selected originator's
+    numeric id wasn't in the old hardcoded list (e.g. a newly added/renamed
+    originator), PeerBerry's own server would NEVER return that
+    originator's loans at all, guaranteeing 0 matches forever regardless of
+    real market activity - not a timing/performance issue, a silent
+    structural exclusion. Now only the generic, sheet-independent
+    constraints are sent server-side; which loans actually count is decided
+    100% client-side against the real Google Sheet selection, so there's no
+    way for the two to drift apart again."""
+    return {
         "sort": "-loanId",
         "hideInvested": "true",
         "groupGuarantee": "true",
@@ -314,9 +338,6 @@ def build_loans_params() -> dict:
         "offset": 0,
         "pageSize": 40,
     }
-    for i, originator_id in enumerate(LOAN_ORIGINATORS):
-        params[f"loanOriginators[{i}]"] = originator_id
-    return params
 
 
 def fetch_public_id(session: requests.Session) -> str:
@@ -655,6 +676,12 @@ def run() -> None:
         "publicId=%s available_money=%.2f EUR selected_originators=%s budgets=%s",
         public_id, available_money, selected_originators, remaining_budget,
     )
+    # Logged once (not per-poll) so it's easy to confirm exactly what's being
+    # sent to PeerBerry - no more originator-id filtering happens server-side
+    # (see build_loans_params()'s docstring for why that was removed), only
+    # the constraints below; every loan in the response is then matched
+    # against `selected_originators` above, by name, client-side.
+    log.info("Loans listing query params (no server-side originator filter): %s", build_loans_params())
     if len(funded_originators) < len(selected_originators):
         log.warning(
             "Not enough available money to fund all %d selected originator(s) in %d EUR blocks - only funding %d: %s",
@@ -727,16 +754,39 @@ def run() -> None:
             signature = (body.get("total"), loan_ids)
 
             if signature != last_loan_signature:
+                # Only logged when the signature actually changes (not every
+                # poll) to avoid spamming the console. Since the 2026-07-28
+                # fix removed the server-side originator filter, `total` can
+                # now legitimately exceed `pageSize` (40) - meaning loans
+                # further down the list (older loanIds) than the 40 newest
+                # returned here are invisible to this poll. Flagged here so
+                # a future "why didn't it see loan X" question can start
+                # from "was pagination the reason" instead of guessing.
+                total_now = body.get("total") or 0
+                if isinstance(total_now, (int, float)) and total_now > 40:
+                    log.info("Loan listing total=%s exceeds pageSize=40 - only the 40 newest loanIds are visible this poll.", total_now)
                 last_loan_signature = signature
                 last_change_at = time.monotonic()
             elif time.monotonic() - last_change_at >= STUCK_AFTER_SECONDS:
-                # Just a count for the summary email (how much of the run
-                # saw no matching loans/change) - NOT written to the
-                # diagnostics log file: this is normal/expected (the market
-                # is simply empty right now, not a bug), and logging the
-                # full loan listing response every time it fires would just
-                # bloat the accumulating diagnostics file for no real
-                # diagnostic value.
+                # Counted for the summary email (how much of the run saw no
+                # matching loans/change) - this is normal/expected (the
+                # market is simply empty right now, not a bug). A LIGHTWEIGHT
+                # diagnostics entry is also written here (just total/poll/
+                # request duration, NOT the full loan array - re-added
+                # 2026-07-28 after a real run had 119 stuck_events but a
+                # totally empty diagnostics file, leaving no way to confirm
+                # the polls were actually succeeding vs. silently broken) -
+                # this proves the request itself keeps succeeding (200 OK,
+                # `total: 0`/unchanged) throughout a long "nothing matches"
+                # stretch, without bloating the file with repeated empty
+                # loan arrays the way the old full-response dump did.
+                _log_diagnostics(
+                    "stuck",
+                    poll=stats["polls"],
+                    total=body.get("total"),
+                    request_duration_seconds=fetch_duration_seconds,
+                    stuck_for_seconds=round(time.monotonic() - last_change_at, 1),
+                )
                 stats["stuck_events"] += 1
                 # Reset so we only count once per stuck period, not every poll.
                 last_change_at = time.monotonic()
