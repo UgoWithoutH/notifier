@@ -233,6 +233,15 @@ REFRESH_BALANCE_EVERY_N_POLLS = max(1, int(30 / max(POLL_INTERVAL_SECONDS, 0.1))
 # attempts hammering a loan that's likely already gone while other loans in
 # the same poll/next polls could be invested in instead.
 FAILED_LOAN_COOLDOWN_SECONDS = float(os.environ.get("FAILED_LOAN_COOLDOWN_SECONDS", "3"))
+# Max time to wait for any single HTTP call (connect+read) before giving up.
+# Matching loans can disappear within seconds, so a slow/hanging request
+# eating the old 8s default could waste most (or all) of a loan's whole
+# availability window while doing nothing else - lowered so the bot fails
+# fast and moves on (poll loop / next attempt) instead of blocking. Real
+# request_duration_seconds logged in diagnostics has consistently been well
+# under 1s in practice, so 4s still leaves comfortable headroom for normal
+# latency/slow-response spikes without tying up the bot for 8s on a stall.
+HTTP_REQUEST_TIMEOUT_SECONDS = float(os.environ.get("HTTP_REQUEST_TIMEOUT_SECONDS", "4"))
 
 DIAGNOSTICS_FILE = Path(__file__).parent / "peerberry_invest_bot_diagnostics.log"
 
@@ -311,7 +320,7 @@ def build_loans_params() -> dict:
 
 
 def fetch_public_id(session: requests.Session) -> str:
-    r = session.get(PROFILE_API_URL, headers=_HEADERS, timeout=8)
+    r = session.get(PROFILE_API_URL, headers=_HEADERS, timeout=HTTP_REQUEST_TIMEOUT_SECONDS)
     r.raise_for_status()
     public_id = (r.json() or {}).get("publicId")
     if not public_id:
@@ -320,7 +329,7 @@ def fetch_public_id(session: requests.Session) -> str:
 
 
 def fetch_available_money(session: requests.Session) -> float:
-    r = session.get(OVERVIEW_API_URL, headers=_HEADERS, timeout=8)
+    r = session.get(OVERVIEW_API_URL, headers=_HEADERS, timeout=HTTP_REQUEST_TIMEOUT_SECONDS)
     r.raise_for_status()
     try:
         return float((r.json() or {}).get("availableMoney"))
@@ -333,7 +342,7 @@ def fetch_loans(session: requests.Session, public_id: str) -> dict:
         f"{API_BASE}/v1/{public_id}/loans",
         headers=_HEADERS,
         params=build_loans_params(),
-        timeout=8,
+        timeout=HTTP_REQUEST_TIMEOUT_SECONDS,
     )
     r.raise_for_status()
     return r.json() or {}
@@ -488,14 +497,14 @@ def attempt_investment(session: requests.Session, loan: dict, amount: float) -> 
     url = f"{API_BASE}/v1/loans/{loan_id}"
     payload = {"amount": _format_amount(amount)}
     try:
-        r = session.post(url, json=payload, headers=_HEADERS, timeout=8)
+        r = session.post(url, json=payload, headers=_HEADERS, timeout=HTTP_REQUEST_TIMEOUT_SECONDS)
         if r.status_code == 401:
             # Same expired-access-token situation as _call_with_reauth
             # handles for the read-only endpoints - re-login once and retry
             # this POST before treating it as a real investment failure.
             log.warning("Investment attempt for loan %s got 401 Unauthorized - re-authenticating and retrying once.", loan_id)
             login(session)
-            r = session.post(url, json=payload, headers=_HEADERS, timeout=8)
+            r = session.post(url, json=payload, headers=_HEADERS, timeout=HTTP_REQUEST_TIMEOUT_SECONDS)
     except Exception as exc:
         _log_diagnostics(
             "invest_attempt_exception",
