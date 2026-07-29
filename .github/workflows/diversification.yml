@@ -372,3 +372,58 @@ jobs:
           GOOGLE_CREDENTIALS: ${{ secrets.GOOGLE_CREDENTIALS }}
           REPORT_DATE: ${{ github.event.inputs.report_date }}
         run: python -m diversification.bricks_diversification
+
+  mintos:
+    runs-on: ubuntu-22.04
+    concurrency:
+      group: mintos-diversification
+      cancel-in-progress: false
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Python dependencies
+        run: pip install -r requirements.txt
+
+      - name: Remove broken third-party apt repos (Azure CLI / Microsoft)
+        run: |
+          sudo find /etc/apt/sources.list.d -maxdepth 1 -type f \( -name "*microsoft*" -o -name "*azure*" \) -print -delete || true
+          sudo sed -i '/packages.microsoft.com/d;/azure-cli/d' /etc/apt/sources.list || true
+          sudo apt-get update
+
+      - name: Cache Playwright browsers
+        uses: actions/cache@v4
+        id: playwright-cache
+        with:
+          path: ~/.cache/ms-playwright
+          key: ${{ runner.os }}-playwright-${{ hashFiles('requirements.txt') }}
+
+      - name: Install Playwright Chromium (cache miss only)
+        if: steps.playwright-cache.outputs.cache-hit != 'true'
+        run: playwright install --with-deps chromium
+
+      - name: Install Playwright OS dependencies (cache hit)
+        if: steps.playwright-cache.outputs.cache-hit == 'true'
+        run: playwright install-deps chromium
+
+      # No stored session - logs in fresh every run (email/password/TOTP,
+      # fully automated) via diversification/mintos_get_session.py, which
+      # runs headless + non-interactively here (GITHUB_ACTIONS=true) - if
+      # Mintos's adaptive reCAPTCHA happens to show a puzzle this run,
+      # there's no human to solve it so this job just fails cleanly; retry
+      # on the next scheduled run (empirically didn't trigger on several
+      # real runs 2026-07-29, see that file's docstring).
+      - name: Run Mintos login + diversification report
+        env:
+          MINTOS_EMAIL: ${{ secrets.MINTOS_EMAIL }}
+          MINTOS_PASSWORD: ${{ secrets.MINTOS_PASSWORD }}
+          MINTOS_TOTP_SECRET: ${{ secrets.MINTOS_TOTP_SECRET }}
+          GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
+          GOOGLE_CREDENTIALS: ${{ secrets.GOOGLE_CREDENTIALS }}
+          REPORT_DATE: ${{ github.event.inputs.report_date }}
+        run: python -m diversification.mintos_get_session
