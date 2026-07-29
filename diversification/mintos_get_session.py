@@ -23,11 +23,17 @@ type your TOTP code either).
 Usage: `python -m diversification.mintos_get_session`
 1. A visible Chromium window opens on the Mintos login page.
 2. Email/password are filled and submitted automatically.
-3. IF a CAPTCHA puzzle appears (unpredictable), the script pauses and
-   asks you to solve it in the window, then press Enter here.
+3. IF a CAPTCHA puzzle appears on THIS login/password page (unpredictable,
+   detected by looking for the reCAPTCHA iframe), the script pauses and
+   asks you to solve it AND submit the form yourself in the window, then
+   press Enter here - it then waits for the resulting navigation instead
+   of assuming it already happened.
 4. IF a 2FA page appears, the TOTP code is filled and submitted
    automatically (tries the current/previous/next 30s window for clock-
-   drift safety, same pattern as afranga_diversification.py).
+   drift safety, same pattern as afranga_diversification.py). IF a
+   SEPARATE CAPTCHA puzzle appears on THIS 2FA page (checked independently
+   of step 3's), the script pauses again the same way, then keeps trying
+   TOTP candidates once you've submitted it.
 5. The script detects the moment you're fully logged in (URL leaves
    /login entirely), automatically captures the PHPSESSID/MW_SESSION_ID
    session cookies, and immediately calls
@@ -94,21 +100,48 @@ def _reached_twofactor_or_past_login(url: str) -> bool:
     return "/login/twofactor" in url or "/login" not in url
 
 
+def _captcha_visible(page) -> bool:
+    """Detects Mintos's reCAPTCHA Enterprise challenge iframe on whichever
+    page is currently shown, so login/2FA submission can tell a puzzle
+    that's actually blocking progress apart from a plain slow response."""
+    try:
+        return page.locator("iframe[src*='recaptcha' i], iframe[title*='recaptcha' i]").first.is_visible()
+    except Exception:
+        return False
+
+
 def _submit_credentials(page) -> None:
     page.locator("#login-username").fill(MINTOS_EMAIL)
     page.locator("#login-password").fill(MINTOS_PASSWORD)
     page.locator("[data-testid='login-button']").click()
     try:
         page.wait_for_url(_reached_twofactor_or_past_login, timeout=LOGIN_WAIT_TIMEOUT_MS)
+        return
     except PlaywrightTimeoutError:
-        log.warning("Still on the login page after submitting credentials - likely a CAPTCHA puzzle (Mintos's reCAPTCHA is adaptive/unpredictable).")
-        input("\nPlease solve the CAPTCHA puzzle (and/or fix credentials) in the browser window, THEN come back here and press Enter...\n")
+        pass
+
+    if _captcha_visible(page):
+        log.warning("CAPTCHA puzzle detected on the login page (Mintos's reCAPTCHA is adaptive/unpredictable).")
+    else:
+        log.warning("Still on the login page after submitting credentials (no CAPTCHA iframe detected - might just be slow).")
+    input("\nPlease solve the CAPTCHA puzzle (if shown) and submit the login form in the browser window, THEN come back here and press Enter...\n")
+    try:
+        # The user's own submit click (after solving the puzzle) triggers the
+        # navigation - just wait for it instead of assuming it already happened.
+        page.wait_for_url(_reached_twofactor_or_past_login, timeout=LOGIN_WAIT_TIMEOUT_MS)
+    except PlaywrightTimeoutError:
+        log.warning("Still on the login page after pressing Enter - will fall back to a fully manual login.")
 
 
 def _submit_totp(page) -> bool:
     """Tries 3 candidate TOTP codes (current/previous/next 30s window, same
     resilience pattern as afranga_diversification.py/lendermarket_monitor.py)
-    against the 2FA form. Returns True once the page moves off /twofactor."""
+    against the 2FA form. Returns True once the page moves off /twofactor.
+
+    If a SEPARATE CAPTCHA puzzle shows up on this 2FA page (verified to be
+    possible independently of the login-page one), pauses and asks the user
+    to solve it and submit the form themselves, then waits for that
+    navigation, instead of silently burning through TOTP candidates."""
     totp = pyotp.TOTP(MINTOS_TOTP_SECRET)
     now = int(time.time())
     for candidate in (totp.at(now), totp.at(now - 30), totp.at(now + 30)):
@@ -118,7 +151,15 @@ def _submit_totp(page) -> bool:
             page.wait_for_url(lambda u: "/login/twofactor" not in u, timeout=8000)
             return True
         except PlaywrightTimeoutError:
-            continue
+            if not _captcha_visible(page):
+                continue
+            log.warning("CAPTCHA puzzle detected on the 2FA page.")
+            input("\nPlease solve the CAPTCHA puzzle and submit the 2FA form in the browser window, THEN come back here and press Enter...\n")
+            try:
+                page.wait_for_url(lambda u: "/login/twofactor" not in u, timeout=LOGIN_WAIT_TIMEOUT_MS)
+                return True
+            except PlaywrightTimeoutError:
+                continue
     return False
 
 
