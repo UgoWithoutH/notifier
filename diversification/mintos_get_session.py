@@ -54,18 +54,6 @@ only locally by this helper to fill the login/2FA forms - never sent
 anywhere but Mintos's own login form) - GOOGLE_SHEET_ID/GOOGLE_CREDENTIALS
 are still needed (transitively, by mintos_diversification.run()) to write
 the fetched data to the Sheet.
-
-Also runnable UNATTENDED in CI (GITHUB_ACTIONS=true): launches headless
-instead of visible, and if a CAPTCHA/unexpected state blocks progress
-there's no human to solve it, so that run just fails cleanly (sys.exit(1))
-instead of hanging on an `input()` prompt - acceptable given Mintos's
-reCAPTCHA is adaptive (empirically didn't trigger on several real runs
-2026-07-29), so most scheduled runs are expected to succeed and an
-occasional CAPTCHA-blocked run just fails until the next scheduled
-attempt. Session cookies are NEVER printed when running in CI (this repo
-is public - would otherwise leak them into a public Actions log); a fresh
-login happens every CI run instead of reusing MINTOS_PHPSESSID/
-MINTOS_MW_SESSION_ID secrets.
 """
 
 import os
@@ -87,7 +75,6 @@ log = logging.getLogger("mintos_get_session")
 
 LOGIN_URL = "https://www.mintos.com/fr/login/"
 LOGIN_WAIT_TIMEOUT_MS = 15_000  # after auto-submitting credentials, how long to wait before assuming a CAPTCHA is blocking
-IS_CI = os.environ.get("GITHUB_ACTIONS") == "true"
 
 MINTOS_EMAIL = os.environ.get("MINTOS_EMAIL")
 MINTOS_PASSWORD = os.environ.get("MINTOS_PASSWORD")
@@ -107,15 +94,6 @@ def _reached_twofactor_or_past_login(url: str) -> bool:
     return "/login/twofactor" in url or "/login" not in url
 
 
-def _wait_for_human(prompt: str) -> None:
-    """In CI (no human present) there's nothing to wait for - fail fast
-    instead of hanging on input(). Locally, prompts and blocks as usual."""
-    if IS_CI:
-        log.error("%s (running unattended in CI - no human available to help, aborting this run.)", prompt)
-        sys.exit(1)
-    input(f"\n{prompt}\n")
-
-
 def _submit_credentials(page) -> None:
     page.locator("#login-username").fill(MINTOS_EMAIL)
     page.locator("#login-password").fill(MINTOS_PASSWORD)
@@ -124,7 +102,7 @@ def _submit_credentials(page) -> None:
         page.wait_for_url(_reached_twofactor_or_past_login, timeout=LOGIN_WAIT_TIMEOUT_MS)
     except PlaywrightTimeoutError:
         log.warning("Still on the login page after submitting credentials - likely a CAPTCHA puzzle (Mintos's reCAPTCHA is adaptive/unpredictable).")
-        _wait_for_human("Please solve the CAPTCHA puzzle (and/or fix credentials) in the browser window, THEN come back here and press Enter...")
+        input("\nPlease solve the CAPTCHA puzzle (and/or fix credentials) in the browser window, THEN come back here and press Enter...\n")
 
 
 def _submit_totp(page) -> bool:
@@ -154,7 +132,7 @@ def build_session_from_cookies(cookies: dict) -> requests.Session:
 
 def main() -> None:
     with sync_playwright() as p:
-        browser = p.chromium.launch(headless=IS_CI)
+        browser = p.chromium.launch(headless=False)
         context = browser.new_context(locale="fr-FR")
         page = context.new_page()
 
@@ -172,7 +150,10 @@ def main() -> None:
                 log.warning("All 3 TOTP candidates were rejected.")
 
         if "/login" in page.url:
-            _wait_for_human(f"Still on {page.url} - please finish logging in manually in the browser window, THEN come back here and press Enter...")
+            input(
+                f"\nStill on {page.url} - please finish logging in manually "
+                "in the browser window, THEN come back here and press Enter...\n"
+            )
 
         log.info("Login detected, current URL: %s", page.url)
 
@@ -187,11 +168,6 @@ def main() -> None:
     log.info("Session captured - taking over: running the Mintos diversification fetch now...")
     session = build_session_from_cookies(wanted)
     run_diversification(session=session)
-
-    if IS_CI:
-        # Never print session cookies into a public CI log - this repo is
-        # public, and CI logs in fresh every run anyway, no need to persist.
-        return
 
     print("\nDone. To let the scheduled/cron-job.org-triggered workflow reuse this session")
     print("headlessly afterward, also update these in your local .env AND as GitHub repository secrets:\n")
