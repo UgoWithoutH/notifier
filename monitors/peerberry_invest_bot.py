@@ -2,9 +2,14 @@
 
 `workflow_dispatch`-only bot, externally triggered via cron-job.org, that
 repeatedly polls PeerBerry's filtered loan listing (same filters as
-https://peerberry.com/en/client/invest?loanTermId=&hideInvested=true&groupGuarantee=true&loanOriginators=53,52,74,12,67,47,43,49,73,39,63,59,69,30,55,70,72,71,57,48,56,54,33,23,68,66,45,36,51,64,62,58,75,50,65,4,41,7,76&minInterestRate=10&maxRemainingTerm=185&minRemainingTerm=1)
+https://peerberry.com/en/client/invest?minRemainingTerm=1&maxRemainingTerm=185&minInterestRate=8.5&loanTermId=&loanOriginators=4,12,23,30,33,36,39,41,43,45,47,48,49,50,51,52,53,54,55,56,57,58,59,62,63,64,65,66,67,68,69,70,71,72,73,74,75,76,77,78&groupGuarantee=true&hideInvested=true,
+confirmed with the user 2026-07-29 after a run that saw 0 matching loans
+for ~1h30 - the previous filters (minInterestRate=10, maxRemainingTerm=185,
+a stale 39-id loanOriginators list) turned out to no longer reflect the
+user's real site filters at all: id 7 was dropped, id 78 was added, and
+minInterestRate was lowered to 8.5)
 and tries to invest available funds into any newly-appeared/still-available
-matching loan, as fast as possible (~0.5s polling by default), before other investors
+matching loan, as fast as possible (~0.2s polling by default), before other investors
 grab it. Within each poll, loans are attempted starting from the END of the
 listing (i.e. reversed vs. PeerBerry's own "-loanId" sort/UI order), since
 human investors using the real website naturally start clicking from the
@@ -35,19 +40,20 @@ via one-off, read-only/network-intercepted Playwright explorations on
     loans-listing URL below (NOT the same as `accountId`, also present in
     that response).
   - `GET /v1/{publicId}/loans` with `hideInvested`/`groupGuarantee`/
-    `minInterestRate`/`maxRemainingTerm`/`minRemainingTerm` filters (see
-    `build_loans_params()`) -> `{"data": [...], "total": N, ...}`. Only the
-    field names are known (from the response's own `sort` mapping):
-    `loanId`, `countryId`, `loanOriginator`, `issuedDate`,
-    `termTypeTitle`/`termType`, `interestRate`, `term`, `availableToInvest`.
-    IMPORTANT (fixed 2026-07-28): this request does NOT filter by
-    `loanOriginators[]` server-side anymore - an earlier version DID (a
-    fixed 39-ID list from the user's original reference URL), but that was
-    completely disconnected from the Google-Sheet-driven originator
-    SELECTION below and silently guaranteed 0 matches for any
-    sheet-selected originator whose id wasn't in that stale list,
-    regardless of real market activity. See `build_loans_params()`'s own
-    docstring for the full story.
+    `minInterestRate`/`maxRemainingTerm`/`minRemainingTerm`/
+    `loanOriginators[]` filters (see `build_loans_params()`) ->
+    `{"data": [...], "total": N, ...}`. Only the field names are known
+    (from the response's own `sort` mapping): `loanId`, `countryId`,
+    `loanOriginator`, `issuedDate`, `termTypeTitle`/`termType`,
+    `interestRate`, `term`, `availableToInvest`.
+    The `loanOriginators[]` server-side filter (the `LOAN_ORIGINATORS` id
+    list) was briefly removed on 2026-07-28 over a disconnection-from-the-
+    Sheet concern, then explicitly RESTORED 2026-07-29 at the user's
+    request after they gave the exact filtered URL straight from their own
+    logged-in PeerBerry session and it was verified (via the workspace's
+    browser tools, real network capture against the live API) to match
+    reality - see `build_loans_params()`'s own docstring for the full
+    story and the accepted trade-off.
   - `GET /v1/investor/overview` -> `availableMoney` (same as
     peerberry_monitor.fetch_available_money()) - re-fetched periodically to
     track remaining funds across investment attempts within a single run.
@@ -59,11 +65,17 @@ via one-off, read-only/network-intercepted Playwright explorations on
     money was spent). This is NOT the previously-guessed
     `/v1/investor/loans/{loanId}/invest` shape.
 
-Target loan originators come from the Google Sheet, NOT a hardcoded list -
-and (since 2026-07-28) the ACTUAL API REQUEST is no longer restricted by
-originator id either, only by the generic constraints in
-`build_loans_params()` - so there is exactly ONE place that decides which
-originators matter (the Sheet), not two potentially-conflicting ones.
+Which originator actually gets INVESTED IN (and how much budget it gets)
+is still driven 100% by the Google Sheet, NOT by `LOAN_ORIGINATORS` - the
+id list only narrows down what PeerBerry's API itself returns (fewer,
+more relevant loans per poll), it does not decide investment targets.
+`LOAN_ORIGINATORS` is meant to be a superset of every originator the user
+might ever select in the Sheet (confirmed 2026-07-29 straight from the
+user's own real, logged-in `/invest` filter panel) - if the Sheet ever
+selects an originator whose id isn't in this list, its loans would never
+be returned by the server at all (the exact 2026-07-28 failure mode) - so
+`LOAN_ORIGINATORS` MUST be kept in sync with the site's own filter panel
+whenever the user changes it there.
 shared.google_sheet.get_selected_peerberry_loan_originators() finds the
 "Répartition géographique" cell, then the "Peerberry" cell below it (same
 column) - every row between "Peerberry" and the next "Swaper" cell (both
@@ -145,7 +157,7 @@ Optional:
                                                "1h20" (1h 20m), "1h20m30s",
                                                "45m", "90s", "2h", or a plain
                                                number of seconds ("300").
-    POLL_INTERVAL_SECONDS (default 0.5)    -> delay between polls
+    POLL_INTERVAL_SECONDS (default 0.2)    -> delay between polls
     MIN_INVESTMENT_AMOUNT (default 10)     -> skip investing below this
                                                remaining balance/loan amount
     STUCK_AFTER_SECONDS (default 45)       -> log diagnostics if the loan
@@ -186,6 +198,18 @@ log = logging.getLogger("peerberry_invest_bot")
 PROFILE_API_URL = f"{API_BASE}/v2/investor/profile"
 OVERVIEW_API_URL = f"{API_BASE}/v1/investor/overview"
 
+# Same 40 loan-originator IDs as the user's real, logged-in `/invest` filter
+# panel (confirmed 2026-07-29 via the workspace's browser tools against the
+# live API - see module/build_loans_params() docstrings). Must be kept in
+# sync with that filter panel whenever the user changes it there, or newly
+# selected Sheet originators outside this list will never be returned by
+# the server at all.
+LOAN_ORIGINATORS = [
+    4, 12, 23, 30, 33, 36, 39, 41, 43, 45, 47, 48, 49, 50, 51, 52, 53, 54,
+    55, 56, 57, 58, 59, 62, 63, 64, 65, 66, 67, 68, 69, 70, 71, 72, 73, 74,
+    75, 76, 77, 78,
+]
+
 _DURATION_SHORTHAND_RE = re.compile(r"^(?P<hours>\d+)h(?P<minutes>\d+)$")
 _DURATION_UNITS_RE = re.compile(
     r"^(?:(?P<hours>\d+)h)?(?:(?P<minutes>\d+)m)?(?:(?P<seconds>\d+(?:\.\d+)?)s)?$"
@@ -225,7 +249,10 @@ def _parse_duration_seconds(value: str) -> float:
 
 
 DURATION_SECONDS = _parse_duration_seconds(os.environ.get("DURATION_SECONDS", "5m"))
-POLL_INTERVAL_SECONDS = float(os.environ.get("POLL_INTERVAL_SECONDS", "0.5"))
+# Lowered from 0.5s to 0.2s on 2026-07-29: real request round-trips observed
+# in DIAGNOSTICS_FILE are ~0.13s, so 0.2s still leaves a bit of headroom
+# while polling noticeably faster (~5 polls/s instead of ~2/s).
+POLL_INTERVAL_SECONDS = float(os.environ.get("POLL_INTERVAL_SECONDS", "0.2"))
 MIN_INVESTMENT_AMOUNT = float(os.environ.get("MIN_INVESTMENT_AMOUNT", "10"))
 STUCK_AFTER_SECONDS = float(os.environ.get("STUCK_AFTER_SECONDS", "45"))
 # Re-fetch the real "available for investment" balance from the server every
@@ -311,33 +338,40 @@ def _collect_run_diagnostics(since: datetime) -> str | None:
 
 
 def build_loans_params() -> dict:
-    """Deliberately does NOT filter by `loanOriginators[]` server-side (that
-    param existed in an earlier version, hardcoded to a fixed 39-ID list
-    captured from the user's original 2026-07-22 reference URL) - FIXED
-    2026-07-28 after a real run showed 0 loans_seen across ~90 minutes of
-    polling while the user was manually seeing/investing in matching loans
-    on the site at the same time. Root cause: that hardcoded ID list was
+    """Send the exact same filters as the user's real, logged-in PeerBerry
+    `/invest` filter panel, INCLUDING `loanOriginators[]` (the
+    `LOAN_ORIGINATORS` id list).
+
+    History: an earlier version had a hardcoded 39-ID `loanOriginators[]`
+    list (from the user's original 2026-07-22 reference URL) that was
     completely disconnected from the Google-Sheet-driven originator
     SELECTION (`selected_originators`, matched by NAME client-side in
-    `_match_selected_originator()`) - if a sheet-selected originator's
-    numeric id wasn't in the old hardcoded list (e.g. a newly added/renamed
-    originator), PeerBerry's own server would NEVER return that
-    originator's loans at all, guaranteeing 0 matches forever regardless of
-    real market activity - not a timing/performance issue, a silent
-    structural exclusion. Now only the generic, sheet-independent
-    constraints are sent server-side; which loans actually count is decided
-    100% client-side against the real Google Sheet selection, so there's no
-    way for the two to drift apart again."""
-    return {
+    `_match_selected_originator()`) - a real run then showed 0 loans_seen
+    across ~90 minutes while the user was manually seeing/investing on the
+    site at the same time, so the id-based filter was removed 2026-07-28 to
+    stop that silent structural exclusion. It was then explicitly RESTORED
+    2026-07-29 at the user's request, after they supplied the exact
+    filtered URL straight from their own live `/invest` filter panel and it
+    was verified (via the workspace's browser tools, a real network capture
+    against the live, authenticated API) to return real loans matching
+    every one of these filters. Accepted trade-off: `LOAN_ORIGINATORS` must
+    be kept in sync with that filter panel by hand going forward - if the
+    Sheet ever selects an originator whose id isn't in this list, the
+    server will never return that originator's loans at all (the exact
+    2026-07-28 failure mode), regardless of real market activity."""
+    params = {
         "sort": "-loanId",
         "hideInvested": "true",
         "groupGuarantee": "true",
-        "minInterestRate": 10,
+        "minInterestRate": 8.5,
         "maxRemainingTerm": 185,
         "minRemainingTerm": 1,
         "offset": 0,
         "pageSize": 40,
     }
+    for i, originator_id in enumerate(LOAN_ORIGINATORS):
+        params[f"loanOriginators[{i}]"] = originator_id
+    return params
 
 
 def fetch_public_id(session: requests.Session) -> str:
@@ -677,11 +711,12 @@ def run() -> None:
         public_id, available_money, selected_originators, remaining_budget,
     )
     # Logged once (not per-poll) so it's easy to confirm exactly what's being
-    # sent to PeerBerry - no more originator-id filtering happens server-side
-    # (see build_loans_params()'s docstring for why that was removed), only
-    # the constraints below; every loan in the response is then matched
-    # against `selected_originators` above, by name, client-side.
-    log.info("Loans listing query params (no server-side originator filter): %s", build_loans_params())
+    # sent to PeerBerry, including the LOAN_ORIGINATORS id filter (see
+    # build_loans_params()'s docstring for why/when it was restored) - every
+    # loan in the (now server-side pre-filtered) response is then matched
+    # against `selected_originators` above, by name, client-side, to decide
+    # actual investment targets/budgets.
+    log.info("Loans listing query params: %s", build_loans_params())
     if len(funded_originators) < len(selected_originators):
         log.warning(
             "Not enough available money to fund all %d selected originator(s) in %d EUR blocks - only funding %d: %s",
@@ -755,13 +790,13 @@ def run() -> None:
 
             if signature != last_loan_signature:
                 # Only logged when the signature actually changes (not every
-                # poll) to avoid spamming the console. Since the 2026-07-28
-                # fix removed the server-side originator filter, `total` can
-                # now legitimately exceed `pageSize` (40) - meaning loans
-                # further down the list (older loanIds) than the 40 newest
-                # returned here are invisible to this poll. Flagged here so
-                # a future "why didn't it see loan X" question can start
-                # from "was pagination the reason" instead of guessing.
+                # poll) to avoid spamming the console. `total` can still
+                # legitimately exceed `pageSize` (40) even with the
+                # LOAN_ORIGINATORS server-side filter restored - meaning
+                # loans further down the list (older loanIds) than the 40
+                # newest returned here are invisible to this poll. Flagged
+                # here so a future "why didn't it see loan X" question can
+                # start from "was pagination the reason" instead of guessing.
                 total_now = body.get("total") or 0
                 if isinstance(total_now, (int, float)) and total_now > 40:
                     log.info("Loan listing total=%s exceeds pageSize=40 - only the 40 newest loanIds are visible this poll.", total_now)
