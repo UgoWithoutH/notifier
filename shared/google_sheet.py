@@ -246,6 +246,77 @@ def fill_current_month_amounts(platform: str, amounts: dict, section: str = "Cro
     logger.info("Mise à jour terminée pour %s", platform)
 
 
+def fill_current_month_amounts_with_labels(
+    platform: str, total, labeled_amounts: dict, section: str = "Crowdlending", max_rows: int = 6
+):
+    """Like fill_current_month_amounts(), but for a platform whose block has
+    been split into several individually-labeled sub-rows instead of a
+    single merged row directly below the platform (fill_current_month_amounts()
+    always assumes THAT shape - it would silently write into the wrong row
+    otherwise). Writes `total` directly onto the platform's own row, then
+    writes each `labeled_amounts` entry (label -> amount) to its own
+    dedicated sub-row found below the platform's row, using the same
+    label-matching mechanism as fill_current_month_bonus_breakdown()/
+    find_rows_by_texts_below() (case-insensitive substring, bounded to
+    `max_rows` rows below the platform so it can never bleed into the next
+    platform's block).
+
+    Added for Mintos (2026-07-29): its block was split from a single
+    "intérêts brut" row into "en cours prêts" / "en cours obligations" /
+    "intérêts brut prêts" / "intérêts brut obligations".
+    """
+    logger.info("Début mise à jour Google Sheet (par labels) pour %s (section '%s')", platform, section)
+
+    worksheet = get_latest_dashboard_worksheet(SPREADSHEET_ID)
+
+    grid = _call_with_retry(worksheet.get_all_values)
+
+    section_pos = find_cell_by_value(grid, section)
+    if not section_pos:
+        raise RuntimeError(f"La section '{section}' n'a pas été trouvée.")
+
+    section_row, section_col = section_pos
+
+    current_month_cell = find_current_month_cell(grid, section_row)
+    if not current_month_cell:
+        raise RuntimeError("La colonne du mois courant n'a pas été trouvée.")
+
+    current_month_col = current_month_cell["col"]
+
+    platform_row = find_first_cell_containing_below(
+        grid, section_row, section_col, platform
+    )
+    if not platform_row:
+        raise RuntimeError(
+            f"La plateforme '{platform}' n'a pas été trouvée sous '{section}'."
+        )
+
+    updates = [{"range": rowcol_to_a1(platform_row, current_month_col), "values": [[total]]}]
+    logger.info("Préparation écriture : %s / total = %s", platform, total)
+
+    labels = list(labeled_amounts.keys())
+    rows_by_label = find_rows_by_texts_below(
+        grid, platform_row, section_col, labels, max_rows=max_rows
+    )
+
+    missing = [label for label in labels if label not in rows_by_label]
+    if missing:
+        logger.warning(
+            "Ligne(s) non trouvée(s) pour %s (ignorée(s), pas de valeur écrite) : %s",
+            platform, missing
+        )
+
+    for label, row in rows_by_label.items():
+        amount = labeled_amounts[label]
+        address = rowcol_to_a1(row, current_month_col)
+        updates.append({"range": address, "values": [[amount]]})
+        logger.info("Préparation écriture : %s / %s = %s (%s)", platform, label, amount, address)
+
+    _call_with_retry(worksheet.batch_update, updates, value_input_option="USER_ENTERED")
+
+    logger.info("Mise à jour terminée pour %s (par labels)", platform)
+
+
 def fill_current_month_bonus_breakdown(platform: str, breakdown: dict, section: str = "Crowdlending"):
     """Write this month's bonus/cashback/contest figures to their own
     dedicated sub-rows under a platform's block, instead of the merged
