@@ -25,24 +25,29 @@ outside Playwright's control - no `--enable-automation`, no CDP launch
 signature at all) with `--remote-debugging-port` and a dedicated
 `--user-data-dir` (kept, not a temp dir, so a future run may not always
 need a fresh full manual login if Cloudflare's clearance/session persists
-- unverified how long that lasts). The user logs in 100% manually in that
-genuinely non-automated window (the Turnstile checkbox passes normally
-here). ONLY AFTER that, this script attaches via Playwright's
-`connect_over_cdp()` - purely to read the resulting cookies (cf_clearance,
-lande_session, XSRF-TOKEN) - never to drive any further navigation/clicks
-that could re-trigger detection.
+- unverified how long that lasts). The user only needs to solve the
+Turnstile "I'm not a robot" checkbox by hand in that genuinely
+non-automated window - ONLY AFTER that does this script attach via
+Playwright's `connect_over_cdp()`, verified 2026-07-29 to work fine for
+filling/submitting the login form + 2FA code (not just reading cookies
+afterward as originally assumed) - the already-granted `cf_clearance`
+cookie is apparently what matters, not whether a CDP session is attached
+for the rest of the page's lifetime.
 
 Usage: `python -m diversification.lande_get_session`
 1. Your real Chrome opens (a separate profile, not your everyday one) on
    the Lande login page.
-2. Log in yourself: email, password, and the "I'm not a robot" checkbox -
-   all manual, in a real, non-automated browser window.
-3. Once you're on the /investor page (or any logged-in page), come back
-   to this terminal and press Enter.
-4. The script attaches to that browser via CDP, captures the 3 needed
-   cookies, and immediately calls `lande_diversification.run(session=...)`
-   with them - the account's current data is fetched and written to the
-   Google Sheet right away.
+2. Solve ONLY the "I'm not a robot" checkbox yourself, leave the email/
+   password fields blank, then come back here and press Enter.
+3. The script attaches via CDP and fills/submits email+password
+   (LANDE_EMAIL/LANDE_PASSWORD) and, if a 2FA page appears, the TOTP code
+   (LANDE_TOTP_SECRET) - fully automatic from here. If any step doesn't
+   land where expected (wrong credentials, unexpected page), it tells you
+   and waits for you to sort it out by hand in the same window before
+   pressing Enter again.
+4. Once logged in, it captures the 3 needed cookies and immediately calls
+   `lande_diversification.run(session=...)` - the account's current data
+   is fetched and written to the Google Sheet right away.
 5. The three cookie values are also printed at the end - copy them into
    your local .env and the GitHub repository secrets (Settings > Secrets
    and variables > Actions) of the same names, so the scheduled/
@@ -54,9 +59,11 @@ characterized yet (unlike Mintos's confirmed self-renewing sliding
 window) - if the scheduled job's run eventually fails with a "session
 expired" error (see lande_diversification.py), just re-run this script.
 
-Required env vars: none (login is fully manual) - GOOGLE_SHEET_ID/
-GOOGLE_CREDENTIALS are still needed (transitively, by
-lande_diversification.run()) to write the fetched data to the Sheet.
+Required env vars: LANDE_EMAIL, LANDE_PASSWORD, LANDE_TOTP_SECRET (used
+only locally by this helper to fill the login/2FA forms - never sent
+anywhere but Lande's own login form) - GOOGLE_SHEET_ID/GOOGLE_CREDENTIALS
+are still needed (transitively, by lande_diversification.run()) to write
+the fetched data to the Sheet.
 """
 
 import os
@@ -65,9 +72,10 @@ import sys
 import time
 import logging
 
+import pyotp
 import requests
 from dotenv import load_dotenv
-from playwright.sync_api import sync_playwright
+from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
 
 from diversification.lande_diversification import run as run_diversification
 
@@ -76,7 +84,7 @@ load_dotenv()
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger("lande_get_session")
 
-LOGIN_URL = "https://lande.finance/fr/investor"
+LOGIN_URL = "https://lande.finance/login"
 DEBUG_PORT = 9333
 CHROME_CANDIDATES = [
     r"C:\Program Files\Google\Chrome\Application\chrome.exe",
@@ -84,6 +92,10 @@ CHROME_CANDIDATES = [
     os.path.expandvars(r"%LOCALAPPDATA%\Google\Chrome\Application\chrome.exe"),
 ]
 PROFILE_DIR = os.path.join(os.environ.get("TEMP", "."), "lande_get_session_chrome_profile")
+
+LANDE_EMAIL = os.environ.get("LANDE_EMAIL")
+LANDE_PASSWORD = os.environ.get("LANDE_PASSWORD")
+LANDE_TOTP_SECRET = os.environ.get("LANDE_TOTP_SECRET")
 
 
 def _find_chrome() -> str:
@@ -106,6 +118,33 @@ def build_session_from_cookies(cookies: dict) -> requests.Session:
     return session
 
 
+def _submit_credentials(page) -> None:
+    page.locator("#inp-email").fill(LANDE_EMAIL)
+    page.locator("#password").fill(LANDE_PASSWORD)
+    page.locator("form#login button[type='submit']").click()
+    try:
+        page.wait_for_url(lambda u: "/login" not in u, timeout=20000)
+    except PlaywrightTimeoutError:
+        log.warning("Still on /login after submitting credentials (wrong password? already on a CAPTCHA retry?) - current URL: %s", page.url)
+
+
+def _submit_totp(page) -> bool:
+    """Tries 3 candidate TOTP codes (current/previous/next 30s window, same
+    resilience pattern as afranga_diversification.py/lendermarket_monitor.py)
+    against the 2FA form. Returns True once the page moves off /2fa."""
+    totp = pyotp.TOTP(LANDE_TOTP_SECRET)
+    now = int(time.time())
+    for candidate in (totp.at(now), totp.at(now - 30), totp.at(now + 30)):
+        page.locator("#two_factor_code").fill(candidate)
+        page.locator("#two_factor_form_submit").click()
+        try:
+            page.wait_for_url(lambda u: "/2fa" not in u, timeout=8000)
+            return True
+        except PlaywrightTimeoutError:
+            continue
+    return False
+
+
 def main() -> None:
     chrome_path = _find_chrome()
     log.info("Launching real Chrome (%s) with a separate profile, remote debugging on :%s ...", chrome_path, DEBUG_PORT)
@@ -120,14 +159,31 @@ def main() -> None:
     time.sleep(2)
 
     input(
-        "\nA real Chrome window should now be open. Please log in manually "
-        "(email, password, the 'I'm not a robot' checkbox) until you're on "
-        "the /investor page, THEN come back here and press Enter...\n"
+        "\nA real Chrome window should now be open. Please solve ONLY the "
+        "'I'm not a robot' checkbox (leave email/password blank), THEN come "
+        "back here and press Enter...\n"
     )
 
     with sync_playwright() as p:
         browser = p.chromium.connect_over_cdp(f"http://localhost:{DEBUG_PORT}")
         context = browser.contexts[0]
+        page = context.pages[0] if context.pages else context.new_page()
+
+        if "/login" in page.url and LANDE_EMAIL and LANDE_PASSWORD:
+            log.info("Filling email/password automatically...")
+            _submit_credentials(page)
+
+        if "/2fa" in page.url and LANDE_TOTP_SECRET:
+            log.info("Filling 2FA code automatically...")
+            if not _submit_totp(page):
+                log.warning("All 3 TOTP candidates were rejected.")
+
+        if "/login" in page.url or "/2fa" in page.url:
+            input(
+                f"\nStill on {page.url} - please finish logging in manually "
+                "in the browser window, THEN come back here and press Enter...\n"
+            )
+
         raw_cookies = context.cookies()
         # Don't close the browser (it's the user's real Chrome process) -
         # just disconnect Playwright from it.
