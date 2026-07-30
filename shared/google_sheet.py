@@ -526,6 +526,28 @@ def fill_geographic_repartition_amounts(loan_originators: list):
     )
 
 
+def _find_x_flag_left_of(row, name_col: int, max_lookback: int = 3) -> bool:
+    """Retourne True si l'une des cellules jusqu'à `max_lookback` colonnes à
+    gauche de la colonne (1-based) `name_col` vaut exactement "x"
+    (insensible à la casse). Recherche de la plus proche à la plus
+    éloignée (name_col-1, name_col-2, ...) plutôt qu'un simple
+    row[name_col-2], pour rester robuste si une colonne visuelle
+    supplémentaire (ex. un taux d'intérêt de référence) est un jour
+    insérée entre le flag "x" et le nom du loan originator - repéré le
+    2026-07-30 sur le bloc Peerberry, qui a gagné une colonne "taux
+    d'intérêt" entre le flag et le nom (flag décalé de -2 à -3), alors que
+    les blocs Swaper/Lendermarket n'ont pas cette colonne (flag toujours à
+    -2) - cette fonction gère les deux cas sans distinction par plateforme.
+    """
+    for offset in range(1, max_lookback + 1):
+        idx = name_col - 1 - offset
+        if idx < 0:
+            break
+        if idx < len(row) and row[idx].strip().lower() == "x":
+            return True
+    return False
+
+
 def get_selected_peerberry_loan_originators() -> list:
     """
     Cherche la cellule "Répartition géographique", puis la cellule
@@ -581,13 +603,61 @@ def get_selected_peerberry_loan_originators() -> list:
         if not name:
             continue
 
-        flag = row[geo_col - 2].strip() if geo_col - 2 < len(row) else ""
-        if flag.lower() == "x":
+        if _find_x_flag_left_of(row, geo_col):
             selected.append(name)
             logger.info("Loan originator PeerBerry sélectionné : '%s' (ligne %s)", name, row_idx)
 
     logger.info("Loan originators PeerBerry sélectionnés : %s", selected)
     return selected
+
+
+def get_peerberry_min_interest_rate() -> float:
+    """
+    Cherche la cellule "Répartition géographique", puis la ligne "Peerberry"
+    en dessous (même colonne), et lit la valeur numérique (format français,
+    virgule décimale, ex. "8,5") dans la cellule juste à gauche du nom
+    "Peerberry" sur CETTE ligne (pas les lignes des loan originators
+    en dessous, qui ont chacune leur propre valeur dans la même colonne
+    visuelle - non utilisée ici). Ajoutée le 2026-07-30 pour piloter
+    `minInterestRate` de peerberry_invest_bot.py depuis la feuille au lieu
+    d'une valeur codée en dur.
+    """
+    logger.info("Lecture du minInterestRate PeerBerry depuis la cellule à gauche de 'Peerberry'")
+
+    worksheet = get_latest_dashboard_worksheet(SPREADSHEET_ID)
+
+    grid = _call_with_retry(worksheet.get_all_values)
+
+    geo_pos = find_cell_by_value(grid, "Répartition géographique")
+    if not geo_pos:
+        raise RuntimeError(
+            "La section 'Répartition géographique' n'a pas été trouvée."
+        )
+
+    geo_row, geo_col = geo_pos
+
+    if geo_col < 2:
+        raise RuntimeError(
+            "Impossible de lire la colonne à gauche de 'Peerberry' : "
+            "'Répartition géographique' est dans la première colonne."
+        )
+
+    peerberry_row = find_first_cell_containing_below(grid, geo_row, geo_col, "Peerberry")
+    if not peerberry_row:
+        raise RuntimeError(
+            "La cellule 'Peerberry' n'a pas été trouvée sous 'Répartition géographique'."
+        )
+
+    row = grid[peerberry_row - 1]
+    raw = row[geo_col - 2].strip() if geo_col - 2 < len(row) else ""
+    if not raw:
+        raise RuntimeError(
+            "La cellule à gauche de 'Peerberry' est vide - impossible d'en tirer un minInterestRate."
+        )
+
+    value = float(raw.replace("\u202f", "").replace(" ", "").replace(",", "."))
+    logger.info("minInterestRate PeerBerry lu dans la feuille : %s", value)
+    return value
 
 
 def get_selected_lendermarket_lenders() -> list:
@@ -649,8 +719,7 @@ def get_selected_lendermarket_lenders() -> list:
         if not name:
             continue
 
-        flag = row[geo_col - 2].strip() if geo_col - 2 < len(row) else ""
-        if flag.lower() == "x":
+        if _find_x_flag_left_of(row, geo_col):
             selected.append(name)
             logger.info("Lender Lendermarket sélectionné : '%s' (ligne %s)", name, row_idx)
 
@@ -722,8 +791,7 @@ def get_selected_swaper_loan_originators() -> list:
         if not name:
             continue
 
-        flag = row[geo_col - 2].strip() if geo_col - 2 < len(row) else ""
-        if flag.lower() == "x":
+        if _find_x_flag_left_of(row, geo_col):
             selected.append(name)
             logger.info("Loan originator Swaper sélectionné : '%s' (ligne %s)", name, row_idx)
 
