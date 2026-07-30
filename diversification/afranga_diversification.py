@@ -527,7 +527,7 @@ def run() -> None:
         for o in originators
     ]
 
-    fill_geographic_repartition_amounts(loan_originators)
+    fill_geographic_repartition_amounts(loan_originators, platform="Afranga")
 
 
 if __name__ == "__main__":

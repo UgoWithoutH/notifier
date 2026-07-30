@@ -360,7 +360,7 @@ def run() -> None:
 
     fill_current_month_amounts(platform="Iuvo", amounts=amounts)
 
-    fill_geographic_repartition_amounts(balance_data["originators"])
+    fill_geographic_repartition_amounts(balance_data["originators"], platform="Iuvo")
 
 
 if __name__ == "__main__":

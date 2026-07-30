@@ -458,7 +458,7 @@ def run(session: requests.Session | None = None) -> None:
     # cell in the Sheet (sums its own sub-rows) - only write the per-issuer
     # rows below it, same pattern as Swaper.
     geo_entries = [{"name": name, "amount": round(amount, 2)} for name, amount in combined_originators.items()]
-    fill_geographic_repartition_amounts(geo_entries)
+    fill_geographic_repartition_amounts(geo_entries, platform="Mintos")
 
 
 if __name__ == "__main__":

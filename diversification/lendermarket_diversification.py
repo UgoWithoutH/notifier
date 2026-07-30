@@ -264,7 +264,7 @@ def run() -> None:
         for l in lenders
     ]
 
-    fill_geographic_repartition_amounts(loan_originators)
+    fill_geographic_repartition_amounts(loan_originators, platform="Lendermarket")
 
 
 if __name__ == "__main__":
