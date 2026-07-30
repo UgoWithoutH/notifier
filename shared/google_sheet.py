@@ -446,7 +446,100 @@ def find_rows_by_texts_below(grid, start_row, start_col, texts: list, max_rows: 
 
     return found
 
-def fill_geographic_repartition_amounts(loan_originators: list):
+# Labels susceptibles de marquer la fin du bloc de sociétés de prêt d'une
+# plateforme sous "Répartition géographique" - soit la ligne d'une AUTRE
+# plateforme, soit un en-tête de sous-section (ex. "Crowdlending savings").
+# Utilisé par fill_geographic_repartition_amounts() (paramètre `platform`)
+# pour détecter automatiquement la fin du bloc d'une plateforme sans que
+# chaque appelant ait besoin de préciser explicitement la borne de fin.
+# Layout réel vérifié le 2026-07-30 (ordre constaté : Afranga, Iuvo,
+# Lendermarket, Loanch, Mintos, Peerberry, Swaper, puis "Crowdlending
+# savings" [Monefit/Go & Grow], puis "Crowdlending agricole" [Lande]) -
+# mais la recherche ci-dessous ne dépend pas de cet ordre précis : elle
+# prend simplement la première de ces étiquettes trouvée sous la ligne de
+# la plateforme donnée, quelle que soit sa position dans cette liste.
+GEO_SECTION_BOUNDARY_LABELS = [
+    "Afranga", "Iuvo", "Lendermarket", "Loanch", "Mintos", "Peerberry",
+    "Swaper", "Monefit", "Go & Grow", "Lande",
+    "Crowdlending savings", "Crowdlending agricole", "Bourse",
+]
+
+
+def _find_geo_block_end_row(grid, geo_row: int, geo_col: int, platform_row: int, platform: str) -> int:
+    """Retourne la ligne (1-based) qui marque la fin du bloc de sociétés de
+    prêt du `platform` donné (première ligne strictement en dessous de
+    `platform_row` qui n'en fait plus partie) : soit la première ligne
+    correspondant à une autre étiquette de GEO_SECTION_BOUNDARY_LABELS,
+    soit la 2e ligne vide consécutive (nom vide dans la colonne géo), soit
+    la fin de la feuille si rien de tout ça n'est trouvé.
+    """
+    candidate_rows = []
+
+    for label in GEO_SECTION_BOUNDARY_LABELS:
+        if label == platform:
+            continue
+        row = find_first_cell_containing_below(grid, platform_row, geo_col, label)
+        if row and row > platform_row:
+            candidate_rows.append(row)
+
+    blank_streak = 0
+    for row_idx in range(platform_row + 1, len(grid) + 1):
+        row = grid[row_idx - 1]
+        name = row[geo_col - 1].strip() if geo_col - 1 < len(row) else ""
+        if name:
+            blank_streak = 0
+            continue
+        blank_streak += 1
+        if blank_streak >= 2:
+            candidate_rows.append(row_idx - 1)
+            break
+
+    if not candidate_rows:
+        return len(grid) + 1
+
+    return min(candidate_rows)
+
+
+def _zero_fill_missing_geo_rows(grid, geo_row: int, geo_col: int, target_col: int, platform: str, written_names) -> list:
+    """Pour le bloc de sociétés de prêt du `platform` donné sous
+    'Répartition géographique', prépare une écriture de 0 pour chaque
+    ligne ayant un nom non vide qui n'est PAS dans `written_names` (une
+    société de prêt déjà listée dans le tableau mais sans investissement
+    actuel ce mois-ci) - pour éviter de laisser une ancienne valeur
+    périmée d'un mois précédent au lieu d'un 0 explicite.
+    """
+    platform_row = find_first_cell_containing_below(grid, geo_row, geo_col, platform)
+    if not platform_row:
+        logger.warning(
+            "Zero-fill 'Répartition géographique' ignoré : la plateforme "
+            "'%s' n'a pas été trouvée sous 'Répartition géographique'.",
+            platform,
+        )
+        return []
+
+    end_row = _find_geo_block_end_row(grid, geo_row, geo_col, platform_row, platform)
+
+    updates = []
+    for row_idx in range(platform_row + 1, end_row):
+        row = grid[row_idx - 1]
+        name = row[geo_col - 1].strip() if geo_col - 1 < len(row) else ""
+        if not name or name in written_names:
+            continue
+
+        address = rowcol_to_a1(row_idx, target_col)
+        updates.append({
+            "range": address,
+            "values": [[0]],
+        })
+        logger.info(
+            "Zero-fill '%s' : '%s' n'a pas d'investissement actuel -> %s = 0",
+            platform, name, address
+        )
+
+    return updates
+
+
+def fill_geographic_repartition_amounts(loan_originators: list, platform: str | None = None):
     """
     loan_originators : liste de dicts, ex.
         [{"name": "Bienprêter", "amount": 1000}, {"name": "Lendix", "amount": 500}]
@@ -454,6 +547,15 @@ def fill_geographic_repartition_amounts(loan_originators: list):
     Cherche la cellule "Répartition géographique", puis pour chaque loan
     originator cherche son nom sous cette cellule, dans la même colonne,
     et écrit le montant dans la cellule juste à droite (colonne + 1).
+
+    `platform` (optionnel) : nom de la plateforme (tel qu'écrit dans la
+    feuille, ex. "Peerberry") dont `loan_originators` est le relevé complet
+    des sociétés de prêt actuellement investies. Si fourni, toute société
+    de prêt déjà listée dans le bloc de cette plateforme mais absente de
+    `loan_originators` (= plus aucun investissement actuel dessus) reçoit
+    un 0 explicite, au lieu de garder sa dernière valeur écrite (qui
+    pourrait dater d'un mois précédent où il y avait encore un
+    investissement).
     """
     logger.info(
         "Début mise à jour Répartition géographique (%s loan originators)",
@@ -513,6 +615,12 @@ def fill_geographic_repartition_amounts(loan_originators: list):
             address
         )
 
+    zero_fill_count = 0
+    if platform:
+        zero_updates = _zero_fill_missing_geo_rows(grid, geo_row, geo_col, target_col, platform, set(names))
+        zero_fill_count = len(zero_updates)
+        updates.extend(zero_updates)
+
     if not updates:
         logger.warning("Aucun loan originator trouvé, rien à écrire.")
         return
@@ -520,9 +628,10 @@ def fill_geographic_repartition_amounts(loan_originators: list):
     _call_with_retry(worksheet.batch_update, updates, value_input_option="USER_ENTERED")
 
     logger.info(
-        "Mise à jour Répartition géographique terminée (%d trouvé(s), %d manquant(s)).",
-        len(updates),
+        "Mise à jour Répartition géographique terminée (%d trouvé(s), %d manquant(s), %d mis à 0).",
+        len(updates) - zero_fill_count,
         len(missing),
+        zero_fill_count,
     )
 
 
