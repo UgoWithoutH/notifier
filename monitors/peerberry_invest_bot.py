@@ -2,12 +2,13 @@
 
 `workflow_dispatch`-only bot, externally triggered via cron-job.org, that
 repeatedly polls PeerBerry's filtered loan listing (same filters as
-https://peerberry.com/en/client/invest?minRemainingTerm=1&maxRemainingTerm=185&minInterestRate=8.5&loanTermId=&loanOriginators=4,12,23,30,33,36,39,41,43,45,47,48,49,50,51,52,53,54,55,56,57,58,59,62,63,64,65,66,67,68,69,70,71,72,73,74,75,76,77,78&groupGuarantee=true&hideInvested=true,
-confirmed with the user 2026-07-29 after a run that saw 0 matching loans
-for ~1h30 - the previous filters (minInterestRate=10, maxRemainingTerm=185,
-a stale 39-id loanOriginators list) turned out to no longer reflect the
-user's real site filters at all: id 7 was dropped, id 78 was added, and
-minInterestRate was lowered to 8.5)
+https://peerberry.com/en/client/invest?sort=-loanId&groupGuarantee=1&loanOriginators=4,12,23,30,33,36,39,41,43,45,47,48,49,50,51,52,53,54,55,56,57,58,59,62,63,64,65,66,67,68,69,70,71,72,73,74,75,76,77,78&minInterestRate=8.5&maxRemainingTerm=185&minRemainingTerm=1,
+confirmed with the user 2026-07-30 - critically this DROPS `hideInvested`
+entirely (the previous 2026-07-29 filter set included `hideInvested=true`,
+which the user confirmed was NOT actually part of their real site filter
+after a run saw 0 matching loans across 22272 polls/~75 minutes with this
+param present) - see `build_loans_params()`'s own docstring for the
+2026-07-29 filter's own history)
 and tries to invest available funds into any newly-appeared/still-available
 matching loan, as fast as possible (~0.2s polling by default), before other investors
 grab it. Within each poll, loans are attempted starting from the END of the
@@ -190,7 +191,7 @@ load_dotenv()
 
 from monitors.peerberry_monitor import login, PEERBERRY_EMAIL, PEERBERRY_PASSWORD, _HEADERS, API_BASE
 from shared.notifier import send_peerberry_invest_bot_summary_email
-from shared.google_sheet import get_selected_peerberry_loan_originators
+from shared.google_sheet import get_selected_peerberry_loan_originators, get_peerberry_min_interest_rate
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger("peerberry_invest_bot")
@@ -209,6 +210,12 @@ LOAN_ORIGINATORS = [
     55, 56, 57, 58, 59, 62, 63, 64, 65, 66, 67, 68, 69, 70, 71, 72, 73, 74,
     75, 76, 77, 78,
 ]
+
+# Overridden at startup in run() from the Sheet cell just left of "Peerberry"
+# (shared.google_sheet.get_peerberry_min_interest_rate()) - this literal is
+# only the fallback used if that read fails (soft-fail, not fatal, unlike
+# the loan originator selection).
+MIN_INTEREST_RATE = 8.5
 
 _DURATION_SHORTHAND_RE = re.compile(r"^(?P<hours>\d+)h(?P<minutes>\d+)$")
 _DURATION_UNITS_RE = re.compile(
@@ -358,12 +365,23 @@ def build_loans_params() -> dict:
     be kept in sync with that filter panel by hand going forward - if the
     Sheet ever selects an originator whose id isn't in this list, the
     server will never return that originator's loans at all (the exact
-    2026-07-28 failure mode), regardless of real market activity."""
+    2026-07-28 failure mode), regardless of real market activity.
+
+    UPDATED 2026-07-30: `hideInvested` REMOVED entirely (was `"true"`), per
+    the user's fresh reference URL - a run with `hideInvested=true` still
+    active saw `total=0` on every single one of 22272 polls (~75 minutes),
+    confirming that param no longer (if it ever did) matches the user's
+    real site filter panel.
+
+    UPDATED 2026-07-30 (later same day): `minInterestRate` now comes from
+    `MIN_INTEREST_RATE` (read once at startup in run() from the Sheet cell
+    just left of "Peerberry" - see get_peerberry_min_interest_rate()),
+    instead of a hardcoded 8.5, so the user can change it from the Sheet
+    without a code edit."""
     params = {
         "sort": "-loanId",
-        "hideInvested": "true",
         "groupGuarantee": "true",
-        "minInterestRate": 8.5,
+        "minInterestRate": MIN_INTEREST_RATE,
         "maxRemainingTerm": 185,
         "minRemainingTerm": 1,
         "offset": 0,
@@ -667,6 +685,13 @@ def run() -> None:
             diagnostics_text=_collect_run_diagnostics(run_started_at),
         )
         sys.exit(1)
+
+    global MIN_INTEREST_RATE
+    try:
+        MIN_INTEREST_RATE = get_peerberry_min_interest_rate()
+    except Exception as exc:
+        log.warning("Could not read minInterestRate from the Google Sheet, keeping the fallback %.2f: %s", MIN_INTEREST_RATE, exc)
+        _log_diagnostics("min_interest_rate_read_error", error=str(exc), traceback=traceback.format_exc(), fallback=MIN_INTEREST_RATE)
 
     if not selected_originators:
         log.error("No PeerBerry loan originator selected in the Google Sheet (column -1 == 'x'), nothing to invest in.")
