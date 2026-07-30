@@ -5,6 +5,7 @@ import logging
 import time
 
 import gspread
+import requests
 from dotenv import load_dotenv
 from google.oauth2.service_account import Credentials
 from gspread.utils import rowcol_to_a1
@@ -53,12 +54,27 @@ def _is_rate_limit_error(exc: Exception) -> bool:
     return False
 
 
+def _is_transient_network_error(exc: Exception) -> bool:
+    """True if `exc` looks like a transient (non-HTTP-status) network glitch
+    - e.g. a connection reset / aborted TLS handshake while calling Google's
+    API - rather than a real application-level error. gspread's requests-
+    based transport raises these as requests.exceptions.ConnectionError
+    (which wraps urllib3's ProtocolError/ConnectionResetError). Seen in a
+    real GitHub Actions run: 'Connection aborted.',
+    ConnectionResetError(104, 'Connection reset by peer').
+    """
+    if isinstance(exc, (requests.exceptions.ConnectionError, requests.exceptions.Timeout)):
+        return True
+    return False
+
+
 def _call_with_retry(func, *args, **kwargs):
     """Calls func(*args, **kwargs), retrying with exponential backoff
     (30s, 60s, 120s, 240s, 480s by default) whenever it fails with a
-    Google Sheets API 429 "quota exceeded" error, instead of letting it
-    propagate and fail the whole run. Any other exception (or a 429 that
-    persists after all retries) is re-raised as-is.
+    Google Sheets API 429 "quota exceeded" error OR a transient network
+    error (connection reset/aborted, timeout), instead of letting it
+    propagate and fail the whole run. Any other exception (or a
+    retryable error that persists after all retries) is re-raised as-is.
     """
     wait_seconds = API_RATE_LIMIT_INITIAL_WAIT_SECONDS
 
@@ -66,10 +82,11 @@ def _call_with_retry(func, *args, **kwargs):
         try:
             return func(*args, **kwargs)
         except Exception as exc:
-            if not _is_rate_limit_error(exc) or attempt > API_RATE_LIMIT_MAX_RETRIES:
+            retryable = _is_rate_limit_error(exc) or _is_transient_network_error(exc)
+            if not retryable or attempt > API_RATE_LIMIT_MAX_RETRIES:
                 raise
             logger.warning(
-                "Quota Google Sheets API dépassé (tentative %s/%s) : %s. "
+                "Erreur Google Sheets API transitoire (tentative %s/%s) : %s. "
                 "Attente de %ss avant nouvelle tentative...",
                 attempt, API_RATE_LIMIT_MAX_RETRIES, exc, wait_seconds
             )
