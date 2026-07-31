@@ -77,6 +77,21 @@ originator only gets invested into up to its own share - see
 `_match_selected_originator()`/`remaining_budget` in `run()`. A loan whose
 `loanOriginator` doesn't match any selected name is skipped entirely.
 
+Since the SAME PeerBerry account also has an independent, unrelated bot/
+feature active on it (e.g. PeerBerry's own "Auto-Invest EASY" scheme, or a
+real human), a selected originator's remaining budget could otherwise stay
+stale relative to what's actually still available for THIS bot to invest.
+Every `EXTERNAL_INVESTMENT_CHECK_INTERVAL_SECONDS` (default 60s), `run()`
+re-fetches each selected originator's total invested amount (via
+`fetch_originator_invested_amounts()`, the SAME overview/originators
+endpoint already used by diversification/peerberry_diversification.py) and
+compares it to the previous check: any increase NOT explained by this
+bot's own successful investments since that check is, by definition,
+external, and gets subtracted from that originator's `remaining_budget`
+(floored at 0 - once a budget hits 0 this way, the existing per-originator
+minimum check in the poll loop naturally stops investing in it, exactly as
+if its budget had been spent by this bot itself).
+
 If the available balance seen at startup is already below
 MIN_INVESTMENT_AMOUNT, `run()` stops right away (no polling at all, not
 even reading the Google Sheet) instead of burning the whole
@@ -161,6 +176,16 @@ Optional:
                                                since the market moves fast
                                                and a re-opened loan
                                                shouldn't be missed for long
+    EXTERNAL_INVESTMENT_CHECK_INTERVAL_SECONDS (default 60) -> how often to
+                                               check whether SOMETHING ELSE
+                                               (PeerBerry's own "Auto-Invest
+                                               EASY" scheme, or a real human,
+                                               active on the same account
+                                               outside this bot) invested in
+                                               a selected originator, and
+                                               shrink that originator's own
+                                               remaining budget accordingly -
+                                               see `fetch_originator_invested_amounts()`
 """
 
 import os
@@ -187,6 +212,14 @@ log = logging.getLogger("peerberry_invest_bot")
 
 PROFILE_API_URL = f"{API_BASE}/v2/investor/profile"
 OVERVIEW_API_URL = f"{API_BASE}/v1/investor/overview"
+# Per-loan-originator invested-amount breakdown - same endpoint already
+# verified live in diversification/peerberry_diversification.py. Reused here
+# (NOT the unverified /en/client/my-investments page, which can't be tested
+# locally - the Michelin proxy blocks the login POST for any local live
+# check, see repo memory) to detect investments made by something OTHER than
+# this bot (PeerBerry's own "Auto-Invest EASY" scheme, or a real human)
+# during a run - see fetch_originator_invested_amounts().
+ORIGINATORS_DISTRIBUTION_API_URL = f"{API_BASE}/v1/investor/overview/originators"
 
 # UNUSED as of 2026-07-31 - see build_loans_params()'s docstring for why
 # the server-side loanOriginators[] id filter was removed for good (twice
@@ -262,6 +295,11 @@ REFRESH_BALANCE_EVERY_N_POLLS = max(1, int(30 / max(POLL_INTERVAL_SECONDS, 0.1))
 # attempts hammering a loan that's likely already gone while other loans in
 # the same poll/next polls could be invested in instead.
 FAILED_LOAN_COOLDOWN_SECONDS = float(os.environ.get("FAILED_LOAN_COOLDOWN_SECONDS", "3"))
+# How often to check for external investments (see ORIGINATORS_DISTRIBUTION_API_URL
+# above) - a real GET, so not free to call every ~0.2s poll like the loan
+# listing itself; every 60s is frequent enough to keep an active external
+# bot's budget-eating in check without adding meaningful load.
+EXTERNAL_INVESTMENT_CHECK_INTERVAL_SECONDS = float(os.environ.get("EXTERNAL_INVESTMENT_CHECK_INTERVAL_SECONDS", "60"))
 # Max time to wait for any single HTTP call (connect+read) before giving up.
 # Matching loans can disappear within seconds, so a slow/hanging request
 # eating the old 8s default could waste most (or all) of a loan's whole
@@ -404,6 +442,29 @@ def fetch_available_money(session: requests.Session) -> float:
         return 0.0
 
 
+def fetch_originator_invested_amounts(session: requests.Session) -> dict:
+    """Fetch the raw {originator_name: total_invested_amount} breakdown from
+    the same overview/originators endpoint already verified live by
+    diversification/peerberry_diversification.py. Used to detect investments
+    made by something OTHER than this bot (PeerBerry's own "Auto-Invest EASY"
+    scheme, or a real human, active on the same account) during a run: any
+    increase in a selected originator's total that isn't explained by this
+    bot's own successful investments is, by definition, external - see the
+    periodic check in run()."""
+    r = session.get(ORIGINATORS_DISTRIBUTION_API_URL, headers=_HEADERS, timeout=HTTP_REQUEST_TIMEOUT_SECONDS)
+    r.raise_for_status()
+    amounts = {}
+    for entry in r.json() or []:
+        name = entry.get("originator")
+        if not name:
+            continue
+        try:
+            amounts[name] = float(entry.get("amount") or 0)
+        except (TypeError, ValueError):
+            amounts[name] = 0.0
+    return amounts
+
+
 def fetch_loans(session: requests.Session, public_id: str) -> dict:
     r = session.get(
         f"{API_BASE}/v1/{public_id}/loans",
@@ -466,6 +527,19 @@ def _match_selected_originator(loan_originator_value, selected_originators: list
         if name_lower in value or value in name_lower:
             return name
     return None
+
+
+def _sum_matched_amounts(raw_amounts: dict, selected_originators: list) -> dict:
+    """Map the overview/originators API's raw {name: amount} dict onto the
+    Sheet-selected originator names, using the same fuzzy match as loan
+    listings (`_match_selected_originator`) - sums any raw entry that
+    matches a selected name (0.0 for a selected originator with none)."""
+    result = {name: 0.0 for name in selected_originators}
+    for raw_name, amount in raw_amounts.items():
+        matched = _match_selected_originator(raw_name, selected_originators)
+        if matched is not None:
+            result[matched] += amount
+    return result
 
 
 def _compute_originator_budgets(available_money: float, selected_originators: list, block_size: float = MIN_INVESTMENT_AMOUNT) -> dict:
@@ -729,6 +803,18 @@ def run() -> None:
         for name in selected_originators
     }
     redistributions = []
+    external_adjustments = []
+
+    # Baseline invested-per-originator snapshot, used to detect external
+    # investments (see EXTERNAL_INVESTMENT_CHECK_INTERVAL_SECONDS below) -
+    # soft-fail (0.0 baseline) rather than fatal, since external-investment
+    # detection is a nice-to-have, not required for the bot to run at all.
+    try:
+        last_checked_invested = _sum_matched_amounts(fetch_originator_invested_amounts(session), selected_originators)
+    except Exception as exc:
+        log.warning("Could not fetch the initial invested-per-originator snapshot (external investment detection starts from the next check): %s", exc)
+        last_checked_invested = {name: 0.0 for name in selected_originators}
+    own_invested_at_last_check = {name: 0.0 for name in selected_originators}
 
     log.info(
         "publicId=%s available_money=%.2f EUR selected_originators=%s budgets=%s",
@@ -755,6 +841,7 @@ def run() -> None:
     # Raw loanOriginator values already console-logged as "unmatched" this
     # run, so the same value isn't logged on every single poll.
     logged_unmatched_originators: set = set()
+    last_external_check_at = start
 
     try:
         while time.monotonic() - start < DURATION_SECONDS:
@@ -777,6 +864,35 @@ def run() -> None:
                         request_duration_seconds=round(time.monotonic() - balance_refresh_started_at, 3),
                     )
                     log.exception("Failed to refresh available balance, keeping last known value (%.2f EUR).", available_money)
+
+            if time.monotonic() - last_external_check_at >= EXTERNAL_INVESTMENT_CHECK_INTERVAL_SECONDS:
+                last_external_check_at = time.monotonic()
+                try:
+                    current_invested = _sum_matched_amounts(_call_with_reauth(session, fetch_originator_invested_amounts), selected_originators)
+                    for name in selected_originators:
+                        # Total change since the last check, minus whatever
+                        # of that change is explained by THIS bot's own
+                        # successful investments since the last check -
+                        # what's left is, by definition, external.
+                        total_delta = current_invested.get(name, 0.0) - last_checked_invested.get(name, 0.0)
+                        own_delta = originator_stats[name]["invested_amount"] - own_invested_at_last_check[name]
+                        external_delta = total_delta - own_delta
+                        if external_delta > 0.01:
+                            budget_before = remaining_budget.get(name, 0.0)
+                            remaining_budget[name] = max(0.0, budget_before - external_delta)
+                            log.info(
+                                "Investissement externe détecté sur '%s' : %.2f EUR - budget restant réduit de %.2f EUR à %.2f EUR.",
+                                name, external_delta, budget_before, remaining_budget[name],
+                            )
+                            adjustment = {"originator": name, "external_amount": round(external_delta, 2), "budget_before": budget_before, "budget_after": remaining_budget[name]}
+                            external_adjustments.append(adjustment)
+                            _log_diagnostics("external_investment_detected", **adjustment)
+                        last_checked_invested[name] = current_invested.get(name, 0.0)
+                        own_invested_at_last_check[name] = originator_stats[name]["invested_amount"]
+                except Exception as exc:
+                    stats["errors"] += 1
+                    _log_diagnostics("external_investment_check_error", error=str(exc), traceback=traceback.format_exc())
+                    log.exception("Failed to check for external investments, will retry at the next interval.")
 
             fetch_started_at = time.monotonic()
             try:
@@ -994,6 +1110,7 @@ def run() -> None:
     stats["final_available_money"] = available_money
     stats["final_originator_budgets"] = dict(remaining_budget)
     stats["redistributions"] = redistributions
+    stats["external_adjustments"] = external_adjustments
     for name, s in originator_stats.items():
         s["loans_seen"] = len(s["loans_seen"])
     stats["originator_stats"] = originator_stats
