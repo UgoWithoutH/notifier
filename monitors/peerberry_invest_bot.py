@@ -860,6 +860,13 @@ def run() -> None:
     # Country names already console-logged as "blocked" this run, so the
     # same country isn't logged again on every single poll once blocked.
     logged_blocked_countries: set = set()
+    # (loan_id, reason) pairs already console-logged as "skipped" this run,
+    # so the same loan+reason isn't logged again on every single poll it
+    # keeps reappearing in the listing - reasons: "cooldown" (recent failed
+    # attempt), "balance_too_low" (overall available_money too low),
+    # "amount_too_low" (this specific loan's own investable amount is below
+    # MIN_INVESTMENT_AMOUNT).
+    logged_skip_reasons: set = set()
     last_external_check_at = start
 
     try:
@@ -957,6 +964,12 @@ def run() -> None:
                 total_now = body.get("total") or 0
                 if isinstance(total_now, (int, float)) and total_now > 40:
                     log.info("Loan listing total=%s exceeds pageSize=40 - only the 40 newest loanIds are visible this poll.", total_now)
+                if data:
+                    log.info(
+                        "%d prêt(s) reçu(s) de l'API (poll=%d, total=%s) : %s",
+                        len(data), stats["polls"], body.get("total"),
+                        [(loan.get("loanId"), loan.get("loanOriginator")) for loan in data],
+                    )
                 last_loan_signature = signature
                 last_change_at = time.monotonic()
             elif time.monotonic() - last_change_at >= STUCK_AFTER_SECONDS:
@@ -1018,10 +1031,18 @@ def run() -> None:
 
                 failed_at = recently_failed.get(loan_id)
                 if failed_at is not None and time.monotonic() - failed_at < FAILED_LOAN_COOLDOWN_SECONDS:
+                    if (loan_id, "cooldown") not in logged_skip_reasons:
+                        logged_skip_reasons.add((loan_id, "cooldown"))
+                        log.info(
+                            "Loan %s (originator '%s') en cooldown après un échec récent - ignoré pendant %.0fs.",
+                            loan_id, matched_originator, FAILED_LOAN_COOLDOWN_SECONDS,
+                        )
                     continue
 
                 if available_money < MIN_INVESTMENT_AMOUNT:
-                    log.info("Remaining balance %.2f EUR is below the minimum (%.2f EUR), skipping loan %s.", available_money, MIN_INVESTMENT_AMOUNT, loan_id)
+                    if (loan_id, "balance_too_low") not in logged_skip_reasons:
+                        logged_skip_reasons.add((loan_id, "balance_too_low"))
+                        log.info("Remaining balance %.2f EUR is below the minimum (%.2f EUR), skipping loan %s.", available_money, MIN_INVESTMENT_AMOUNT, loan_id)
                     continue
 
                 try:
@@ -1030,6 +1051,12 @@ def run() -> None:
                     loan_available = 0.0
                 amount = min(available_money, loan_available)
                 if amount < MIN_INVESTMENT_AMOUNT:
+                    if (loan_id, "amount_too_low") not in logged_skip_reasons:
+                        logged_skip_reasons.add((loan_id, "amount_too_low"))
+                        log.info(
+                            "Loan %s (originator '%s') availableToInvest=%.2f -> montant investissable %.2f EUR sous le minimum (%.2f EUR) - ignoré.",
+                            loan_id, matched_originator, loan_available, amount, MIN_INVESTMENT_AMOUNT,
+                        )
                     continue
 
                 log.info("Matching loan found: loanId=%s originator=%s availableToInvest=%.2f -> attempting %.2f EUR.", loan_id, matched_originator, loan_available, amount)
