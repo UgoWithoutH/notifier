@@ -863,10 +863,21 @@ def run() -> None:
 
     newly_available = {}
 
+    # Below the minimum, every segment is unavailable regardless of its own
+    # loan count (see `available` below) - skip the per-segment API call
+    # entirely instead of fetching just to log a predetermined SKIP.
+    # should_notify() is still called (with count=0) so gates that were open
+    # get properly reset now, not silently left stale for next time.
+    skip_loan_fetch = balance is not None and balance < 10
+
     for segment in LOAN_SEGMENTS:
-        loans = fetch_active_loans(segment)
-        count = len(loans)
-        log.info("Segment '%s': %d loan(s) currently available.", segment["label"], count)
+        if skip_loan_fetch:
+            count = 0
+            log.info("Segment '%s': skipping loan availability check (balance < 10 EUR).", segment["label"])
+        else:
+            loans = fetch_active_loans(segment)
+            count = len(loans)
+            log.info("Segment '%s': %d loan(s) currently available.", segment["label"], count)
 
         available = (balance is None or balance >= 10) and count > 0
         send, was_reset = should_notify(gates, segment["key"], available)
