@@ -626,3 +626,55 @@ def send_peerberry_invest_bot_summary_email(stats: dict, error: str | None = Non
         log.info("PeerBerry invest bot summary email sent to %s.", EMAIL_TO)
     except Exception:
         log.exception("Failed to send PeerBerry invest bot summary email.")
+
+
+def send_bienpreter_geo_issues_email(issues: list, error: str | None = None) -> None:
+    """Sent by bienpreter_diversification.py's run() ONLY when the
+    'Répartition géographique' per-borrower breakdown step
+    (fetch_active_loans_by_borrower() + fill_bienpreter_borrower_geo_amounts())
+    hit at least one issue this run - never on a fully clean run, to avoid
+    spamming an email every time.
+
+    `issues` : list of short strings, each describing one non-fatal problem
+    (a project's country couldn't be found/parsed, a borrower has loans in
+    more than one country, a resolved country doesn't match any column
+    header in the Sheet, ...) - collected across both the fetch side and
+    the Sheet-write side.
+    `error`, if set, is a short description of an unexpected exception that
+    stopped the whole borrower/geo breakdown step early (the rest of the
+    Bienprêter run - balances, this month's interest, bonus - is
+    unaffected, this step is a soft-fail by design).
+    """
+    if not all([SMTP_HOST, SMTP_USER, SMTP_PASSWORD, EMAIL_TO]):
+        log.error(
+            "SMTP configuration is incomplete; cannot send email. "
+            "Required env vars: SMTP_HOST, SMTP_USER, SMTP_PASSWORD, EMAIL_TO."
+        )
+        return
+
+    status = "ERREUR" if error else "ATTENTION"
+    subject = f"[Bienprêter] {status} - répartition géographique par emprunteur"
+
+    body_parts = []
+    if error:
+        body_parts.append(f"Une erreur a interrompu la mise à jour de la répartition géographique : {error}")
+        body_parts.append("")
+    if issues:
+        body_parts.append(f"{len(issues)} problème(s) rencontré(s) :")
+        body_parts.extend(f"  - {issue}" for issue in issues)
+    body = "\n".join(body_parts)
+
+    msg = MIMEMultipart()
+    msg["From"] = EMAIL_FROM
+    msg["To"] = EMAIL_TO
+    msg["Subject"] = subject
+    msg.attach(MIMEText(body, "plain"))
+
+    try:
+        with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=15) as server:
+            server.starttls()
+            server.login(SMTP_USER, SMTP_PASSWORD)
+            server.sendmail(EMAIL_FROM, [EMAIL_TO], msg.as_string())
+        log.info("Bienprêter geographic breakdown issues email sent to %s.", EMAIL_TO)
+    except Exception:
+        log.exception("Failed to send Bienprêter geographic breakdown issues email.")

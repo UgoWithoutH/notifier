@@ -669,6 +669,198 @@ def fill_geographic_repartition_amounts(loan_originators: list, platform: str | 
     )
 
 
+def _col_letter(col_idx: int) -> str:
+    """Retourne juste la partie lettre(s) d'une colonne 1-based (ex. 5 -> 'E')."""
+    return re.sub(r"\d+", "", rowcol_to_a1(1, col_idx))
+
+
+def _normalize_borrower_name(name: str) -> str:
+    return " ".join(name.strip().lower().split())
+
+
+def fill_bienpreter_borrower_geo_amounts(borrowers: dict):
+    """
+    borrowers : {nom_emprunteur: {"amount": float, "country": str|None}} -
+    les prêts Bienprêter actuellement en cours (statut "en remboursement"),
+    regroupés/sommés par emprunteur (ex. "EXCAVAN").
+
+    Contrairement à fill_geographic_repartition_amounts() (un seul montant
+    juste à droite du nom), le bloc "Bienprêter" de "Répartition
+    géographique" est une VRAIE matrice pays x emprunteur : une colonne par
+    pays (en-têtes sur la ligne "Répartition géographique" elle-même, à
+    partir de geo_col+2 - la colonne juste à droite du nom, geo_col+1, est
+    une colonne "total" séparée, sans en-tête pays). Pour chaque emprunteur :
+    - Si une ligne du bloc porte déjà ce nom (recherche insensible à la
+      casse), le montant est écrit dans la colonne du pays correspondant
+      SUR CETTE ligne (ne touche aucune autre colonne pays de la ligne).
+    - Sinon, une nouvelle ligne est INSÉRÉE juste avant la ligne de la
+      plateforme suivante (donc juste après le dernier emprunteur du bloc
+      Bienprêter), avec le nom + le montant dans la bonne colonne pays -
+      son nom est explicitement formaté (aligné à droite, police taille 9,
+      non gras) pour matcher le style des autres lignes emprunteur, car une
+      ligne insérée hérite par défaut du style de la ligne d'en-tête de
+      plateforme suivante (gras, aligné à gauche), pas de ses voisines.
+    - Toute ligne du bloc dont le nom n'apparaît PLUS dans `borrowers` (prêt
+      soldé/plus aucun prêt en cours pour cet emprunteur) est SUPPRIMÉE.
+
+    Par ailleurs, la colonne "total" (geo_col+1, juste à droite du nom) de
+    TOUTES les lignes du bloc restantes (pas seulement celles mises à jour
+    ce run) est réécrite comme une formule vivante
+    "=SOMME(<1re colonne pays><ligne>:<ligne>)" (ex. "=SOMME(E395:395)") -
+    cette colonne ne contenait auparavant qu'un "0,00 €" statique qui ne
+    reflétait jamais les montants par pays déjà présents sur la ligne.
+
+    IMPORTANT : la ligne "Bienprêter" elle-même (son propre total en
+    geo_col+1) n'est JAMAIS touchée ici - explicitement exclue à la
+    demande de l'utilisateur (ce solde est maintenu manuellement).
+
+    Retourne une liste de courtes descriptions de problèmes rencontrés
+    (pays introuvable comme en-tête de colonne, pays inconnu pour un
+    emprunteur) - liste vide si tout s'est bien passé. Utilisée par
+    bienpreter_diversification.py pour décider d'envoyer un email
+    d'alerte (ne lève jamais d'exception pour ces cas-là, seulement pour
+    une vraie erreur bloquante, ex. section/plateforme introuvable).
+    """
+    logger.info(
+        "Début mise à jour Répartition géographique / Bienprêter (%d emprunteur(s))",
+        len(borrowers),
+    )
+
+    issues = []
+
+    worksheet = get_latest_dashboard_worksheet(SPREADSHEET_ID)
+    grid = _call_with_retry(worksheet.get_all_values)
+
+    geo_pos = find_cell_by_value(grid, "Répartition géographique")
+    if not geo_pos:
+        raise RuntimeError("La section 'Répartition géographique' n'a pas été trouvée.")
+    geo_row, geo_col = geo_pos
+
+    bienpreter_row = find_first_cell_containing_below(grid, geo_row, geo_col, "Bienprêter")
+    if not bienpreter_row:
+        raise RuntimeError("La cellule 'Bienprêter' n'a pas été trouvée sous 'Répartition géographique'.")
+
+    end_row = _find_geo_block_end_row(grid, geo_row, geo_col, bienpreter_row, "Bienprêter")
+
+    header_row = grid[geo_row - 1]
+    country_columns = {
+        header_row[col_idx - 1].strip().lower(): col_idx
+        for col_idx in range(geo_col + 1, len(header_row) + 1)
+        if header_row[col_idx - 1].strip()
+    }
+    if not country_columns:
+        raise RuntimeError("Aucune colonne pays trouvée à droite de 'Répartition géographique'.")
+
+    target_col = geo_col + 1
+    first_country_col = min(country_columns.values())
+    first_country_letter = _col_letter(first_country_col)
+
+    active_names = {_normalize_borrower_name(name) for name in borrowers}
+
+    # Toutes les lignes du bloc (SANS dédoublonner par nom, contrairement à
+    # `existing_rows` ci-dessous) - sert à décider quelles lignes supprimer :
+    # une ligne dont le nom n'est plus dans `borrowers` est supprimée, même
+    # si un doublon du même nom existe ailleurs dans le bloc.
+    rows_to_delete = []
+    existing_rows = {}
+    for row_idx in range(bienpreter_row + 1, end_row):
+        row = grid[row_idx - 1]
+        name = row[geo_col - 1].strip() if geo_col - 1 < len(row) else ""
+        if not name:
+            continue
+        normalized = _normalize_borrower_name(name)
+        existing_rows.setdefault(normalized, row_idx)
+        if normalized not in active_names:
+            rows_to_delete.append(row_idx)
+
+    updates = []
+
+    # Réécrit la formule SOMME sur les lignes du bloc qui restent (pas
+    # celles sur le point d'être supprimées).
+    for row_idx in range(bienpreter_row + 1, end_row):
+        if row_idx in rows_to_delete:
+            continue
+        formula = f"=SOMME({first_country_letter}{row_idx}:{row_idx})"
+        updates.append({"range": rowcol_to_a1(row_idx, target_col), "values": [[formula]]})
+
+    pending_new_borrowers = []
+    name_cells_to_restyle = []
+
+    for name, data in borrowers.items():
+        amount = data.get("amount", 0)
+        country = (data.get("country") or "").strip()
+        country_col = country_columns.get(country.lower()) if country else None
+        if country and country_col is None:
+            message = f"Pays '{country}' (emprunteur '{name}') introuvable comme en-tête de colonne - montant non écrit."
+            logger.warning(message)
+            issues.append(message)
+        elif not country:
+            message = f"Emprunteur '{name}' : pays inconnu - montant non écrit (ligne quand même créée/mise à jour)."
+            logger.warning(message)
+            issues.append(message)
+
+        row_idx = existing_rows.get(_normalize_borrower_name(name))
+        if row_idx is not None:
+            name_cells_to_restyle.append(rowcol_to_a1(row_idx, geo_col))
+            if country_col is not None:
+                updates.append({"range": rowcol_to_a1(row_idx, country_col), "values": [[amount]]})
+                logger.info("Préparation écriture : %s (ligne %s) / %s = %s", name, row_idx, country, amount)
+        else:
+            pending_new_borrowers.append((name, country_col, amount))
+
+    if updates:
+        _call_with_retry(worksheet.batch_update, updates, value_input_option="USER_ENTERED")
+
+    # Style des lignes emprunteur (confirmé en direct le 2026-07-31 sur des
+    # lignes déjà correctes, ex. 374/392) : nom aligné à droite, police
+    # taille 9, non gras - réappliqué explicitement à CHAQUE emprunteur
+    # touché ce run (existant ou nouveau), pas seulement les nouvelles
+    # lignes : une ligne INSÉRÉE via insert_rows() hérite par défaut du
+    # style de la ligne d'en-tête de plateforme suivante (gras, aligné à
+    # gauche), pas de ses voisines emprunteur - un ancien run l'a déjà vécu
+    # (ligne 'SAMAG'), d'où le fait de corriger aussi les lignes existantes.
+    borrower_name_format = {
+        "horizontalAlignment": "RIGHT",
+        "textFormat": {"fontSize": 9, "bold": False},
+    }
+
+    insert_row = end_row
+    for name, country_col, amount in pending_new_borrowers:
+        row_length = max(geo_col, target_col, country_col or 0)
+        row_values = [""] * row_length
+        row_values[geo_col - 1] = name
+        row_values[target_col - 1] = f"=SOMME({first_country_letter}{insert_row}:{insert_row})"
+        if country_col is not None:
+            row_values[country_col - 1] = amount
+
+        logger.info(
+            "Insertion d'une nouvelle ligne emprunteur '%s' à la ligne %s (pays=%s, montant=%s)",
+            name, insert_row, country_col, amount,
+        )
+        _call_with_retry(worksheet.insert_rows, [row_values], insert_row, value_input_option="USER_ENTERED")
+        name_cells_to_restyle.append(rowcol_to_a1(insert_row, geo_col))
+        insert_row += 1
+
+    if name_cells_to_restyle:
+        _call_with_retry(worksheet.format, name_cells_to_restyle, borrower_name_format)
+
+    # Suppression des lignes emprunteur devenues obsolètes - de la plus
+    # basse à la plus haute pour ne jamais invalider l'index d'une ligne
+    # encore à supprimer (supprimer une ligne ne décale que celles EN
+    # DESSOUS, jamais celles au-dessus).
+    for row_idx in sorted(rows_to_delete, reverse=True):
+        logger.info("Suppression de la ligne emprunteur obsolète %s (plus de prêt en cours).", row_idx)
+        _call_with_retry(worksheet.delete_rows, row_idx, row_idx)
+
+    logger.info(
+        "Mise à jour Répartition géographique / Bienprêter terminée (%d ligne(s) existante(s) mise(s) à "
+        "jour, %d nouvelle(s) ligne(s) ajoutée(s), %d ligne(s) supprimée(s)).",
+        len(existing_rows), len(pending_new_borrowers), len(rows_to_delete),
+    )
+
+    return issues
+
+
 def _find_x_flag_left_of(row, name_col: int, max_lookback: int = 3) -> bool:
     """Retourne True si l'une des cellules jusqu'à `max_lookback` colonnes à
     gauche de la colonne (1-based) `name_col` vaut exactement "x"
