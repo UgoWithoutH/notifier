@@ -310,7 +310,14 @@ def send_lendermarket_invest_summary_email(stats: dict, error: str | None = None
     a selected lender with no loan available this run), `invest_attempts`,
     `invest_successes`, `invest_failures`, `total_invested`, `lender_stats`
     (per-lender dict with `budget`, `loans_seen`, `attempts`, `successes`,
-    `failures`, `invested_amount`, `invested_loans`).
+    `failures`, `invested_amount`, `invested_loans`), `country_blocked`
+    (added 2026-07-31: list of lender names excluded this run because their
+    country already hit the Google-Sheet-configured per-country cap - see
+    get_lendermarket_country_allocations()), `min_interest_rate` (the rate
+    actually used this run) and `country_status` (per-country invested
+    amount vs. the EUR cap, added 2026-07-31 so the email shows exactly
+    where each relevant country stands, not just which lenders got
+    blocked).
     `error`, if set, is a short description of an unexpected exception that
     interrupted the invest step early. Same convention as
     peerberry_invest_bot.py's summary email: the body never includes raw
@@ -345,6 +352,27 @@ def send_lendermarket_invest_summary_email(stats: dict, error: str | None = None
         f"Montant total investi : {stats.get('total_invested', 0.0):.2f} €",
     ]
 
+    min_interest_rate = stats.get("min_interest_rate")
+    if min_interest_rate is not None:
+        body_parts.append(f"Taux d'intérêt minimum utilisé : {min_interest_rate}%")
+
+    threshold_percentage = stats.get("country_threshold_percentage")
+    country_status = stats.get("country_status") or {}
+    if country_status:
+        body_parts.append("")
+        if threshold_percentage is not None:
+            body_parts.append(f"=== Seuil par pays ({threshold_percentage}% du budget total) ===")
+        else:
+            body_parts.append("=== Seuil par pays (aucun seuil configuré) ===")
+        for country, s in sorted(country_status.items()):
+            threshold_amount = s.get("threshold_amount")
+            line = f"- {country} : investi {s.get('invested', 0.0):.2f} €"
+            if threshold_amount is not None:
+                line += f" / plafond {threshold_amount:.2f} €"
+            if s.get("blocked"):
+                line += " (BLOQUÉ)"
+            body_parts.append(line)
+
     lender_stats = stats.get("lender_stats") or {}
     if lender_stats:
         body_parts.append("")
@@ -367,6 +395,14 @@ def send_lendermarket_invest_summary_email(stats: dict, error: str | None = None
                 body_parts.append(f"    Prêts investis : {details}")
             else:
                 body_parts.append("    Prêts investis : aucun")
+
+    country_blocked = stats.get("country_blocked") or []
+    if country_blocked:
+        body_parts.append("")
+        body_parts.append(
+            "Lenders bloqués ce run (seuil d'investissement par pays atteint) : "
+            + ", ".join(country_blocked)
+        )
 
     if stats.get("invest_failures", 0) > 0 or error:
         body_parts.append("")
