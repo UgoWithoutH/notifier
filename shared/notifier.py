@@ -482,7 +482,11 @@ def send_peerberry_invest_bot_summary_email(stats: dict, error: str | None = Non
     (initial per-originator budget), `final_originator_budgets`,
     `originator_stats` (per-originator dict with `loans_seen`, `attempts`,
     `successes`, `failures`, `invested_amount`, `invested_loans`),
-    `redistributions` (stuck-budget reallocations that happened mid-run).
+    `redistributions` (stuck-budget reallocations that happened mid-run),
+    `raw_originators_seen` (every distinct raw `loanOriginator` value
+    PeerBerry returned this run, matched or not - lets a mismatch between
+    the Sheet selection and PeerBerry's real values be spotted directly
+    from the email).
     `error`, if set, is a short description of a fatal error that stopped
     the run early. The email body itself never includes any diagnostic
     request/response detail - `diagnostics_text`, if provided (this run's
@@ -514,6 +518,12 @@ def send_peerberry_invest_bot_summary_email(stats: dict, error: str | None = Non
         f"Situations bloquées détectées : {stats.get('stuck_events', 0)}",
         f"Erreurs rencontrées : {stats.get('errors', 0)}",
     ]
+
+    raw_originators_seen = stats.get("raw_originators_seen") or []
+    if raw_originators_seen:
+        body_parts.append("")
+        body_parts.append("Loan originators bruts vus (renvoyés par l'API, matchés ou non) :")
+        body_parts.append("  " + ", ".join(raw_originators_seen))
 
     redistributions = stats.get("redistributions") or []
     if redistributions:
