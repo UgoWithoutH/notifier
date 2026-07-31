@@ -51,7 +51,11 @@ jobs:
         id: playwright-cache
         with:
           path: ~/.cache/ms-playwright
-          key: ${{ runner.os }}-playwright-${{ hashFiles('requirements.txt') }}
+          # "-v2" bump (2026-07-31): the previous cache was populated before
+          # Playwright started shipping chrome-headless-shell as a separate
+          # download, so headless launches failed with "Executable doesn't
+          # exist" despite a cache hit. Bumping invalidates that stale entry.
+          key: ${{ runner.os }}-playwright-v2-${{ hashFiles('requirements.txt') }}
 
       - name: Install Playwright Chromium (cache miss only)
         if: steps.playwright-cache.outputs.cache-hit != 'true'
@@ -59,7 +63,14 @@ jobs:
 
       - name: Install Playwright OS dependencies (cache hit)
         if: steps.playwright-cache.outputs.cache-hit == 'true'
-        run: playwright install-deps chromium
+        # Also re-run `playwright install` (not just install-deps): a cache
+        # populated before Playwright started shipping the separate
+        # chrome-headless-shell binary would otherwise never get it, since
+        # the cache key (hash of requirements.txt) doesn't change - this is
+        # a no-op download-wise if the binary is already present.
+        run: |
+          playwright install chromium
+          playwright install-deps chromium
 
       - name: Restore persisted state (session cookies + seen loan IDs + cron schedule)
         uses: actions/cache/restore@v4
