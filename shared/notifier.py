@@ -478,20 +478,29 @@ def send_peerberry_invest_bot_summary_email(stats: dict, error: str | None = Non
     `stats` is the dict built by peerberry_invest_bot.run(): `polls`,
     `loans_seen` (count), `invest_attempts`, `invest_successes`,
     `invest_failures`, `total_invested_attempted`, `stuck_events`, `errors`,
-    `final_available_money`, `selected_originators`, `originator_budgets`
-    (initial per-originator budget), `final_originator_budgets`,
+    `final_available_money`, `selected_originators`,
     `originator_stats` (per-originator dict with `loans_seen`, `attempts`,
-    `successes`, `failures`, `invested_amount`, `invested_loans`),
-    `redistributions` (stuck-budget reallocations that happened mid-run),
-    `external_adjustments` (per-originator budget reductions caused by an
-    investment made by something OTHER than this bot - e.g. PeerBerry's own
-    "Auto-Invest EASY" scheme, or a real human, active on the same account -
-    detected via a periodic invested-per-originator check, see
-    peerberry_invest_bot.py's EXTERNAL_INVESTMENT_CHECK_INTERVAL_SECONDS),
+    `successes`, `failures`, `invested_amount`, `invested_loans` - there is
+    no per-originator budget anymore, investments simply draw from the
+    shared `final_available_money`),
     `raw_originators_seen` (every distinct raw `loanOriginator` value
     PeerBerry returned this run, matched or not - lets a mismatch between
     the Sheet selection and PeerBerry's real values be spotted directly
-    from the email).
+    from the email), `initial_available_money` (balance seen at startup,
+    before any investment this run), `total_invested_all_originators`/
+    `total_peerberry_budget` (everything invested across EVERY loan
+    originator on the account, live from the API, plus the available
+    balance - the base the per-country threshold percentage is applied
+    to), `country_threshold_percentage`/`country_threshold_amount`
+    (per-country investment cap read from the Sheet at startup, see
+    shared.google_sheet.get_peerberry_country_allocations()),
+    `country_invested_initial`/`country_invested_final`/`blocked_countries`
+    (countries that reached that cap during the run - see
+    peerberry_invest_bot.py's `_update_blocked_countries()`), and
+    `country_details` (one dict per country - `country`, `initial_amount`,
+    `final_amount`, `pct_of_budget`, `blocked` - the full per-country debug
+    breakdown shown in the email below, to spot a wrong-looking block/
+    non-block directly without digging through logs/diagnostics).
     `error`, if set, is a short description of a fatal error that stopped
     the run early. The email body itself never includes any diagnostic
     request/response detail - `diagnostics_text`, if provided (this run's
@@ -530,36 +539,46 @@ def send_peerberry_invest_bot_summary_email(stats: dict, error: str | None = Non
         body_parts.append("Loan originators bruts vus (renvoyés par l'API, matchés ou non) :")
         body_parts.append("  " + ", ".join(raw_originators_seen))
 
-    redistributions = stats.get("redistributions") or []
-    if redistributions:
+    country_threshold_percentage = stats.get("country_threshold_percentage")
+    if country_threshold_percentage is not None:
+        total_peerberry_budget = stats.get("total_peerberry_budget", 0.0)
         body_parts.append("")
-        body_parts.append(f"Reliquats redistribués en cours de run ({len(redistributions)}) :")
-        for r in redistributions:
-            body_parts.append(f"  - {r['amount']:.2f} € : '{r['from']}' -> '{r['to']}'")
+        body_parts.append(
+            f"Seuil par pays : {country_threshold_percentage:.2f}% du budget total "
+            f"({stats.get('total_invested_all_originators', 0.0):.2f} € investis + "
+            f"{stats.get('initial_available_money', 0.0):.2f} € disponible = "
+            f"{total_peerberry_budget:.2f} €) = {stats.get('country_threshold_amount', 0.0):.2f} € max par pays"
+        )
 
-    external_adjustments = stats.get("external_adjustments") or []
-    if external_adjustments:
+        country_details = stats.get("country_details") or []
+        if country_details:
+            body_parts.append("")
+            body_parts.append("Détail par pays (lu depuis le Sheet au démarrage, puis suivi en direct) :")
+            for d in country_details:
+                flag = "BLOQUÉ" if d["blocked"] else "ok"
+                body_parts.append(
+                    f"  - {d['country']:<20s} initial : {d['initial_amount']:>10.2f} € | "
+                    f"final : {d['final_amount']:>10.2f} € | "
+                    f"{d['pct_of_budget']:>6.2f}% du budget "
+                    f"(seuil {country_threshold_percentage:.2f}%) -> {flag}"
+                )
+
+        blocked_countries = stats.get("blocked_countries") or []
         body_parts.append("")
-        body_parts.append(f"Investissements externes détectés (hors ce bot, {len(external_adjustments)}) :")
-        for a in external_adjustments:
-            body_parts.append(
-                f"  - {a['originator']} : {a['external_amount']:.2f} € investis ailleurs "
-                f"(budget {a['budget_before']:.2f} € -> {a['budget_after']:.2f} €)"
-            )
+        if blocked_countries:
+            body_parts.append(f"Pays bloqués ce run ({len(blocked_countries)}) : {', '.join(blocked_countries)}")
+        else:
+            body_parts.append("Aucun pays bloqué ce run.")
 
     originator_stats = stats.get("originator_stats") or {}
     if originator_stats:
-        initial_budgets = stats.get("originator_budgets") or {}
-        final_budgets = stats.get("final_originator_budgets") or {}
         body_parts.append("")
         body_parts.append("=== Détail par loan originator ===")
         for name, s in originator_stats.items():
             body_parts.append("")
             body_parts.append(f"- {name}")
             body_parts.append(
-                f"    Budget initial : {initial_budgets.get(name, 0.0):.2f} € | "
-                f"restant : {final_budgets.get(name, 0.0):.2f} € | "
-                f"investi : {s.get('invested_amount', 0.0):.2f} €"
+                f"    Investi : {s.get('invested_amount', 0.0):.2f} €"
             )
             body_parts.append(
                 f"    Prêts disponibles vus : {s.get('loans_seen', 0)} | "
