@@ -41,20 +41,16 @@ via one-off, read-only/network-intercepted Playwright explorations on
     loans-listing URL below (NOT the same as `accountId`, also present in
     that response).
   - `GET /v1/{publicId}/loans` with `hideInvested`/`groupGuarantee`/
-    `minInterestRate`/`maxRemainingTerm`/`minRemainingTerm`/
-    `loanOriginators[]` filters (see `build_loans_params()`) ->
-    `{"data": [...], "total": N, ...}`. Only the field names are known
-    (from the response's own `sort` mapping): `loanId`, `countryId`,
-    `loanOriginator`, `issuedDate`, `termTypeTitle`/`termType`,
-    `interestRate`, `term`, `availableToInvest`.
-    The `loanOriginators[]` server-side filter (the `LOAN_ORIGINATORS` id
-    list) was briefly removed on 2026-07-28 over a disconnection-from-the-
-    Sheet concern, then explicitly RESTORED 2026-07-29 at the user's
-    request after they gave the exact filtered URL straight from their own
-    logged-in PeerBerry session and it was verified (via the workspace's
-    browser tools, real network capture against the live API) to match
-    reality - see `build_loans_params()`'s own docstring for the full
-    story and the accepted trade-off.
+    `minInterestRate`/`maxRemainingTerm`/`minRemainingTerm` filters (see
+    `build_loans_params()`) -> `{"data": [...], "total": N, ...}`. Only the
+    field names are known (from the response's own `sort` mapping):
+    `loanId`, `countryId`, `loanOriginator`, `issuedDate`,
+    `termTypeTitle`/`termType`, `interestRate`, `term`, `availableToInvest`.
+    NO server-side `loanOriginators[]` id filter is sent anymore (removed
+    for good 2026-07-31, after being removed 2026-07-28, restored
+    2026-07-29, then proven to break again - see `build_loans_params()`'s
+    own docstring for the full story) - originator selection happens
+    100% client-side by name.
   - `GET /v1/investor/overview` -> `availableMoney` (same as
     peerberry_monitor.fetch_available_money()) - re-fetched periodically to
     track remaining funds across investment attempts within a single run.
@@ -67,16 +63,9 @@ via one-off, read-only/network-intercepted Playwright explorations on
     `/v1/investor/loans/{loanId}/invest` shape.
 
 Which originator actually gets INVESTED IN (and how much budget it gets)
-is still driven 100% by the Google Sheet, NOT by `LOAN_ORIGINATORS` - the
-id list only narrows down what PeerBerry's API itself returns (fewer,
-more relevant loans per poll), it does not decide investment targets.
-`LOAN_ORIGINATORS` is meant to be a superset of every originator the user
-might ever select in the Sheet (confirmed 2026-07-29 straight from the
-user's own real, logged-in `/invest` filter panel) - if the Sheet ever
-selects an originator whose id isn't in this list, its loans would never
-be returned by the server at all (the exact 2026-07-28 failure mode) - so
-`LOAN_ORIGINATORS` MUST be kept in sync with the site's own filter panel
-whenever the user changes it there.
+is driven 100% by the Google Sheet - there is no server-side id filter
+anymore, so a newly-selected Sheet originator is always visible to the bot
+(subject only to pagination, see the `total > pageSize` log warning).
 shared.google_sheet.get_selected_peerberry_loan_originators() finds the
 "Répartition géographique" cell, then the "Peerberry" cell below it (same
 column) - every row between "Peerberry" and the next "Swaper" cell (both
@@ -199,12 +188,11 @@ log = logging.getLogger("peerberry_invest_bot")
 PROFILE_API_URL = f"{API_BASE}/v2/investor/profile"
 OVERVIEW_API_URL = f"{API_BASE}/v1/investor/overview"
 
-# Same 40 loan-originator IDs as the user's real, logged-in `/invest` filter
-# panel (confirmed 2026-07-29 via the workspace's browser tools against the
-# live API - see module/build_loans_params() docstrings). Must be kept in
-# sync with that filter panel whenever the user changes it there, or newly
-# selected Sheet originators outside this list will never be returned by
-# the server at all.
+# UNUSED as of 2026-07-31 - see build_loans_params()'s docstring for why
+# the server-side loanOriginators[] id filter was removed for good (twice
+# now proven to silently exclude all loans for a real, currently-selected
+# Sheet originator, causing 0 loans_seen for 75+ minutes despite normal
+# market activity). Kept only for historical reference.
 LOAN_ORIGINATORS = [
     4, 12, 23, 30, 33, 36, 39, 41, 43, 45, 47, 48, 49, 50, 51, 52, 53, 54,
     55, 56, 57, 58, 59, 62, 63, 64, 65, 66, 67, 68, 69, 70, 71, 72, 73, 74,
@@ -345,27 +333,36 @@ def _collect_run_diagnostics(since: datetime) -> str | None:
 
 
 def build_loans_params() -> dict:
-    """Send the exact same filters as the user's real, logged-in PeerBerry
-    `/invest` filter panel, INCLUDING `loanOriginators[]` (the
-    `LOAN_ORIGINATORS` id list).
+    """Send only the generic, sheet-independent filters - NO
+    `loanOriginators[]` server-side id filter anymore. Which originators
+    actually count is decided 100% client-side, by NAME, against the
+    Google-Sheet-driven selection (`selected_originators`, matched via
+    `_match_selected_originator()`).
 
     History: an earlier version had a hardcoded 39-ID `loanOriginators[]`
-    list (from the user's original 2026-07-22 reference URL) that was
-    completely disconnected from the Google-Sheet-driven originator
-    SELECTION (`selected_originators`, matched by NAME client-side in
-    `_match_selected_originator()`) - a real run then showed 0 loans_seen
-    across ~90 minutes while the user was manually seeing/investing on the
-    site at the same time, so the id-based filter was removed 2026-07-28 to
-    stop that silent structural exclusion. It was then explicitly RESTORED
-    2026-07-29 at the user's request, after they supplied the exact
-    filtered URL straight from their own live `/invest` filter panel and it
-    was verified (via the workspace's browser tools, a real network capture
-    against the live, authenticated API) to return real loans matching
-    every one of these filters. Accepted trade-off: `LOAN_ORIGINATORS` must
-    be kept in sync with that filter panel by hand going forward - if the
-    Sheet ever selects an originator whose id isn't in this list, the
-    server will never return that originator's loans at all (the exact
-    2026-07-28 failure mode), regardless of real market activity.
+    list that was completely disconnected from the Sheet-driven originator
+    SELECTION - a real run then showed 0 loans_seen across ~90 minutes
+    while the user was manually seeing/investing on the site at the same
+    time, so the id-based filter was removed 2026-07-28 to stop that silent
+    structural exclusion. It was RESTORED 2026-07-29 (a fresh 40-id list,
+    claimed to be verified against the user's own live filter panel).
+
+    REMOVED AGAIN 2026-07-31: a real run (22413 polls, ~75 minutes, right
+    after the 2026-07-30 `hideInvested` fix) again showed `total=0` on
+    EVERY single poll for all 33 currently-selected Sheet originators (0
+    errors, request durations normal ~0.12-0.2s) - the exact same symptom
+    as the 2026-07-28 bug, strongly indicating the 2026-07-29 40-id list
+    does not actually cover all 33 names currently selected in the Sheet.
+    Since there is no reliable way to keep a hardcoded id list in sync with
+    an ever-changing Sheet selection, the server-side id filter is REMOVED
+    for good this time - only sheet-independent constraints
+    (`groupGuarantee`/`minInterestRate`/`maxRemainingTerm`/`minRemainingTerm`/
+    `sort`/`pageSize`) are sent, and `_match_selected_originator()` alone
+    decides which loans matter. The `LOAN_ORIGINATORS` constant is now
+    unused dead code, kept only for historical reference - do not re-add a
+    `loanOriginators[]` param to this function without a real, freshly
+    re-verified id list AND a plan to keep it in sync, given this has now
+    silently broken the bot twice.
 
     UPDATED 2026-07-30: `hideInvested` REMOVED entirely (was `"true"`), per
     the user's fresh reference URL - a run with `hideInvested=true` still
@@ -378,7 +375,7 @@ def build_loans_params() -> dict:
     just left of "Peerberry" - see get_peerberry_min_interest_rate()),
     instead of a hardcoded 8.5, so the user can change it from the Sheet
     without a code edit."""
-    params = {
+    return {
         "sort": "-loanId",
         "groupGuarantee": "true",
         "minInterestRate": MIN_INTEREST_RATE,
@@ -387,9 +384,6 @@ def build_loans_params() -> dict:
         "offset": 0,
         "pageSize": 40,
     }
-    for i, originator_id in enumerate(LOAN_ORIGINATORS):
-        params[f"loanOriginators[{i}]"] = originator_id
-    return params
 
 
 def fetch_public_id(session: requests.Session) -> str:
@@ -635,6 +629,11 @@ def run() -> None:
         "total_invested_attempted": 0.0,
         "stuck_events": 0,
         "errors": 0,
+        # Every distinct raw `loanOriginator` value returned by PeerBerry
+        # this run, matched or not - lets a future "why didn't originator X
+        # match" question be answered directly from the summary email
+        # instead of digging through DIAGNOSTICS_FILE's loans_found entries.
+        "raw_originators_seen": set(),
     }
 
     session = requests.Session()
@@ -736,11 +735,10 @@ def run() -> None:
         public_id, available_money, selected_originators, remaining_budget,
     )
     # Logged once (not per-poll) so it's easy to confirm exactly what's being
-    # sent to PeerBerry, including the LOAN_ORIGINATORS id filter (see
-    # build_loans_params()'s docstring for why/when it was restored) - every
-    # loan in the (now server-side pre-filtered) response is then matched
-    # against `selected_originators` above, by name, client-side, to decide
-    # actual investment targets/budgets.
+    # sent to PeerBerry - NO loanOriginators[] id filter anymore (see
+    # build_loans_params()'s docstring) - every loan in the response is
+    # matched against `selected_originators` above, by name, client-side, to
+    # decide actual investment targets/budgets.
     log.info("Loans listing query params: %s", build_loans_params())
     if len(funded_originators) < len(selected_originators):
         log.warning(
@@ -754,6 +752,9 @@ def run() -> None:
     run_error = None
     # loan_id -> monotonic() timestamp of its last failed investment attempt.
     recently_failed: dict = {}
+    # Raw loanOriginator values already console-logged as "unmatched" this
+    # run, so the same value isn't logged on every single poll.
+    logged_unmatched_originators: set = set()
 
     try:
         while time.monotonic() - start < DURATION_SECONDS:
@@ -815,13 +816,13 @@ def run() -> None:
 
             if signature != last_loan_signature:
                 # Only logged when the signature actually changes (not every
-                # poll) to avoid spamming the console. `total` can still
-                # legitimately exceed `pageSize` (40) even with the
-                # LOAN_ORIGINATORS server-side filter restored - meaning
-                # loans further down the list (older loanIds) than the 40
-                # newest returned here are invisible to this poll. Flagged
-                # here so a future "why didn't it see loan X" question can
-                # start from "was pagination the reason" instead of guessing.
+                # poll) to avoid spamming the console. `total` can now be
+                # much larger since there's no server-side loanOriginators[]
+                # filter narrowing it down anymore - meaning loans further
+                # down the list (older loanIds) than the 40 newest returned
+                # here are invisible to this poll. Flagged here so a future
+                # "why didn't it see loan X" question can start from "was
+                # pagination the reason" instead of guessing.
                 total_now = body.get("total") or 0
                 if isinstance(total_now, (int, float)) and total_now > 40:
                     log.info("Loan listing total=%s exceeds pageSize=40 - only the 40 newest loanIds are visible this poll.", total_now)
@@ -862,9 +863,14 @@ def run() -> None:
                 loan = loans_to_try.pop(0)
                 loan_id = loan.get("loanId")
                 stats["loans_seen"].add(loan_id)
+                raw_originator = loan.get("loanOriginator")
+                stats["raw_originators_seen"].add(raw_originator)
 
-                matched_originator = _match_selected_originator(loan.get("loanOriginator"), selected_originators)
+                matched_originator = _match_selected_originator(raw_originator, selected_originators)
                 if matched_originator is None:
+                    if raw_originator not in logged_unmatched_originators:
+                        logged_unmatched_originators.add(raw_originator)
+                        log.info("Loan originator '%s' (loanId=%s) does not match any selected Sheet originator - skipping.", raw_originator, loan_id)
                     continue
 
                 originator_stats[matched_originator]["loans_seen"].add(loan_id)
@@ -984,6 +990,7 @@ def run() -> None:
         log.exception("Unhandled error during the poll loop.")
 
     stats["loans_seen"] = len(stats["loans_seen"])
+    stats["raw_originators_seen"] = sorted(str(v) for v in stats["raw_originators_seen"])
     stats["final_available_money"] = available_money
     stats["final_originator_budgets"] = dict(remaining_budget)
     stats["redistributions"] = redistributions
