@@ -1430,6 +1430,179 @@ def get_selected_swaper_loan_originators() -> list:
     logger.info("Loan originators Swaper sélectionnés : %s", selected)
     return selected
 
+
+def get_swaper_min_interest_rate() -> float:
+    """
+    Cherche la cellule "Répartition géographique", puis la ligne "Swaper"
+    en dessous (même colonne), et lit la valeur numérique (format
+    français, virgule décimale, ex. "8,5") dans la cellule juste à gauche
+    du nom "Swaper" sur CETTE ligne - même logique exacte que
+    get_peerberry_min_interest_rate()/get_lendermarket_min_interest_rate().
+    Ajoutée le 2026-07-31 pour piloter un taux d'intérêt minimum côté
+    monitors/swaper_monitor.py (filtrage client-side sur
+    `interestRatePerYear`, l'API `/rest/public/loans` n'exposant pas de
+    paramètre de filtre par taux connu/vérifié, contrairement au
+    "groups").
+    """
+    logger.info("Lecture du minInterestRate Swaper depuis la cellule à gauche de 'Swaper'")
+
+    worksheet = get_latest_dashboard_worksheet(SPREADSHEET_ID)
+
+    grid = _call_with_retry(worksheet.get_all_values)
+
+    geo_pos = find_cell_by_value(grid, "Répartition géographique")
+    if not geo_pos:
+        raise RuntimeError(
+            "La section 'Répartition géographique' n'a pas été trouvée."
+        )
+
+    geo_row, geo_col = geo_pos
+
+    if geo_col < 2:
+        raise RuntimeError(
+            "Impossible de lire la colonne à gauche de 'Swaper' : "
+            "'Répartition géographique' est dans la première colonne."
+        )
+
+    swaper_row = find_first_cell_containing_below(grid, geo_row, geo_col, "Swaper")
+    if not swaper_row:
+        raise RuntimeError(
+            "La cellule 'Swaper' n'a pas été trouvée sous 'Répartition géographique'."
+        )
+
+    row = grid[swaper_row - 1]
+    raw = row[geo_col - 2].strip() if geo_col - 2 < len(row) else ""
+    if not raw:
+        raise RuntimeError(
+            "La cellule à gauche de 'Swaper' est vide - impossible d'en tirer un minInterestRate."
+        )
+
+    value = float(raw.replace("\u202f", "").replace(" ", "").replace(",", "."))
+    logger.info("minInterestRate Swaper lu dans la feuille : %s", value)
+    return value
+
+
+def get_swaper_country_allocations() -> dict:
+    """
+    Cherche la cellule "Répartition géographique" (sa ligne contient les
+    noms de pays en en-tête de colonne), puis la ligne "Swaper" en
+    dessous (même colonne que get_selected_swaper_loan_originators()/
+    get_swaper_min_interest_rate()). Même logique exacte que
+    get_peerberry_country_allocations()/get_lendermarket_country_allocations(),
+    adaptée au bloc Swaper (borné par "Swaper"/"Crowdlending savings" au
+    lieu de "Peerberry"/"Swaper" ou "Lendermarket"/"Loanch"). Ajoutée le
+    2026-07-31 pour le plafond d'investissement par pays de
+    monitors/swaper_monitor.py.
+
+    Retourne un dict avec :
+    - `threshold_percentage` : la valeur numérique (format français) lue
+      dans la cellule 2 colonnes à gauche de "Swaper" SUR SA PROPRE ligne
+      (une colonne de plus à gauche que le minInterestRate) - un
+      pourcentage du budget total Swaper (investi + disponible) à ne
+      jamais dépasser, par pays. None si la cellule est vide (pas de
+      seuil configuré - le blocage par pays doit alors être désactivé
+      côté appelant).
+    - `country_amounts` : {nom_pays: montant déjà investi} lu directement
+      sur la ligne "Swaper" elle-même, une valeur par colonne pays.
+    - `originator_countries` : {nom_loan_originator: nom_pays} déduit,
+      pour chaque ligne de loan originator du bloc Swaper (entre "Swaper"
+      et "Crowdlending savings" exclus), de la SEULE colonne pays non
+      vide sur sa propre ligne.
+    """
+    logger.info("Lecture des allocations par pays Swaper depuis la feuille")
+
+    worksheet = get_latest_dashboard_worksheet(SPREADSHEET_ID)
+
+    grid = _call_with_retry(worksheet.get_all_values)
+
+    geo_pos = find_cell_by_value(grid, "Répartition géographique")
+    if not geo_pos:
+        raise RuntimeError(
+            "La section 'Répartition géographique' n'a pas été trouvée."
+        )
+
+    geo_row, geo_col = geo_pos
+
+    if geo_col < 3:
+        raise RuntimeError(
+            "Impossible de lire le seuil par pays Swaper : "
+            "'Répartition géographique' doit avoir au moins 2 colonnes à sa gauche."
+        )
+
+    swaper_row = find_first_cell_containing_below(grid, geo_row, geo_col, "Swaper")
+    if not swaper_row:
+        raise RuntimeError(
+            "La cellule 'Swaper' n'a pas été trouvée sous 'Répartition géographique'."
+        )
+
+    crowdlending_row = find_first_cell_containing_below(grid, swaper_row, geo_col, "Crowdlending savings")
+    if not crowdlending_row:
+        raise RuntimeError(
+            "La cellule 'Crowdlending savings' n'a pas été trouvée sous 'Swaper' "
+            "(elle délimite la fin du bloc Swaper)."
+        )
+
+    header_row = grid[geo_row - 1]
+    country_columns = {
+        col_idx: header_row[col_idx - 1].strip()
+        for col_idx in range(geo_col + 1, len(header_row) + 1)
+        if header_row[col_idx - 1].strip()
+    }
+    if not country_columns:
+        raise RuntimeError(
+            "Aucune colonne pays trouvée à droite de 'Répartition géographique'."
+        )
+
+    swaper_data_row = grid[swaper_row - 1]
+
+    # Colonne du pourcentage de seuil : 2 colonnes à gauche de "Swaper" sur
+    # SA PROPRE ligne (une de plus à gauche que le minInterestRate).
+    threshold_col_idx = geo_col - 2
+    threshold_raw = (
+        swaper_data_row[threshold_col_idx - 1].strip()
+        if 0 <= threshold_col_idx - 1 < len(swaper_data_row)
+        else ""
+    )
+    threshold_percentage = _parse_french_amount(threshold_raw)
+    if threshold_percentage is None:
+        logger.warning(
+            "Aucun pourcentage de seuil par pays Swaper configuré (cellule vide) - "
+            "le blocage par pays devrait être désactivé côté appelant."
+        )
+    else:
+        logger.info("Pourcentage de seuil par pays Swaper lu dans la feuille : %s%%", threshold_percentage)
+
+    country_amounts = {}
+    for col_idx, country_name in country_columns.items():
+        raw = swaper_data_row[col_idx - 1].strip() if col_idx - 1 < len(swaper_data_row) else ""
+        country_amounts[country_name] = _parse_french_amount(raw) or 0.0
+
+    originator_countries = {}
+    for row_idx in range(swaper_row + 1, crowdlending_row):
+        row = grid[row_idx - 1]
+
+        name = row[geo_col - 1].strip() if geo_col - 1 < len(row) else ""
+        if not name:
+            continue
+
+        for col_idx, country_name in country_columns.items():
+            raw = row[col_idx - 1].strip() if col_idx - 1 < len(row) else ""
+            if raw:
+                originator_countries[name] = country_name
+                break
+
+    logger.info(
+        "Allocations par pays Swaper : seuil=%s%%, %d pays lus, %d loan originators mappés à un pays.",
+        threshold_percentage, len(country_amounts), len(originator_countries),
+    )
+
+    return {
+        "threshold_percentage": threshold_percentage,
+        "country_amounts": country_amounts,
+        "originator_countries": originator_countries,
+    }
+
+
 if __name__ == "__main__":
     fill_current_month_amounts(
         platform="Bienprêter",

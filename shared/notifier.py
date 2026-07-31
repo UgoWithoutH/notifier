@@ -77,7 +77,14 @@ def send_swaper_email(balance: float, loans: list) -> None:
         log.exception("Failed to send notification email.")
 
 
-def send_swaper_investment_summary_email(attempts: list, captured_api_calls: list) -> None:
+def send_swaper_investment_summary_email(
+    attempts: list,
+    captured_api_calls: list,
+    min_interest_rate: float | None = None,
+    country_threshold_percentage: float | None = None,
+    country_status: dict | None = None,
+    country_blocked: list | None = None,
+) -> None:
     """Send a summary of REAL Swaper investments made this run via the
     manual "+" button (see monitors.swaper_monitor._invest_available_loans()
     - explicit user decision 2026-07-25 to make this the actual production
@@ -103,6 +110,17 @@ def send_swaper_investment_summary_email(attempts: list, captured_api_calls: lis
     monitors/lendermarket_monitor.py's `requests.Session`-based bot),
     instead of driving a real browser - also useful right now, to confirm
     each investment attempt actually succeeded (status code/body).
+
+    `min_interest_rate`/`country_threshold_percentage`/`country_status`/
+    `country_blocked` (added 2026-07-31, mirrors
+    `send_lendermarket_invest_summary_email()`'s equivalent sections): the
+    minimum interest rate actually used this run (from
+    `shared.google_sheet.get_swaper_min_interest_rate()`), the configured
+    per-country cap percentage (from `get_swaper_country_allocations()`,
+    None if no threshold cell is set), a per-country
+    `{invested, threshold_amount, blocked}` breakdown, and the list of loan
+    originators excluded this run because their country already hit the
+    cap.
     """
     if not all([SMTP_HOST, SMTP_USER, SMTP_PASSWORD, EMAIL_TO]):
         log.error(
@@ -128,6 +146,32 @@ def send_swaper_investment_summary_email(attempts: list, captured_api_calls: lis
             line += " -- une fen\u00eatre de confirmation inattendue est apparue, investissement stopp\u00e9 ensuite (voir la pi\u00e8ce jointe)"
         body_lines.append(line)
     body_lines.append("")
+
+    if min_interest_rate is not None:
+        body_lines.append(f"Taux d'int\u00e9r\u00eat minimum utilis\u00e9 : {min_interest_rate}%")
+
+    if country_status:
+        if country_threshold_percentage is not None:
+            body_lines.append(f"=== Seuil par pays ({country_threshold_percentage}% du budget total) ===")
+        else:
+            body_lines.append("=== Seuil par pays (aucun seuil configur\u00e9) ===")
+        for country, s in sorted(country_status.items()):
+            threshold_amount = s.get("threshold_amount")
+            line = f"- {country} : investi {s.get('invested', 0.0):.2f} \u20ac"
+            if threshold_amount is not None:
+                line += f" / plafond {threshold_amount:.2f} \u20ac"
+            if s.get("blocked"):
+                line += " (BLOQU\u00c9)"
+            body_lines.append(line)
+        body_lines.append("")
+
+    if country_blocked:
+        body_lines.append(
+            "Loan originators bloqu\u00e9s ce run (seuil d'investissement par pays atteint) : "
+            + ", ".join(country_blocked)
+        )
+        body_lines.append("")
+
     body_lines.append(
         "Le fichier joint contient les vraies requ\u00eates/r\u00e9ponses HTTP /rest/ observ\u00e9es "
         "pendant ce run (m\u00e9thode/URL/toutes les en-t\u00eates - valeurs sensibles redacted - "
