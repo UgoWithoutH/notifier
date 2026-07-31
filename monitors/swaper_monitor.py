@@ -116,7 +116,29 @@ request) - it's sent every run those conditions hold. The real
 invest-call structure itself still can't be observed without a real
 investment actually happening (real money moving, per the 2026-07-25
 decision to drop click-and-abort captures).
+
+Sheet-driven minInterestRate + per-country cap (added 2026-07-31, mirrors
+the same feature already built for Lendermarket): `shared.google_sheet.
+get_swaper_min_interest_rate()`/`get_swaper_country_allocations()` read
+the same cell layout convention as PeerBerry/Lendermarket (cell 1 column
+left of "Swaper" itself = minInterestRate, 2 columns left = per-country
+cap threshold %). Unlike PeerBerry/Lendermarket, Swaper's
+`/rest/public/loans` endpoint has no known/verified server-side
+interest-rate filter param, so `_filter_loans_by_min_interest_rate()`
+applies it client-side on each fetched loan's `interestRatePerYear`
+instead. The per-country cap is checked ONCE per run (not continuously
+re-polled, same one-shot design as Lendermarket's): an originator whose
+mapped country is already at/above `threshold_percentage`% of the total
+Swaper budget (balance + every country's already-invested amount) is
+excluded entirely from this run's budget split, tracked in
+`country_blocked_originators` and shown in
+`send_swaper_investment_summary_email()`'s body alongside the
+minInterestRate used and a per-country invested/threshold breakdown. Both
+Sheet reads are soft-fail (fall back to the module default / disable
+country blocking on a read error), same pattern as every other soft-fail
+Sheet read in this repo.
 """
+
 
 import json
 import os
@@ -135,7 +157,11 @@ from shared.notifier import send_swaper_email, send_swaper_investment_summary_em
 from shared.state import load_state, save_state
 from shared.cron_schedule import ensure_schedule
 from shared.notification_gate import should_notify
-from shared.google_sheet import get_selected_swaper_loan_originators
+from shared.google_sheet import (
+    get_selected_swaper_loan_originators,
+    get_swaper_min_interest_rate,
+    get_swaper_country_allocations,
+)
 from shared.browser_stealth import get_context_options, apply_stealth, human_pause, human_mouse_wander, human_type
 
 DEFAULT_STATE = {
@@ -161,6 +187,13 @@ SWAPER_CRON_JOB_ID = os.environ.get("SWAPER_CRON_JOB_ID")
 # this, don't even attempt a click (mirrors MIN_INVESTMENT_AMOUNT in
 # monitors/peerberry_invest_bot.py).
 MIN_INVESTMENT_AMOUNT = float(os.environ.get("MIN_INVESTMENT_AMOUNT", "10"))
+
+# Fallback used only if get_swaper_min_interest_rate() (reads the cell just
+# left of "Swaper" in "Répartition géographique", see that function's
+# docstring) fails - default 0 preserves the pre-2026-07-31 behavior (no
+# interest-rate filtering at all) instead of silently excluding every loan
+# on a read error.
+MIN_INTEREST_RATE = float(os.environ.get("SWAPER_MIN_INTEREST_RATE", "0"))
 
 
 
@@ -353,6 +386,30 @@ def fetch_loans_for_originator(page, originator_name: str) -> dict:
         return response.json()
     finally:
         page.unroute("**/rest/public/loans", _rewrite_body)
+
+
+def _filter_loans_by_min_interest_rate(loans: list, min_interest_rate: float) -> list:
+    """Client-side minimum-interest-rate filter (added 2026-07-31, from
+    get_swaper_min_interest_rate() - same Sheet cell convention as
+    PeerBerry's/Lendermarket's own minInterestRate). Unlike those two
+    platforms, Swaper's `/rest/public/loans` endpoint has no known/verified
+    server-side interest-rate filter parameter (only `groups`, used by
+    `fetch_loans_for_originator()`, is confirmed) - so this filters the
+    already-fetched loans locally on their own `interestRatePerYear` field
+    instead of adding an unverified request param. A `min_interest_rate` of
+    0 (or falsy) is a no-op, returning `loans` unchanged.
+    """
+    if not min_interest_rate:
+        return loans
+    kept = []
+    for loan in loans:
+        try:
+            rate = float(loan.get("interestRatePerYear") or 0)
+        except (TypeError, ValueError):
+            rate = 0.0
+        if rate >= min_interest_rate:
+            kept.append(loan)
+    return kept
 
 
 def _split_budget_across_available_originators(available_money: float, originator_loans: dict) -> dict:
@@ -664,6 +721,43 @@ def run(headless: bool = True) -> None:
                 log.exception("Could not read selected Swaper loan originators from the Google Sheet.")
                 selected_originators = []
 
+            # minInterestRate + per-country cap, read from the Sheet once per
+            # run (added 2026-07-31, same convention/cell layout as
+            # PeerBerry's/Lendermarket's own MIN_INTEREST_RATE/country
+            # allocations, see get_swaper_min_interest_rate()/
+            # get_swaper_country_allocations()) - both are soft-fail: a read
+            # error just falls back to the module default / disables country
+            # blocking for this run, rather than aborting.
+            min_interest_rate = MIN_INTEREST_RATE
+            try:
+                min_interest_rate = get_swaper_min_interest_rate()
+            except Exception:
+                log.exception(
+                    "Could not read the Swaper minInterestRate from the Google Sheet, falling back to the default (%s).",
+                    MIN_INTEREST_RATE,
+                )
+
+            country_allocations = {}
+            try:
+                country_allocations = get_swaper_country_allocations()
+            except Exception:
+                log.exception("Could not read the Swaper per-country allocations from the Google Sheet, country blocking is disabled this run.")
+
+            country_threshold_percentage = country_allocations.get("threshold_percentage")
+            country_invested = dict(country_allocations.get("country_amounts") or {})
+            originator_countries = country_allocations.get("originator_countries") or {}
+            country_blocked_originators = []
+            relevant_countries = {
+                originator_countries[name] for name in selected_originators if name in originator_countries
+            }
+
+            def _is_country_blocked(country, total_budget):
+                if not country or country_threshold_percentage is None or total_budget <= 0:
+                    return False
+                return country_invested.get(country, 0.0) >= (country_threshold_percentage / 100.0) * total_budget
+
+            total_budget = balance_now + sum(country_invested.values())
+
             originator_loans = {}
             if not selected_originators:
                 log.info("No Swaper loan originator is flagged with 'x' in the Google Sheet - skipping auto-invest.")
@@ -675,11 +769,13 @@ def run(headless: bool = True) -> None:
                 # this is what feeds the one-time API-structure diagnostics
                 # email below even when there's nothing to actually invest
                 # yet. Only the real investing step further below stays
-                # gated behind the minimum balance.
+                # gated behind the minimum balance. The minInterestRate is
+                # applied client-side here too (see
+                # _filter_loans_by_min_interest_rate()'s docstring).
                 log.info(
                     "%d loan originator(s) selected in the Google Sheet (%s) - checking current "
-                    "availability for each.",
-                    len(selected_originators), ", ".join(selected_originators),
+                    "availability for each (min interest rate: %s%%).",
+                    len(selected_originators), ", ".join(selected_originators), min_interest_rate,
                 )
                 for name in selected_originators:
                     try:
@@ -687,7 +783,9 @@ def run(headless: bool = True) -> None:
                     except Exception:
                         log.exception("Failed to fetch filtered loans for originator %r - skipping it.", name)
                         continue
-                    loans_for_name = extract_loans(originator_payload)
+                    loans_for_name = _filter_loans_by_min_interest_rate(
+                        extract_loans(originator_payload), min_interest_rate
+                    )
                     if loans_for_name:
                         originator_loans[name] = loans_for_name
                         log.info("Originator %r currently has %d loan(s) available.", name, len(loans_for_name))
@@ -701,6 +799,26 @@ def run(headless: bool = True) -> None:
                         balance_now, MIN_INVESTMENT_AMOUNT,
                     )
                 else:
+                    # Per-country cap (added 2026-07-31, mirrors
+                    # lendermarket_monitor.py's invest_selected_lenders() -
+                    # checked ONCE per run, not continuously re-polled since
+                    # this bot allocates budget in a single real-time pass
+                    # each time it's triggered): any currently-available
+                    # originator whose mapped country is already at/above
+                    # `country_threshold_percentage`% of the total Swaper
+                    # budget (balance + every country's already-invested
+                    # amount) is excluded entirely from this run's budget
+                    # split (same treatment as "0 loans available").
+                    for name in list(originator_loans.keys()):
+                        country = originator_countries.get(name)
+                        if _is_country_blocked(country, total_budget):
+                            log.info(
+                                "Originator %r (country %r) is blocked this run: already at/above the %s%% country cap.",
+                                name, country, country_threshold_percentage,
+                            )
+                            country_blocked_originators.append(name)
+                            del originator_loans[name]
+
                     budgets = _split_budget_across_available_originators(balance_now, originator_loans)
                     for name, budget in budgets.items():
                         log.info("Investing up to %.2f EUR into originator %r's loan(s).", budget, name)
@@ -715,8 +833,18 @@ def run(headless: bool = True) -> None:
                             continue
                         shares = _compute_swaper_loan_shares(budget, originator_loans[name])
                         attempts = _invest_available_loans(page, originator_loans[name], shares)
+                        country = originator_countries.get(name)
                         for attempt in attempts:
                             attempt["originator"] = name
+                            # country_invested is updated after EVERY
+                            # attempted amount (not just a confirmed-success
+                            # status, which this bot's real clicks don't
+                            # expose - see _invest_available_loans()'s
+                            # docstring) so multiple originators sharing the
+                            # same country within this same run can't
+                            # jointly blow past the cap.
+                            if country and not attempt.get("error"):
+                                country_invested[country] = country_invested.get(country, 0.0) + (attempt.get("amount") or 0.0)
                         investment_attempts.extend(attempts)
 
                     if investment_attempts:
@@ -724,6 +852,24 @@ def run(headless: bool = True) -> None:
                         # (notification email etc.) to reflect what's actually
                         # left AFTER investing, not the stale pre-invest numbers.
                         payload = fetch_loans(page)
+
+            # Per-country status snapshot for the summary email (added
+            # 2026-07-31, mirrors send_lendermarket_invest_summary_email()'s
+            # "=== Seuil par pays ===" section) - built AFTER the invest loop
+            # above so it reflects this run's own successful attempts too.
+            country_status = {}
+            for country in relevant_countries:
+                invested = country_invested.get(country, 0.0)
+                threshold_amount = (
+                    (country_threshold_percentage / 100.0) * total_budget
+                    if country_threshold_percentage is not None and total_budget > 0
+                    else None
+                )
+                country_status[country] = {
+                    "invested": invested,
+                    "threshold_amount": threshold_amount,
+                    "blocked": threshold_amount is not None and invested >= threshold_amount,
+                }
         except Exception:
             log.exception("Failed to log in or fetch loans.")
             browser.close()
@@ -747,7 +893,14 @@ def run(headless: bool = True) -> None:
     # time), so successes/failures/modals are always visible.
     if investment_attempts:
         log.info("Sending Swaper investment summary email (%d attempt(s) this run).", len(investment_attempts))
-        send_swaper_investment_summary_email(investment_attempts, captured_api_calls)
+        send_swaper_investment_summary_email(
+            investment_attempts,
+            captured_api_calls,
+            min_interest_rate=min_interest_rate,
+            country_threshold_percentage=country_threshold_percentage,
+            country_status=country_status,
+            country_blocked=country_blocked_originators,
+        )
     elif captured_api_calls and originator_loans and balance >= MIN_INVESTMENT_AMOUNT:
         # Diagnostics email (added 2026-07-26, explicit user request: get
         # the loans-listing/filter API structure right away, without
