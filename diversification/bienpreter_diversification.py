@@ -11,6 +11,29 @@ sums them, and hands the single total to fill_current_month_amounts() (see
 google_sheet.py) - no per-originator dict, just one number, no email sent
 either.
 
+ADDED 2026-07-31: unlike the "Crowdlending" section above (single aggregate
+figure), the "Répartition géographique" section's Bienprêter block IS
+broken down - one row per BORROWER (emprunteur, e.g. "EXCAVAN"), with a
+country-column matrix (one column per country, shared across every
+platform's block on that sheet). `fetch_active_loans_by_borrower()` fetches
+every currently active ("en cours") loan from
+https://www.bienpreter.com/u/mes-prets (paginated), sums the invested
+amount per borrower (a borrower can have several concurrent loans/
+contracts), and resolves each loan's country via its project page
+(https://www.bienpreter.com/projets/{id}, "Localisation" field, e.g.
+"Madrid - Espagne" -> "Espagne" - see _country_from_location() for the
+French-domestic-postal-code special case). The result feeds
+shared.google_sheet.fill_bienpreter_borrower_geo_amounts(), which writes
+each borrower's amount into the matching country column, inserts a new row
+for any borrower not already listed (right after the block's last existing
+borrower - explicitly re-styled to match sibling borrower rows, since an
+inserted row inherits the next platform header's bold/left-aligned style
+otherwise), DELETES any row whose borrower no longer has an active loan,
+and rewrites every remaining row's "total" column (one column right of the
+borrower name) as a live "=SOMME(...)" formula summing that row's country
+columns - it deliberately never touches the "Bienprêter" row's OWN total
+column (kept manual, per explicit user request).
+
 REWRITTEN 2026-07-17 to use plain `requests` instead of Playwright (no
 browser at all), same technique as bricks_diversification.py /
 goandgrow_diversification.py - much faster in GitHub Actions (no Chromium
@@ -80,13 +103,19 @@ Optional:
 import re
 import os
 import sys
+import html
 import logging
 
 import requests
 from dotenv import load_dotenv
 
-from shared.google_sheet import fill_current_month_amounts, fill_current_month_bonus_breakdown
+from shared.google_sheet import (
+    fill_current_month_amounts,
+    fill_current_month_bonus_breakdown,
+    fill_bienpreter_borrower_geo_amounts,
+)
 from shared.report_date import get_report_now
+from shared.notifier import send_bienpreter_geo_issues_email
 
 load_dotenv()
 
@@ -211,6 +240,212 @@ def fetch_balances(dashboard_html: str) -> dict:
         raise RuntimeError(f"Could not parse 'Capital à recevoir' out of {raw_recevoir!r}.")
 
     return {"available_balance": available_balance, "capital_to_receive": capital_to_receive}
+
+
+ACTIVE_LOANS_URL = "https://www.bienpreter.com/u/mes-prets"
+# Fixed filter params matching the user's own reference URL (status[]=3 =
+# "en cours"/active loans, not fully repaid/sold ones) - only `page` is
+# overridden per request below.
+ACTIVE_LOANS_BASE_PARAMS = {
+    "magicSearch": "",
+    "year": "",
+    "status[]": "3",
+    "litigation": "",
+    "investmentFrom": "all",
+    "bpflexEligible": "",
+    "sellStatus": "",
+    "orderBy": "default",
+    "orderType": "ASC",
+    "join": "",
+}
+MAX_ACTIVE_LOANS_PAGES = 20  # safety net against an infinite loop
+LOAN_ROW_REGEX = re.compile(r'<tr[^>]*class="bp-tr-main"[^>]*>(.*?)</tr>', re.DOTALL)
+LOAN_PROJECT_BORROWER_REGEX = re.compile(
+    r'<a\s+href="/projets/(\d+)"[^>]*>.*?</a>\s*<br>\s*([^<]+?)\s*</p>', re.DOTALL
+)
+LOAN_AMOUNT_REGEX = re.compile(r'contract__amount[^"]*">\s*([^<]+?)\s*</td>', re.DOTALL)
+PROJECT_LOCATION_REGEX = re.compile(r"<dt>\s*Localisation\s*</dt>\s*<dd[^>]*>(.*?)</dd>", re.DOTALL)
+# "<p class=\"text-center\">\n    24\n    r\u00e9sultats au total\n  </p>" - used to bound
+# pagination reliably instead of "stop on an empty page", since out-of-
+# range pages on this site don't reliably come back empty (same bug
+# already documented for the /u/operations pagination in this file's
+# module docstring/repo memory - out-of-range pages can echo stray rows
+# instead of a clean empty result set).
+TOTAL_RESULTS_REGEX = re.compile(r"(\d+)\s*r\u00e9sultats au total", re.IGNORECASE)
+
+
+def _parse_active_loans_rows(page_html: str) -> list:
+    """Parses one page of https://www.bienpreter.com/u/mes-prets into a
+    list of {"project_id", "borrower", "amount"} dicts - see module
+    docstring section on active-loans fetching for the verified row
+    markup (`<tr class="bp-tr-main">`, project link + borrower name in
+    `.contract__project__name`, amount in `.contract__amount`)."""
+    rows = []
+    for row_html in LOAN_ROW_REGEX.findall(page_html):
+        project_match = LOAN_PROJECT_BORROWER_REGEX.search(row_html)
+        amount_match = LOAN_AMOUNT_REGEX.search(row_html)
+        if not project_match or not amount_match:
+            continue
+
+        borrower = html.unescape(_strip_tags(project_match.group(2)))
+        amount = _parse_amount(amount_match.group(1))
+        if not borrower or amount is None:
+            continue
+
+        rows.append({"project_id": project_match.group(1), "borrower": borrower, "amount": amount})
+    return rows
+
+
+def fetch_active_loans(session: requests.Session):
+    """Fetches every currently active ("en cours") Bienprêter loan from
+    https://www.bienpreter.com/u/mes-prets, paginating via the `page`
+    query param until a page returns no loan rows (bounded by
+    MAX_ACTIVE_LOANS_PAGES as a safety net). Returns (loans, issues):
+    - loans : flat list of {"project_id", "borrower", "amount"} dicts, one
+      per loan/contract (a single borrower can appear multiple times, once
+      per contract).
+    - issues : list of short strings describing a pagination problem (hit
+      the page safety net, or collected more/fewer rows than the site's
+      own "X résultats au total" - both signal the result may be
+      incomplete) - feeds shared.notifier.send_bienpreter_geo_issues_email()."""
+    loans = []
+    issues = []
+    expected_total = None
+    for page_number in range(1, MAX_ACTIVE_LOANS_PAGES + 1):
+        params = dict(ACTIVE_LOANS_BASE_PARAMS, page=str(page_number))
+        log.info("GET active loans page %d...", page_number)
+        r = session.get(ACTIVE_LOANS_URL, params=params, timeout=30)
+        log.info("GET active loans page %d: status=%s", page_number, r.status_code)
+        r.raise_for_status()
+
+        if expected_total is None:
+            total_match = TOTAL_RESULTS_REGEX.search(r.text)
+            if total_match:
+                expected_total = int(total_match.group(1))
+                log.info("Active loans: %d résultat(s) au total (from page 1).", expected_total)
+
+        rows = _parse_active_loans_rows(r.text)
+        log.info("Active loans page %d: %d loan(s) found.", page_number, len(rows))
+        if not rows:
+            break
+        loans.extend(rows)
+        if expected_total is not None and len(loans) >= expected_total:
+            break
+    else:
+        message = (
+            f"Pagination des prêts actifs interrompue après {MAX_ACTIVE_LOANS_PAGES} pages sans "
+            "atteindre le total attendu - les résultats sont peut-être incomplets."
+        )
+        log.warning(message)
+        issues.append(message)
+
+    if expected_total is not None and len(loans) != expected_total:
+        message = (
+            f"Prêts actifs : {expected_total} résultat(s) au total attendu(s) mais {len(loans)} "
+            "collecté(s) - seuls les premiers ont été conservés (une page hors limite a peut-être "
+            "renvoyé des lignes erronées/dupliquées au lieu d'être vide)."
+        )
+        log.warning(message)
+        issues.append(message)
+        loans = loans[:expected_total]
+
+    log.info("Total active loans found: %d", len(loans))
+    return loans, issues
+
+
+def _country_from_location(location: str):
+    """Parses the project page's 'Localisation' text into just the
+    country name. Two formats observed on real projects: foreign ones are
+    'City - Country' (e.g. 'Madrid - Espagne', 'Bucarest - Roumanie',
+    even 'Montpellier - France'), domestic (French) ones instead start
+    with a postal code and have NO country at all - either just
+    '13007 Marseille'/'92800 PUTEAUX', OR (confusingly) STILL a dash
+    before a city name, e.g. '83330 - Le Castellet' (NOT a 'city -
+    country' pair despite the dash). So: if it starts with a postal code,
+    it's always France regardless of any dash; otherwise take the text
+    after the last ' - ' if present, else the whole string as a fallback.
+    """
+    location = location.strip()
+    if re.match(r"^\d{4,5}\b", location):
+        return "France"
+    if " - " in location:
+        return location.rsplit(" - ", 1)[-1].strip()
+    return location or None
+
+
+def fetch_project_country(session: requests.Session, project_id: str):
+    """Fetches https://www.bienpreter.com/projets/{project_id} and reads
+    the '<dt>Localisation</dt><dd>...</dd>' pair, returning just the
+    country part via _country_from_location(). Returns None if the
+    location can't be found/parsed."""
+    url = f"https://www.bienpreter.com/projets/{project_id}"
+    log.info("GET project page %s (for country)...", project_id)
+    r = session.get(url, timeout=30)
+    log.info("GET project page %s: status=%s", project_id, r.status_code)
+    r.raise_for_status()
+
+    match = PROJECT_LOCATION_REGEX.search(r.text)
+    if not match:
+        log.warning("Could not find 'Localisation' on project page %s.", project_id)
+        return None
+
+    location = _strip_tags(match.group(1))
+    country = _country_from_location(location)
+    log.info("Project %s location=%r -> country=%r", project_id, location, country)
+    return country
+
+
+def fetch_active_loans_by_borrower(session: requests.Session):
+    """Fetches every active loan (fetch_active_loans()) and its project's
+    country (fetch_project_country(), cached per project_id since several
+    contracts can point at the same project), then groups/sums by
+    borrower name. Returns (borrowers, issues):
+    - borrowers : {borrower_name: {"amount": float, "country": str|None}} -
+      feeds fill_bienpreter_borrower_geo_amounts() in shared/google_sheet.py.
+    - issues : list of short strings, one per country that couldn't be
+      found/fetched or per borrower with loans in more than one country -
+      feeds shared.notifier.send_bienpreter_geo_issues_email() (per
+      explicit user request: any missing country or error here should be
+      emailed, not just logged).
+    """
+    loans, issues = fetch_active_loans(session)
+
+    project_country_cache = {}
+    borrowers = {}
+
+    for loan in loans:
+        project_id = loan["project_id"]
+        name = loan["borrower"]
+        if project_id not in project_country_cache:
+            try:
+                country = fetch_project_country(session, project_id)
+                if country is None:
+                    issues.append(
+                        f"Pays introuvable sur la page du projet {project_id} (emprunteur '{name}')."
+                    )
+                project_country_cache[project_id] = country
+            except Exception as exc:
+                log.exception("Failed to fetch country for project %s - leaving it unknown.", project_id)
+                issues.append(
+                    f"Erreur en récupérant le pays du projet {project_id} (emprunteur '{name}') : {exc}"
+                )
+                project_country_cache[project_id] = None
+
+        country = project_country_cache[project_id]
+        entry = borrowers.setdefault(name, {"amount": 0.0, "country": None})
+        entry["amount"] += loan["amount"]
+        if country and not entry["country"]:
+            entry["country"] = country
+        elif country and entry["country"] and entry["country"] != country:
+            message = (
+                f"Emprunteur '{name}' a des prêts dans plusieurs pays "
+                f"({entry['country']} vs {country}) - seul le premier trouvé est conservé."
+            )
+            log.warning(message)
+            issues.append(message)
+
+    log.info("Active loans grouped by borrower: %d borrower(s) found.", len(borrowers))
+    return borrowers, issues
 
 
 def _fetch_operations_page(session: requests.Session, start_date: str, end_date: str, page_number: int) -> list:
@@ -357,6 +592,27 @@ def run() -> None:
         platform="Bienprêter",
         breakdown={"prime": interest_totals["bonus_cashback_contest"]},
     )
+
+    # "Répartition géographique" per-borrower breakdown (added 2026-07-31,
+    # per explicit user request): does NOT touch the "Bienprêter" row's own
+    # total (kept manual) - only the borrower sub-rows below it, one per
+    # active loan's company, amount placed under its loan's country column.
+    # Any missing/ambiguous country or unexpected error is emailed (per
+    # explicit user request), not just logged - never blocks the rest of
+    # the run (Crowdlending section writes already happened above).
+    geo_issues = []
+    geo_error = None
+    try:
+        log.info("Fetching active loans grouped by borrower (for the geographic breakdown)...")
+        borrowers, fetch_issues = fetch_active_loans_by_borrower(session)
+        geo_issues.extend(fetch_issues)
+        geo_issues.extend(fill_bienpreter_borrower_geo_amounts(borrowers))
+    except Exception as exc:
+        log.exception("Failed to update the Bienprêter geographic breakdown by borrower.")
+        geo_error = str(exc)
+
+    if geo_issues or geo_error:
+        send_bienpreter_geo_issues_email(geo_issues, error=geo_error)
 
 
 if __name__ == "__main__":
