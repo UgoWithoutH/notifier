@@ -483,6 +483,11 @@ def send_peerberry_invest_bot_summary_email(stats: dict, error: str | None = Non
     `originator_stats` (per-originator dict with `loans_seen`, `attempts`,
     `successes`, `failures`, `invested_amount`, `invested_loans`),
     `redistributions` (stuck-budget reallocations that happened mid-run),
+    `external_adjustments` (per-originator budget reductions caused by an
+    investment made by something OTHER than this bot - e.g. PeerBerry's own
+    "Auto-Invest EASY" scheme, or a real human, active on the same account -
+    detected via a periodic invested-per-originator check, see
+    peerberry_invest_bot.py's EXTERNAL_INVESTMENT_CHECK_INTERVAL_SECONDS),
     `raw_originators_seen` (every distinct raw `loanOriginator` value
     PeerBerry returned this run, matched or not - lets a mismatch between
     the Sheet selection and PeerBerry's real values be spotted directly
@@ -531,6 +536,16 @@ def send_peerberry_invest_bot_summary_email(stats: dict, error: str | None = Non
         body_parts.append(f"Reliquats redistribués en cours de run ({len(redistributions)}) :")
         for r in redistributions:
             body_parts.append(f"  - {r['amount']:.2f} € : '{r['from']}' -> '{r['to']}'")
+
+    external_adjustments = stats.get("external_adjustments") or []
+    if external_adjustments:
+        body_parts.append("")
+        body_parts.append(f"Investissements externes détectés (hors ce bot, {len(external_adjustments)}) :")
+        for a in external_adjustments:
+            body_parts.append(
+                f"  - {a['originator']} : {a['external_amount']:.2f} € investis ailleurs "
+                f"(budget {a['budget_before']:.2f} € -> {a['budget_after']:.2f} €)"
+            )
 
     originator_stats = stats.get("originator_stats") or {}
     if originator_stats:
