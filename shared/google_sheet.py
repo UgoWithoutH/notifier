@@ -146,6 +146,23 @@ def find_cell_by_value(grid, value: str):
     return None
 
 
+def _parse_french_amount(raw: str):
+    """Parse un montant/pourcentage au format français d'une cellule
+    (ex. '4 719,62 €', '0,00 €', '10,5', avec U+202F comme séparateur de
+    milliers) en float. Retourne None si `raw` est vide/non-parsable -
+    utilisé par get_peerberry_country_allocations() pour lire à la fois le
+    pourcentage de seuil par pays et les montants déjà investis par pays."""
+    if not raw:
+        return None
+    cleaned = raw.replace("\u202f", "").replace(" ", "").replace("€", "").replace(",", ".").strip()
+    if not cleaned:
+        return None
+    try:
+        return float(cleaned)
+    except ValueError:
+        return None
+
+
 def find_current_month_cell(grid, row):
     """Recherche en mémoire dans la ligne `row` (1-based). Uses
     get_report_date() (REPORT_DATE env var override, falls back to the
@@ -784,6 +801,134 @@ def get_peerberry_min_interest_rate() -> float:
     value = float(raw.replace("\u202f", "").replace(" ", "").replace(",", "."))
     logger.info("minInterestRate PeerBerry lu dans la feuille : %s", value)
     return value
+
+
+def get_peerberry_country_allocations() -> dict:
+    """
+    Cherche la cellule "Répartition géographique" (sa ligne contient les
+    noms de pays en en-tête de colonne - détectés dynamiquement comme
+    toute colonne à droite de "Répartition géographique" ayant un nom non
+    vide sur cette ligne), puis la ligne "Peerberry" en dessous (même
+    colonne que get_selected_peerberry_loan_originators()/
+    get_peerberry_min_interest_rate()). Ajoutée le 2026-07-31 pour le
+    plafond d'investissement par pays de monitors/peerberry_invest_bot.py.
+
+    Retourne un dict avec :
+    - `threshold_percentage` : la valeur numérique (format français, ex.
+      "10" ou "10,5") lue dans la cellule 2 colonnes à gauche de
+      "Peerberry" SUR SA PROPRE ligne (une colonne de plus à gauche que le
+      minInterestRate lu par get_peerberry_min_interest_rate() - cette
+      cellule sert de flag "x" pour les lignes de loan originators en
+      dessous mais est libre sur la ligne "Peerberry" elle-même). C'est un
+      pourcentage du budget total PeerBerry (investi + disponible) à ne
+      jamais dépasser, par pays. None si la cellule est vide (pas de seuil
+      configuré - le blocage par pays doit alors être désactivé côté
+      appelant).
+    - `country_amounts` : {nom_pays: montant déjà investi} lu directement
+      sur la ligne "Peerberry" elle-même, une valeur par colonne pays -
+      snapshot utilisé comme point de départ par peerberry_invest_bot.py
+      (mis à jour ensuite en cours de run directement via l'API PeerBerry,
+      SANS jamais relire cette feuille - voir ce module).
+    - `originator_countries` : {nom_loan_originator: nom_pays} déduit,
+      pour chaque ligne de loan originator du bloc PeerBerry (entre
+      "Peerberry" et "Swaper" exclus), de la SEULE colonne pays non vide
+      sur sa propre ligne (chaque loan originator PeerBerry n'opère que
+      dans un seul pays) - permet à peerberry_invest_bot.py d'attribuer
+      tout investissement (le sien ou externe) à son pays sans avoir à
+      mapper le `countryId`/un `iso2` renvoyé par l'API PeerBerry.
+    """
+    logger.info("Lecture des allocations par pays PeerBerry depuis la feuille")
+
+    worksheet = get_latest_dashboard_worksheet(SPREADSHEET_ID)
+
+    grid = _call_with_retry(worksheet.get_all_values)
+
+    geo_pos = find_cell_by_value(grid, "Répartition géographique")
+    if not geo_pos:
+        raise RuntimeError(
+            "La section 'Répartition géographique' n'a pas été trouvée."
+        )
+
+    geo_row, geo_col = geo_pos
+
+    if geo_col < 3:
+        raise RuntimeError(
+            "Impossible de lire le seuil par pays PeerBerry : "
+            "'Répartition géographique' doit avoir au moins 2 colonnes à sa gauche."
+        )
+
+    peerberry_row = find_first_cell_containing_below(grid, geo_row, geo_col, "Peerberry")
+    if not peerberry_row:
+        raise RuntimeError(
+            "La cellule 'Peerberry' n'a pas été trouvée sous 'Répartition géographique'."
+        )
+
+    swaper_row = find_first_cell_containing_below(grid, peerberry_row, geo_col, "Swaper")
+    if not swaper_row:
+        raise RuntimeError(
+            "La cellule 'Swaper' n'a pas été trouvée sous 'Peerberry' "
+            "(elle délimite la fin du bloc PeerBerry)."
+        )
+
+    header_row = grid[geo_row - 1]
+    country_columns = {
+        col_idx: header_row[col_idx - 1].strip()
+        for col_idx in range(geo_col + 1, len(header_row) + 1)
+        if header_row[col_idx - 1].strip()
+    }
+    if not country_columns:
+        raise RuntimeError(
+            "Aucune colonne pays trouvée à droite de 'Répartition géographique'."
+        )
+
+    peerberry_data_row = grid[peerberry_row - 1]
+
+    # Colonne du pourcentage de seuil : 2 colonnes à gauche de "Peerberry"
+    # sur SA PROPRE ligne (une de plus à gauche que le minInterestRate).
+    threshold_col_idx = geo_col - 2
+    threshold_raw = (
+        peerberry_data_row[threshold_col_idx - 1].strip()
+        if 0 <= threshold_col_idx - 1 < len(peerberry_data_row)
+        else ""
+    )
+    threshold_percentage = _parse_french_amount(threshold_raw)
+    if threshold_percentage is None:
+        logger.warning(
+            "Aucun pourcentage de seuil par pays PeerBerry configuré (cellule vide) - "
+            "le blocage par pays devrait être désactivé côté appelant."
+        )
+    else:
+        logger.info("Pourcentage de seuil par pays PeerBerry lu dans la feuille : %s%%", threshold_percentage)
+
+    country_amounts = {}
+    for col_idx, country_name in country_columns.items():
+        raw = peerberry_data_row[col_idx - 1].strip() if col_idx - 1 < len(peerberry_data_row) else ""
+        country_amounts[country_name] = _parse_french_amount(raw) or 0.0
+
+    originator_countries = {}
+    for row_idx in range(peerberry_row + 1, swaper_row):
+        row = grid[row_idx - 1]
+
+        name = row[geo_col - 1].strip() if geo_col - 1 < len(row) else ""
+        if not name:
+            continue
+
+        for col_idx, country_name in country_columns.items():
+            raw = row[col_idx - 1].strip() if col_idx - 1 < len(row) else ""
+            if raw:
+                originator_countries[name] = country_name
+                break
+
+    logger.info(
+        "Allocations par pays PeerBerry : seuil=%s%%, %d pays lus, %d loan originators mappés à un pays.",
+        threshold_percentage, len(country_amounts), len(originator_countries),
+    )
+
+    return {
+        "threshold_percentage": threshold_percentage,
+        "country_amounts": country_amounts,
+        "originator_countries": originator_countries,
+    }
 
 
 def get_selected_lendermarket_lenders() -> list:
