@@ -472,7 +472,6 @@ def fetch_loans(page, captured_api_calls: list, groups: list = None) -> dict:
         raise RuntimeError(
             f"Loans API returned status {response.status}" + (f" for groups {groups!r}" if groups else "")
         )
-    human_mouse_wander(page)
     return json.loads(text or "null")
 
 
@@ -524,6 +523,56 @@ def _filter_loans_by_min_interest_rate(loans: list, min_interest_rate: float) ->
         if rate >= min_interest_rate:
             kept.append(loan)
     return kept
+
+
+# Candidate field names tried (in order) to attribute a loan back to its
+# originator when using the combined multi-group fetch below - the real
+# field name is unconfirmed (no live loan data available to inspect at the
+# time this was written, see repo memory).
+_ORIGINATOR_FIELD_CANDIDATES = ("company", "loanOriginator", "originator", "originatorName", "group")
+
+
+def fetch_loans_by_selected_originators(page, captured_api_calls: list, selected_originators: list, min_interest_rate: float):
+    """Fetch ALL selected originators' loans in a SINGLE `fetch_loans()` call
+    (`groups` accepts multiple originator names at once, same as Auto-Invest
+    EASY's own `defaultGroups` array - confirmed by the user) instead of one
+    navigation per originator - cuts the discovery loop from O(N) page
+    reloads to O(1).
+
+    Only trusted if every returned loan can be confidently attributed back
+    to one of the requested originators via a recognizable field (tried in
+    order, see `_ORIGINATOR_FIELD_CANDIDATES`) - returns `None` (the caller
+    falls back to the slower, proven one-call-per-originator method) if that
+    can't be established, since silently misgrouping or dropping a real loan
+    is worse than the wasted time of the slow path. An empty result needs no
+    field to trust (nothing to group), so it's always accepted as-is.
+
+    Returns `{originator_name: [loan, ...]}` on success, `None` on failure.
+    """
+    payload = fetch_loans(page, captured_api_calls, groups=selected_originators)
+    loans = _filter_loans_by_min_interest_rate(extract_loans(payload), min_interest_rate)
+
+    grouped = {name: [] for name in selected_originators}
+    if not loans:
+        return grouped
+
+    field = next((c for c in _ORIGINATOR_FIELD_CANDIDATES if all(c in loan for loan in loans)), None)
+    if field is None:
+        log.warning("Combined multi-originator fetch: no recognizable originator field on the response - falling back.")
+        return None
+
+    lowered_names = {name.lower(): name for name in selected_originators}
+    for loan in loans:
+        matched_name = lowered_names.get(str(loan.get(field) or "").strip().lower())
+        if matched_name is None:
+            log.warning(
+                "Combined multi-originator fetch: loan %s has unrecognized %r value %r - falling back.",
+                loan.get("number") or loan.get("id"), field, loan.get(field),
+            )
+            return None
+        grouped[matched_name].append(loan)
+
+    return grouped
 
 
 def _split_budget_across_available_originators(available_money: float, originator_loans: dict) -> dict:
@@ -671,6 +720,31 @@ def _record_api_response(captured: list, response) -> None:
     except Exception:
         entry["body"] = None
     captured.append(entry)
+
+
+def _extract_balance_from_attempts(attempts: list):
+    """Reads the post-investment balance directly out of the real `buy`
+    call's response body (already captured via `_record_api_response()`,
+    shape `{"investment": {...}, "user": {"accountBalance": ...}}`) instead
+    of firing an extra `fetch_loans()` navigation just to learn it - saves a
+    full page reload after every successful invest pass. Returns `None` if
+    no confirmed attempt's buy response can be parsed this way (caller
+    falls back to a real refresh).
+    """
+    for attempt in reversed(attempts):
+        if not attempt.get("confirmed"):
+            continue
+        for call in reversed(attempt.get("confirm_api_calls") or []):
+            if call.get("method") != "POST" or "/buy" not in (call.get("url") or ""):
+                continue
+            try:
+                body = json.loads(call.get("body") or "null") or {}
+            except Exception:
+                continue
+            balance = (body.get("user") or {}).get("accountBalance")
+            if isinstance(balance, (int, float)):
+                return float(balance)
+    return None
 
 
 def _invest_available_loans(page, loans: list, shares: dict, captured_api_calls: list) -> list:
@@ -1008,22 +1082,40 @@ def run(headless: bool = True) -> None:
                                 len(selected_originators), ", ".join(selected_originators), min_interest_rate, pass_number,
                             )
                             originator_loans = {}
-                            for name in selected_originators:
-                                try:
-                                    originator_payload = _with_relogin_retry(
-                                        lambda name=name: fetch_loans(page, captured_api_calls, groups=[name])
+                            fast_grouped = None
+                            try:
+                                fast_grouped = _with_relogin_retry(
+                                    lambda: fetch_loans_by_selected_originators(
+                                        page, captured_api_calls, selected_originators, min_interest_rate
                                     )
-                                except Exception:
-                                    log.exception("Failed to fetch filtered loans for originator %r - skipping it.", name)
-                                    continue
-                                loans_for_name = _filter_loans_by_min_interest_rate(
-                                    extract_loans(originator_payload), min_interest_rate
                                 )
-                                if loans_for_name:
-                                    originator_loans[name] = loans_for_name
-                                    log.info("Originator %r currently has %d loan(s) available.", name, len(loans_for_name))
-                                else:
-                                    log.info("Originator %r currently has no loans available.", name)
+                            except Exception:
+                                log.exception("Combined multi-originator fetch failed - falling back to per-originator fetches.")
+
+                            if fast_grouped is not None:
+                                for name, loans_for_name in fast_grouped.items():
+                                    if loans_for_name:
+                                        originator_loans[name] = loans_for_name
+                                        log.info("Originator %r currently has %d loan(s) available (fast combined fetch).", name, len(loans_for_name))
+                                    else:
+                                        log.info("Originator %r currently has no loans available (fast combined fetch).", name)
+                            else:
+                                for name in selected_originators:
+                                    try:
+                                        originator_payload = _with_relogin_retry(
+                                            lambda name=name: fetch_loans(page, captured_api_calls, groups=[name])
+                                        )
+                                    except Exception:
+                                        log.exception("Failed to fetch filtered loans for originator %r - skipping it.", name)
+                                        continue
+                                    loans_for_name = _filter_loans_by_min_interest_rate(
+                                        extract_loans(originator_payload), min_interest_rate
+                                    )
+                                    if loans_for_name:
+                                        originator_loans[name] = loans_for_name
+                                        log.info("Originator %r currently has %d loan(s) available.", name, len(loans_for_name))
+                                    else:
+                                        log.info("Originator %r currently has no loans available.", name)
 
                             pass_attempts = []
                             if balance_now < MIN_INVESTMENT_AMOUNT:
@@ -1103,12 +1195,23 @@ def run(headless: bool = True) -> None:
                             investment_attempts.extend(pass_attempts)
 
                             if pass_attempts:
-                                # Refresh the snapshot used for the rest of this run
-                                # (notification email etc.) to reflect what's actually
-                                # left AFTER investing, not the stale pre-invest numbers -
-                                # also feeds balance_now for this loop's own exit checks.
-                                payload = _with_relogin_retry(lambda: fetch_loans(page, captured_api_calls))
-                                balance_now = extract_balance(payload)
+                                if any(a.get("confirmed") for a in pass_attempts):
+                                    # Refresh the balance used for the rest of this run
+                                    # (notification email etc.) and this loop's own exit
+                                    # checks. The real buy response already embeds the
+                                    # post-investment balance (user.accountBalance) - use
+                                    # that directly instead of an extra full page reload
+                                    # when possible, falling back to a real refresh only
+                                    # if that can't be extracted.
+                                    fresh_balance = _extract_balance_from_attempts(pass_attempts)
+                                    if fresh_balance is not None:
+                                        balance_now = fresh_balance
+                                        log.info("Balance updated from the buy response: %.2f EUR (skipped an extra fetch).", balance_now)
+                                    else:
+                                        payload = _with_relogin_retry(lambda: fetch_loans(page, captured_api_calls))
+                                        balance_now = extract_balance(payload)
+                                # else: nothing confirmed this pass - balance/loans are
+                                # unchanged, no refresh needed at all.
 
                             if not loop_active:
                                 break
