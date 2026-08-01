@@ -193,10 +193,29 @@ calls a real investment fires (confirmed from a real successful capture,
 `{"amount": <float>}` - there is NO separate "confirm" API call, the
 browser's confirmation modal is purely a UI safety step, so these 2 calls
 are the whole real flow, not a guess. The browser/context stay open for
-the whole run only to persist `storage_state` at the end (cookies picked
-up by the `requests.Session` mid-run, e.g. a rotated `XSRF-TOKEN`, are
-synced back into the context via `context.add_cookies()` right before
-saving, so the next run's login-skip stays valid).
+the whole run only to persist `storage_state` at the end.
+
+REVERTED (2026-08-01, later same day, real GitHub Actions failure): the
+plain `requests.Session()` approach above is now BLOCKED by Cloudflare -
+a real run got `403 Forbidden` on the very first `fetch_loans()` call
+right after a successful Playwright login, and the SAME 403 recurred
+identically after `_relogin_and_rebuild_session()` logged back in again
+(login itself succeeded both times - "Reused a previous session, already
+logged in" - only the plain-HTTP calls failed). This is the exact same
+fingerprint-based Cloudflare bot-fight-mode pattern already documented in
+repo memory for Bricks (a naive non-browser client gets blocked even with
+valid session cookies, while the identical call through a real automated
+Chromium succeeds) - swaper.com is also Cloudflare-fronted (`Server:
+cloudflare`, `CF-RAY` present on the 403 responses). FIX: every post-login
+call (`fetch_loans()`, the manual-investment-approval check, the buy call)
+now goes through `page.evaluate(fetch(...))` - the real browser's own
+fetch(), same-origin, cookies attached automatically - instead of a
+separate `requests.Session()`. `_build_http_session()`/`_xsrf_headers()`
+were replaced by `_page_fetch()`/`_xsrf_headers_for_page()`; `login()`
+stays exactly as before (still the only step needing a real browser for
+its own reCAPTCHA-related reasons). No more session cookie syncing needed
+at the end of the run since the browser context IS the source of truth
+throughout.
 """
 
 
@@ -210,7 +229,6 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 import pyotp
-import requests
 from dotenv import load_dotenv
 from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
 
@@ -270,29 +288,23 @@ SWAPER_LOOP_POLL_INTERVAL_SECONDS = float(os.environ.get("SWAPER_LOOP_POLL_INTER
 # on a read error.
 MIN_INTEREST_RATE = float(os.environ.get("SWAPER_MIN_INTEREST_RATE", "0"))
 
-# Pure-HTTP endpoints used for everything after login (see module docstring,
-# "Post-login flow switched to pure HTTP", 2026-08-01).
+# Post-login endpoints (see module docstring). LOANS_PAGE_URL is navigated
+# to directly (fetch_loans() lets the real Angular app fire LOANS_URL
+# itself - see that function's docstring for why a manually-built request
+# gets 403); the other two are still built via page.evaluate(fetch()).
+LOANS_PAGE_URL = "https://swaper.com/en/loans"
 LOANS_URL = "https://swaper.com/rest/public/loans"
 IS_MANUAL_INVESTMENT_APPROVED_URL = "https://swaper.com/rest/public/profile/is-manual-investment-approved"
 BUY_URL_TEMPLATE = "https://swaper.com/rest/public/loans/{loan_id}/buy"
 
-# Fallback only used if reading the real browser's navigator.userAgent right
-# after login fails for some reason - keeps the requests.Session looking like
-# a realistic recent desktop Chrome instead of the default `python-requests/...`
-# User-Agent.
-DEFAULT_USER_AGENT = (
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
-)
-
-
 class SwaperSessionExpired(RuntimeError):
-    """Raised by the pure-HTTP calls (fetch_loans()/_invest_available_loans())
-    when Swaper responds 401/403 - distinguished from other failures so
-    run()'s invest loop can tell "the login session went stale mid-run"
-    apart from a genuine API/validation error, and react by logging back in
-    again (see run()'s `_relogin_and_rebuild_session()`/`_with_relogin_retry()`)
-    instead of just giving up for the rest of the loop.
+    """Raised by the post-login page.evaluate(fetch()) calls
+    (fetch_loans()/_invest_available_loans()) when Swaper responds 401/403 -
+    distinguished from other failures so run()'s invest loop can tell "the
+    login session went stale mid-run" apart from a genuine API/validation
+    error, and react by logging back in again (see run()'s
+    `_relogin()`/`_with_relogin_retry()`) instead of just giving up for the
+    rest of the loop.
     """
 
 
@@ -387,103 +399,124 @@ def login(page) -> None:
     log.info("Logged in successfully, current URL: %s", page.url)
 
 
-def _build_http_session(context, user_agent: str) -> requests.Session:
-    """Seed a plain `requests.Session()` with the Playwright login session's
-    cookies (added 2026-08-01, explicit user request: keep login on
-    Playwright - the only step genuinely gated by Swaper's reCAPTCHA,
-    confirmed 2026-07-26 - but do everything after it as plain HTTP for
-    speed, no more page reloads/DOM waits in the hot discovery+invest loop).
-    `requests.Session`'s own cookie jar auto-updates from `Set-Cookie`
-    response headers on every call, so any server-side cookie rotation
-    (e.g. XSRF-TOKEN) is handled transparently - only the `x-xsrf-token`
-    HEADER (a separate Angular anti-CSRF mechanism mirroring the cookie's
-    current value) must be re-read fresh before each request, see
-    `_xsrf_headers()`.
+def _page_fetch(page, method: str, url: str, headers: dict, body: str = None) -> dict:
+    """Issue an HTTP call through the real browser's own `fetch()` via
+    `page.evaluate()` - NOT a separate `requests.Session()` (see module
+    docstring's 2026-08-01 Cloudflare-block finding: a plain non-browser
+    HTTP client gets a blanket 403 even with valid session cookies, while
+    the identical call through the real Playwright-driven Chromium context
+    succeeds). Same-origin, so cookies are attached automatically via
+    `credentials: 'include'`; the caller still passes any app-specific
+    headers (content-type, x-xsrf-token, ...) explicitly.
+
+    Returns `{"status": int, "headers": dict, "text": str}`.
     """
-    session = requests.Session()
-    for cookie in context.cookies():
-        session.cookies.set(
-            cookie["name"], cookie["value"],
-            domain=cookie.get("domain") or "swaper.com",
-            path=cookie.get("path") or "/",
-        )
-    session.headers.update({
-        "user-agent": user_agent,
-        "referer": "https://swaper.com/en/loans",
-        "accept-language": "en-US,en;q=0.9",
-        "swaper-client": "",
-    })
-    return session
+    return page.evaluate(
+        """
+        async ({url, method, headers, body}) => {
+            const resp = await fetch(url, {
+                method,
+                headers,
+                credentials: 'include',
+                body: (body === null || body === undefined) ? undefined : body,
+            });
+            const text = await resp.text();
+            const headersObj = {};
+            resp.headers.forEach((value, key) => { headersObj[key] = value; });
+            return { status: resp.status, headers: headersObj, text };
+        }
+        """,
+        {"url": url, "method": method, "headers": headers, "body": body},
+    )
 
 
-def _xsrf_headers(session: requests.Session) -> dict:
+def _xsrf_headers_for_page(page) -> dict:
     """Angular convention (see `fetch_loans()`'s docstring): mirror the
     CURRENT `XSRF-TOKEN` cookie value into an `x-xsrf-token` header, read
-    fresh on every call since the cookie can rotate mid-run.
+    fresh via the real browser context's own cookie jar on every call since
+    the cookie can rotate mid-run.
     """
-    return {"x-xsrf-token": session.cookies.get("XSRF-TOKEN") or ""}
+    for cookie in page.context.cookies():
+        if cookie.get("name") == "XSRF-TOKEN":
+            return {"x-xsrf-token": cookie.get("value") or ""}
+    return {"x-xsrf-token": ""}
 
 
-def _record_http_call(captured: list, method: str, url: str, request_headers: dict, request_body, response) -> None:
-    """Pure-HTTP replacement (2026-08-01) for the old `page.on("response",
-    ...)` listener - performs no request itself, just builds the same
-    shaped entry (redacted request/response headers, raw bodies) as before
-    so `send_swaper_investment_summary_email()`/`send_swaper_api_structure_email()`
-    need no changes.
+def _record_http_call(captured: list, method: str, url: str, request_headers: dict, request_body, result: dict) -> None:
+    """Builds the same shaped diagnostics entry (redacted request/response
+    headers, raw bodies) as before so
+    `send_swaper_investment_summary_email()`/`send_swaper_api_structure_email()`
+    need no changes - `result` is the dict returned by `_page_fetch()`.
     """
     entry = {
         "method": method,
         "url": url,
         "request_headers": _redact_sensitive_headers(dict(request_headers)),
         "request_post_data": request_body,
-        "status": response.status_code,
+        "status": result.get("status"),
     }
     try:
-        entry["response_headers"] = _redact_sensitive_headers(dict(response.headers))
+        entry["response_headers"] = _redact_sensitive_headers(dict(result.get("headers") or {}))
     except Exception:
         entry["response_headers"] = None
-    try:
-        entry["body"] = response.text[:20000]
-    except Exception:
-        entry["body"] = None
+    entry["body"] = (result.get("text") or "")[:20000]
     captured.append(entry)
 
 
-def fetch_loans(session: requests.Session, captured_api_calls: list, groups: list = None) -> dict:
-    """Fetch the loans list via a plain HTTP POST (2026-08-01: the post-login
-    flow moved off Playwright entirely for speed - see module docstring;
-    `login()` still drives a real browser, the only step genuinely gated by
-    Swaper's reCAPTCHA). Same endpoint/body shape already verified live via
-    a real in-page fetch() this replaces: `POST /rest/public/loans` with
-    body `{"page": 1, "pageSize": 13, "groups": [...], "amountFrom": null,
-    "amountTo": null, "status": null}`, returning `{accountBalance,
-    totalRecords, page, results}`.
+def fetch_loans(page, captured_api_calls: list, groups: list = None) -> dict:
+    """Fetch the loans list by letting Swaper's own Angular SPA fire its
+    REAL request (`page.goto()` to the loans page) - NOT a manually
+    reconstructed fetch call (confirmed 2026-08-01, later same day: a
+    manually-built request gets HTTP 403 regardless of whether it's built
+    via `requests` or via `page.evaluate(fetch(...))` - this exact risk was
+    already flagged on 2026-07-25 for this same endpoint: "a fully manual
+    reconstructed request gets 403/415", but was apparently forgotten when
+    the pure-HTTP migration shipped). Verified response shape:
+    `{accountBalance, totalRecords, page, results}`.
 
     `groups` filters to a single loan originator by its exact display name
     (confirmed via real DevTools captures, 2026-07-25 - e.g.
-    `{"groups": ["Wandoo Finance Group"]}`, not an opaque id) - omitted/empty
-    for the unfiltered aggregate listing. Every call (filtered or not) is
-    recorded into `captured_api_calls`, same as every other pure-HTTP call
-    in this module, feeding the investment summary/diagnostics emails.
+    `["Wandoo Finance Group"]`, not an opaque id): rather than building the
+    request from scratch, a `page.route()` interceptor rewrites the SPA's
+    own outgoing request BODY to add `"groups": [...]` before letting it
+    through unmodified otherwise - every header the real app computed
+    itself (x-xsrf-token/referer/cookies/swaper-client) is preserved
+    untouched. Every call (filtered or not) is recorded into
+    `captured_api_calls`, feeding the investment summary/diagnostics
+    emails.
     """
-    body = {
-        "page": 1, "pageSize": 13, "groups": groups or [],
-        "amountFrom": None, "amountTo": None, "status": None,
-    }
-    headers = {
-        "accept": "application/vnd.com.swaper.v2+json",
-        "content-type": "application/vnd.com.swaper.v2+json",
-        **_xsrf_headers(session),
-    }
-    response = session.post(LOANS_URL, json=body, headers=headers, timeout=15)
-    _record_http_call(captured_api_calls, "POST", LOANS_URL, {**session.headers, **headers}, json.dumps(body), response)
-    if response.status_code in (401, 403):
-        raise SwaperSessionExpired(f"Loans API returned status {response.status_code} - session likely expired")
+    def _patch_body(route):
+        request = route.request
+        try:
+            body = json.loads(request.post_data or "{}")
+        except Exception:
+            body = {}
+        body["groups"] = groups
+        route.continue_(post_data=json.dumps(body))
+
+    if groups:
+        page.route("**/rest/public/loans", _patch_body)
+    try:
+        with page.expect_response(
+            lambda r: r.url == LOANS_URL and r.request.method == "POST"
+        ) as response_info:
+            page.goto(LOANS_PAGE_URL, wait_until="domcontentloaded")
+        response = response_info.value
+    finally:
+        if groups:
+            page.unroute("**/rest/public/loans", _patch_body)
+
+    request = response.request
+    text = response.text()
+    result = {"status": response.status, "headers": dict(response.headers), "text": text}
+    _record_http_call(captured_api_calls, "POST", LOANS_URL, dict(request.headers), request.post_data, result)
+    if response.status in (401, 403):
+        raise SwaperSessionExpired(f"Loans API returned status {response.status} - session likely expired")
     if not response.ok:
         raise RuntimeError(
-            f"Loans API returned status {response.status_code}" + (f" for groups {groups!r}" if groups else "")
+            f"Loans API returned status {response.status}" + (f" for groups {groups!r}" if groups else "")
         )
-    return response.json()
+    return json.loads(text or "null")
 
 
 def extract_loans(payload) -> list:
@@ -649,16 +682,17 @@ def _compute_swaper_loan_shares(budget: float, loans: list, min_investment: floa
     return shares
 
 
-def _invest_available_loans(session: requests.Session, loans: list, shares: dict, captured_api_calls: list) -> list:
+def _invest_available_loans(page, loans: list, shares: dict, captured_api_calls: list) -> list:
     """Actually invest into available manual loans, using the exact
     per-loan amounts precomputed by `_compute_swaper_loan_shares()` (loans
     with no entry in `shares`, e.g. below the minimum, are skipped).
 
     REAL requests, REAL money (2026-07-25, explicit user decision to make
-    this the production invest bot - see module docstring). Switched from
-    real Playwright UI clicks to plain HTTP requests on 2026-08-01 (explicit
-    user request for speed): a real captured successful investment showed
-    there is NO separate backend "confirm" API call behind the browser's
+    this the production invest bot - see module docstring). Uses the real
+    browser's own `fetch()` via `_page_fetch()` (reverted 2026-08-01 from a
+    plain `requests.Session()` after Cloudflare started blocking it - see
+    module docstring): a real captured successful investment showed there
+    is NO separate backend "confirm" API call behind the browser's
     confirmation modal - the modal is purely a client-side UI gate. The real
     server-side sequence is just:
       1. `GET /rest/public/profile/is-manual-investment-approved` - must
@@ -666,9 +700,9 @@ def _invest_available_loans(session: requests.Session, loans: list, shares: dict
       2. `POST /rest/public/loans/{loan_id}/buy` with `{"amount": <float>}` -
          response contains an `"investment"` key on success.
     Both calls are recorded into `captured_api_calls` (same list used by
-    every other pure-HTTP call in this module) via `_record_http_call()`, so
-    the investment summary email keeps showing the real request/response for
-    every attempt, same as before.
+    every other call in this module) via `_record_http_call()`, so the
+    investment summary email keeps showing the real request/response for
+    every attempt.
 
     Stops attempting further loans as soon as one loan isn't approved or a
     buy call fails/errors, rather than guessing, with real money on the
@@ -688,22 +722,26 @@ def _invest_available_loans(session: requests.Session, loans: list, shares: dict
         if not amount or amount < MIN_INVESTMENT_AMOUNT:
             continue
 
-        log.info("Investing %.2f EUR into loan %s (REAL money, HTTP request).", amount, loan_label)
+        log.info("Investing %.2f EUR into loan %s (REAL money, HTTP request via browser fetch).", amount, loan_label)
         calls_before = len(captured_api_calls)
 
         try:
             approved_headers = {
                 "accept": "application/vnd.com.swaper.v1+json",
-                **_xsrf_headers(session),
+                **_xsrf_headers_for_page(page),
             }
-            approved_response = session.get(IS_MANUAL_INVESTMENT_APPROVED_URL, headers=approved_headers, timeout=15)
+            approved_result = _page_fetch(page, "GET", IS_MANUAL_INVESTMENT_APPROVED_URL, approved_headers)
             _record_http_call(
                 captured_api_calls, "GET", IS_MANUAL_INVESTMENT_APPROVED_URL,
-                {**session.headers, **approved_headers}, None, approved_response,
+                approved_headers, None, approved_result,
             )
-            if approved_response.status_code in (401, 403):
-                raise SwaperSessionExpired(f"is-manual-investment-approved returned {approved_response.status_code}")
-            approved = approved_response.ok and approved_response.json() is True
+            approved_status = approved_result.get("status")
+            if approved_status in (401, 403):
+                raise SwaperSessionExpired(f"is-manual-investment-approved returned {approved_status}")
+            approved = (
+                approved_status is not None and 200 <= approved_status < 300
+                and json.loads(approved_result.get("text") or "null") is True
+            )
         except SwaperSessionExpired:
             raise
         except Exception:
@@ -732,17 +770,20 @@ def _invest_available_loans(session: requests.Session, loans: list, shares: dict
             buy_headers = {
                 "accept": "application/json, text/plain, */*",
                 "content-type": "application/json;charset=UTF-8",
-                **_xsrf_headers(session),
+                **_xsrf_headers_for_page(page),
             }
             buy_body = {"amount": round(amount, 2)}
-            buy_response = session.post(buy_url, json=buy_body, headers=buy_headers, timeout=15)
+            buy_result = _page_fetch(page, "POST", buy_url, buy_headers, json.dumps(buy_body))
             _record_http_call(
                 captured_api_calls, "POST", buy_url,
-                {**session.headers, **buy_headers}, json.dumps(buy_body), buy_response,
+                buy_headers, json.dumps(buy_body), buy_result,
             )
-            if buy_response.status_code in (401, 403):
-                raise SwaperSessionExpired(f"buy call returned {buy_response.status_code}")
-            confirmed = buy_response.ok and "investment" in (buy_response.json() if buy_response.content else {})
+            buy_status = buy_result.get("status")
+            if buy_status in (401, 403):
+                raise SwaperSessionExpired(f"buy call returned {buy_status}")
+            buy_ok = buy_status is not None and 200 <= buy_status < 300
+            buy_json = json.loads(buy_result.get("text") or "null") if buy_ok and buy_result.get("text") else None
+            confirmed = buy_ok and isinstance(buy_json, dict) and "investment" in buy_json
         except SwaperSessionExpired:
             raise
         except Exception:
@@ -792,7 +833,6 @@ def run(headless: bool = True) -> None:
     # itself skip sending the email.
     run_error = None
     payload = None
-    session = None
     captured_api_calls = []
     investment_attempts = []
     min_interest_rate = MIN_INTEREST_RATE
@@ -820,45 +860,26 @@ def run(headless: bool = True) -> None:
 
         try:
             login(page)
-            # Everything after login() is now plain HTTP (2026-08-01, see
-            # module docstring) - build a requests.Session seeded with the
-            # just-established login cookies, using the real browser's own
-            # User-Agent for consistency with the session that was just
-            # authenticated.
-            try:
-                user_agent = page.evaluate("() => navigator.userAgent")
-            except Exception:
-                user_agent = None
-            session = _build_http_session(context, user_agent or DEFAULT_USER_AGENT)
 
-            def _relogin_and_rebuild_session() -> None:
+            def _relogin() -> None:
                 # The browser/page are kept alive for the whole run anyway
                 # (see the storage_state persistence at the end), so a mid-run
-                # session expiry (added 2026-08-01, explicit user request: "et
-                # si la session expire ça refait le login") can be recovered
-                # from without restarting the whole process - just log back in
-                # again and rebuild the HTTP session from the fresh cookies.
-                nonlocal session
+                # session expiry (explicit user request: "et si la session
+                # expire ça refait le login") can be recovered from without
+                # restarting the whole process - every call reads cookies
+                # fresh from the same page/context (see _page_fetch()), no
+                # separate session object to rebuild.
                 log.warning("Swaper session appears to have expired mid-run - logging back in again.")
                 login(page)
-                try:
-                    fresh_user_agent = page.evaluate("() => navigator.userAgent")
-                except Exception:
-                    fresh_user_agent = None
-                session = _build_http_session(context, fresh_user_agent or DEFAULT_USER_AGENT)
 
             def _with_relogin_retry(call):
-                # `call` is a zero-arg lambda reading `session` from this
-                # closure at CALL time (not capture time), so retrying it
-                # after `_relogin_and_rebuild_session()` reassigns `session`
-                # transparently uses the fresh one.
                 try:
                     return call()
                 except SwaperSessionExpired:
-                    _relogin_and_rebuild_session()
+                    _relogin()
                     return call()
 
-            payload = _with_relogin_retry(lambda: fetch_loans(session, captured_api_calls))
+            payload = _with_relogin_retry(lambda: fetch_loans(page, captured_api_calls))
 
             # REAL investment attempt (2026-07-25, explicit user decision -
             # see module docstring). Per-originator investing (added later
@@ -868,7 +889,7 @@ def run(headless: bool = True) -> None:
             # shared.google_sheet.get_selected_swaper_loan_originators(),
             # mirroring the PeerBerry/Lendermarket sheet convention) are
             # considered, and each is checked individually for CURRENT loan
-            # availability via fetch_loans(session, ..., groups=[name])
+            # availability via fetch_loans(page, ..., groups=[name])
             # (the site's "Loan originators" filter, driven through the
             # API's "groups" field - see that function's docstring). The
             # available balance is then split EVENLY across only the
@@ -989,7 +1010,7 @@ def run(headless: bool = True) -> None:
                             for name in selected_originators:
                                 try:
                                     originator_payload = _with_relogin_retry(
-                                        lambda name=name: fetch_loans(session, captured_api_calls, groups=[name])
+                                        lambda name=name: fetch_loans(page, captured_api_calls, groups=[name])
                                     )
                                 except Exception:
                                     log.exception("Failed to fetch filtered loans for originator %r - skipping it.", name)
@@ -1048,7 +1069,7 @@ def run(headless: bool = True) -> None:
                                         # for/targeting a loan that no longer exists, and
                                         # correctly picks up any loan that appeared since.
                                         refreshed_payload = _with_relogin_retry(
-                                            lambda name=name: fetch_loans(session, captured_api_calls, groups=[name])
+                                            lambda name=name: fetch_loans(page, captured_api_calls, groups=[name])
                                         )
                                     except Exception:
                                         log.exception("Failed to re-fetch loans for originator %r before investing - skipping it.", name)
@@ -1062,7 +1083,7 @@ def run(headless: bool = True) -> None:
                                     shares = _compute_swaper_loan_shares(budget, current_loans)
                                     try:
                                         attempts = _with_relogin_retry(
-                                            lambda: _invest_available_loans(session, current_loans, shares, captured_api_calls)
+                                            lambda: _invest_available_loans(page, current_loans, shares, captured_api_calls)
                                         )
                                     except Exception:
                                         log.exception("Failed to invest into originator %r's loan(s) - skipping it this pass.", name)
@@ -1085,7 +1106,7 @@ def run(headless: bool = True) -> None:
                                 # (notification email etc.) to reflect what's actually
                                 # left AFTER investing, not the stale pre-invest numbers -
                                 # also feeds balance_now for this loop's own exit checks.
-                                payload = _with_relogin_retry(lambda: fetch_loans(session, captured_api_calls))
+                                payload = _with_relogin_retry(lambda: fetch_loans(page, captured_api_calls))
                                 balance_now = extract_balance(payload)
 
                             if not loop_active:
@@ -1146,23 +1167,12 @@ def run(headless: bool = True) -> None:
         # Persist cookies/local storage so the next run can skip login (and
         # 2FA, thanks to the "trust this browser" checkbox) while the session
         # remains valid - only on a clean run, never after an error (the
-        # session may be in a broken/partial state). The requests.Session's
-        # cookies may have rotated during the pure-HTTP loop (e.g.
-        # XSRF-TOKEN) - synced back into the Playwright context first so the
-        # persisted state reflects the latest values, not just the ones from
-        # right after login.
+        # session may be in a broken/partial state). Every call in this run
+        # went through the same Playwright context (see _page_fetch()), so
+        # its cookie jar already reflects any mid-run rotation (e.g.
+        # XSRF-TOKEN) with no separate syncing needed.
         if run_error is None:
             try:
-                if session is not None:
-                    context.add_cookies([
-                        {
-                            "name": cookie.name,
-                            "value": cookie.value,
-                            "domain": cookie.domain or "swaper.com",
-                            "path": cookie.path or "/",
-                        }
-                        for cookie in session.cookies
-                    ])
                 context.storage_state(path=str(STORAGE_STATE_FILE))
             except Exception:
                 log.exception("Failed to persist storage state.")
