@@ -1254,10 +1254,10 @@ def run(headless: bool = True) -> None:
         log.info("FORCE_TEST_EMAIL is set - sending a forced test recap email.")
         send_swaper_email(balance, loans)
 
-    if balance < 10:
-        ensure_schedule("30m", cron_job_id=SWAPER_CRON_JOB_ID, state_file=CRON_SCHEDULE_STATE_FILE)
-    else:
-        ensure_schedule("2m", cron_job_id=SWAPER_CRON_JOB_ID, state_file=CRON_SCHEDULE_STATE_FILE)
+    # if balance < 10:
+    #     ensure_schedule("30m", cron_job_id=SWAPER_CRON_JOB_ID, state_file=CRON_SCHEDULE_STATE_FILE)
+    # else:
+    #     ensure_schedule("2m", cron_job_id=SWAPER_CRON_JOB_ID, state_file=CRON_SCHEDULE_STATE_FILE)
 
     # Same rule for both monitors (see notification_gate.py): only really
     # "available" when there's money to invest AND at least one loan listed.
