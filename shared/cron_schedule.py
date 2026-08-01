@@ -98,3 +98,51 @@ def ensure_schedule(mode: str, cron_job_id: str, state_file: Path) -> None:
         log.info("Cron decision: UPDATE success (new_mode=%s).", mode)
     else:
         log.warning("Cron decision: UPDATE failed (target_mode=%s).", mode)
+
+
+def set_job_enabled(cron_job_id: str, enabled: bool) -> bool:
+    """Enable/disable a cron-job.org job outright (its `job.enabled` flag),
+    as opposed to `ensure_schedule()` which only ever changes HOW OFTEN an
+    enabled job fires. Used by monitors that now poll continuously inside
+    a single long-running invocation (e.g. swaper_monitor.py's invest loop,
+    added 2026-08-01) - the external cron-job.org trigger is disabled for
+    the duration of that loop (no need for it to fire a second, overlapping
+    run) and re-enabled once the loop stops, success or timeout. Returns
+    True on a confirmed API success, False otherwise (missing API key/job
+    id, or the request itself failed) - callers should treat False as
+    "best effort, not guaranteed" and log accordingly, never raise.
+    """
+    if not CRON_JOB_API_KEY or not cron_job_id:
+        log.info("CRON_JOB_API_KEY or cron job id missing, skipping cron-job.org enable/disable.")
+        return False
+
+    endpoint = f"https://api.cron-job.org/jobs/{cron_job_id}"
+    payload = {"job": {"enabled": enabled}}
+    req = request.Request(
+        endpoint,
+        method="PATCH",
+        data=json.dumps(payload).encode("utf-8"),
+        headers={
+            "Authorization": f"Bearer {CRON_JOB_API_KEY}",
+            "Content-Type": "application/json",
+        },
+    )
+
+    try:
+        with request.urlopen(req, timeout=20) as resp:
+            if 200 <= resp.status < 300:
+                log.info("cron-job.org job %s %s.", cron_job_id, "enabled" if enabled else "disabled")
+                return True
+            log.warning("cron-job.org enable/disable returned unexpected HTTP status %s.", resp.status)
+            return False
+    except error.HTTPError as exc:
+        details = ""
+        try:
+            details = exc.read().decode("utf-8", errors="ignore")
+        except Exception:
+            pass
+        log.warning("cron-job.org enable/disable failed (HTTP %s). Response: %s", exc.code, details[:400])
+    except Exception:
+        log.exception("cron-job.org enable/disable failed.")
+
+    return False
