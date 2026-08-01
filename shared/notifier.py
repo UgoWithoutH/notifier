@@ -84,6 +84,7 @@ def send_swaper_investment_summary_email(
     country_threshold_percentage: float | None = None,
     country_status: dict | None = None,
     country_blocked: list | None = None,
+    error: str | None = None,
 ) -> None:
     """Send a summary of REAL Swaper investments made this run via the
     manual "+" button (see monitors.swaper_monitor._invest_available_loans()
@@ -111,6 +112,13 @@ def send_swaper_investment_summary_email(
     instead of driving a real browser - also useful right now, to confirm
     each investment attempt actually succeeded (status code/body).
 
+    Each attempt's own `confirm_api_calls` (added 2026-08-01, per explicit
+    user request: "je veux absolument r\u00e9cup\u00e9rer la requ\u00eate api pour
+    investir par mail je veux des logs d\u00e9taill\u00e9s") - the real /rest/ call(s)
+    fired by clicking the modal's "Confirm" button - are rendered DIRECTLY
+    in the email BODY (method/url/status + response body, not just buried
+    in the JSON attachment), right under that attempt's own line.
+
     `min_interest_rate`/`country_threshold_percentage`/`country_status`/
     `country_blocked` (added 2026-07-31, mirrors
     `send_lendermarket_invest_summary_email()`'s equivalent sections): the
@@ -121,6 +129,13 @@ def send_swaper_investment_summary_email(
     `{invested, threshold_amount, blocked}` breakdown, and the list of loan
     originators excluded this run because their country already hit the
     cap.
+
+    `error` (added 2026-08-01, explicit user request: "si y'a une erreur ou
+    autre il faut arrêter le bot et à la fin du run quoi qu'il arrive
+    envoyer le mail") - when set, this email is sent EVEN IF `attempts` is
+    empty (monitors/swaper_monitor.py's `run()` calls this whenever
+    `attempts or error`), with the error message shown prominently at the
+    top of the body and in the subject, so a failed run is never silent.
     """
     if not all([SMTP_HOST, SMTP_USER, SMTP_PASSWORD, EMAIL_TO]):
         log.error(
@@ -130,7 +145,13 @@ def send_swaper_investment_summary_email(
         return
 
     subject = f"[Swaper] {len(attempts)} investissement(s) r\u00e9el(s) tent\u00e9(s)"
-    body_lines = [
+    if error:
+        subject += " - ERREUR"
+    body_lines = []
+    if error:
+        body_lines.append(f"\u26a0 ERREUR pendant ce run - le bot s'est arr\u00eat\u00e9 : {error}")
+        body_lines.append("")
+    body_lines += [
         f"{len(attempts)} investissement(s) r\u00e9el(s) tent\u00e9(s) automatiquement sur Swaper "
         "(bouton '+' manuel, argent r\u00e9el) :",
         "",
@@ -142,9 +163,17 @@ def send_swaper_investment_summary_email(
         line = f"- {prefix}Pr\u00eat {label} : {attempt.get('amount'):.2f} \u20ac"
         if attempt.get("error"):
             line += " -- ERREUR pendant le clic, voir les logs"
-        elif attempt.get("modal_html"):
-            line += " -- une fen\u00eatre de confirmation inattendue est apparue, investissement stopp\u00e9 ensuite (voir la pi\u00e8ce jointe)"
+        elif attempt.get("modal_html") and not attempt.get("confirmed"):
+            line += " -- une fen\u00eatre de confirmation est apparue mais le bouton Confirm n'a pas pu \u00eatre cliqu\u00e9, investissement stopp\u00e9 (voir la pi\u00e8ce jointe)"
+        elif attempt.get("modal_html") and attempt.get("confirmed"):
+            line += " -- confirm\u00e9 via la fen\u00eatre de confirmation"
         body_lines.append(line)
+        for call in attempt.get("confirm_api_calls") or []:
+            body_lines.append(
+                f"    -> Requ\u00eate API d'investissement : {call.get('method')} {call.get('url')} "
+                f"-> HTTP {call.get('status')}"
+            )
+            body_lines.append(f"       Corps r\u00e9ponse : {(call.get('body') or '')[:1000]}")
     body_lines.append("")
 
     if min_interest_rate is not None:
