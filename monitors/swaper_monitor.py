@@ -737,6 +737,14 @@ def _invest_available_loans(page, loans: list, shares: dict, captured_api_calls:
                 page.locator("#loan-confirmation-slider.open").wait_for(state="visible", timeout=8000)
             except PlaywrightTimeoutError:
                 pass
+            # The modal can open as an empty shell (no .modal-footer/Confirm
+            # button yet) while Swaper runs an async approval check first -
+            # real production failure (loan BLS-305654) before this wait was
+            # added. Silently gives up after 15s, same as the wait above.
+            try:
+                page.locator(".modal-footer .button.clickable", has_text="Confirm").wait_for(state="visible", timeout=15000)
+            except PlaywrightTimeoutError:
+                pass
         except Exception:
             log.exception("Exception while attempting to invest in loan %s - stopping.", loan_label)
             attempts.append({"loan_id": loan_id, "loan_number": loan.get("number"), "amount": amount, "error": True})
