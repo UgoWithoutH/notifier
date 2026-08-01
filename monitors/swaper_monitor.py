@@ -173,6 +173,30 @@ minInterestRate used and a per-country invested/threshold breakdown. Both
 Sheet reads are soft-fail (fall back to the module default / disable
 country blocking on a read error), same pattern as every other soft-fail
 Sheet read in this repo.
+
+Post-login flow switched to pure HTTP (added 2026-08-01, explicit user
+request for speed - "login en playwright et après le reste en pur http"):
+`login()` still drives a real Playwright browser (the only step genuinely
+gated by Swaper's reCAPTCHA v3, confirmed 2026-07-26 - see repo memory),
+but everything afterward (loan-listing/filter polling AND the real invest
+calls) now goes through a plain `requests.Session()` seeded with the
+login's cookies (`_build_http_session()`), instead of driving the UI via
+`page.goto()`/clicks. `fetch_loans()` is now a single function (an HTTP
+POST, optionally filtered via `groups`) replacing the old
+`fetch_loans()`/`fetch_loans_for_originator()`/`fetch_loans_fast()` trio -
+there's no more "slow reload vs fast in-page fetch" distinction since a
+plain request is already fast. `_invest_available_loans()` no longer
+clicks the amount input/"+" icon/Confirm button - it replicates the 2 real
+calls a real investment fires (confirmed from a real successful capture,
+2026-08-01): `GET /rest/public/profile/is-manual-investment-approved`
+(must return `true`) then `POST /rest/public/loans/{id}/buy` with
+`{"amount": <float>}` - there is NO separate "confirm" API call, the
+browser's confirmation modal is purely a UI safety step, so these 2 calls
+are the whole real flow, not a guess. The browser/context stay open for
+the whole run only to persist `storage_state` at the end (cookies picked
+up by the `requests.Session` mid-run, e.g. a rotated `XSRF-TOKEN`, are
+synced back into the context via `context.add_cookies()` right before
+saving, so the next run's login-skip stays valid).
 """
 
 
@@ -186,6 +210,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 import pyotp
+import requests
 from dotenv import load_dotenv
 from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
 
@@ -244,6 +269,31 @@ SWAPER_LOOP_POLL_INTERVAL_SECONDS = float(os.environ.get("SWAPER_LOOP_POLL_INTER
 # interest-rate filtering at all) instead of silently excluding every loan
 # on a read error.
 MIN_INTEREST_RATE = float(os.environ.get("SWAPER_MIN_INTEREST_RATE", "0"))
+
+# Pure-HTTP endpoints used for everything after login (see module docstring,
+# "Post-login flow switched to pure HTTP", 2026-08-01).
+LOANS_URL = "https://swaper.com/rest/public/loans"
+IS_MANUAL_INVESTMENT_APPROVED_URL = "https://swaper.com/rest/public/profile/is-manual-investment-approved"
+BUY_URL_TEMPLATE = "https://swaper.com/rest/public/loans/{loan_id}/buy"
+
+# Fallback only used if reading the real browser's navigator.userAgent right
+# after login fails for some reason - keeps the requests.Session looking like
+# a realistic recent desktop Chrome instead of the default `python-requests/...`
+# User-Agent.
+DEFAULT_USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
+)
+
+
+class SwaperSessionExpired(RuntimeError):
+    """Raised by the pure-HTTP calls (fetch_loans()/_invest_available_loans())
+    when Swaper responds 401/403 - distinguished from other failures so
+    run()'s invest loop can tell "the login session went stale mid-run"
+    apart from a genuine API/validation error, and react by logging back in
+    again (see run()'s `_relogin_and_rebuild_session()`/`_with_relogin_retry()`)
+    instead of just giving up for the rest of the loop.
+    """
 
 
 
@@ -337,29 +387,102 @@ def login(page) -> None:
     log.info("Logged in successfully, current URL: %s", page.url)
 
 
-def fetch_loans(page) -> dict:
-    """Fetch the loans list by navigating to the real /en/loans page and
-    capturing its own API call, so the CSRF token (`x-xsrf-token` header,
-    derived from a cookie) and `referer` are exactly what the API expects -
-    a manually reconstructed fetch() call gets rejected with 403 otherwise.
-
-    Verified against a real account on 2026-07-06: the page issues
-    `POST /rest/public/loans` with body
-    `{"page": 1, "pageSize": 13, "groups": [], "amountFrom": null,
-    "amountTo": null, "status": null}` and returns
-    `{accountBalance, totalRecords, page, results}`. This only fetches the
-    first page (13 items) - fine for "is anything newly available" style
-    monitoring, but increase pageSize / paginate if you need the full list.
+def _build_http_session(context, user_agent: str) -> requests.Session:
+    """Seed a plain `requests.Session()` with the Playwright login session's
+    cookies (added 2026-08-01, explicit user request: keep login on
+    Playwright - the only step genuinely gated by Swaper's reCAPTCHA,
+    confirmed 2026-07-26 - but do everything after it as plain HTTP for
+    speed, no more page reloads/DOM waits in the hot discovery+invest loop).
+    `requests.Session`'s own cookie jar auto-updates from `Set-Cookie`
+    response headers on every call, so any server-side cookie rotation
+    (e.g. XSRF-TOKEN) is handled transparently - only the `x-xsrf-token`
+    HEADER (a separate Angular anti-CSRF mechanism mirroring the cookie's
+    current value) must be re-read fresh before each request, see
+    `_xsrf_headers()`.
     """
-    log.info("Navigating to the loans page and capturing the loans API response...")
-    with page.expect_response(
-        lambda r: r.url.endswith("/rest/public/loans") and r.request.method == "POST"
-    ) as response_info:
-        page.goto("https://swaper.com/en/loans", wait_until="domcontentloaded")
-    response = response_info.value
+    session = requests.Session()
+    for cookie in context.cookies():
+        session.cookies.set(
+            cookie["name"], cookie["value"],
+            domain=cookie.get("domain") or "swaper.com",
+            path=cookie.get("path") or "/",
+        )
+    session.headers.update({
+        "user-agent": user_agent,
+        "referer": "https://swaper.com/en/loans",
+        "accept-language": "en-US,en;q=0.9",
+        "swaper-client": "",
+    })
+    return session
+
+
+def _xsrf_headers(session: requests.Session) -> dict:
+    """Angular convention (see `fetch_loans()`'s docstring): mirror the
+    CURRENT `XSRF-TOKEN` cookie value into an `x-xsrf-token` header, read
+    fresh on every call since the cookie can rotate mid-run.
+    """
+    return {"x-xsrf-token": session.cookies.get("XSRF-TOKEN") or ""}
+
+
+def _record_http_call(captured: list, method: str, url: str, request_headers: dict, request_body, response) -> None:
+    """Pure-HTTP replacement (2026-08-01) for the old `page.on("response",
+    ...)` listener - performs no request itself, just builds the same
+    shaped entry (redacted request/response headers, raw bodies) as before
+    so `send_swaper_investment_summary_email()`/`send_swaper_api_structure_email()`
+    need no changes.
+    """
+    entry = {
+        "method": method,
+        "url": url,
+        "request_headers": _redact_sensitive_headers(dict(request_headers)),
+        "request_post_data": request_body,
+        "status": response.status_code,
+    }
+    try:
+        entry["response_headers"] = _redact_sensitive_headers(dict(response.headers))
+    except Exception:
+        entry["response_headers"] = None
+    try:
+        entry["body"] = response.text[:20000]
+    except Exception:
+        entry["body"] = None
+    captured.append(entry)
+
+
+def fetch_loans(session: requests.Session, captured_api_calls: list, groups: list = None) -> dict:
+    """Fetch the loans list via a plain HTTP POST (2026-08-01: the post-login
+    flow moved off Playwright entirely for speed - see module docstring;
+    `login()` still drives a real browser, the only step genuinely gated by
+    Swaper's reCAPTCHA). Same endpoint/body shape already verified live via
+    a real in-page fetch() this replaces: `POST /rest/public/loans` with
+    body `{"page": 1, "pageSize": 13, "groups": [...], "amountFrom": null,
+    "amountTo": null, "status": null}`, returning `{accountBalance,
+    totalRecords, page, results}`.
+
+    `groups` filters to a single loan originator by its exact display name
+    (confirmed via real DevTools captures, 2026-07-25 - e.g.
+    `{"groups": ["Wandoo Finance Group"]}`, not an opaque id) - omitted/empty
+    for the unfiltered aggregate listing. Every call (filtered or not) is
+    recorded into `captured_api_calls`, same as every other pure-HTTP call
+    in this module, feeding the investment summary/diagnostics emails.
+    """
+    body = {
+        "page": 1, "pageSize": 13, "groups": groups or [],
+        "amountFrom": None, "amountTo": None, "status": None,
+    }
+    headers = {
+        "accept": "application/vnd.com.swaper.v2+json",
+        "content-type": "application/vnd.com.swaper.v2+json",
+        **_xsrf_headers(session),
+    }
+    response = session.post(LOANS_URL, json=body, headers=headers, timeout=15)
+    _record_http_call(captured_api_calls, "POST", LOANS_URL, {**session.headers, **headers}, json.dumps(body), response)
+    if response.status_code in (401, 403):
+        raise SwaperSessionExpired(f"Loans API returned status {response.status_code} - session likely expired")
     if not response.ok:
-        raise RuntimeError(f"Loans API returned status {response.status}")
-    human_mouse_wander(page)
+        raise RuntimeError(
+            f"Loans API returned status {response.status_code}" + (f" for groups {groups!r}" if groups else "")
+        )
     return response.json()
 
 
@@ -387,99 +510,6 @@ def extract_balance(payload) -> float:
         if isinstance(balance, (int, float)):
             return float(balance)
     return 0.0
-
-
-def fetch_loans_for_originator(page, originator_name: str) -> dict:
-    """Fetch loans filtered to a single loan originator, without driving
-    Swaper's custom JS "Loan originators" multiselect dropdown (a fragile
-    custom widget - reverse-engineering its click/toggle behaviour turned
-    out to be unreliable). Confirmed instead via real DevTools captures
-    (2026-07-25, provided directly by the user) that `POST
-    /rest/public/loans`'s body simply takes the originator's exact display
-    name as a plain string in its `"groups"` array - e.g.
-    `{"groups": ["Wandoo Finance Group"]}` or `{"groups": ["SW Finance"]}`
-    - not an opaque id, so no name->id mapping is needed at all.
-
-    Instead of reconstructing the request from scratch (which fetch_loans()'s
-    docstring already documented gets rejected with 403 - the x-xsrf-token
-    header/cookie and referer must be exactly what the real app computes),
-    this intercepts the page's OWN outgoing request (fired by a normal
-    `page.goto` to the loans page) via `page.route()` and rewrites only its
-    JSON body to add the `groups` filter, then forwards it unmodified
-    otherwise - so every header the app itself computed (csrf token,
-    referer, cookies, ...) is preserved exactly. Because this is the
-    Angular app's own request/response cycle (just with a patched body),
-    the app renders the FILTERED results in the page itself afterwards, so
-    the visible `tr.loan-row` rows on the page match this originator right
-    after this call returns - no separate UI filtering step needed before
-    investing.
-    """
-    def _rewrite_body(route):
-        request = route.request
-        try:
-            body = json.loads(request.post_data or "{}")
-        except ValueError:
-            body = {}
-        body["groups"] = [originator_name]
-        route.continue_(post_data=json.dumps(body))
-
-    page.route("**/rest/public/loans", _rewrite_body)
-    try:
-        with page.expect_response(
-            lambda r: r.url.endswith("/rest/public/loans") and r.request.method == "POST"
-        ) as response_info:
-            page.goto("https://swaper.com/en/loans", wait_until="domcontentloaded")
-        response = response_info.value
-        if not response.ok:
-            raise RuntimeError(f"Loans API returned status {response.status} for originator {originator_name!r}")
-        human_mouse_wander(page)
-        return response.json()
-    finally:
-        page.unroute("**/rest/public/loans", _rewrite_body)
-
-
-def fetch_loans_fast(page, groups: list) -> dict:
-    """Same `/rest/public/loans` query as `fetch_loans_for_originator()`,
-    but fired as an in-page `fetch()` call (page.evaluate) instead of a full
-    `page.goto()` reload - skips re-bootstrapping the whole Angular app
-    (the repeated constraints/logged-in/history-statistics calls a full
-    reload triggers) and the human_mouse_wander pause, at the cost of NOT
-    updating the visible DOM (so this must never be used right before a
-    real click - only for availability checks, added 2026-08-01 to shrink
-    the discovery-loop's contribution to the gap between "loan seen as
-    available" and the real invest click, since that gap is exactly what
-    let a loan get sniped by another investor - see the invest loop's
-    "re-fetch right before investing" comment).
-
-    Assumes the standard Angular convention of an `XSRF-TOKEN` cookie
-    mirrored into the `x-xsrf-token` header (unverified against a live
-    session at the time this was written) - raises on any failure so the
-    caller can fall back to the slower, proven `fetch_loans_for_originator()`.
-    """
-    body = json.dumps({
-        "page": 1, "pageSize": 13, "groups": groups,
-        "amountFrom": None, "amountTo": None, "status": None,
-    })
-    return page.evaluate(
-        """
-        async ({ body }) => {
-            const match = document.cookie.match(/(?:^|; )XSRF-TOKEN=([^;]*)/);
-            const token = match ? decodeURIComponent(match[1]) : '';
-            const resp = await fetch('/rest/public/loans', {
-                method: 'POST',
-                headers: {
-                    'accept': 'application/vnd.com.swaper.v2+json',
-                    'content-type': 'application/vnd.com.swaper.v2+json',
-                    'x-xsrf-token': token,
-                },
-                body,
-            });
-            if (!resp.ok) { throw new Error('loans fetch failed: ' + resp.status); }
-            return resp.json();
-        }
-        """,
-        {"body": body},
-    )
 
 
 def _filter_loans_by_min_interest_rate(loans: list, min_interest_rate: float) -> list:
@@ -547,52 +577,6 @@ def _redact_sensitive_headers(headers: dict) -> dict:
         else:
             redacted[name] = value
     return redacted
-
-
-def _record_api_response(captured: list, response) -> None:
-    """`page.on("response", ...)` handler used by run() to passively capture
-    Swaper's own `/rest/` API traffic while browsing the loans page - feeds
-    the investment summary email's attachment (see
-    `send_swaper_investment_summary_email()`), which is meant to carry
-    everything needed to later attempt building a pure-HTTP-request-based
-    bot (mirroring monitors/lendermarket_monitor.py's `requests.Session`
-    approach) instead of driving a real browser: for every captured call,
-    both the request (method, full url, ALL header NAMES - values redacted
-    for cookies/auth/csrf, see `_redact_sensitive_headers()` - and the raw
-    POST body) and the response (status, ALL header NAMES same redaction,
-    and the raw body) are kept. Only ever registered AFTER login() has
-    fully completed; also explicitly skips anything login/auth-related as
-    a second safety layer (belt-and-braces, per the repo's security lesson
-    about page.route()/page.on() interceptors and credentials) even though
-    that should never happen at this point in the flow - the login/2FA
-    request shape itself is deliberately NEVER captured this way (a future
-    pure-HTTP bot would still need `login()`/`handle_two_factor()`'s
-    already-documented browser-based flow, or its own separate careful
-    capture - not silently piggy-backed onto this listener).
-    """
-    url = response.url
-    if "swaper.com" not in url or "/rest/" not in url:
-        return
-    lower_url = url.lower()
-    if any(keyword in lower_url for keyword in ("login", "auth", "password")):
-        return
-    request = response.request
-    entry = {
-        "method": request.method,
-        "url": url,
-        "request_headers": _redact_sensitive_headers(request.headers),
-        "request_post_data": request.post_data,
-        "status": response.status,
-    }
-    try:
-        entry["response_headers"] = _redact_sensitive_headers(response.headers)
-    except Exception:
-        entry["response_headers"] = None
-    try:
-        entry["body"] = response.text()[:20000]
-    except Exception:
-        entry["body"] = None
-    captured.append(entry)
 
 
 def _compute_swaper_loan_shares(budget: float, loans: list, min_investment: float = MIN_INVESTMENT_AMOUNT) -> dict:
@@ -665,62 +649,36 @@ def _compute_swaper_loan_shares(budget: float, loans: list, min_investment: floa
     return shares
 
 
-def _invest_available_loans(page, loans: list, shares: dict, captured_api_calls: list) -> list:
+def _invest_available_loans(session: requests.Session, loans: list, shares: dict, captured_api_calls: list) -> list:
     """Actually invest into available manual loans, using the exact
     per-loan amounts precomputed by `_compute_swaper_loan_shares()` (loans
     with no entry in `shares`, e.g. below the minimum, are skipped).
 
-    REAL clicks, REAL money (2026-07-25, explicit user decision to make this
-    the production invest bot rather than only a safe click-and-abort
-    capture - see repo memory). For each loan with a computed share: fills
-    its amount input with that exact amount and clicks its "+" icon.
-    Nothing here blocks/intercepts the request - the real HTTP call really
-    goes to Swaper's server, and is passively captured (request+response,
-    not blocked) by the already-registered `_record_api_response()`
-    listener, so its outcome can be reviewed in the summary email.
+    REAL requests, REAL money (2026-07-25, explicit user decision to make
+    this the production invest bot - see module docstring). Switched from
+    real Playwright UI clicks to plain HTTP requests on 2026-08-01 (explicit
+    user request for speed): a real captured successful investment showed
+    there is NO separate backend "confirm" API call behind the browser's
+    confirmation modal - the modal is purely a client-side UI gate. The real
+    server-side sequence is just:
+      1. `GET /rest/public/profile/is-manual-investment-approved` - must
+         return `true`.
+      2. `POST /rest/public/loans/{loan_id}/buy` with `{"amount": <float>}` -
+         response contains an `"investment"` key on success.
+    Both calls are recorded into `captured_api_calls` (same list used by
+    every other pure-HTTP call in this module) via `_record_http_call()`, so
+    the investment summary email keeps showing the real request/response for
+    every attempt, same as before.
 
-    Each loan's row is targeted by its visible `number` text (NOT always
-    `rows.first`) since a loan given only a PARTIAL share (share < loan's
-    own full amount, the normal case under equal-split) stays visible on
-    the page afterwards rather than disappearing/reordering.
-
-    Swaper shows a `#loan-confirmation-slider` confirmation modal after
-    clicking "+" (confirmed 2026-08-01, real money click explicitly
-    approved by the user, modal ID/class - `open`/closed - verified from a
-    real captured attachment) - this now clicks the modal's real "Confirm"
-    button (`.modal-footer .button.clickable` containing the text
-    "Confirm") to actually complete the purchase. If that button can't be
-    found/clicked, stops attempting further loans immediately and reports
-    the modal's HTML rather than guessing which button to click with real
-    money on the line. Also stops on any exception while interacting with
-    a row. The modal is scoped to a single loan (its title is that loan's
-    own number, one amount field, one Confirm button) - there's no
-    evidence of a multi-loan batch-select-then-confirm-once UI, so
-    multiple loans in `shares` are still invested one at a time here, each
-    through its own "+"/modal/Confirm cycle - but the wait after each step
-    is now tied to the modal's real visible/hidden state instead of a
-    fixed 3s sleep, to invest through several loans faster (2026-08-01).
-
-    The modal CSS-selector guess (`.modal`/`[role=dialog]`/etc.) is
-    unverified against every possible UI pattern, so it could miss some
-    other one (toast, snackbar, inline button next to the row) - as
-    a fallback safety net, the row's own outerHTML right after the click is
-    always captured too (`row_html_after_click`), so whatever appeared near
-    it is visible in the summary email's attachment even if it isn't
-    recognized as a "modal" by the selector above.
-
-    `captured_api_calls` is the SAME list already populated by the
-    page-wide `_record_api_response()` listener (registered in `run()`
-    before this function is ever called) - passed in here so the exact
-    call(s) fired by the real "Confirm" click can be sliced out and both
-    logged to the console (detailed, per explicit user request 2026-08-01:
-    "je veux absolument récupérer la requête api pour investir par mail je
-    veux des logs détaillés") and stored per-attempt as
-    `confirm_api_calls`, so the invest request/response is front-and-center
-    in the summary email body, not just buried in the full JSON attachment.
+    Stops attempting further loans as soon as one loan isn't approved or a
+    buy call fails/errors, rather than guessing, with real money on the
+    line - same conservative behavior as the old click-driven version. A
+    401/403 on either call raises `SwaperSessionExpired` instead of being
+    swallowed as a generic error, so `run()` can tell a stale session apart
+    from a real failure and log back in rather than just giving up.
 
     Returns a list of attempt dicts: {loan_id, loan_number, amount,
-    modal_html, row_html_after_click, confirmed, confirm_api_calls, error}.
+    confirmed, confirm_api_calls, error, not_approved}.
     """
     attempts = []
     for loan in loans:
@@ -730,98 +688,88 @@ def _invest_available_loans(page, loans: list, shares: dict, captured_api_calls:
         if not amount or amount < MIN_INVESTMENT_AMOUNT:
             continue
 
-        row = page.locator("tr.loan-row", has_text=str(loan_label))
-        if row.count() == 0:
-            log.warning("Could not find the row for loan %s on the page - skipping it.", loan_label)
-            continue
-        row = row.first
+        log.info("Investing %.2f EUR into loan %s (REAL money, HTTP request).", amount, loan_label)
+        calls_before = len(captured_api_calls)
 
-        log.info("Investing %.2f EUR into loan %s (REAL money, real click).", amount, loan_label)
         try:
-            amount_input = row.locator(".field.currency input").first
-            amount_input.click()
-            amount_input.fill(f"{amount:.2f}")
-            row.locator(".icon-plus").first.click(timeout=10000)
-            # Wait for the real modal (confirmed ID/class, see docstring) to
-            # actually appear instead of a fixed 3s sleep - usually resolves
-            # in well under a second, speeding up runs with several loans to
-            # invest into (added 2026-08-01, explicit user question: "il me
-            # semble qu'on peut investir sur plusieurs prêt à la fois... ce
-            # serait pas plus rapide"). Falls through silently if no modal
-            # shows up this time - the outerHTML sniff below still runs.
-            try:
-                page.locator("#loan-confirmation-slider.open").wait_for(state="visible", timeout=8000)
-            except PlaywrightTimeoutError:
-                pass
+            approved_headers = {
+                "accept": "application/vnd.com.swaper.v1+json",
+                **_xsrf_headers(session),
+            }
+            approved_response = session.get(IS_MANUAL_INVESTMENT_APPROVED_URL, headers=approved_headers, timeout=15)
+            _record_http_call(
+                captured_api_calls, "GET", IS_MANUAL_INVESTMENT_APPROVED_URL,
+                {**session.headers, **approved_headers}, None, approved_response,
+            )
+            if approved_response.status_code in (401, 403):
+                raise SwaperSessionExpired(f"is-manual-investment-approved returned {approved_response.status_code}")
+            approved = approved_response.ok and approved_response.json() is True
+        except SwaperSessionExpired:
+            raise
         except Exception:
-            log.exception("Exception while attempting to invest in loan %s - stopping.", loan_label)
-            attempts.append({"loan_id": loan.get("id"), "loan_number": loan.get("number"), "amount": amount, "error": True})
+            log.exception("Exception while checking investment approval for loan %s - stopping.", loan_label)
+            attempts.append({
+                "loan_id": loan_id, "loan_number": loan.get("number"), "amount": amount,
+                "error": True, "confirm_api_calls": captured_api_calls[calls_before:],
+            })
             break
 
-        modal_html = None
-        try:
-            modal_html = page.evaluate(
-                "() => { const m = document.querySelector("
-                "'.modal, [class*=modal], [role=dialog], [class*=dialog], "
-                "[class*=toast], [class*=snackbar], [class*=popup], [class*=confirm]"
-                "'); return m && m.offsetParent !== null ? m.outerHTML : null; }"
+        if not approved:
+            log.warning(
+                "Swaper reports manual investment is NOT approved for loan %s - stopping rather than guessing.",
+                loan_label,
             )
-        except Exception:
-            pass
-
-        # Always captured, modal or not - the surest way to see whatever
-        # actually appeared near the row (see docstring on why the selector
-        # guess above alone isn't trusted).
-        row_html_after_click = None
-        try:
-            row_html_after_click = row.evaluate("el => el.outerHTML")
-        except Exception:
-            pass
+            attempts.append({
+                "loan_id": loan_id, "loan_number": loan.get("number"), "amount": amount,
+                "confirmed": False, "not_approved": True,
+                "confirm_api_calls": captured_api_calls[calls_before:],
+            })
+            break
 
         confirmed = False
-        confirm_api_calls = []
-        if modal_html:
-            calls_before_confirm = len(captured_api_calls)
-            try:
-                confirm_button = page.locator(".modal-footer .button.clickable", has_text="Confirm").first
-                confirm_button.click(timeout=10000)
-                # Same rationale as the wait above - wait for the modal to
-                # actually close instead of a fixed 3s sleep.
-                try:
-                    page.locator("#loan-confirmation-slider.open").wait_for(state="hidden", timeout=8000)
-                except PlaywrightTimeoutError:
-                    pass
-                confirmed = True
-            except Exception:
-                log.exception(
-                    "Could not click the Confirm button for loan %s - stopping here rather than guessing.",
-                    loan_label,
-                )
-            confirm_api_calls = captured_api_calls[calls_before_confirm:]
-            if confirm_api_calls:
-                for call in confirm_api_calls:
-                    log.info(
-                        "REAL INVEST API CALL for loan %s: %s %s -> HTTP %s | body: %s",
-                        loan_label, call.get("method"), call.get("url"), call.get("status"),
-                        (call.get("body") or "")[:2000],
-                    )
-            else:
-                log.warning(
-                    "Clicked Confirm for loan %s but no new /rest/ API call was captured afterward.",
-                    loan_label,
-                )
+        try:
+            buy_url = BUY_URL_TEMPLATE.format(loan_id=loan_id)
+            buy_headers = {
+                "accept": "application/json, text/plain, */*",
+                "content-type": "application/json;charset=UTF-8",
+                **_xsrf_headers(session),
+            }
+            buy_body = {"amount": round(amount, 2)}
+            buy_response = session.post(buy_url, json=buy_body, headers=buy_headers, timeout=15)
+            _record_http_call(
+                captured_api_calls, "POST", buy_url,
+                {**session.headers, **buy_headers}, json.dumps(buy_body), buy_response,
+            )
+            if buy_response.status_code in (401, 403):
+                raise SwaperSessionExpired(f"buy call returned {buy_response.status_code}")
+            confirmed = buy_response.ok and "investment" in (buy_response.json() if buy_response.content else {})
+        except SwaperSessionExpired:
+            raise
+        except Exception:
+            log.exception("Exception while investing in loan %s - stopping.", loan_label)
+            attempts.append({
+                "loan_id": loan_id, "loan_number": loan.get("number"), "amount": amount,
+                "error": True, "confirm_api_calls": captured_api_calls[calls_before:],
+            })
+            break
+
+        confirm_api_calls = captured_api_calls[calls_before:]
+        for call in confirm_api_calls:
+            log.info(
+                "REAL INVEST API CALL for loan %s: %s %s -> HTTP %s | body: %s",
+                loan_label, call.get("method"), call.get("url"), call.get("status"),
+                (call.get("body") or "")[:2000],
+            )
 
         attempts.append({
-            "loan_id": loan.get("id"),
+            "loan_id": loan_id,
             "loan_number": loan.get("number"),
             "amount": amount,
-            "modal_html": modal_html,
-            "row_html_after_click": row_html_after_click,
             "confirmed": confirmed,
             "confirm_api_calls": confirm_api_calls,
         })
 
-        if modal_html and not confirmed:
+        if not confirmed:
             break
 
     return attempts
@@ -844,6 +792,7 @@ def run(headless: bool = True) -> None:
     # itself skip sending the email.
     run_error = None
     payload = None
+    session = None
     captured_api_calls = []
     investment_attempts = []
     min_interest_rate = MIN_INTEREST_RATE
@@ -871,13 +820,45 @@ def run(headless: bool = True) -> None:
 
         try:
             login(page)
-            # Registered only AFTER login() has fully completed (see
-            # _record_api_response()'s docstring) - passively captures the
-            # /rest/ API traffic fired while fetch_loans() navigates to the
-            # loans page (and later, any real investment calls - see below),
-            # for the investment summary email.
-            page.on("response", lambda response: _record_api_response(captured_api_calls, response))
-            payload = fetch_loans(page)
+            # Everything after login() is now plain HTTP (2026-08-01, see
+            # module docstring) - build a requests.Session seeded with the
+            # just-established login cookies, using the real browser's own
+            # User-Agent for consistency with the session that was just
+            # authenticated.
+            try:
+                user_agent = page.evaluate("() => navigator.userAgent")
+            except Exception:
+                user_agent = None
+            session = _build_http_session(context, user_agent or DEFAULT_USER_AGENT)
+
+            def _relogin_and_rebuild_session() -> None:
+                # The browser/page are kept alive for the whole run anyway
+                # (see the storage_state persistence at the end), so a mid-run
+                # session expiry (added 2026-08-01, explicit user request: "et
+                # si la session expire ça refait le login") can be recovered
+                # from without restarting the whole process - just log back in
+                # again and rebuild the HTTP session from the fresh cookies.
+                nonlocal session
+                log.warning("Swaper session appears to have expired mid-run - logging back in again.")
+                login(page)
+                try:
+                    fresh_user_agent = page.evaluate("() => navigator.userAgent")
+                except Exception:
+                    fresh_user_agent = None
+                session = _build_http_session(context, fresh_user_agent or DEFAULT_USER_AGENT)
+
+            def _with_relogin_retry(call):
+                # `call` is a zero-arg lambda reading `session` from this
+                # closure at CALL time (not capture time), so retrying it
+                # after `_relogin_and_rebuild_session()` reassigns `session`
+                # transparently uses the fresh one.
+                try:
+                    return call()
+                except SwaperSessionExpired:
+                    _relogin_and_rebuild_session()
+                    return call()
+
+            payload = _with_relogin_retry(lambda: fetch_loans(session, captured_api_calls))
 
             # REAL investment attempt (2026-07-25, explicit user decision -
             # see module docstring). Per-originator investing (added later
@@ -887,282 +868,273 @@ def run(headless: bool = True) -> None:
             # shared.google_sheet.get_selected_swaper_loan_originators(),
             # mirroring the PeerBerry/Lendermarket sheet convention) are
             # considered, and each is checked individually for CURRENT loan
-            # availability via fetch_loans_for_originator() (the site's
-            # "Loan originators" filter, driven through the API's "groups"
-            # field rather than the fragile custom JS dropdown widget - see
-            # that function's docstring). The available balance is then
-            # split EVENLY across only the originators that currently have
-            # >=1 loan available (see
+            # availability via fetch_loans(session, ..., groups=[name])
+            # (the site's "Loan originators" filter, driven through the
+            # API's "groups" field - see that function's docstring). The
+            # available balance is then split EVENLY across only the
+            # originators that currently have >=1 loan available (see
             # _split_budget_across_available_originators()'s docstring for
             # the exact rule), and _invest_available_loans() is called once
-            # per such originator with its own budget cap - reusing the
-            # existing real-click investing logic, just scoped to whichever
-            # originator's rows are currently visible on the page (each
-            # fetch_loans_for_originator() call leaves the page showing that
-            # originator's filtered rows only, since it's the real Angular
-            # app rendering the real - filtered - API response).
+            # per such originator with its own budget cap (pure HTTP calls,
+            # see that function's docstring for the 2026-08-01 switch off
+            # Playwright clicks).
             loans_now = extract_loans(payload)
             balance_now = extract_balance(payload)
 
-            try:
-                selected_originators = get_selected_swaper_loan_originators()
-            except Exception:
-                log.exception("Could not read selected Swaper loan originators from the Google Sheet.")
-                selected_originators = []
-
-            # minInterestRate + per-country cap, read from the Sheet once per
-            # run (added 2026-07-31, same convention/cell layout as
-            # PeerBerry's/Lendermarket's own MIN_INTEREST_RATE/country
-            # allocations, see get_swaper_min_interest_rate()/
-            # get_swaper_country_allocations()) - both are soft-fail: a read
-            # error just falls back to the module default / disables country
-            # blocking for this run, rather than aborting.
-            min_interest_rate = MIN_INTEREST_RATE
-            try:
-                min_interest_rate = get_swaper_min_interest_rate()
-            except Exception:
-                log.exception(
-                    "Could not read the Swaper minInterestRate from the Google Sheet, falling back to the default (%s).",
-                    MIN_INTEREST_RATE,
+            if balance_now < MIN_INVESTMENT_AMOUNT:
+                # Stop the whole run right here (2026-08-01, explicit user
+                # request) - no Sheet reads, no per-originator availability
+                # discovery, no invest loop at all when there isn't even enough
+                # to fund a single manual investment. investment_attempts/
+                # originator_loans/country_status keep their safe pre-declared
+                # defaults, so the summary-email logic below behaves exactly as
+                # if this run had nothing to invest.
+                log.info(
+                    "Balance %.2f EUR is below the minimum (%.2f EUR) at the start of this run - "
+                    "stopping here, no discovery or investing this run.",
+                    balance_now, MIN_INVESTMENT_AMOUNT,
                 )
-
-            country_allocations = {}
-            try:
-                country_allocations = get_swaper_country_allocations()
-            except Exception:
-                log.exception("Could not read the Swaper per-country allocations from the Google Sheet, country blocking is disabled this run.")
-
-            country_threshold_percentage = country_allocations.get("threshold_percentage")
-            country_invested = dict(country_allocations.get("country_amounts") or {})
-            originator_countries = country_allocations.get("originator_countries") or {}
-            country_blocked_originators = []
-            relevant_countries = {
-                originator_countries[name] for name in selected_originators if name in originator_countries
-            }
-
-            def _is_country_blocked(country, total_budget):
-                if not country or country_threshold_percentage is None or total_budget <= 0:
-                    return False
-                return country_invested.get(country, 0.0) >= (country_threshold_percentage / 100.0) * total_budget
-
-            total_budget = balance_now + sum(country_invested.values())
-
-            originator_loans = {}
-            if not selected_originators:
-                log.info("No Swaper loan originator is flagged with 'x' in the Google Sheet - skipping auto-invest.")
             else:
-                # Continuous invest loop (added 2026-08-01, explicit user
-                # request: "d\u00e8s que solde >= 10 je voudrais que le bot tourne
-                # en boucle sans s'arr\u00eater jusqu'\u00e0 qu'il r\u00e9ussisse \u00e0
-                # investir"). As long as the balance is >= the minimum,
-                # repeat discovery+invest passes - instead of a single pass
-                # per externally-triggered run - until either a real
-                # investment gets confirmed, the balance drops back below
-                # the minimum (nothing left to invest), or
-                # SWAPER_LOOP_MAX_HOURS elapses without success (a
-                # user-adjustable safety cutoff, see that env var's
-                # docstring). The external cron-job.org trigger is disabled
-                # for the loop's duration (no point in a second, overlapping
-                # run firing mid-loop) and re-enabled once it stops, in a
-                # `finally` so it's re-enabled even on an unexpected error.
-                loop_active = balance_now >= MIN_INVESTMENT_AMOUNT
-                loop_deadline = time.monotonic() + SWAPER_LOOP_MAX_HOURS * 3600
-                cron_disabled = False
-                if loop_active:
-                    log.info(
-                        "Balance %.2f EUR >= minimum - looping continuously (up to %.1fh) until an "
-                        "investment succeeds.", balance_now, SWAPER_LOOP_MAX_HOURS,
-                    )
-                    cron_disabled = set_job_enabled(SWAPER_CRON_JOB_ID, False)
-
                 try:
-                    pass_number = 0
-                    while True:
-                        pass_number += 1
-                        # Availability is checked for every selected originator
-                        # REGARDLESS of balance (added 2026-07-26, explicit user
-                        # request: "j'ai pas besoin d'attendre d'avoir des sous sur
-                        # mon compte pour te donner tout ce dont tu auras besoin") -
-                        # this is what feeds the one-time API-structure diagnostics
-                        # email below even when there's nothing to actually invest
-                        # yet. Only the real investing step further below stays
-                        # gated behind the minimum balance. The minInterestRate is
-                        # applied client-side here too (see
-                        # _filter_loans_by_min_interest_rate()'s docstring).
+                    selected_originators = get_selected_swaper_loan_originators()
+                except Exception:
+                    log.exception("Could not read selected Swaper loan originators from the Google Sheet.")
+                    selected_originators = []
+
+                # minInterestRate + per-country cap, read from the Sheet once per
+                # run (added 2026-07-31, same convention/cell layout as
+                # PeerBerry's/Lendermarket's own MIN_INTEREST_RATE/country
+                # allocations, see get_swaper_min_interest_rate()/
+                # get_swaper_country_allocations()) - both are soft-fail: a read
+                # error just falls back to the module default / disables country
+                # blocking for this run, rather than aborting.
+                min_interest_rate = MIN_INTEREST_RATE
+                try:
+                    min_interest_rate = get_swaper_min_interest_rate()
+                except Exception:
+                    log.exception(
+                        "Could not read the Swaper minInterestRate from the Google Sheet, falling back to the default (%s).",
+                        MIN_INTEREST_RATE,
+                    )
+
+                country_allocations = {}
+                try:
+                    country_allocations = get_swaper_country_allocations()
+                except Exception:
+                    log.exception("Could not read the Swaper per-country allocations from the Google Sheet, country blocking is disabled this run.")
+
+                country_threshold_percentage = country_allocations.get("threshold_percentage")
+                country_invested = dict(country_allocations.get("country_amounts") or {})
+                originator_countries = country_allocations.get("originator_countries") or {}
+                country_blocked_originators = []
+                relevant_countries = {
+                    originator_countries[name] for name in selected_originators if name in originator_countries
+                }
+
+                def _is_country_blocked(country, total_budget):
+                    if not country or country_threshold_percentage is None or total_budget <= 0:
+                        return False
+                    return country_invested.get(country, 0.0) >= (country_threshold_percentage / 100.0) * total_budget
+
+                total_budget = balance_now + sum(country_invested.values())
+
+                originator_loans = {}
+                if not selected_originators:
+                    log.info("No Swaper loan originator is flagged with 'x' in the Google Sheet - skipping auto-invest.")
+                else:
+                    # Continuous invest loop (added 2026-08-01, explicit user
+                    # request: "d\u00e8s que solde >= 10 je voudrais que le bot tourne
+                    # en boucle sans s'arr\u00eater jusqu'\u00e0 qu'il r\u00e9ussisse \u00e0
+                    # investir"). As long as the balance is >= the minimum,
+                    # repeat discovery+invest passes - instead of a single pass
+                    # per externally-triggered run - until either a real
+                    # investment gets confirmed, the balance drops back below
+                    # the minimum (nothing left to invest), or
+                    # SWAPER_LOOP_MAX_HOURS elapses without success (a
+                    # user-adjustable safety cutoff, see that env var's
+                    # docstring). The external cron-job.org trigger is disabled
+                    # for the loop's duration (no point in a second, overlapping
+                    # run firing mid-loop) and re-enabled once it stops, in a
+                    # `finally` so it's re-enabled even on an unexpected error.
+                    loop_active = balance_now >= MIN_INVESTMENT_AMOUNT
+                    loop_deadline = time.monotonic() + SWAPER_LOOP_MAX_HOURS * 3600
+                    cron_disabled = False
+                    if loop_active:
                         log.info(
-                            "%d loan originator(s) selected in the Google Sheet (%s) - checking current "
-                            "availability for each (min interest rate: %s%%, pass %d).",
-                            len(selected_originators), ", ".join(selected_originators), min_interest_rate, pass_number,
+                            "Balance %.2f EUR >= minimum - looping continuously (up to %.1fh) until an "
+                            "investment succeeds.", balance_now, SWAPER_LOOP_MAX_HOURS,
                         )
-                        originator_loans = {}
-                        for name in selected_originators:
-                            try:
-                                # Fast in-page fetch first (no page reload, see its
-                                # docstring) - falls back to the slower, proven
-                                # page.goto()-based method if it fails for any reason.
-                                originator_payload = fetch_loans_fast(page, [name])
-                            except Exception:
-                                log.warning("Fast in-page fetch failed for originator %r, falling back to the page-reload method.", name)
+                        cron_disabled = set_job_enabled(SWAPER_CRON_JOB_ID, False)
+
+                    try:
+                        pass_number = 0
+                        while True:
+                            pass_number += 1
+                            # Availability is checked for every selected originator
+                            # REGARDLESS of balance (added 2026-07-26, explicit user
+                            # request: "j'ai pas besoin d'attendre d'avoir des sous sur
+                            # mon compte pour te donner tout ce dont tu auras besoin") -
+                            # this is what feeds the one-time API-structure diagnostics
+                            # email below even when there's nothing to actually invest
+                            # yet. Only the real investing step further below stays
+                            # gated behind the minimum balance. The minInterestRate is
+                            # applied client-side here too (see
+                            # _filter_loans_by_min_interest_rate()'s docstring).
+                            log.info(
+                                "%d loan originator(s) selected in the Google Sheet (%s) - checking current "
+                                "availability for each (min interest rate: %s%%, pass %d).",
+                                len(selected_originators), ", ".join(selected_originators), min_interest_rate, pass_number,
+                            )
+                            originator_loans = {}
+                            for name in selected_originators:
                                 try:
-                                    originator_payload = fetch_loans_for_originator(page, name)
+                                    originator_payload = _with_relogin_retry(
+                                        lambda name=name: fetch_loans(session, captured_api_calls, groups=[name])
+                                    )
                                 except Exception:
                                     log.exception("Failed to fetch filtered loans for originator %r - skipping it.", name)
                                     continue
-                            loans_for_name = _filter_loans_by_min_interest_rate(
-                                extract_loans(originator_payload), min_interest_rate
-                            )
-                            if loans_for_name:
-                                originator_loans[name] = loans_for_name
-                                log.info("Originator %r currently has %d loan(s) available.", name, len(loans_for_name))
-                            else:
-                                log.info("Originator %r currently has no loans available.", name)
-
-                        pass_attempts = []
-                        if balance_now < MIN_INVESTMENT_AMOUNT:
-                            log.info(
-                                "Balance %.2f EUR is below the minimum (%.2f EUR) - availability was still "
-                                "checked above for diagnostics, but skipping the actual auto-invest step.",
-                                balance_now, MIN_INVESTMENT_AMOUNT,
-                            )
-                        else:
-                            # Per-country cap (added 2026-07-31, mirrors
-                            # lendermarket_monitor.py's invest_selected_lenders() -
-                            # re-checked on EVERY pass since balance_now/total_budget
-                            # can change as this loop invests) - any currently-
-                            # available originator whose mapped country is already
-                            # at/above `country_threshold_percentage`% of the total
-                            # Swaper budget (balance + every country's already-
-                            # invested amount) is excluded from this pass's budget
-                            # split (same treatment as "0 loans available").
-                            total_budget = balance_now + sum(country_invested.values())
-                            for name in list(originator_loans.keys()):
-                                country = originator_countries.get(name)
-                                if _is_country_blocked(country, total_budget):
-                                    log.info(
-                                        "Originator %r (country %r) is blocked this run: already at/above the %s%% country cap.",
-                                        name, country, country_threshold_percentage,
-                                    )
-                                    if name not in country_blocked_originators:
-                                        country_blocked_originators.append(name)
-                                    del originator_loans[name]
-
-                            budgets = _split_budget_across_available_originators(balance_now, originator_loans)
-                            for name, budget in budgets.items():
-                                log.info("Investing up to %.2f EUR into originator %r's loan(s).", budget, name)
-
-                                # Cheap fast-check first (added 2026-08-01) - skips
-                                # the slower page.goto() reload below entirely when
-                                # the loan is already gone, so that time is freed up
-                                # for the remaining originators' own invest attempts
-                                # this run instead of being wasted reloading a page
-                                # just to find nothing there.
-                                try:
-                                    quick_check = _filter_loans_by_min_interest_rate(
-                                        extract_loans(fetch_loans_fast(page, [name])), min_interest_rate
-                                    )
-                                    if not quick_check:
-                                        log.info("Originator %r no longer has any loan available (fast check) - skipping.", name)
-                                        continue
-                                except Exception:
-                                    pass  # fast check itself failed - fall through to the real (slow) refetch below
-
-                                try:
-                                    # Re-fetch (not just re-apply the filter) right
-                                    # before investing - the discovery loop's loan
-                                    # list can already be stale by now since Swaper's
-                                    # manual inventory is extremely transient (a loan
-                                    # can be grabbed by someone else, or a new one can
-                                    # appear, within seconds - confirmed 2026-08-01:
-                                    # a loan seen as available during discovery was
-                                    # already gone a few seconds later). Using the
-                                    # fresh list here (instead of the discovery-time
-                                    # originator_loans[name]) avoids computing shares
-                                    # for/targeting a row that no longer exists, and
-                                    # correctly picks up any loan that appeared since.
-                                    # A real page.goto() (not the fast fetch above) is
-                                    # required here regardless - the DOM must reflect
-                                    # the filtered rows before _invest_available_loans()
-                                    # can click on them.
-                                    refreshed_payload = fetch_loans_for_originator(page, name)
-                                except Exception:
-                                    log.exception("Failed to re-apply the filter for originator %r before investing - skipping it.", name)
-                                    continue
-                                current_loans = _filter_loans_by_min_interest_rate(
-                                    extract_loans(refreshed_payload), min_interest_rate
+                                loans_for_name = _filter_loans_by_min_interest_rate(
+                                    extract_loans(originator_payload), min_interest_rate
                                 )
-                                if not current_loans:
-                                    log.info("Originator %r no longer has any loan available right before investing - skipping.", name)
-                                    continue
-                                shares = _compute_swaper_loan_shares(budget, current_loans)
-                                attempts = _invest_available_loans(page, current_loans, shares, captured_api_calls)
-                                country = originator_countries.get(name)
-                                for attempt in attempts:
-                                    attempt["originator"] = name
-                                    # country_invested is updated after EVERY
-                                    # attempted amount (not just a confirmed
-                                    # status) so multiple originators sharing the
-                                    # same country can't jointly blow past the cap.
-                                    if country and not attempt.get("error"):
-                                        country_invested[country] = country_invested.get(country, 0.0) + (attempt.get("amount") or 0.0)
-                                pass_attempts.extend(attempts)
+                                if loans_for_name:
+                                    originator_loans[name] = loans_for_name
+                                    log.info("Originator %r currently has %d loan(s) available.", name, len(loans_for_name))
+                                else:
+                                    log.info("Originator %r currently has no loans available.", name)
 
-                        investment_attempts.extend(pass_attempts)
+                            pass_attempts = []
+                            if balance_now < MIN_INVESTMENT_AMOUNT:
+                                log.info(
+                                    "Balance %.2f EUR is below the minimum (%.2f EUR) - availability was still "
+                                    "checked above for diagnostics, but skipping the actual auto-invest step.",
+                                    balance_now, MIN_INVESTMENT_AMOUNT,
+                                )
+                            else:
+                                # Per-country cap (added 2026-07-31, mirrors
+                                # lendermarket_monitor.py's invest_selected_lenders() -
+                                # re-checked on EVERY pass since balance_now/total_budget
+                                # can change as this loop invests) - any currently-
+                                # available originator whose mapped country is already
+                                # at/above `country_threshold_percentage`% of the total
+                                # Swaper budget (balance + every country's already-
+                                # invested amount) is excluded from this pass's budget
+                                # split (same treatment as "0 loans available").
+                                total_budget = balance_now + sum(country_invested.values())
+                                for name in list(originator_loans.keys()):
+                                    country = originator_countries.get(name)
+                                    if _is_country_blocked(country, total_budget):
+                                        log.info(
+                                            "Originator %r (country %r) is blocked this run: already at/above the %s%% country cap.",
+                                            name, country, country_threshold_percentage,
+                                        )
+                                        if name not in country_blocked_originators:
+                                            country_blocked_originators.append(name)
+                                        del originator_loans[name]
 
-                        if pass_attempts:
-                            # Refresh the snapshot used for the rest of this run
-                            # (notification email etc.) to reflect what's actually
-                            # left AFTER investing, not the stale pre-invest numbers -
-                            # also feeds balance_now for this loop's own exit checks.
-                            payload = fetch_loans(page)
-                            balance_now = extract_balance(payload)
+                                budgets = _split_budget_across_available_originators(balance_now, originator_loans)
+                                for name, budget in budgets.items():
+                                    log.info("Investing up to %.2f EUR into originator %r's loan(s).", budget, name)
 
-                        if not loop_active:
-                            break
+                                    try:
+                                        # Re-fetch (not just re-apply the filter) right
+                                        # before investing - the discovery loop's loan
+                                        # list can already be stale by now since Swaper's
+                                        # manual inventory is extremely transient (a loan
+                                        # can be grabbed by someone else, or a new one can
+                                        # appear, within seconds). Using the fresh list
+                                        # here (instead of the discovery-time
+                                        # originator_loans[name]) avoids computing shares
+                                        # for/targeting a loan that no longer exists, and
+                                        # correctly picks up any loan that appeared since.
+                                        refreshed_payload = _with_relogin_retry(
+                                            lambda name=name: fetch_loans(session, captured_api_calls, groups=[name])
+                                        )
+                                    except Exception:
+                                        log.exception("Failed to re-fetch loans for originator %r before investing - skipping it.", name)
+                                        continue
+                                    current_loans = _filter_loans_by_min_interest_rate(
+                                        extract_loans(refreshed_payload), min_interest_rate
+                                    )
+                                    if not current_loans:
+                                        log.info("Originator %r no longer has any loan available right before investing - skipping.", name)
+                                        continue
+                                    shares = _compute_swaper_loan_shares(budget, current_loans)
+                                    try:
+                                        attempts = _with_relogin_retry(
+                                            lambda: _invest_available_loans(session, current_loans, shares, captured_api_calls)
+                                        )
+                                    except Exception:
+                                        log.exception("Failed to invest into originator %r's loan(s) - skipping it this pass.", name)
+                                        continue
+                                    country = originator_countries.get(name)
+                                    for attempt in attempts:
+                                        attempt["originator"] = name
+                                        # country_invested is updated after EVERY
+                                        # attempted amount (not just a confirmed
+                                        # status) so multiple originators sharing the
+                                        # same country can't jointly blow past the cap.
+                                        if country and not attempt.get("error"):
+                                            country_invested[country] = country_invested.get(country, 0.0) + (attempt.get("amount") or 0.0)
+                                    pass_attempts.extend(attempts)
 
-                        pass_succeeded = any(a.get("confirmed") and not a.get("error") for a in pass_attempts)
-                        if pass_succeeded:
-                            log.info("Investment confirmed on pass %d - stopping the invest loop.", pass_number)
-                            break
-                        if balance_now < MIN_INVESTMENT_AMOUNT:
-                            log.info("Balance dropped below the minimum - stopping the invest loop (nothing left to invest).")
-                            break
-                        if time.monotonic() >= loop_deadline:
-                            log.warning(
-                                "Reached the %.1fh safety limit without a successful investment - stopping the invest loop.",
-                                SWAPER_LOOP_MAX_HOURS,
-                            )
-                            break
-                        page.wait_for_timeout(int(SWAPER_LOOP_POLL_INTERVAL_SECONDS * 1000))
-                except Exception as exc:
-                    # Unexpected error during the loop itself (not one of the
-                    # already-handled per-originator fetch/invest failures
-                    # above, which just `continue` past that one originator) -
-                    # stop the bot immediately rather than keep looping
-                    # blindly (explicit user request, see run_error's usage
-                    # below - the summary email is still sent regardless).
-                    log.exception("Unexpected error during the invest loop - stopping.")
-                    run_error = str(exc)
-                finally:
-                    if cron_disabled:
-                        set_job_enabled(SWAPER_CRON_JOB_ID, True)
+                            investment_attempts.extend(pass_attempts)
 
-            # Per-country status snapshot for the summary email (added
-            # 2026-07-31, mirrors send_lendermarket_invest_summary_email()'s
-            # "=== Seuil par pays ===" section) - built AFTER the invest loop
-            # above so it reflects this run's own successful attempts too.
-            country_status = {}
-            for country in relevant_countries:
-                invested = country_invested.get(country, 0.0)
-                threshold_amount = (
-                    (country_threshold_percentage / 100.0) * total_budget
-                    if country_threshold_percentage is not None and total_budget > 0
-                    else None
-                )
-                country_status[country] = {
-                    "invested": invested,
-                    "threshold_amount": threshold_amount,
-                    "blocked": threshold_amount is not None and invested >= threshold_amount,
-                }
+                            if pass_attempts:
+                                # Refresh the snapshot used for the rest of this run
+                                # (notification email etc.) to reflect what's actually
+                                # left AFTER investing, not the stale pre-invest numbers -
+                                # also feeds balance_now for this loop's own exit checks.
+                                payload = _with_relogin_retry(lambda: fetch_loans(session, captured_api_calls))
+                                balance_now = extract_balance(payload)
+
+                            if not loop_active:
+                                break
+
+                            pass_succeeded = any(a.get("confirmed") and not a.get("error") for a in pass_attempts)
+                            if pass_succeeded:
+                                log.info("Investment confirmed on pass %d - stopping the invest loop.", pass_number)
+                                break
+                            if balance_now < MIN_INVESTMENT_AMOUNT:
+                                log.info("Balance dropped below the minimum - stopping the invest loop (nothing left to invest).")
+                                break
+                            if time.monotonic() >= loop_deadline:
+                                log.warning(
+                                    "Reached the %.1fh safety limit without a successful investment - stopping the invest loop.",
+                                    SWAPER_LOOP_MAX_HOURS,
+                                )
+                                break
+                            time.sleep(SWAPER_LOOP_POLL_INTERVAL_SECONDS)
+                    except Exception as exc:
+                        # Unexpected error during the loop itself (not one of the
+                        # already-handled per-originator fetch/invest failures
+                        # above, which just `continue` past that one originator) -
+                        # stop the bot immediately rather than keep looping
+                        # blindly (explicit user request, see run_error's usage
+                        # below - the summary email is still sent regardless).
+                        log.exception("Unexpected error during the invest loop - stopping.")
+                        run_error = str(exc)
+                    finally:
+                        if cron_disabled:
+                            set_job_enabled(SWAPER_CRON_JOB_ID, True)
+
+                # Per-country status snapshot for the summary email (added
+                # 2026-07-31, mirrors send_lendermarket_invest_summary_email()'s
+                # "=== Seuil par pays ===" section) - built AFTER the invest loop
+                # above so it reflects this run's own successful attempts too.
+                country_status = {}
+                for country in relevant_countries:
+                    invested = country_invested.get(country, 0.0)
+                    threshold_amount = (
+                        (country_threshold_percentage / 100.0) * total_budget
+                        if country_threshold_percentage is not None and total_budget > 0
+                        else None
+                    )
+                    country_status[country] = {
+                        "invested": invested,
+                        "threshold_amount": threshold_amount,
+                        "blocked": threshold_amount is not None and invested >= threshold_amount,
+                    }
         except Exception as exc:
             # Any failure here (login, initial fetch, or anything above not
             # already caught by the invest loop's own try/except) stops the
@@ -1174,9 +1146,23 @@ def run(headless: bool = True) -> None:
         # Persist cookies/local storage so the next run can skip login (and
         # 2FA, thanks to the "trust this browser" checkbox) while the session
         # remains valid - only on a clean run, never after an error (the
-        # session may be in a broken/partial state).
+        # session may be in a broken/partial state). The requests.Session's
+        # cookies may have rotated during the pure-HTTP loop (e.g.
+        # XSRF-TOKEN) - synced back into the Playwright context first so the
+        # persisted state reflects the latest values, not just the ones from
+        # right after login.
         if run_error is None:
             try:
+                if session is not None:
+                    context.add_cookies([
+                        {
+                            "name": cookie.name,
+                            "value": cookie.value,
+                            "domain": cookie.domain or "swaper.com",
+                            "path": cookie.path or "/",
+                        }
+                        for cookie in session.cookies
+                    ])
                 context.storage_state(path=str(STORAGE_STATE_FILE))
             except Exception:
                 log.exception("Failed to persist storage state.")

@@ -162,11 +162,13 @@ def send_swaper_investment_summary_email(
         prefix = f"[{originator}] " if originator else ""
         line = f"- {prefix}Pr\u00eat {label} : {attempt.get('amount'):.2f} \u20ac"
         if attempt.get("error"):
-            line += " -- ERREUR pendant le clic, voir les logs"
-        elif attempt.get("modal_html") and not attempt.get("confirmed"):
-            line += " -- une fen\u00eatre de confirmation est apparue mais le bouton Confirm n'a pas pu \u00eatre cliqu\u00e9, investissement stopp\u00e9 (voir la pi\u00e8ce jointe)"
-        elif attempt.get("modal_html") and attempt.get("confirmed"):
-            line += " -- confirm\u00e9 via la fen\u00eatre de confirmation"
+            line += " -- ERREUR pendant la requ\u00eate HTTP, voir les logs"
+        elif attempt.get("not_approved"):
+            line += " -- Swaper indique que l'investissement manuel n'est pas approuv\u00e9 pour ce pr\u00eat, investissement stopp\u00e9"
+        elif attempt.get("confirmed"):
+            line += " -- investissement confirm\u00e9 (requ\u00eate d'achat r\u00e9ussie)"
+        else:
+            line += " -- non confirm\u00e9, voir la pi\u00e8ce jointe"
         body_lines.append(line)
         for call in attempt.get("confirm_api_calls") or []:
             body_lines.append(
@@ -204,11 +206,11 @@ def send_swaper_investment_summary_email(
     body_lines.append(
         "Le fichier joint contient les vraies requ\u00eates/r\u00e9ponses HTTP /rest/ observ\u00e9es "
         "pendant ce run (m\u00e9thode/URL/toutes les en-t\u00eates - valeurs sensibles redacted - "
-        "corps/statut), pour les appels de listing/filtre de pr\u00eats ET d'investissement. "
-        "V\u00e9rifie le statut de la requ\u00eate d'investissement pour confirmer qu'elle a bien "
-        "r\u00e9ussi. Objectif secondaire : accumuler de quoi tenter, plus tard, de reproduire "
-        "ces appels en pur HTTP (sans navigateur) - la connexion/2FA reste elle bas\u00e9e sur "
-        "le navigateur (voir monitors/swaper_monitor.py) et n'est jamais captur\u00e9e ici."
+        "corps/statut), pour les appels de listing/filtre de pr\u00eats, de v\u00e9rification "
+        "d'approbation ET d'achat. V\u00e9rifie le statut de la requ\u00eate d'achat pour confirmer "
+        "qu'elle a bien r\u00e9ussi. Depuis le 2026-08-01, tout ce flux (apr\u00e8s connexion) est "
+        "fait en pur HTTP (sans navigateur) - seule la connexion/2FA reste bas\u00e9e sur le "
+        "navigateur (voir monitors/swaper_monitor.py) et n'est jamais captur\u00e9e ici."
     )
     body = "\n".join(body_lines)
 
@@ -218,11 +220,11 @@ def send_swaper_investment_summary_email(
     msg["Subject"] = subject
     msg.attach(MIMEText(body, "plain"))
 
-    # `attempts` (with each attempt's own modal_html/row_html_after_click,
-    # see _invest_available_loans()'s docstring) is included alongside
-    # captured_api_calls - the body text above tells the reader to check the
-    # attachment for the modal's HTML when one appeared, so it actually needs
-    # to be in there instead of only living in the in-memory `attempts` list.
+    # `attempts` (see _invest_available_loans()'s docstring for its shape:
+    # loan_id/loan_number/amount/confirmed/not_approved/error/
+    # confirm_api_calls) is included alongside captured_api_calls so the
+    # full per-attempt detail is in the attachment, not just living in the
+    # in-memory `attempts` list.
     attachment_payload = {"attempts": attempts, "captured_api_calls": captured_api_calls}
     attachment_text = json.dumps(attachment_payload, indent=2, ensure_ascii=False, default=str)
     attachment = MIMEText(attachment_text, "plain", "utf-8")
