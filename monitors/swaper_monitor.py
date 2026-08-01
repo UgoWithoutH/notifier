@@ -211,7 +211,9 @@ call (`fetch_loans()`, the manual-investment-approval check, the buy call)
 now goes through `page.evaluate(fetch(...))` - the real browser's own
 fetch(), same-origin, cookies attached automatically - instead of a
 separate `requests.Session()`. `_build_http_session()`/`_xsrf_headers()`
-were replaced by `_page_fetch()`/`_xsrf_headers_for_page()`; `login()`
+were replaced by `page.goto()`-driven navigation for the loans listing and
+real UI clicks for investing (see `fetch_loans()`/`_invest_available_loans()`);
+`login()`
 stays exactly as before (still the only step needing a real browser for
 its own reCAPTCHA-related reasons). No more session cookie syncing needed
 at the end of the run since the browser context IS the source of truth
@@ -288,14 +290,11 @@ SWAPER_LOOP_POLL_INTERVAL_SECONDS = float(os.environ.get("SWAPER_LOOP_POLL_INTER
 # on a read error.
 MIN_INTEREST_RATE = float(os.environ.get("SWAPER_MIN_INTEREST_RATE", "0"))
 
-# Post-login endpoints (see module docstring). LOANS_PAGE_URL is navigated
-# to directly (fetch_loans() lets the real Angular app fire LOANS_URL
-# itself - see that function's docstring for why a manually-built request
-# gets 403); the other two are still built via page.evaluate(fetch()).
+# Loans-listing page navigated to directly (fetch_loans() lets the real
+# Angular app fire the API call itself - see that function's docstring for
+# why a manually-built request gets 403).
 LOANS_PAGE_URL = "https://swaper.com/en/loans"
 LOANS_URL = "https://swaper.com/rest/public/loans"
-IS_MANUAL_INVESTMENT_APPROVED_URL = "https://swaper.com/rest/public/profile/is-manual-investment-approved"
-BUY_URL_TEMPLATE = "https://swaper.com/rest/public/loans/{loan_id}/buy"
 
 class SwaperSessionExpired(RuntimeError):
     """Raised by the post-login page.evaluate(fetch()) calls
@@ -399,54 +398,11 @@ def login(page) -> None:
     log.info("Logged in successfully, current URL: %s", page.url)
 
 
-def _page_fetch(page, method: str, url: str, headers: dict, body: str = None) -> dict:
-    """Issue an HTTP call through the real browser's own `fetch()` via
-    `page.evaluate()` - NOT a separate `requests.Session()` (see module
-    docstring's 2026-08-01 Cloudflare-block finding: a plain non-browser
-    HTTP client gets a blanket 403 even with valid session cookies, while
-    the identical call through the real Playwright-driven Chromium context
-    succeeds). Same-origin, so cookies are attached automatically via
-    `credentials: 'include'`; the caller still passes any app-specific
-    headers (content-type, x-xsrf-token, ...) explicitly.
-
-    Returns `{"status": int, "headers": dict, "text": str}`.
-    """
-    return page.evaluate(
-        """
-        async ({url, method, headers, body}) => {
-            const resp = await fetch(url, {
-                method,
-                headers,
-                credentials: 'include',
-                body: (body === null || body === undefined) ? undefined : body,
-            });
-            const text = await resp.text();
-            const headersObj = {};
-            resp.headers.forEach((value, key) => { headersObj[key] = value; });
-            return { status: resp.status, headers: headersObj, text };
-        }
-        """,
-        {"url": url, "method": method, "headers": headers, "body": body},
-    )
-
-
-def _xsrf_headers_for_page(page) -> dict:
-    """Angular convention (see `fetch_loans()`'s docstring): mirror the
-    CURRENT `XSRF-TOKEN` cookie value into an `x-xsrf-token` header, read
-    fresh via the real browser context's own cookie jar on every call since
-    the cookie can rotate mid-run.
-    """
-    for cookie in page.context.cookies():
-        if cookie.get("name") == "XSRF-TOKEN":
-            return {"x-xsrf-token": cookie.get("value") or ""}
-    return {"x-xsrf-token": ""}
-
-
 def _record_http_call(captured: list, method: str, url: str, request_headers: dict, request_body, result: dict) -> None:
     """Builds the same shaped diagnostics entry (redacted request/response
     headers, raw bodies) as before so
     `send_swaper_investment_summary_email()`/`send_swaper_api_structure_email()`
-    need no changes - `result` is the dict returned by `_page_fetch()`.
+    need no changes - `result` is `{"status": int, "headers": dict, "text": str}`.
     """
     entry = {
         "method": method,
@@ -516,6 +472,7 @@ def fetch_loans(page, captured_api_calls: list, groups: list = None) -> dict:
         raise RuntimeError(
             f"Loans API returned status {response.status}" + (f" for groups {groups!r}" if groups else "")
         )
+    human_mouse_wander(page)
     return json.loads(text or "null")
 
 
@@ -682,135 +639,168 @@ def _compute_swaper_loan_shares(budget: float, loans: list, min_investment: floa
     return shares
 
 
+def _record_api_response(captured: list, response) -> None:
+    """Passively captures every `/rest/` API call fired by real UI clicks
+    (registered on `page.on("response", ...)` only AFTER `login()` has fully
+    returned - never during credentials/2FA - with a belt-and-braces skip of
+    any URL containing login/auth/password, per this repo's documented
+    security lesson about interceptors leaking credentials). Never blocks
+    anything - purely observational, feeding the investment summary email.
+    """
+    url = response.url
+    if "swaper.com" not in url or "/rest/" not in url:
+        return
+    lowered = url.lower()
+    if "login" in lowered or "auth" in lowered or "password" in lowered:
+        return
+
+    request = response.request
+    entry = {
+        "method": request.method,
+        "url": url,
+        "request_headers": _redact_sensitive_headers(dict(request.headers)),
+        "request_post_data": request.post_data,
+        "status": response.status,
+    }
+    try:
+        entry["response_headers"] = _redact_sensitive_headers(dict(response.headers))
+    except Exception:
+        entry["response_headers"] = None
+    try:
+        entry["body"] = response.text()[:20000]
+    except Exception:
+        entry["body"] = None
+    captured.append(entry)
+
+
 def _invest_available_loans(page, loans: list, shares: dict, captured_api_calls: list) -> list:
     """Actually invest into available manual loans, using the exact
     per-loan amounts precomputed by `_compute_swaper_loan_shares()` (loans
     with no entry in `shares`, e.g. below the minimum, are skipped).
 
-    REAL requests, REAL money (2026-07-25, explicit user decision to make
-    this the production invest bot - see module docstring). Uses the real
-    browser's own `fetch()` via `_page_fetch()` (reverted 2026-08-01 from a
-    plain `requests.Session()` after Cloudflare started blocking it - see
-    module docstring): a real captured successful investment showed there
-    is NO separate backend "confirm" API call behind the browser's
-    confirmation modal - the modal is purely a client-side UI gate. The real
-    server-side sequence is just:
-      1. `GET /rest/public/profile/is-manual-investment-approved` - must
-         return `true`.
-      2. `POST /rest/public/loans/{loan_id}/buy` with `{"amount": <float>}` -
-         response contains an `"investment"` key on success.
-    Both calls are recorded into `captured_api_calls` (same list used by
-    every other call in this module) via `_record_http_call()`, so the
-    investment summary email keeps showing the real request/response for
-    every attempt.
+    REAL clicks, REAL money (2026-07-25, explicit user decision to make this
+    the production invest bot - see module docstring). Reverted 2026-08-01
+    (later same day, real GitHub Actions failure) from manually-reconstructed
+    `page.evaluate(fetch())` calls back to driving the actual UI: a safe
+    throwaway test (nonexistent loan_id + a below-minimum amount, so no real
+    money could ever move) confirmed Swaper's WAF returns 403 for a manually
+    built request to BOTH `is-manual-investment-approved` AND `.../buy`, the
+    exact same block already found on `fetch_loans()` - the real click flow
+    is the only way these calls actually succeed. Both real requests fire as
+    a side effect of the click sequence below and are captured passively by
+    the `page.on("response", ...)` listener registered in `run()` (see
+    `_record_api_response()`) - this function makes no HTTP calls itself.
+    Ported verbatim from the last pre-pure-HTTP commit (`cc26b84`) rather
+    than re-guessed, since that version was already live-verified.
 
-    Stops attempting further loans as soon as one loan isn't approved or a
-    buy call fails/errors, rather than guessing, with real money on the
-    line - same conservative behavior as the old click-driven version. A
-    401/403 on either call raises `SwaperSessionExpired` instead of being
-    swallowed as a generic error, so `run()` can tell a stale session apart
-    from a real failure and log back in rather than just giving up.
+    Each loan's row is targeted by its visible `number` (NOT always
+    `rows.first`) since a loan given only a PARTIAL share (the normal case
+    under equal-split) stays visible afterwards rather than
+    disappearing/reordering - skipped (not fatal) if its row can't be found
+    at all. Swaper shows a `#loan-confirmation-slider.open` confirmation
+    modal after clicking "+"; the modal detection itself uses a generic
+    CSS query (modal/dialog/toast/snackbar/popup/confirm classes) rather
+    than hardcoding that one ID, since that selector is unverified against
+    every possible UI variant - the row's own outerHTML right after the
+    click is ALSO always captured as a fallback, so whatever appeared is
+    visible in the summary email even if not recognized as a "modal" here.
+    Stops attempting further loans as soon as a modal was shown but
+    couldn't be confirmed (real money on the line, never guesses which
+    button to click) - keeps going to the next loan only if clicking "+"
+    never produced any recognizable modal at all.
 
     Returns a list of attempt dicts: {loan_id, loan_number, amount,
-    confirmed, confirm_api_calls, error, not_approved}.
+    modal_html, row_html_after_click, confirmed, confirm_api_calls, error}.
     """
     attempts = []
     for loan in loans:
         loan_id = loan.get("id")
         amount = shares.get(loan_id)
         loan_label = loan.get("number") or loan_id
+
         if not amount or amount < MIN_INVESTMENT_AMOUNT:
             continue
 
-        log.info("Investing %.2f EUR into loan %s (REAL money, HTTP request via browser fetch).", amount, loan_label)
-        calls_before = len(captured_api_calls)
+        row = page.locator("tr.loan-row", has_text=str(loan_label))
+        if row.count() == 0:
+            log.warning("Could not find the row for loan %s on the page - skipping it.", loan_label)
+            continue
+        row = row.first
 
+        log.info("Investing %.2f EUR into loan %s (REAL money, real click).", amount, loan_label)
         try:
-            approved_headers = {
-                "accept": "application/vnd.com.swaper.v1+json",
-                **_xsrf_headers_for_page(page),
-            }
-            approved_result = _page_fetch(page, "GET", IS_MANUAL_INVESTMENT_APPROVED_URL, approved_headers)
-            _record_http_call(
-                captured_api_calls, "GET", IS_MANUAL_INVESTMENT_APPROVED_URL,
-                approved_headers, None, approved_result,
-            )
-            approved_status = approved_result.get("status")
-            if approved_status in (401, 403):
-                raise SwaperSessionExpired(f"is-manual-investment-approved returned {approved_status}")
-            approved = (
-                approved_status is not None and 200 <= approved_status < 300
-                and json.loads(approved_result.get("text") or "null") is True
-            )
-        except SwaperSessionExpired:
-            raise
+            amount_input = row.locator(".field.currency input").first
+            amount_input.click()
+            amount_input.fill(f"{amount:.2f}")
+            row.locator(".icon-plus").first.click(timeout=10000)
+            try:
+                page.locator("#loan-confirmation-slider.open").wait_for(state="visible", timeout=8000)
+            except PlaywrightTimeoutError:
+                pass
         except Exception:
-            log.exception("Exception while checking investment approval for loan %s - stopping.", loan_label)
-            attempts.append({
-                "loan_id": loan_id, "loan_number": loan.get("number"), "amount": amount,
-                "error": True, "confirm_api_calls": captured_api_calls[calls_before:],
-            })
+            log.exception("Exception while attempting to invest in loan %s - stopping.", loan_label)
+            attempts.append({"loan_id": loan_id, "loan_number": loan.get("number"), "amount": amount, "error": True})
             break
 
-        if not approved:
-            log.warning(
-                "Swaper reports manual investment is NOT approved for loan %s - stopping rather than guessing.",
-                loan_label,
+        modal_html = None
+        try:
+            modal_html = page.evaluate(
+                "() => { const m = document.querySelector("
+                "'.modal, [class*=modal], [role=dialog], [class*=dialog], "
+                "[class*=toast], [class*=snackbar], [class*=popup], [class*=confirm]"
+                "'); return m && m.offsetParent !== null ? m.outerHTML : null; }"
             )
-            attempts.append({
-                "loan_id": loan_id, "loan_number": loan.get("number"), "amount": amount,
-                "confirmed": False, "not_approved": True,
-                "confirm_api_calls": captured_api_calls[calls_before:],
-            })
-            break
+        except Exception:
+            pass
+
+        row_html_after_click = None
+        try:
+            row_html_after_click = row.evaluate("el => el.outerHTML")
+        except Exception:
+            pass
 
         confirmed = False
-        try:
-            buy_url = BUY_URL_TEMPLATE.format(loan_id=loan_id)
-            buy_headers = {
-                "accept": "application/json, text/plain, */*",
-                "content-type": "application/json;charset=UTF-8",
-                **_xsrf_headers_for_page(page),
-            }
-            buy_body = {"amount": round(amount, 2)}
-            buy_result = _page_fetch(page, "POST", buy_url, buy_headers, json.dumps(buy_body))
-            _record_http_call(
-                captured_api_calls, "POST", buy_url,
-                buy_headers, json.dumps(buy_body), buy_result,
-            )
-            buy_status = buy_result.get("status")
-            if buy_status in (401, 403):
-                raise SwaperSessionExpired(f"buy call returned {buy_status}")
-            buy_ok = buy_status is not None and 200 <= buy_status < 300
-            buy_json = json.loads(buy_result.get("text") or "null") if buy_ok and buy_result.get("text") else None
-            confirmed = buy_ok and isinstance(buy_json, dict) and "investment" in buy_json
-        except SwaperSessionExpired:
-            raise
-        except Exception:
-            log.exception("Exception while investing in loan %s - stopping.", loan_label)
-            attempts.append({
-                "loan_id": loan_id, "loan_number": loan.get("number"), "amount": amount,
-                "error": True, "confirm_api_calls": captured_api_calls[calls_before:],
-            })
-            break
-
-        confirm_api_calls = captured_api_calls[calls_before:]
-        for call in confirm_api_calls:
-            log.info(
-                "REAL INVEST API CALL for loan %s: %s %s -> HTTP %s | body: %s",
-                loan_label, call.get("method"), call.get("url"), call.get("status"),
-                (call.get("body") or "")[:2000],
-            )
+        confirm_api_calls = []
+        if modal_html:
+            calls_before_confirm = len(captured_api_calls)
+            try:
+                confirm_button = page.locator(".modal-footer .button.clickable", has_text="Confirm").first
+                confirm_button.click(timeout=10000)
+                try:
+                    page.locator("#loan-confirmation-slider.open").wait_for(state="hidden", timeout=8000)
+                except PlaywrightTimeoutError:
+                    pass
+                confirmed = True
+            except Exception:
+                log.exception(
+                    "Could not click the Confirm button for loan %s - stopping here rather than guessing.",
+                    loan_label,
+                )
+            confirm_api_calls = captured_api_calls[calls_before_confirm:]
+            if confirm_api_calls:
+                for call in confirm_api_calls:
+                    log.info(
+                        "REAL INVEST API CALL for loan %s: %s %s -> HTTP %s | body: %s",
+                        loan_label, call.get("method"), call.get("url"), call.get("status"),
+                        (call.get("body") or "")[:2000],
+                    )
+            else:
+                log.warning(
+                    "Clicked Confirm for loan %s but no new /rest/ API call was captured afterward.",
+                    loan_label,
+                )
 
         attempts.append({
             "loan_id": loan_id,
             "loan_number": loan.get("number"),
             "amount": amount,
+            "modal_html": modal_html,
+            "row_html_after_click": row_html_after_click,
             "confirmed": confirmed,
             "confirm_api_calls": confirm_api_calls,
         })
 
-        if not confirmed:
+        if modal_html and not confirmed:
             break
 
     return attempts
@@ -860,6 +850,9 @@ def run(headless: bool = True) -> None:
 
         try:
             login(page)
+            # Registered only AFTER login() fully returns, never during
+            # credentials/2FA - see _record_api_response()'s docstring.
+            page.on("response", lambda response: _record_api_response(captured_api_calls, response))
 
             def _relogin() -> None:
                 # The browser/page are kept alive for the whole run anyway
@@ -867,8 +860,8 @@ def run(headless: bool = True) -> None:
                 # session expiry (explicit user request: "et si la session
                 # expire ça refait le login") can be recovered from without
                 # restarting the whole process - every call reads cookies
-                # fresh from the same page/context (see _page_fetch()), no
-                # separate session object to rebuild.
+                # fresh from the same page/context, no separate session
+                # object to rebuild.
                 log.warning("Swaper session appears to have expired mid-run - logging back in again.")
                 login(page)
 
@@ -1168,9 +1161,9 @@ def run(headless: bool = True) -> None:
         # 2FA, thanks to the "trust this browser" checkbox) while the session
         # remains valid - only on a clean run, never after an error (the
         # session may be in a broken/partial state). Every call in this run
-        # went through the same Playwright context (see _page_fetch()), so
-        # its cookie jar already reflects any mid-run rotation (e.g.
-        # XSRF-TOKEN) with no separate syncing needed.
+        # went through the same Playwright context, so its cookie jar
+        # already reflects any mid-run rotation (e.g. XSRF-TOKEN) with no
+        # separate syncing needed.
         if run_error is None:
             try:
                 context.storage_state(path=str(STORAGE_STATE_FILE))
