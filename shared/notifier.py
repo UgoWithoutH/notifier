@@ -189,8 +189,8 @@ def send_swaper_investment_summary_email(
     msg["Subject"] = subject
     msg.attach(MIMEText(body, "plain"))
 
-    # `attempts` (with each attempt's own modal_html, see
-    # _invest_available_loans()'s docstring) is included alongside
+    # `attempts` (with each attempt's own modal_html/row_html_after_click,
+    # see _invest_available_loans()'s docstring) is included alongside
     # captured_api_calls - the body text above tells the reader to check the
     # attachment for the modal's HTML when one appeared, so it actually needs
     # to be in there instead of only living in the in-memory `attempts` list.
