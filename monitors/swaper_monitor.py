@@ -388,6 +388,50 @@ def fetch_loans_for_originator(page, originator_name: str) -> dict:
         page.unroute("**/rest/public/loans", _rewrite_body)
 
 
+def fetch_loans_fast(page, groups: list) -> dict:
+    """Same `/rest/public/loans` query as `fetch_loans_for_originator()`,
+    but fired as an in-page `fetch()` call (page.evaluate) instead of a full
+    `page.goto()` reload - skips re-bootstrapping the whole Angular app
+    (the repeated constraints/logged-in/history-statistics calls a full
+    reload triggers) and the human_mouse_wander pause, at the cost of NOT
+    updating the visible DOM (so this must never be used right before a
+    real click - only for availability checks, added 2026-08-01 to shrink
+    the discovery-loop's contribution to the gap between "loan seen as
+    available" and the real invest click, since that gap is exactly what
+    let a loan get sniped by another investor - see the invest loop's
+    "re-fetch right before investing" comment).
+
+    Assumes the standard Angular convention of an `XSRF-TOKEN` cookie
+    mirrored into the `x-xsrf-token` header (unverified against a live
+    session at the time this was written) - raises on any failure so the
+    caller can fall back to the slower, proven `fetch_loans_for_originator()`.
+    """
+    body = json.dumps({
+        "page": 1, "pageSize": 13, "groups": groups,
+        "amountFrom": None, "amountTo": None, "status": None,
+    })
+    return page.evaluate(
+        """
+        async ({ body }) => {
+            const match = document.cookie.match(/(?:^|; )XSRF-TOKEN=([^;]*)/);
+            const token = match ? decodeURIComponent(match[1]) : '';
+            const resp = await fetch('/rest/public/loans', {
+                method: 'POST',
+                headers: {
+                    'accept': 'application/vnd.com.swaper.v2+json',
+                    'content-type': 'application/vnd.com.swaper.v2+json',
+                    'x-xsrf-token': token,
+                },
+                body,
+            });
+            if (!resp.ok) { throw new Error('loans fetch failed: ' + resp.status); }
+            return resp.json();
+        }
+        """,
+        {"body": body},
+    )
+
+
 def _filter_loans_by_min_interest_rate(loans: list, min_interest_rate: float) -> list:
     """Client-side minimum-interest-rate filter (added 2026-07-31, from
     get_swaper_min_interest_rate() - same Sheet cell convention as
@@ -596,8 +640,16 @@ def _invest_available_loans(page, loans: list, shares: dict) -> list:
     guessing which button to click with real money on the line. Also stops
     on any exception while interacting with a row.
 
+    The modal CSS-selector guess (`.modal`/`[role=dialog]`/etc.) is
+    unverified against a real confirmation step, so it could miss some
+    other UI pattern (toast, snackbar, inline button next to the row) - as
+    a fallback safety net, the row's own outerHTML right after the click is
+    always captured too (`row_html_after_click`), so whatever appeared near
+    it is visible in the summary email's attachment even if it isn't
+    recognized as a "modal" by the selector above.
+
     Returns a list of attempt dicts: {loan_id, loan_number, amount,
-    modal_html, error}.
+    modal_html, row_html_after_click, error}.
     """
     attempts = []
     for loan in loans:
@@ -628,9 +680,20 @@ def _invest_available_loans(page, loans: list, shares: dict) -> list:
         modal_html = None
         try:
             modal_html = page.evaluate(
-                "() => { const m = document.querySelector('.modal, [class*=modal], [role=dialog]'); "
-                "return m && m.offsetParent !== null ? m.outerHTML : null; }"
+                "() => { const m = document.querySelector("
+                "'.modal, [class*=modal], [role=dialog], [class*=dialog], "
+                "[class*=toast], [class*=snackbar], [class*=popup], [class*=confirm]"
+                "'); return m && m.offsetParent !== null ? m.outerHTML : null; }"
             )
+        except Exception:
+            pass
+
+        # Always captured, modal or not - the surest way to see whatever
+        # actually appeared near the row (see docstring on why the selector
+        # guess above alone isn't trusted).
+        row_html_after_click = None
+        try:
+            row_html_after_click = row.evaluate("el => el.outerHTML")
         except Exception:
             pass
 
@@ -639,6 +702,7 @@ def _invest_available_loans(page, loans: list, shares: dict) -> list:
             "loan_number": loan.get("number"),
             "amount": amount,
             "modal_html": modal_html,
+            "row_html_after_click": row_html_after_click,
         })
 
         if modal_html:
@@ -779,10 +843,17 @@ def run(headless: bool = True) -> None:
                 )
                 for name in selected_originators:
                     try:
-                        originator_payload = fetch_loans_for_originator(page, name)
+                        # Fast in-page fetch first (no page reload, see its
+                        # docstring) - falls back to the slower, proven
+                        # page.goto()-based method if it fails for any reason.
+                        originator_payload = fetch_loans_fast(page, [name])
                     except Exception:
-                        log.exception("Failed to fetch filtered loans for originator %r - skipping it.", name)
-                        continue
+                        log.warning("Fast in-page fetch failed for originator %r, falling back to the page-reload method.", name)
+                        try:
+                            originator_payload = fetch_loans_for_originator(page, name)
+                        except Exception:
+                            log.exception("Failed to fetch filtered loans for originator %r - skipping it.", name)
+                            continue
                     loans_for_name = _filter_loans_by_min_interest_rate(
                         extract_loans(originator_payload), min_interest_rate
                     )
@@ -822,6 +893,23 @@ def run(headless: bool = True) -> None:
                     budgets = _split_budget_across_available_originators(balance_now, originator_loans)
                     for name, budget in budgets.items():
                         log.info("Investing up to %.2f EUR into originator %r's loan(s).", budget, name)
+
+                        # Cheap fast-check first (added 2026-08-01) - skips
+                        # the slower page.goto() reload below entirely when
+                        # the loan is already gone, so that time is freed up
+                        # for the remaining originators' own invest attempts
+                        # this run instead of being wasted reloading a page
+                        # just to find nothing there.
+                        try:
+                            quick_check = _filter_loans_by_min_interest_rate(
+                                extract_loans(fetch_loans_fast(page, [name])), min_interest_rate
+                            )
+                            if not quick_check:
+                                log.info("Originator %r no longer has any loan available (fast check) - skipping.", name)
+                                continue
+                        except Exception:
+                            pass  # fast check itself failed - fall through to the real (slow) refetch below
+
                         try:
                             # Re-fetch (not just re-apply the filter) right
                             # before investing - the discovery loop's loan
@@ -835,6 +923,10 @@ def run(headless: bool = True) -> None:
                             # originator_loans[name]) avoids computing shares
                             # for/targeting a row that no longer exists, and
                             # correctly picks up any loan that appeared since.
+                            # A real page.goto() (not the fast fetch above) is
+                            # required here regardless - the DOM must reflect
+                            # the filtered rows before _invest_available_loans()
+                            # can click on them.
                             refreshed_payload = fetch_loans_for_originator(page, name)
                         except Exception:
                             log.exception("Failed to re-apply the filter for originator %r before investing - skipping it.", name)
