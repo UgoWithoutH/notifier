@@ -260,15 +260,15 @@ def fill_current_month_amounts(platform: str, amounts: dict, section: str = "Cro
     total_amount = amounts.get("total", 0)
     gross_interest_received = amounts.get("gross_interest_received", 0)
 
-    logger.info(
-        "Valeurs à écrire : total=%s, intérêts=%s",
-        total_amount, gross_interest_received
-    )
-
     # 1 seul appel API pour écrire les 2 valeurs (lignes adjacentes, même colonne)
     start_a1 = rowcol_to_a1(platform_row, current_month_col)
     end_a1 = rowcol_to_a1(platform_row + 1, current_month_col)
     range_name = f"{start_a1}:{end_a1}"
+
+    logger.info(
+        "Préparation écriture : %s / total = %s (%s), intérêts = %s (%s)",
+        platform, total_amount, start_a1, gross_interest_received, end_a1,
+    )
 
     _call_with_retry(
         worksheet.update,
@@ -277,7 +277,7 @@ def fill_current_month_amounts(platform: str, amounts: dict, section: str = "Cro
         value_input_option="USER_ENTERED"
     )
 
-    logger.info("Mise à jour terminée pour %s", platform)
+    logger.info("Mise à jour terminée pour %s (%s écrit)", platform, range_name)
 
 
 def fill_current_month_amounts_with_labels(
@@ -775,13 +775,20 @@ def fill_bienpreter_borrower_geo_amounts(borrowers: dict):
 
     updates = []
 
+    logger.info(
+        "Ligne %s ('%s' elle-même) ne sera PAS écrite - seules les lignes %s à %s le seront.",
+        bienpreter_row, "Bienprêter", bienpreter_row + 1, end_row - 1,
+    )
+
     # Réécrit la formule SOMME sur les lignes du bloc qui restent (pas
     # celles sur le point d'être supprimées).
     for row_idx in range(bienpreter_row + 1, end_row):
         if row_idx in rows_to_delete:
             continue
         formula = f"=SOMME({first_country_letter}{row_idx}:{row_idx})"
-        updates.append({"range": rowcol_to_a1(row_idx, target_col), "values": [[formula]]})
+        address = rowcol_to_a1(row_idx, target_col)
+        updates.append({"range": address, "values": [[formula]]})
+        logger.info("Préparation écriture formule : %s = %s", address, formula)
 
     pending_new_borrowers = []
     name_cells_to_restyle = []
@@ -803,8 +810,9 @@ def fill_bienpreter_borrower_geo_amounts(borrowers: dict):
         if row_idx is not None:
             name_cells_to_restyle.append(rowcol_to_a1(row_idx, geo_col))
             if country_col is not None:
-                updates.append({"range": rowcol_to_a1(row_idx, country_col), "values": [[amount]]})
-                logger.info("Préparation écriture : %s (ligne %s) / %s = %s", name, row_idx, country, amount)
+                address = rowcol_to_a1(row_idx, country_col)
+                updates.append({"range": address, "values": [[amount]]})
+                logger.info("Préparation écriture : %s (ligne %s) / %s = %s (%s)", name, row_idx, country, amount, address)
         else:
             pending_new_borrowers.append((name, country_col, amount))
 
