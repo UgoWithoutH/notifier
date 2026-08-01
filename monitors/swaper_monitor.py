@@ -823,16 +823,30 @@ def run(headless: bool = True) -> None:
                     for name, budget in budgets.items():
                         log.info("Investing up to %.2f EUR into originator %r's loan(s).", budget, name)
                         try:
-                            # Re-apply the filter so the page's visible rows
-                            # match THIS originator right before investing (the
-                            # discovery loop above left the page showing
-                            # whichever originator was fetched last).
-                            fetch_loans_for_originator(page, name)
+                            # Re-fetch (not just re-apply the filter) right
+                            # before investing - the discovery loop's loan
+                            # list can already be stale by now since Swaper's
+                            # manual inventory is extremely transient (a loan
+                            # can be grabbed by someone else, or a new one can
+                            # appear, within seconds - confirmed 2026-08-01:
+                            # a loan seen as available during discovery was
+                            # already gone a few seconds later). Using the
+                            # fresh list here (instead of the discovery-time
+                            # originator_loans[name]) avoids computing shares
+                            # for/targeting a row that no longer exists, and
+                            # correctly picks up any loan that appeared since.
+                            refreshed_payload = fetch_loans_for_originator(page, name)
                         except Exception:
                             log.exception("Failed to re-apply the filter for originator %r before investing - skipping it.", name)
                             continue
-                        shares = _compute_swaper_loan_shares(budget, originator_loans[name])
-                        attempts = _invest_available_loans(page, originator_loans[name], shares)
+                        current_loans = _filter_loans_by_min_interest_rate(
+                            extract_loans(refreshed_payload), min_interest_rate
+                        )
+                        if not current_loans:
+                            log.info("Originator %r no longer has any loan available right before investing - skipping.", name)
+                            continue
+                        shares = _compute_swaper_loan_shares(budget, current_loans)
+                        attempts = _invest_available_loans(page, current_loans, shares)
                         country = originator_countries.get(name)
                         for attempt in attempts:
                             attempt["originator"] = name

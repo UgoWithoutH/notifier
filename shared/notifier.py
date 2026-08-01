@@ -189,7 +189,13 @@ def send_swaper_investment_summary_email(
     msg["Subject"] = subject
     msg.attach(MIMEText(body, "plain"))
 
-    attachment_text = json.dumps(captured_api_calls, indent=2, ensure_ascii=False, default=str)
+    # `attempts` (with each attempt's own modal_html, see
+    # _invest_available_loans()'s docstring) is included alongside
+    # captured_api_calls - the body text above tells the reader to check the
+    # attachment for the modal's HTML when one appeared, so it actually needs
+    # to be in there instead of only living in the in-memory `attempts` list.
+    attachment_payload = {"attempts": attempts, "captured_api_calls": captured_api_calls}
+    attachment_text = json.dumps(attachment_payload, indent=2, ensure_ascii=False, default=str)
     attachment = MIMEText(attachment_text, "plain", "utf-8")
     attachment.add_header(
         "Content-Disposition", "attachment", filename="swaper_investment_api_calls.json"
