@@ -492,8 +492,17 @@ def find_rows_by_texts_below(grid, start_row, start_col, texts: list, max_rows: 
 # mais la recherche ci-dessous ne dépend pas de cet ordre précis : elle
 # prend simplement la première de ces étiquettes trouvée sous la ligne de
 # la plateforme donnée, quelle que soit sa position dans cette liste.
+# BUG FIXÉ 2026-08-01 : "Bienprêter" manquait de cette liste - son bloc
+# (une ligne plateforme + jusqu'à 19 lignes emprunteur) se trouve entre
+# Afranga et Iuvo, donc _find_geo_block_end_row() pour Afranga ne
+# reconnaissait aucune ligne du bloc Bienprêter comme frontière et
+# continuait jusqu'à "Iuvo" - le zero-fill d'Afranga avalait alors TOUT le
+# bloc Bienprêter (sa propre ligne D + chaque emprunteur) en écrivant 0
+# partout, aucun de ces noms ne correspondant jamais à un loan originator
+# Afranga. Reproduit et confirmé en lecture seule (sans écriture réelle)
+# via _zero_fill_missing_geo_rows().
 GEO_SECTION_BOUNDARY_LABELS = [
-    "Afranga", "Iuvo", "Lendermarket", "Loanch", "Mintos", "Peerberry",
+    "Afranga", "Bienprêter", "Iuvo", "Lendermarket", "Loanch", "Mintos", "Peerberry",
     "Swaper", "Monefit", "Go & Grow", "Lande",
     "Crowdlending savings", "Crowdlending agricole", "Bourse",
 ]
