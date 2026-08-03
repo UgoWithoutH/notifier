@@ -370,6 +370,29 @@ def handle_two_factor(page) -> None:
     page.locator("div.button.clickable", has_text="Log In").click()
 
 
+def _type_with_retry(page, selector: str, text: str, attempts: int = 3) -> None:
+    """Same as human_type(), but re-resolves `selector` and retries on a
+    PlaywrightTimeoutError - added 2026-08-03 after a real GitHub Actions
+    failure where the email input kept reporting "element is not
+    stable"/"element was detached from the DOM, retrying" for the full 30s
+    default timeout (Swaper's Angular login page apparently still
+    re-rendering/replacing its form nodes shortly after
+    domcontentloaded/the cookie-banner click, before settling)."""
+    last_exc = None
+    for attempt in range(1, attempts + 1):
+        try:
+            human_type(page.locator(selector), text)
+            return
+        except PlaywrightTimeoutError as exc:
+            last_exc = exc
+            log.warning(
+                "Timed out interacting with %s (attempt %d/%d), retrying: %s",
+                selector, attempt, attempts, exc,
+            )
+            human_pause(1.0, 2.0)
+    raise last_exc
+
+
 def login(page) -> None:
     """Log in to Swaper using the credentials (and TOTP secret, if 2FA is
     enabled) from env vars.
@@ -381,7 +404,6 @@ def login(page) -> None:
     """
     log.info("Navigating to login page...")
     page.goto(LOGIN_URL, wait_until="domcontentloaded")
-    human_mouse_wander(page)
 
     # Dismiss the Cookiebot consent banner if it shows up.
     try:
@@ -397,10 +419,21 @@ def login(page) -> None:
         log.info("Reused a previous session, already logged in at %s", page.url)
         return
 
+    # Let the Angular form finish rendering/settling (the cookie-banner click
+    # above can also trigger a reload) before interacting with it - avoids
+    # the "element is not stable"/"detached from the DOM" churn seen when
+    # typing starts too early.
+    try:
+        page.locator("input[name='email']").wait_for(state="visible", timeout=15000)
+    except PlaywrightTimeoutError:
+        pass  # fall through to the retrying type helper below regardless
+    human_pause(0.5, 1.0)
+    human_mouse_wander(page)
+
     log.info("Filling in credentials...")
-    human_type(page.locator("input[name='email']"), SWAPER_EMAIL)
+    _type_with_retry(page, "input[name='email']", SWAPER_EMAIL)
     human_pause()
-    human_type(page.locator("input[name='password']"), SWAPER_PASSWORD)
+    _type_with_retry(page, "input[name='password']", SWAPER_PASSWORD)
     human_pause()
     page.locator("div.button.clickable", has_text="Log In").click()
 
