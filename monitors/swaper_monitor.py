@@ -370,6 +370,20 @@ def handle_two_factor(page) -> None:
     page.locator("div.button.clickable", has_text="Log In").click()
 
 
+class _NavigatedAwayFromLogin(Exception):
+    """Internal signal raised by _type_with_retry() when the page redirects
+    away from /login WHILE we're retrying a login-field interaction - real
+    GitHub Actions failure, 2026-08-03 (later): the early "/login not in
+    page.url" reuse-check in login() ran too early (Swaper's Angular app
+    hadn't yet asynchronously decided a restored session was valid), so
+    login() proceeded to type credentials into a login form that then got
+    silently replaced by a redirect to /dashboard/... mid-retry - every
+    subsequent click just timed out against a page that no longer has that
+    input, wasting the full 3-attempt/90s retry budget before failing the
+    whole run. login() catches this and treats it as "already logged in".
+    """
+
+
 def _type_with_retry(page, selector: str, text: str, attempts: int = 3) -> None:
     """Same as human_type(), but re-resolves `selector` and retries on a
     PlaywrightTimeoutError - added 2026-08-03 after a real GitHub Actions
@@ -384,6 +398,8 @@ def _type_with_retry(page, selector: str, text: str, attempts: int = 3) -> None:
             human_type(page.locator(selector), text)
             return
         except PlaywrightTimeoutError as exc:
+            if "/login" not in page.url:
+                raise _NavigatedAwayFromLogin() from exc
             last_exc = exc
             log.warning(
                 "Timed out interacting with %s (attempt %d/%d), retrying: %s",
@@ -431,10 +447,19 @@ def login(page) -> None:
     human_mouse_wander(page)
 
     log.info("Filling in credentials...")
-    _type_with_retry(page, "input[name='email']", SWAPER_EMAIL)
-    human_pause()
-    _type_with_retry(page, "input[name='password']", SWAPER_PASSWORD)
-    human_pause()
+    try:
+        _type_with_retry(page, "input[name='email']", SWAPER_EMAIL)
+        human_pause()
+        _type_with_retry(page, "input[name='password']", SWAPER_PASSWORD)
+        human_pause()
+    except _NavigatedAwayFromLogin:
+        if "maintenance" in page.url:
+            raise SwaperMaintenanceMode(f"Swaper is in maintenance mode (redirected to {page.url}).")
+        log.info(
+            "Page navigated away from /login while filling credentials (session was "
+            "restored asynchronously), already logged in at %s", page.url,
+        )
+        return
     page.locator("div.button.clickable", has_text="Log In").click()
 
     handle_two_factor(page)
