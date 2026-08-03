@@ -186,7 +186,7 @@ Optional:
                                                "1h20" (1h 20m), "1h20m30s",
                                                "45m", "90s", "2h", or a plain
                                                number of seconds ("300").
-    POLL_INTERVAL_SECONDS (default 0.2)    -> delay between polls
+    POLL_INTERVAL_SECONDS (default 0.05)   -> delay between polls
     MIN_INVESTMENT_AMOUNT (default 10)     -> skip investing below this
                                                remaining balance/loan amount
     STUCK_AFTER_SECONDS (default 45)       -> log diagnostics if the loan
@@ -305,10 +305,15 @@ def _parse_duration_seconds(value: str) -> float:
 
 
 DURATION_SECONDS = _parse_duration_seconds(os.environ.get("DURATION_SECONDS", "5m"))
-# Lowered from 0.5s to 0.2s on 2026-07-29: real request round-trips observed
-# in DIAGNOSTICS_FILE are ~0.13s, so 0.2s still leaves a bit of headroom
-# while polling noticeably faster (~5 polls/s instead of ~2/s).
-POLL_INTERVAL_SECONDS = float(os.environ.get("POLL_INTERVAL_SECONDS", "0.2"))
+# Lowered from 0.5s to 0.2s on 2026-07-29, then to 0.05s on 2026-08-03: a
+# real run's diagnostics (2026-08-03) show request_duration_seconds
+# consistently ~0.17-0.22s - i.e. ALREADY at or above the old 0.2s floor, so
+# that value was adding near-zero extra sleep on most polls. The real speed
+# limit is PeerBerry's own network round-trip, not this sleep - lowering it
+# to 0.05s just removes the artificial floor so a poll that happens to come
+# back faster (network variance) isn't held up waiting out the rest of a
+# fixed 0.2s, without meaningfully increasing request rate on the common case.
+POLL_INTERVAL_SECONDS = float(os.environ.get("POLL_INTERVAL_SECONDS", "0.05"))
 MIN_INVESTMENT_AMOUNT = float(os.environ.get("MIN_INVESTMENT_AMOUNT", "10"))
 STUCK_AFTER_SECONDS = float(os.environ.get("STUCK_AFTER_SECONDS", "45"))
 # Re-fetch the real "available for investment" balance from the server every
@@ -440,10 +445,26 @@ def build_loans_params() -> dict:
     `MIN_INTEREST_RATE` (read once at startup in run() from the Sheet cell
     just left of "Peerberry" - see get_peerberry_min_interest_rate()),
     instead of a hardcoded 8.5, so the user can change it from the Sheet
-    without a code edit."""
+    without a code edit.
+
+    FIXED 2026-08-03: `groupGuarantee` was sent as the string `"true"`,
+    which does NOT match the module docstring's own reference URL
+    (`groupGuarantee=1`) - changed to the literal `1` to match exactly.
+    NOTE: a live side-by-side test against the real API right after this
+    change showed `"true"` and `1` return the IDENTICAL total/loan set -
+    so this was NOT actually the cause of the `total=0` runs, just a
+    latent inconsistency worth fixing anyway. The real cause, confirmed
+    the same day via a live, unfiltered call to the same endpoint: the
+    entire PeerBerry marketplace only had 9 loans total at that moment,
+    ALL with `remainingTerm` of 361 or 702 days - i.e. none could ever
+    pass `maxRemainingTerm=185` regardless of `groupGuarantee`/
+    `minInterestRate`/originator selection. `total=0` for a long stretch
+    is therefore expected/correct behavior when the market is this thin
+    relative to the configured criteria, not a bug in the request
+    itself."""
     return {
         "sort": "-loanId",
-        "groupGuarantee": "true",
+        "groupGuarantee": 1,
         "minInterestRate": MIN_INTEREST_RATE,
         "maxRemainingTerm": 185,
         "minRemainingTerm": 1,
