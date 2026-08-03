@@ -307,6 +307,17 @@ class SwaperSessionExpired(RuntimeError):
     """
 
 
+class SwaperMaintenanceMode(RuntimeError):
+    """Raised when Swaper's whole site is in maintenance mode (real GitHub
+    Actions failure, 2026-08-03: a reused session redirected to
+    https://swaper.com/en/maintenance and the loans API then returned HTTP
+    503). This is a transient external outage, not a bug - run() catches it
+    separately (explicit user decision) and skips the rest of the run
+    cleanly: no summary/error email, no failure exit code, so a maintenance
+    window doesn't get treated/alarmed like a real error.
+    """
+
+
 
 def handle_two_factor(page) -> None:
     """If Swaper prompts for a Google Authenticator code after submitting
@@ -381,6 +392,8 @@ def login(page) -> None:
     # If a previous session was restored (see STORAGE_STATE_FILE) and is still
     # valid, Swaper redirects away from /login immediately - nothing else to do.
     if "/login" not in page.url:
+        if "maintenance" in page.url:
+            raise SwaperMaintenanceMode(f"Swaper is in maintenance mode (redirected to {page.url}).")
         log.info("Reused a previous session, already logged in at %s", page.url)
         return
 
@@ -468,6 +481,8 @@ def fetch_loans(page, captured_api_calls: list, groups: list = None) -> dict:
     _record_http_call(captured_api_calls, "POST", LOANS_URL, dict(request.headers), request.post_data, result)
     if response.status in (401, 403):
         raise SwaperSessionExpired(f"Loans API returned status {response.status} - session likely expired")
+    if response.status == 503:
+        raise SwaperMaintenanceMode("Loans API returned status 503 - Swaper is likely in maintenance mode.")
     if not response.ok:
         raise RuntimeError(
             f"Loans API returned status {response.status}" + (f" for groups {groups!r}" if groups else "")
@@ -1260,6 +1275,13 @@ def run(headless: bool = True) -> None:
                         "threshold_amount": threshold_amount,
                         "blocked": threshold_amount is not None and invested >= threshold_amount,
                     }
+        except SwaperMaintenanceMode as exc:
+            # Transient external outage (site-wide maintenance), not a bug -
+            # explicit user decision (2026-08-03): skip the rest of this run
+            # cleanly, with no summary/error email and no failed exit code
+            # (run_error stays None), so a maintenance window doesn't get
+            # treated/alarmed like a real error.
+            log.warning("Swaper appears to be in maintenance mode (%s) - skipping the rest of this run.", exc)
         except Exception as exc:
             # Any failure here (login, initial fetch, or anything above not
             # already caught by the invest loop's own try/except) stops the
