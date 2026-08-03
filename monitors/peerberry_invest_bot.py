@@ -845,8 +845,20 @@ def run() -> None:
     # sent to PeerBerry - NO loanOriginators[] id filter anymore (see
     # build_loans_params()'s docstring) - every loan in the response is
     # matched against `selected_originators` above, by name, client-side, to
-    # decide actual investment targets.
-    log.info("Loans listing query params: %s", build_loans_params())
+    # decide actual investment targets. ALSO written to DIAGNOSTICS_FILE (not
+    # just the console log) so this is visible in the emailed diagnostics
+    # attachment too, without needing the separate GitHub Actions console
+    # log - added 2026-08-03 after a run with 21989 polls/0 loans_seen had no
+    # way to confirm what minInterestRate/country threshold were actually in
+    # effect that run.
+    loans_params = build_loans_params()
+    log.info("Loans listing query params: %s", loans_params)
+    _log_diagnostics(
+        "run_params",
+        loans_params=loans_params,
+        selected_originators=selected_originators,
+        country_threshold_percentage=country_threshold_percentage,
+    )
 
     start = time.monotonic()
     last_loan_signature = None
@@ -1157,6 +1169,10 @@ def run() -> None:
     stats["loans_seen"] = len(stats["loans_seen"])
     stats["raw_originators_seen"] = sorted(str(v) for v in stats["raw_originators_seen"])
     stats["final_available_money"] = available_money
+    # Visible in the summary email now (was only ever console-logged before
+    # 2026-08-03) - lets a "0 loans_seen" run be diagnosed directly from the
+    # email: was the rate too high, or was the market genuinely empty?
+    stats["min_interest_rate"] = MIN_INTEREST_RATE
     stats["country_threshold_percentage"] = country_threshold_percentage
     stats["country_threshold_amount"] = country_threshold_amount
     stats["country_invested_initial"] = dict(country_data.get("country_amounts") or {})

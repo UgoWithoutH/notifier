@@ -595,7 +595,11 @@ def send_peerberry_invest_bot_summary_email(stats: dict, error: str | None = Non
     `stats` is the dict built by peerberry_invest_bot.run(): `polls`,
     `loans_seen` (count), `invest_attempts`, `invest_successes`,
     `invest_failures`, `total_invested_attempted`, `stuck_events`, `errors`,
-    `final_available_money`, `selected_originators`,
+    `final_available_money`, `selected_originators`, `min_interest_rate`
+    (the real minInterestRate value used this run's `/loans` requests,
+    read from the Sheet at startup - added 2026-08-03 so a "0 loans_seen"
+    run can be diagnosed directly from this email instead of needing the
+    separate GitHub Actions console log),
     `originator_stats` (per-originator dict with `loans_seen`, `attempts`,
     `successes`, `failures`, `invested_amount`, `invested_loans` - there is
     no per-originator budget anymore, investments simply draw from the
@@ -649,6 +653,10 @@ def send_peerberry_invest_bot_summary_email(stats: dict, error: str | None = Non
         f"Situations bloquées détectées : {stats.get('stuck_events', 0)}",
         f"Erreurs rencontrées : {stats.get('errors', 0)}",
     ]
+
+    min_interest_rate = stats.get("min_interest_rate")
+    if min_interest_rate is not None:
+        body_parts.append(f"Taux d'intérêt minimum utilisé (minInterestRate) : {min_interest_rate}")
 
     raw_originators_seen = stats.get("raw_originators_seen") or []
     if raw_originators_seen:
