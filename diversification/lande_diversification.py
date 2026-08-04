@@ -43,11 +43,6 @@ lande_get_session.py locally to get fresh values.
 Data sources (server-rendered HTML - lande.finance is a Laravel app, NOT a
 JSON API - confirmed via the XSRF-TOKEN/lande_session cookie naming and
 verified live 2026-07-29):
-- `GET https://lande.finance/fr/investor` -> account overview page, embeds
-  `<p ... id="total_balance"> € 946.57 </p>` (literal `&nbsp;` between the
-  euro sign and the amount in the raw HTML) - this is the account's total
-  balance ("Fonds disponibles" + "Fonds investis" + "Fonds réservés"),
-  used as-is for the "total" figure.
 - `GET https://lande.finance/fr/investor/transactions?search=1&
   start_date=<DD.MM.YYYY>&end_date=<DD.MM.YYYY>&page=<N>` -> paginated
   (15 rows/page, confirmed via the page's own "Showing X to Y of Z"
@@ -63,12 +58,26 @@ verified live 2026-07-29):
   continues until a page returns zero `<article>` blocks (capped by
   MAX_TRANSACTIONS_PAGES as a safety net, same pattern as
   bienpreter_diversification.py's operations pagination).
-- The "Compte de résultat" link the user mentioned
-  (`/fr/investor/transactions/tax-report?...`) turns out to render a PDF
-  (confirmed 2026-07-29 - Chrome's own PDF viewer loaded it, the raw HTML
-  response is just an empty PDF-embedder shell) - NOT used here, since the
-  transactions page already gives a full per-entry interest breakdown that
-  can be summed directly, no PDF parsing needed.
+- **"total" (the account balance figure) comes from the "Compte de
+  résultat" (tax report) button, same period as the interest above** -
+  found 2026-08-04 (correcting the earlier note here that assumed this was
+  unusable): the button's real link is
+  `GET https://lande.finance/fr/investor/transactions/tax-report?search=1&
+  start_date=<DD.MM.YYYY>&end_date=<DD.MM.YYYY>` and IS a real
+  `application/pdf` response (confirmed via Playwright's
+  `context.request.get()`, which - unlike `page.goto()` - returns the raw
+  PDF bytes instead of Chrome's built-in PDF-viewer's empty embedder
+  shell). Parsed with PyMuPDF (`fitz`, new dependency) - the PDF's plain
+  text includes a line "2. Account value at the end of the period"
+  immediately followed by a line like "946.57 EUR" - that's the figure
+  used for "total", NOT the investor overview page's always-CURRENT
+  `id="total_balance"` value (which was used before this fix, but is wrong
+  for any REPORT_DATE-driven past month - it only ever reflects today's
+  live balance). Fetching the SAME period as the interest means requesting
+  an old month (via REPORT_DATE/run_manual_platform.ps1's date prompt)
+  now gives that month's real historical end-of-period balance instead of
+  today's balance. Verified live 2026-08-04 (period 01.07.2026-31.07.2026):
+  946.57 EUR, matching the previously-verified 2026-07-29 live balance.
 
 No bonus/cashback data has been observed on this account (only
 Intérêt/Principal/Demande de retrait transaction types seen in the range
@@ -105,18 +114,20 @@ import os
 import re
 import sys
 import logging
-from datetime import date
 
+import fitz
 import requests
 from dotenv import load_dotenv
+
+from shared.report_date import get_report_date
 
 load_dotenv()
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger("lande_diversification")
 
-INVESTOR_PAGE_URL = "https://lande.finance/fr/investor"
 TRANSACTIONS_URL = "https://lande.finance/fr/investor/transactions"
+TAX_REPORT_URL = "https://lande.finance/fr/investor/transactions/tax-report"
 PLATFORM_LABEL = "Lande"
 MAX_TRANSACTIONS_PAGES = 50  # safety net, see bienpreter_diversification.py's identical pattern
 
@@ -155,37 +166,38 @@ def _parse_amount(text: str) -> float:
     return float(cleaned)
 
 
-def fetch_account_balance(session: requests.Session) -> float:
-    """Fetch the account's total balance from the investor overview page's
-    own server-rendered `id="total_balance"` element. See module docstring
-    for the verified markup."""
-    log.info("GET %s (fetching account balance)...", INVESTOR_PAGE_URL)
-    r = session.get(INVESTOR_PAGE_URL, timeout=20)
-    log.info("GET /fr/investor: status=%s", r.status_code)
+def fetch_account_value_at_period_end(session: requests.Session, start_date: str, end_date: str) -> float:
+    """Fetch the account's balance as of the END of the given period (same
+    French DD.MM.YYYY dates as fetch_current_month_interest()) via the
+    "Compte de résultat" tax-report PDF. See module docstring for the
+    verified URL/PDF-text format."""
+    params = {"search": "1", "start_date": start_date, "end_date": end_date}
+    log.info("GET %s (fetching tax report PDF for %s - %s)...", TAX_REPORT_URL, start_date, end_date)
+    r = session.get(TAX_REPORT_URL, params=params, timeout=30)
+    log.info("GET tax-report: status=%s content-type=%s", r.status_code, r.headers.get("content-type"))
     _check_authenticated(r)
     if not r.ok:
-        raise RuntimeError(f"Investor page returned status {r.status_code}")
+        raise RuntimeError(f"Tax report PDF request returned status {r.status_code}")
 
-    match = re.search(r'id="total_balance">\s*€[\s\xa0]*([\d.,\s\xa0]+?)\s*</p>', r.text)
+    with fitz.open(stream=r.content, filetype="pdf") as doc:
+        text = "\n".join(page.get_text() for page in doc)
+
+    match = re.search(r"account value at the end of the period\s*\n\s*(-?[\d.,\s]+?)\s*EUR", text, re.IGNORECASE)
     if not match:
-        raise RuntimeError(SESSION_EXPIRED_MESSAGE)
+        raise RuntimeError("Could not find 'Account value at the end of the period' in the tax report PDF.")
 
     try:
         return _parse_amount(match.group(1))
     except ValueError:
-        raise RuntimeError(f"Could not parse total_balance out of {match.group(1)!r}.")
+        raise RuntimeError(f"Could not parse account value out of {match.group(1)!r}.")
 
 
-def fetch_current_month_interest(session: requests.Session) -> float:
-    """Fetch this calendar month's (1st of month through today) gross
-    interest received by paginating the transactions page and summing
-    every "Intérêt"-labelled entry's amount. See module docstring for the
-    verified markup/pagination behavior."""
-    today = date.today()
-    first = today.replace(day=1)
-    start_date = first.strftime("%d.%m.%Y")
-    end_date = today.strftime("%d.%m.%Y")
-
+def fetch_current_month_interest(session: requests.Session, start_date: str, end_date: str) -> float:
+    """Fetch the given period's (same French DD.MM.YYYY dates as
+    fetch_account_value_at_period_end()) gross interest received by
+    paginating the transactions page and summing every "Intérêt"-labelled
+    entry's amount. See module docstring for the verified markup/
+    pagination behavior."""
     gross_interest = 0.0
     page = 1
     while page <= MAX_TRANSACTIONS_PAGES:
@@ -252,16 +264,20 @@ def run(session: requests.Session | None = None) -> None:
 
     log.info("Starting Lande diversification run (pure HTTP, no Playwright).")
 
+    report_date = get_report_date()
+    start_date = report_date.replace(day=1).strftime("%d.%m.%Y")
+    end_date = report_date.strftime("%d.%m.%Y")
+
     try:
-        total = fetch_account_balance(session)
+        total = fetch_account_value_at_period_end(session, start_date, end_date)
     except Exception:
-        log.exception("Failed to fetch Lande account balance.")
+        log.exception("Failed to fetch Lande account value at period end.")
         sys.exit(1)
 
-    log.info("Total balance: %.2f EUR", total)
+    log.info("Account value at period end (%s - %s): %.2f EUR", start_date, end_date, total)
 
     try:
-        gross_interest_received = fetch_current_month_interest(session)
+        gross_interest_received = fetch_current_month_interest(session, start_date, end_date)
     except Exception:
         log.exception("Failed to fetch Lande this month's interest - defaulting to 0.0.")
         gross_interest_received = 0.0
