@@ -135,12 +135,12 @@ import os
 import re
 import sys
 import logging
-from datetime import date
 
 import requests
 from dotenv import load_dotenv
 
 from shared.google_sheet import fill_current_month_amounts_with_labels, fill_geographic_repartition_amounts
+from shared.report_date import get_report_date
 
 load_dotenv()
 
@@ -313,7 +313,7 @@ def fetch_current_month_statement_totals(session: requests.Session) -> dict:
     for the verified endpoint/fields/CSRF mechanism."""
     csrf_token = get_csrf_token(session)
 
-    today = date.today()
+    today = get_report_date()
     first = today.replace(day=1)
     form = {
         "account_statement_filter[currency]": str(CURRENCY_ID),
