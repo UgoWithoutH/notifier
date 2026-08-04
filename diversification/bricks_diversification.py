@@ -102,6 +102,7 @@ Optional:
 
 import os
 import sys
+import time
 import logging
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -146,12 +147,7 @@ def login(session: requests.Session) -> None:
     see module docstring). Sets the `__Secure-better-auth.session_token`
     cookie on `session` for all subsequent authenticated requests."""
     log.info("Signing in to Bricks as %s...", BRICKS_EMAIL)
-    resp = session.post(
-        SIGNIN_URL,
-        json={"email": BRICKS_EMAIL, "password": BRICKS_PASSWORD},
-        headers={"Origin": "https://app.bricks.co", "Referer": "https://app.bricks.co/"},
-        timeout=15,
-    )
+    resp = session.post(SIGNIN_URL, json={"email": BRICKS_EMAIL, "password": BRICKS_PASSWORD}, timeout=15)
     log.info("Sign-in response: status=%s", resp.status_code)
     if resp.status_code != 200:
         raise RuntimeError(f"Bricks login failed: HTTP {resp.status_code} - {resp.text[:300]}")
@@ -168,8 +164,23 @@ def fetch_balances(session: requests.Session) -> dict:
     log.info("Requesting Bricks portfolio wealth home-metrics...")
     resp = session.get(HOME_METRICS_URL, timeout=15)
     log.info("Home-metrics response: status=%s", resp.status_code)
+    if resp.status_code == 401:
+        # Seen on at least one other account: a valid, just-established session
+        # can still 401 here once - log details and retry once after a short
+        # pause in case it's a server-side session-propagation race.
+        log.warning(
+            "Home-metrics returned 401 right after a successful login - headers=%r body=%s. "
+            "Retrying once after a short pause.",
+            {k: v for k, v in resp.headers.items() if k.lower() in ("cf-ray", "server", "content-type")},
+            resp.text[:500],
+        )
+        time.sleep(3)
+        resp = session.get(HOME_METRICS_URL, timeout=15)
+        log.info("Home-metrics retry response: status=%s", resp.status_code)
     if resp.status_code != 200:
-        raise RuntimeError(f"Bricks home-metrics endpoint returned status {resp.status_code}")
+        raise RuntimeError(
+            f"Bricks home-metrics endpoint returned status {resp.status_code} - body: {resp.text[:500]}"
+        )
 
     data = resp.json()
     log.info("Raw home-metrics payload: %r", data)
@@ -298,6 +309,9 @@ def run() -> None:
     log.info("Starting Bricks diversification run (pure-HTTP, no browser).")
 
     session = requests.Session()
+    # Sent on EVERY request (not just sign-in) - some accounts have been seen
+    # to get a 401 on the very next authenticated call otherwise.
+    session.headers.update({"Origin": "https://app.bricks.co", "Referer": "https://app.bricks.co/"})
 
     try:
         login(session)
