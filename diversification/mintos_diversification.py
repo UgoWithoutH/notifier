@@ -360,7 +360,12 @@ def fetch_current_month_statement_totals(session: requests.Session) -> dict:
             # 'intérêts brut prêts' + 'intérêts brut obligations' always
             # adds up to the full gross interest for this period.
             gross_interest_received_loans += amount
-        elif "prélèvement à la source" in label or "prelevement a la source" in label:
+        elif (
+            "prélèvement à la source" in label
+            or "prelevement a la source" in label
+            or "tax withholding" in label
+            or "withholding" in label
+        ):
             withholding_tax += abs(amount)
 
     gross_interest_received = gross_interest_received_loans + gross_interest_received_obligations
@@ -443,6 +448,8 @@ def run(session: requests.Session | None = None) -> None:
     # the platform - fill_current_month_amounts() assumes THAT single-row
     # shape and would silently write into the wrong row ("en cours prêts")
     # here, so this uses the label-matching variant instead.
+    # "prélèvements" (verified live 2026-08-05) sits 10 rows below the
+    # "Mintos" row - past the default max_rows=6 bound - hence max_rows=10.
     fill_current_month_amounts_with_labels(
         platform=PLATFORM_LABEL,
         total=total_outstanding,
@@ -451,7 +458,9 @@ def run(session: requests.Session | None = None) -> None:
             "en cours obligations": portfolio_split["bonds"],
             "intérêts brut prêts": statement_totals["gross_interest_received_loans"],
             "intérêts brut obligations": statement_totals["gross_interest_received_obligations"],
+            "prélèvements": statement_totals["withholding_tax"],
         },
+        max_rows=10,
     )
 
     # "Répartition géographique": the "Mintos" row itself is a computed
