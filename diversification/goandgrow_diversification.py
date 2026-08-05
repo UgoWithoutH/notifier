@@ -87,7 +87,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 from shared.google_sheet import fill_current_month_amounts, fill_current_month_bonus_breakdown, fill_geographic_repartition_amounts
-from shared.report_date import get_report_now
+from shared.report_date import get_report_now, is_current_month
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger("goandgrow_diversification")
@@ -297,10 +297,13 @@ def run() -> None:
         "withholding_tax": 0.0,
         "bonus_cashback_contest": statement_totals["bonus_cashback_contest"],
     }
+    current_month = is_current_month()
+
     fill_current_month_amounts(
         platform=PLATFORM_LABEL,
         amounts=amounts,
         section="Crowdlending savings",
+        skip_total=not current_month,
     )
 
     # No bonus/cashback/contest statement entry Type has been observed yet
@@ -314,7 +317,8 @@ def run() -> None:
         section="Crowdlending savings",
     )
 
-    fill_geographic_repartition_amounts([{"name": PLATFORM_LABEL, "amount": balance}])
+    if current_month:
+        fill_geographic_repartition_amounts([{"name": PLATFORM_LABEL, "amount": balance}])
 
 
 if __name__ == "__main__":

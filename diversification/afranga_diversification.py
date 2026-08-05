@@ -87,7 +87,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 from shared.google_sheet import fill_current_month_amounts, fill_current_month_bonus_breakdown, fill_geographic_repartition_amounts
-from shared.report_date import get_report_now
+from shared.report_date import get_report_now, is_current_month
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger("afranga_diversification")
@@ -508,9 +508,12 @@ def run() -> None:
         statement_totals["net_interest_received"], statement_totals["withholding_tax"],
     )
 
+    current_month = is_current_month()
+
     fill_current_month_amounts(
         platform="Afranga",
-        amounts=statement_totals
+        amounts=statement_totals,
+        skip_total=not current_month,
     )
 
     # Afranga's bonus feature is literally called "Bonus Cashback
@@ -531,7 +534,8 @@ def run() -> None:
         for o in originators
     ]
 
-    fill_geographic_repartition_amounts(loan_originators, platform="Afranga")
+    if current_month:
+        fill_geographic_repartition_amounts(loan_originators, platform="Afranga")
 
 
 if __name__ == "__main__":

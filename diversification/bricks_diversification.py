@@ -115,7 +115,7 @@ import requests
 
 try:
     from shared.google_sheet import fill_current_month_amounts, fill_current_month_bonus_breakdown
-    from shared.report_date import get_report_now
+    from shared.report_date import get_report_now, is_current_month
 except ModuleNotFoundError:
     # Support direct execution (python diversification/bricks_diversification.py)
     # where the project root may not be on sys.path.
@@ -123,7 +123,7 @@ except ModuleNotFoundError:
     if str(project_root) not in sys.path:
         sys.path.insert(0, str(project_root))
     from shared.google_sheet import fill_current_month_amounts, fill_current_month_bonus_breakdown
-    from shared.report_date import get_report_now
+    from shared.report_date import get_report_now, is_current_month
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger("bricks_diversification")
@@ -366,10 +366,13 @@ def run() -> None:
     # gross_interest_received write below will land on "Bourse"'s row
     # instead. Don't revert this to a log-only skeleton without being
     # asked again.
+    current_month = is_current_month()
+
     fill_current_month_amounts(
         platform="Bricks",
         amounts=amounts,
         section="Crowdfunding immobilier",
+        skip_total=not current_month,
     )
 
     # Bricks' block uses its own distinct sub-row labels ("parrainages" /

@@ -57,7 +57,7 @@ from zoneinfo import ZoneInfo
 from dotenv import load_dotenv
 
 from shared.google_sheet import fill_current_month_amounts, fill_current_month_bonus_breakdown, fill_geographic_repartition_amounts
-from shared.report_date import get_report_now
+from shared.report_date import get_report_now, is_current_month
 
 load_dotenv()
 
@@ -388,9 +388,12 @@ def run(headless: bool = True) -> None:
         "bonus_cashback_contest": referral_bonus_earned,
         "interest_received": interest_received,
     }
+    current_month = is_current_month()
+
     fill_current_month_amounts(
         platform="Swaper",
-        amounts=amounts
+        amounts=amounts,
+        skip_total=not current_month,
     )
 
     # Swaper's referral bonus is a "prime" (parrainage/reward), not a
@@ -406,7 +409,8 @@ def run(headless: bool = True) -> None:
         for o in originators
     ]
 
-    fill_geographic_repartition_amounts(loan_originators, platform="Swaper")
+    if current_month:
+        fill_geographic_repartition_amounts(loan_originators, platform="Swaper")
 
 
 if __name__ == "__main__":

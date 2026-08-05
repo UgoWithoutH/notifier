@@ -114,7 +114,7 @@ from shared.google_sheet import (
     fill_current_month_bonus_breakdown,
     fill_bienpreter_borrower_geo_amounts,
 )
-from shared.report_date import get_report_now
+from shared.report_date import get_report_now, is_current_month
 from shared.notifier import send_bienpreter_geo_issues_email
 
 load_dotenv()
@@ -579,9 +579,12 @@ def run() -> None:
         interest_totals["gross_interest_received"], interest_totals["net_interest_received"], interest_totals["withholding_tax"],
     )
 
+    current_month = is_current_month()
+
     fill_current_month_amounts(
         platform="Bienprêter",
-        amounts=interest_totals
+        amounts=interest_totals,
+        skip_total=not current_month,
     )
 
     # Placeholder write (see the comment above bonus_cashback_contest) -
@@ -608,14 +611,15 @@ def run() -> None:
     # the run (Crowdlending section writes already happened above).
     geo_issues = []
     geo_error = None
-    try:
-        log.info("Fetching active loans grouped by borrower (for the geographic breakdown)...")
-        borrowers, fetch_issues = fetch_active_loans_by_borrower(session)
-        geo_issues.extend(fetch_issues)
-        geo_issues.extend(fill_bienpreter_borrower_geo_amounts(borrowers))
-    except Exception as exc:
-        log.exception("Failed to update the Bienprêter geographic breakdown by borrower.")
-        geo_error = str(exc)
+    if current_month:
+        try:
+            log.info("Fetching active loans grouped by borrower (for the geographic breakdown)...")
+            borrowers, fetch_issues = fetch_active_loans_by_borrower(session)
+            geo_issues.extend(fetch_issues)
+            geo_issues.extend(fill_bienpreter_borrower_geo_amounts(borrowers))
+        except Exception as exc:
+            log.exception("Failed to update the Bienprêter geographic breakdown by borrower.")
+            geo_error = str(exc)
 
     if geo_issues or geo_error:
         send_bienpreter_geo_issues_email(geo_issues, error=geo_error)

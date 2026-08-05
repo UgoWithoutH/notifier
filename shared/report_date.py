@@ -47,3 +47,15 @@ def get_report_now(tz: ZoneInfo) -> datetime:
     range calculations."""
     d = get_report_date()
     return datetime(d.year, d.month, d.day, tzinfo=tz)
+
+
+def is_current_month() -> bool:
+    """True if get_report_date() falls in the REAL current (wall-clock)
+    month/year - False when REPORT_DATE points at a past/future month
+    (e.g. a month-range backfill run). Used to skip writing "live snapshot"
+    figures (account balance/total, geographic repartition) for a
+    backfilled month, since those aren't real historical data for that
+    month - only the date-range-computed interest/bonus figures are."""
+    report = get_report_date()
+    today = date.today()
+    return (report.year, report.month) == (today.year, today.month)

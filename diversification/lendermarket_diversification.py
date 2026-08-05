@@ -52,7 +52,7 @@ import requests
 from dotenv import load_dotenv
 
 from shared.google_sheet import fill_current_month_amounts, fill_current_month_bonus_breakdown, fill_geographic_repartition_amounts
-from shared.report_date import get_report_now
+from shared.report_date import get_report_now, is_current_month
 
 load_dotenv()
 
@@ -245,9 +245,12 @@ def run() -> None:
         "bonuses": statement_totals["bonuses"],
     }
 
+    current_month = is_current_month()
+
     fill_current_month_amounts(
         platform="Lendermarket",
-        amounts=amounts
+        amounts=amounts,
+        skip_total=not current_month,
     )
 
     # Lendermarket's "investorBonusesAmount" IS literally labelled "Primes
@@ -264,7 +267,8 @@ def run() -> None:
         for l in lenders
     ]
 
-    fill_geographic_repartition_amounts(loan_originators, platform="Lendermarket")
+    if current_month:
+        fill_geographic_repartition_amounts(loan_originators, platform="Lendermarket")
 
 
 if __name__ == "__main__":
