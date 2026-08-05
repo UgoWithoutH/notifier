@@ -3,8 +3,12 @@ name: Diversification Reports
 on:
   workflow_dispatch:
     inputs:
-      report_date:
-        description: "Date à utiliser pour tous les rapports (JJ/MM/AAAA). Laisser vide pour utiliser la date du jour."
+      start_month:
+        description: "Mois de début de la plage à traiter (MM/AAAA). Laisser vide (avec end_month) pour utiliser la date du jour."
+        required: false
+        default: ""
+      end_month:
+        description: "Mois de fin de la plage à traiter (MM/AAAA, inclus). Laisser vide (avec start_month) pour utiliser la date du jour."
         required: false
         default: ""
 
@@ -77,8 +81,7 @@ jobs:
           SWAPER_TOTP_SECRET: ${{ secrets.SWAPER_TOTP_SECRET }}
           GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
           GOOGLE_CREDENTIALS: ${{ secrets.GOOGLE_CREDENTIALS }}
-          REPORT_DATE: ${{ github.event.inputs.report_date }}
-        run: python -m diversification.swaper_diversification
+        run: bash scripts/run_diversification_for_month_range.sh diversification.swaper_diversification "${{ github.event.inputs.start_month }}" "${{ github.event.inputs.end_month }}"
 
       - name: Save persisted state (session cookies) for the next run
         if: always()
@@ -117,8 +120,7 @@ jobs:
           IUVO_PASSWORD: ${{ secrets.IUVO_PASSWORD }}
           GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
           GOOGLE_CREDENTIALS: ${{ secrets.GOOGLE_CREDENTIALS }}
-          REPORT_DATE: ${{ github.event.inputs.report_date }}
-        run: python -m diversification.iuvo_diversification
+        run: bash scripts/run_diversification_for_month_range.sh diversification.iuvo_diversification "${{ github.event.inputs.start_month }}" "${{ github.event.inputs.end_month }}"
 
   afranga:
     runs-on: ubuntu-22.04
@@ -150,8 +152,7 @@ jobs:
           AFRANGA_TOTP_SECRET: ${{ secrets.AFRANGA_TOTP_SECRET }}
           GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
           GOOGLE_CREDENTIALS: ${{ secrets.GOOGLE_CREDENTIALS }}
-          REPORT_DATE: ${{ github.event.inputs.report_date }}
-        run: python -m diversification.afranga_diversification
+        run: bash scripts/run_diversification_for_month_range.sh diversification.afranga_diversification "${{ github.event.inputs.start_month }}" "${{ github.event.inputs.end_month }}"
 
   bienpreter:
     runs-on: ubuntu-22.04
@@ -182,8 +183,7 @@ jobs:
           BIENPRETER_PASSWORD: ${{ secrets.BIENPRETER_PASSWORD }}
           GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
           GOOGLE_CREDENTIALS: ${{ secrets.GOOGLE_CREDENTIALS }}
-          REPORT_DATE: ${{ github.event.inputs.report_date }}
-        run: python -m diversification.bienpreter_diversification
+        run: bash scripts/run_diversification_for_month_range.sh diversification.bienpreter_diversification "${{ github.event.inputs.start_month }}" "${{ github.event.inputs.end_month }}"
 
   lendermarket:
     runs-on: ubuntu-22.04
@@ -215,8 +215,7 @@ jobs:
           LENDERMARKET_TOTP_SECRET: ${{ secrets.LENDERMARKET_TOTP_SECRET }}
           GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
           GOOGLE_CREDENTIALS: ${{ secrets.GOOGLE_CREDENTIALS }}
-          REPORT_DATE: ${{ github.event.inputs.report_date }}
-        run: python -m diversification.lendermarket_diversification
+        run: bash scripts/run_diversification_for_month_range.sh diversification.lendermarket_diversification "${{ github.event.inputs.start_month }}" "${{ github.event.inputs.end_month }}"
 
   loanch:
     runs-on: ubuntu-22.04
@@ -249,8 +248,7 @@ jobs:
           LOANCH_TOTP_SECRET: ${{ secrets.LOANCH_TOTP_SECRET }}
           GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
           GOOGLE_CREDENTIALS: ${{ secrets.GOOGLE_CREDENTIALS }}
-          REPORT_DATE: ${{ github.event.inputs.report_date }}
-        run: python -m diversification.loanch_diversification
+        run: bash scripts/run_diversification_for_month_range.sh diversification.loanch_diversification "${{ github.event.inputs.start_month }}" "${{ github.event.inputs.end_month }}"
 
   monefit:
     runs-on: ubuntu-22.04
@@ -282,8 +280,7 @@ jobs:
           MONEFIT_PASSWORD: ${{ secrets.MONEFIT_PASSWORD }}
           GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
           GOOGLE_CREDENTIALS: ${{ secrets.GOOGLE_CREDENTIALS }}
-          REPORT_DATE: ${{ github.event.inputs.report_date }}
-        run: python -m diversification.monefit_diversification
+        run: bash scripts/run_diversification_for_month_range.sh diversification.monefit_diversification "${{ github.event.inputs.start_month }}" "${{ github.event.inputs.end_month }}"
 
   peerberry:
     runs-on: ubuntu-22.04
@@ -315,8 +312,7 @@ jobs:
           PEERBERRY_TOTP_SECRET: ${{ secrets.PEERBERRY_TOTP_SECRET }}
           GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
           GOOGLE_CREDENTIALS: ${{ secrets.GOOGLE_CREDENTIALS }}
-          REPORT_DATE: ${{ github.event.inputs.report_date }}
-        run: python -m diversification.peerberry_diversification
+        run: bash scripts/run_diversification_for_month_range.sh diversification.peerberry_diversification "${{ github.event.inputs.start_month }}" "${{ github.event.inputs.end_month }}"
 
   goandgrow:
     runs-on: ubuntu-22.04
@@ -349,8 +345,7 @@ jobs:
           GOANDGROW_PASSWORD: ${{ secrets.GOANDGROW_PASSWORD }}
           GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
           GOOGLE_CREDENTIALS: ${{ secrets.GOOGLE_CREDENTIALS }}
-          REPORT_DATE: ${{ github.event.inputs.report_date }}
-        run: python -m diversification.goandgrow_diversification
+        run: bash scripts/run_diversification_for_month_range.sh diversification.goandgrow_diversification "${{ github.event.inputs.start_month }}" "${{ github.event.inputs.end_month }}"
 
   bricks:
     runs-on: ubuntu-22.04
@@ -381,5 +376,4 @@ jobs:
           BRICKS_PASSWORD: ${{ secrets.BRICKS_PASSWORD }}
           GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
           GOOGLE_CREDENTIALS: ${{ secrets.GOOGLE_CREDENTIALS }}
-          REPORT_DATE: ${{ github.event.inputs.report_date }}
-        run: python -m diversification.bricks_diversification
+        run: bash scripts/run_diversification_for_month_range.sh diversification.bricks_diversification "${{ github.event.inputs.start_month }}" "${{ github.event.inputs.end_month }}"

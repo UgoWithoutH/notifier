@@ -588,9 +588,15 @@ def run() -> None:
     # writes 0.0 into "prime" for now (a referral bonus, if one is ever
     # confirmed, would be a "prime" - not a cashback/concours). Update the
     # breakdown/category once /u/parrainage can actually be investigated.
+    # "prélèvements" (withholding tax on interest, real figure - see
+    # fetch_current_month_interest_totals()) is a separate sub-row in the
+    # same block, right before "Rendements %" - verified live 2026-08-05.
     fill_current_month_bonus_breakdown(
         platform="Bienprêter",
-        breakdown={"prime": interest_totals["bonus_cashback_contest"]},
+        breakdown={
+            "prime": interest_totals["bonus_cashback_contest"],
+            "prélèvements": interest_totals["withholding_tax"],
+        },
     )
 
     # "Répartition géographique" per-borrower breakdown (added 2026-07-31,

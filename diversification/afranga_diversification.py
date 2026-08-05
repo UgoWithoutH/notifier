@@ -516,10 +516,14 @@ def run() -> None:
     # Afranga's bonus feature is literally called "Bonus Cashback
     # Campaigns" - a "cashback", not a prime/concours - written to its own
     # dedicated sub-row, never to the "Bonus" row itself (a SUM formula
-    # over prime/cashback/concours).
+    # over prime/cashback/concours). "prélèvements" gets the real
+    # withholding tax on gross interest, same as Bienprêter's equivalent row.
     fill_current_month_bonus_breakdown(
         platform="Afranga",
-        breakdown={"cashback": statement_totals["bonus_cashback_contest"]},
+        breakdown={
+            "cashback": statement_totals["bonus_cashback_contest"],
+            "prélèvements": statement_totals["withholding_tax"],
+        },
     )
 
     loan_originators = [
