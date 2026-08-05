@@ -81,6 +81,7 @@ from shared.google_sheet import (
     get_selected_lendermarket_lenders,
     get_lendermarket_min_interest_rate,
     get_lendermarket_country_allocations,
+    get_lendermarket_originator_caps,
 )
 from shared.state import load_state, save_state
 from shared.notification_gate import should_notify
@@ -710,6 +711,7 @@ def invest_selected_lenders(
     selected_lender_names: list,
     min_interest_rate: float | None = None,
     country_allocations: dict | None = None,
+    originator_caps: dict | None = None,
 ) -> dict:
     """Real auto-invest step (added 2026-07-24, per explicit user request):
     for each lender selected in the Google Sheet (matched against
@@ -743,6 +745,16 @@ def invest_selected_lenders(
     `country_allocations` isn't provided, country blocking is disabled
     entirely.
 
+    `originator_caps` (added 2026-08-05, from
+    get_lendermarket_originator_caps()) enforces, IN ADDITION to the
+    per-country cap above, a per-lender cap - a percentage of the SAME
+    total Lendermarket budget a single lender should never exceed. A
+    lender already at/above its own cap (`invested_amount` from the Sheet)
+    is excluded from this run's budget split (same treatment as a lender
+    with 0 available loans / a country-blocked lender). A lender absent
+    from `originator_caps`, or with no `max_percentage` configured, has no
+    cap and can never be blocked here.
+
     Returns a stats dict: `balance_before`, `balance_after` (running
     balance decremented by every successful investment, for the summary
     email - same idea as peerberry_invest_bot.py's `final_available_
@@ -751,13 +763,14 @@ def invest_selected_lenders(
     `budget`, `loans_seen`, `attempts`, `successes`, `failures`,
     `invested_amount`, `invested_loans`), `country_blocked` (list of
     lender names excluded this run due to the per-country cap),
-    `min_interest_rate` (the value actually used this run),
-    `country_threshold_percentage` (the configured cap, or None), and
-    `country_status` (added 2026-07-31, for the summary email: one entry
-    per country relevant to a selected lender - `{country: {"invested",
-    "threshold_amount" (the cap in EUR, or None if no threshold
-    configured), "blocked"}}`, refreshed at the very end so it reflects
-    this run's own successful investments too)."""
+    `originator_blocked` (list of lender names excluded this run due to
+    their own per-lender cap), `min_interest_rate` (the value actually
+    used this run), `country_threshold_percentage` (the configured cap, or
+    None), and `country_status` (added 2026-07-31, for the summary email:
+    one entry per country relevant to a selected lender - `{country:
+    {"invested", "threshold_amount" (the cap in EUR, or None if no
+    threshold configured), "blocked"}}`, refreshed at the very end so it
+    reflects this run's own successful investments too)."""
     stats = {
         "balance_before": balance,
         "balance_after": balance,
@@ -768,6 +781,7 @@ def invest_selected_lenders(
         "total_invested": 0.0,
         "lender_stats": {},
         "country_blocked": [],
+        "originator_blocked": [],
     }
 
     country_allocations = country_allocations or {}
@@ -776,6 +790,14 @@ def invest_selected_lenders(
     originator_countries = country_allocations.get("originator_countries") or {}
     total_budget = balance + sum(country_invested.values())
 
+    originator_caps = originator_caps or {}
+    lender_invested = {name: data.get("invested_amount", 0.0) for name, data in originator_caps.items()}
+    lender_max_percentages = {
+        name: data.get("max_percentage")
+        for name, data in originator_caps.items()
+        if data.get("max_percentage") is not None
+    }
+
     def _country_for(sheet_name: str, filter_key: str) -> str | None:
         return originator_countries.get(sheet_name) or originator_countries.get(filter_key)
 
@@ -783,6 +805,12 @@ def invest_selected_lenders(
         if not country or threshold_percentage is None or total_budget <= 0:
             return False
         return country_invested.get(country, 0.0) >= (threshold_percentage / 100.0) * total_budget
+
+    def _is_lender_blocked(sheet_name: str) -> bool:
+        max_percentage = lender_max_percentages.get(sheet_name)
+        if max_percentage is None or total_budget <= 0:
+            return False
+        return lender_invested.get(sheet_name, 0.0) >= (max_percentage / 100.0) * total_budget
 
     matched = []
     relevant_countries = set()
@@ -794,6 +822,13 @@ def invest_selected_lenders(
         country = _country_for(sheet_name, filter_key)
         if country:
             relevant_countries.add(country)
+        if _is_lender_blocked(sheet_name):
+            log.info(
+                "Lender '%s' is blocked this run: already at/above its own %.2f%% cap.",
+                filter_key, lender_max_percentages.get(sheet_name),
+            )
+            stats["originator_blocked"].append(filter_key)
+            continue
         if _is_country_blocked(country):
             log.info(
                 "Lender '%s' (country '%s') is blocked this run: already at/above the %.2f%% country cap.",
@@ -801,7 +836,7 @@ def invest_selected_lenders(
             )
             stats["country_blocked"].append(filter_key)
             continue
-        matched.append((filter_key, country))
+        matched.append((filter_key, country, sheet_name))
 
     def _build_country_status() -> dict:
         status = {}
@@ -833,13 +868,13 @@ def invest_selected_lenders(
     # availability.
     loans_by_lender = {
         name: fetch_active_loans_for_lender(LENDER_INVEST_FILTERS[name], min_interest_rate=min_interest_rate)
-        for name, _country in matched
+        for name, _country, _sheet_name in matched
     }
     lenders_with_loans = [name for name, loans in loans_by_lender.items() if loans]
 
     if not lenders_with_loans:
-        log.info("None of the selected Lendermarket lenders %s currently have an available loan - nothing to invest this run.", [name for name, _country in matched])
-        for name, _country in matched:
+        log.info("None of the selected Lendermarket lenders %s currently have an available loan - nothing to invest this run.", [name for name, _country, _sheet_name in matched])
+        for name, _country, _sheet_name in matched:
             stats["lender_stats"][name] = {
                 "budget": 0.0, "loans_seen": 0, "attempts": 0, "successes": 0,
                 "failures": 0, "invested_amount": 0.0, "invested_loans": [],
@@ -847,9 +882,9 @@ def invest_selected_lenders(
         return stats
 
     lender_budget = balance / len(lenders_with_loans)
-    stats["lender_budgets"] = {name: (lender_budget if name in lenders_with_loans else 0.0) for name, _country in matched}
+    stats["lender_budgets"] = {name: (lender_budget if name in lenders_with_loans else 0.0) for name, _country, _sheet_name in matched}
 
-    for lender_name, country in matched:
+    for lender_name, country, sheet_name in matched:
         loans = loans_by_lender[lender_name]
         budget_for_lender = lender_budget if lender_name in lenders_with_loans else 0.0
         lender_stat = {
@@ -886,11 +921,21 @@ def invest_selected_lenders(
                 lender_stat["invested_loans"].append({"loanUuid": loan_uuid, "amount": amount})
                 if country:
                     country_invested[country] = country_invested.get(country, 0.0) + amount
+                lender_invested[sheet_name] = lender_invested.get(sheet_name, 0.0) + amount
             else:
                 stats["invest_failures"] += 1
                 lender_stat["failures"] += 1
 
     stats["country_status"] = _build_country_status()
+    stats["originator_cap_status"] = {
+        name: {
+            "invested": lender_invested.get(name, 0.0),
+            "max_percentage": max_percentage,
+            "threshold_amount": (max_percentage / 100.0) * total_budget if total_budget > 0 else None,
+            "blocked": _is_lender_blocked(name),
+        }
+        for name, max_percentage in lender_max_percentages.items()
+    }
     return stats
 
 
@@ -934,6 +979,22 @@ def run() -> None:
     except Exception:
         log.exception("Could not read the Lendermarket per-country allocations from the Google Sheet, country blocking is disabled this run.")
 
+    # Per-lender cap (added 2026-08-05, in ADDITION to the per-country cap
+    # above) - same soft-fail convention: a read error just disables this
+    # cap for the run rather than aborting it.
+    originator_caps = None
+    try:
+        originator_caps = get_lendermarket_originator_caps()
+    except Exception:
+        log.exception("Could not read the Lendermarket per-lender caps from the Google Sheet, per-lender cap blocking is disabled this run.")
+
+    if originator_caps:
+        configured_caps = {name: data.get("max_percentage") for name, data in originator_caps.items() if data.get("max_percentage") is not None}
+        if configured_caps:
+            log.info("Plafonds par lender configurés (%% du budget total) : %s", configured_caps)
+        else:
+            log.info("Aucun plafond par lender configuré - blocage par lender désactivé pour ce run.")
+
     # Real auto-invest (added 2026-07-24, per explicit user request) - runs
     # BEFORE the segment-availability monitor below (invest first, monitor/
     # notify after), so a matching loan gets a real investment attempt as
@@ -959,6 +1020,7 @@ def run() -> None:
                 session, balance, selected_lender_names,
                 min_interest_rate=min_interest_rate,
                 country_allocations=country_allocations,
+                originator_caps=originator_caps,
             )
         except Exception as exc:
             invest_error = str(exc)

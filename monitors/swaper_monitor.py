@@ -242,6 +242,7 @@ from shared.google_sheet import (
     get_selected_swaper_loan_originators,
     get_swaper_min_interest_rate,
     get_swaper_country_allocations,
+    get_swaper_originator_caps,
 )
 from shared.browser_stealth import get_context_options, apply_stealth, human_pause, human_mouse_wander, human_type
 
@@ -984,6 +985,8 @@ def run(headless: bool = True) -> None:
     country_threshold_percentage = None
     country_status = {}
     country_blocked_originators = []
+    originator_cap_status = {}
+    originator_cap_blocked = []
     originator_loans = {}
 
     with sync_playwright() as p:
@@ -1107,6 +1110,40 @@ def run(headless: bool = True) -> None:
 
                 total_budget = balance_now + sum(country_invested.values())
 
+                # Per-loan-originator cap (added 2026-08-05, in ADDITION to
+                # the per-country cap above) - same soft-fail convention: a
+                # read error just disables this cap for the run rather than
+                # aborting it. See shared.google_sheet.get_swaper_originator_caps().
+                originator_cap_data = {}
+                try:
+                    originator_cap_data = get_swaper_originator_caps()
+                except Exception:
+                    log.exception("Could not read the Swaper per-loan-originator caps from the Google Sheet, per-originator cap blocking is disabled this run.")
+
+                originator_invested = {
+                    name: data.get("invested_amount", 0.0) for name, data in originator_cap_data.items()
+                }
+                originator_max_percentages = {
+                    name: data.get("max_percentage")
+                    for name, data in originator_cap_data.items()
+                    if data.get("max_percentage") is not None
+                }
+                originator_cap_blocked = []
+
+                if originator_max_percentages:
+                    log.info(
+                        "Plafonds par loan originator configurés (%% du budget total) : %s (déjà investi : %s)",
+                        originator_max_percentages, originator_invested,
+                    )
+                else:
+                    log.info("Aucun plafond par loan originator configuré - blocage par originator désactivé pour ce run.")
+
+                def _is_originator_cap_blocked(name, total_budget):
+                    max_percentage = originator_max_percentages.get(name)
+                    if max_percentage is None or total_budget <= 0:
+                        return False
+                    return originator_invested.get(name, 0.0) >= (max_percentage / 100.0) * total_budget
+
                 originator_loans = {}
                 if not selected_originators:
                     log.info("No Swaper loan originator is flagged with 'x' in the Google Sheet - skipping auto-invest.")
@@ -1218,6 +1255,15 @@ def run(headless: bool = True) -> None:
                                         if name not in country_blocked_originators:
                                             country_blocked_originators.append(name)
                                         del originator_loans[name]
+                                        continue
+                                    if _is_originator_cap_blocked(name, total_budget):
+                                        log.info(
+                                            "Originator %r is blocked this run: already at/above its own %s%% cap.",
+                                            name, originator_max_percentages.get(name),
+                                        )
+                                        if name not in originator_cap_blocked:
+                                            originator_cap_blocked.append(name)
+                                        del originator_loans[name]
 
                                 budgets = _split_budget_across_available_originators(balance_now, originator_loans)
                                 for name, budget in budgets.items():
@@ -1263,6 +1309,10 @@ def run(headless: bool = True) -> None:
                                         # same country can't jointly blow past the cap.
                                         if country and not attempt.get("error"):
                                             country_invested[country] = country_invested.get(country, 0.0) + (attempt.get("amount") or 0.0)
+                                        # Same idea, per loan originator (added
+                                        # 2026-08-05, per-originator cap).
+                                        if not attempt.get("error"):
+                                            originator_invested[name] = originator_invested.get(name, 0.0) + (attempt.get("amount") or 0.0)
                                     pass_attempts.extend(attempts)
 
                             investment_attempts.extend(pass_attempts)
@@ -1333,6 +1383,20 @@ def run(headless: bool = True) -> None:
                         "threshold_amount": threshold_amount,
                         "blocked": threshold_amount is not None and invested >= threshold_amount,
                     }
+
+                # Same snapshot, per loan originator this time (added
+                # 2026-08-05, per-originator cap - mirrors the per-country
+                # one above).
+                originator_cap_status = {}
+                for name, max_percentage in originator_max_percentages.items():
+                    invested = originator_invested.get(name, 0.0)
+                    threshold_amount = (max_percentage / 100.0) * total_budget if total_budget > 0 else None
+                    originator_cap_status[name] = {
+                        "invested": invested,
+                        "max_percentage": max_percentage,
+                        "threshold_amount": threshold_amount,
+                        "blocked": threshold_amount is not None and invested >= threshold_amount,
+                    }
         except SwaperMaintenanceMode as exc:
             # Transient external outage (site-wide maintenance), not a bug -
             # explicit user decision (2026-08-03): skip the rest of this run
@@ -1386,6 +1450,8 @@ def run(headless: bool = True) -> None:
             country_threshold_percentage=country_threshold_percentage,
             country_status=country_status,
             country_blocked=country_blocked_originators,
+            originator_cap_status=originator_cap_status,
+            originator_blocked=originator_cap_blocked,
             error=run_error,
         )
     elif captured_api_calls and originator_loans and balance >= MIN_INVESTMENT_AMOUNT:

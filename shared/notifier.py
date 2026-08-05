@@ -84,6 +84,8 @@ def send_swaper_investment_summary_email(
     country_threshold_percentage: float | None = None,
     country_status: dict | None = None,
     country_blocked: list | None = None,
+    originator_cap_status: dict | None = None,
+    originator_blocked: list | None = None,
     error: str | None = None,
 ) -> None:
     """Send a summary of REAL Swaper investments made this run via the
@@ -129,6 +131,11 @@ def send_swaper_investment_summary_email(
     `{invested, threshold_amount, blocked}` breakdown, and the list of loan
     originators excluded this run because their country already hit the
     cap.
+
+    `originator_cap_status`/`originator_blocked` (added 2026-08-05): the
+    SAME kind of cap, but per loan originator instead of per country - a
+    percentage of the total budget a single loan originator should never
+    exceed, from `shared.google_sheet.get_swaper_originator_caps()`.
 
     `error` (added 2026-08-01, explicit user request: "si y'a une erreur ou
     autre il faut arrêter le bot et à la fin du run quoi qu'il arrive
@@ -202,7 +209,24 @@ def send_swaper_investment_summary_email(
             + ", ".join(country_blocked)
         )
         body_lines.append("")
+    if originator_cap_status:
+        body_lines.append("=== Plafond par loan originator (% du budget total) ===")
+        for name, s in sorted(originator_cap_status.items()):
+            threshold_amount = s.get("threshold_amount")
+            line = f"- {name} : investi {s.get('invested', 0.0):.2f} \u20ac / plafond {s.get('max_percentage', 0.0):.2f}%"
+            if threshold_amount is not None:
+                line += f" ({threshold_amount:.2f} \u20ac)"
+            if s.get("blocked"):
+                line += " (BLOQU\u00c9)"
+            body_lines.append(line)
+        body_lines.append("")
 
+    if originator_blocked:
+        body_lines.append(
+            "Loan originators bloqués ce run (plafond par loan originator atteint) : "
+            + ", ".join(originator_blocked)
+        )
+        body_lines.append("")
     body_lines.append(
         "Le fichier joint contient les vraies requ\u00eates/r\u00e9ponses HTTP /rest/ observ\u00e9es "
         "pendant ce run (m\u00e9thode/URL/toutes les en-t\u00eates - valeurs sensibles redacted - "
@@ -398,7 +422,9 @@ def send_lendermarket_invest_summary_email(stats: dict, error: str | None = None
     actually used this run) and `country_status` (per-country invested
     amount vs. the EUR cap, added 2026-07-31 so the email shows exactly
     where each relevant country stands, not just which lenders got
-    blocked).
+    blocked). Also `originator_blocked`/`originator_cap_status` (added
+    2026-08-05): the SAME kind of cap, but per lender instead of per
+    country - see get_lendermarket_originator_caps().
     `error`, if set, is a short description of an unexpected exception that
     interrupted the invest step early. Same convention as
     peerberry_invest_bot.py's summary email: the body never includes raw
@@ -483,6 +509,27 @@ def send_lendermarket_invest_summary_email(stats: dict, error: str | None = None
         body_parts.append(
             "Lenders bloqués ce run (seuil d'investissement par pays atteint) : "
             + ", ".join(country_blocked)
+        )
+
+    originator_cap_status = stats.get("originator_cap_status") or {}
+    if originator_cap_status:
+        body_parts.append("")
+        body_parts.append("=== Plafond par lender (% du budget total) ===")
+        for name, s in sorted(originator_cap_status.items()):
+            threshold_amount = s.get("threshold_amount")
+            line = f"- {name} : investi {s.get('invested', 0.0):.2f} € / plafond {s.get('max_percentage', 0.0):.2f}%"
+            if threshold_amount is not None:
+                line += f" ({threshold_amount:.2f} €)"
+            if s.get("blocked"):
+                line += " (BLOQUÉ)"
+            body_parts.append(line)
+
+    originator_blocked = stats.get("originator_blocked") or []
+    if originator_blocked:
+        body_parts.append("")
+        body_parts.append(
+            "Lenders bloqués ce run (plafond par lender atteint) : "
+            + ", ".join(originator_blocked)
         )
 
     if stats.get("invest_failures", 0) > 0 or error:
@@ -622,6 +669,12 @@ def send_peerberry_invest_bot_summary_email(stats: dict, error: str | None = Non
     `final_amount`, `pct_of_budget`, `blocked` - the full per-country debug
     breakdown shown in the email below, to spot a wrong-looking block/
     non-block directly without digging through logs/diagnostics).
+    Also `originator_cap_details`/`blocked_originators_cap` (added
+    2026-08-05): the SAME kind of cap, but per loan originator instead of
+    per country - a percentage of the total budget a single loan
+    originator should never exceed, read from
+    shared.google_sheet.get_peerberry_originator_caps() (see
+    peerberry_invest_bot.py's `_update_blocked_originators()`).
     `error`, if set, is a short description of a fatal error that stopped
     the run early. The email body itself never includes any diagnostic
     request/response detail - `diagnostics_text`, if provided (this run's
@@ -694,6 +747,24 @@ def send_peerberry_invest_bot_summary_email(stats: dict, error: str | None = Non
             body_parts.append(f"Pays bloqués ce run ({len(blocked_countries)}) : {', '.join(blocked_countries)}")
         else:
             body_parts.append("Aucun pays bloqué ce run.")
+
+    originator_cap_details = stats.get("originator_cap_details") or []
+    if originator_cap_details:
+        body_parts.append("")
+        body_parts.append("=== Plafond par loan originator (% du budget total) ===")
+        for d in originator_cap_details:
+            flag = "BLOQUÉ" if d["blocked"] else "ok"
+            body_parts.append(
+                f"  - {d['originator']:<20s} plafond {d['max_percentage']:.2f}% "
+                f"({d['threshold_amount']:.2f} €) | investi : {d['final_amount']:.2f} € "
+                f"({d['pct_of_budget']:.2f}%) -> {flag}"
+            )
+        blocked_originators_cap = stats.get("blocked_originators_cap") or []
+        body_parts.append("")
+        if blocked_originators_cap:
+            body_parts.append(f"Loan originators bloqués ce run (plafond par originator atteint) : {', '.join(blocked_originators_cap)}")
+        else:
+            body_parts.append("Aucun loan originator bloqué par son propre plafond ce run.")
 
     originator_stats = stats.get("originator_stats") or {}
     if originator_stats:
