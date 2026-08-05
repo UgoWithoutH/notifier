@@ -900,6 +900,57 @@ def _find_x_flag_left_of(row, name_col: int, max_lookback: int = 3) -> bool:
     return False
 
 
+def _read_originator_max_percentage(row, name_col: int):
+    """Lit le pourcentage plafond par loan originator/lender, ajouté par
+    l'utilisateur le 2026-08-05 dans la colonne 2 colonnes à gauche du nom
+    (row[name_col - 3] en index 0-based) - une colonne à droite du flag
+    "x" (désormais décalé à 3 colonnes à gauche du nom par cet ajout, voir
+    `_find_x_flag_left_of`, dont le `max_lookback=3` gère déjà ce décalage
+    sans modification) et une colonne à gauche de toute colonne visuelle
+    propre à une plateforme (ex. le taux d'intérêt de référence de
+    Peerberry, à 1 colonne à gauche du nom).
+
+    Ce pourcentage représente la part maximale du solde total du compte
+    (investi + disponible) que ce loan originator/lender ne doit jamais
+    dépasser - les bots l'utilisent pour ne pas investir au-delà de ce
+    plafond, même si le loan originator/lender est sélectionné ("x").
+
+    Retourne None si la cellule est vide/non numérique (pas de plafond
+    configuré pour cette ligne)."""
+    idx = name_col - 3
+    if idx < 0 or idx >= len(row):
+        return None
+    return _parse_french_amount(row[idx])
+
+
+def _read_originator_caps(grid, name_col: int, geo_col: int, start_row: int, end_row: int) -> dict:
+    """Construit, pour chaque ligne de loan originator/lender entre
+    `start_row` et `end_row` (exclus, 1-based) du bloc "Répartition
+    géographique", un dict {nom: {"max_percentage": float|None,
+    "invested_amount": float}} - `max_percentage` via
+    `_read_originator_max_percentage()`, `invested_amount` lu directement
+    dans la colonne à droite du nom (`geo_col + 1`, là où
+    fill_geographic_repartition_amounts() écrit le montant actuellement
+    investi pour ce loan originator/lender) - sert de valeur de départ
+    "déjà investi" pour le plafond par loan originator/lender, sur le même
+    principe que `country_amounts` pour le plafond par pays."""
+    caps = {}
+    for row_idx in range(start_row + 1, end_row):
+        row = grid[row_idx - 1]
+
+        name = row[name_col - 1].strip() if name_col - 1 < len(row) else ""
+        if not name:
+            continue
+
+        invested_raw = row[geo_col] if geo_col < len(row) else ""
+        caps[name] = {
+            "max_percentage": _read_originator_max_percentage(row, name_col),
+            "invested_amount": _parse_french_amount(invested_raw) or 0.0,
+        }
+
+    return caps
+
+
 def get_selected_peerberry_loan_originators() -> list:
     """
     Cherche la cellule "Répartition géographique", puis la cellule
@@ -1618,6 +1669,144 @@ def get_swaper_country_allocations() -> dict:
         "country_amounts": country_amounts,
         "originator_countries": originator_countries,
     }
+
+
+def get_peerberry_originator_caps() -> dict:
+    """
+    Plafond par loan originator PeerBerry (ajouté le 2026-08-05, en plus
+    du plafond par pays existant) : pour chaque loan originator du bloc
+    PeerBerry (entre "Peerberry" et "Swaper" exclus, même bornes que
+    get_selected_peerberry_loan_originators()), lit le pourcentage plafond
+    (voir `_read_originator_max_percentage()`, colonne name_col-2) et le
+    montant déjà investi (colonne name_col+1, celle où
+    fill_geographic_repartition_amounts() écrit le montant courant).
+
+    Le pourcentage représente la part maximale du solde total du compte
+    (investi + disponible) que ce loan originator ne doit jamais dépasser
+    - monitors/peerberry_invest_bot.py ne doit pas investir au-delà de ce
+    plafond, en plus du plafond par pays existant. Une valeur vide
+    (`max_percentage: None`) signifie aucun plafond configuré pour ce
+    loan originator.
+
+    Retourne {nom_loan_originator: {"max_percentage": float|None,
+    "invested_amount": float}}.
+    """
+    logger.info("Lecture des plafonds par loan originator PeerBerry depuis la feuille")
+
+    worksheet = get_latest_dashboard_worksheet(SPREADSHEET_ID)
+
+    grid = _call_with_retry(worksheet.get_all_values)
+
+    geo_pos = find_cell_by_value(grid, "Répartition géographique")
+    if not geo_pos:
+        raise RuntimeError(
+            "La section 'Répartition géographique' n'a pas été trouvée."
+        )
+
+    geo_row, geo_col = geo_pos
+
+    peerberry_row = find_first_cell_containing_below(grid, geo_row, geo_col, "Peerberry")
+    if not peerberry_row:
+        raise RuntimeError(
+            "La cellule 'Peerberry' n'a pas été trouvée sous 'Répartition géographique'."
+        )
+
+    swaper_row = find_first_cell_containing_below(grid, peerberry_row, geo_col, "Swaper")
+    if not swaper_row:
+        raise RuntimeError(
+            "La cellule 'Swaper' n'a pas été trouvée sous 'Peerberry' "
+            "(elle délimite la fin du bloc PeerBerry)."
+        )
+
+    caps = _read_originator_caps(grid, geo_col, geo_col, peerberry_row, swaper_row)
+    logger.info("Plafonds par loan originator PeerBerry lus : %s", caps)
+    return caps
+
+
+def get_lendermarket_originator_caps() -> dict:
+    """
+    Plafond par lender Lendermarket (ajouté le 2026-08-05, en plus du
+    plafond par pays existant) - même logique exacte que
+    get_peerberry_originator_caps(), adaptée au bloc Lendermarket (borné
+    par "Lendermarket"/"Loanch" au lieu de "Peerberry"/"Swaper", mêmes
+    bornes que get_selected_lendermarket_lenders()).
+
+    Retourne {nom_lender: {"max_percentage": float|None,
+    "invested_amount": float}}.
+    """
+    logger.info("Lecture des plafonds par lender Lendermarket depuis la feuille")
+
+    worksheet = get_latest_dashboard_worksheet(SPREADSHEET_ID)
+
+    grid = _call_with_retry(worksheet.get_all_values)
+
+    geo_pos = find_cell_by_value(grid, "Répartition géographique")
+    if not geo_pos:
+        raise RuntimeError(
+            "La section 'Répartition géographique' n'a pas été trouvée."
+        )
+
+    geo_row, geo_col = geo_pos
+
+    lendermarket_row = find_first_cell_containing_below(grid, geo_row, geo_col, "Lendermarket")
+    if not lendermarket_row:
+        raise RuntimeError(
+            "La cellule 'Lendermarket' n'a pas été trouvée sous 'Répartition géographique'."
+        )
+
+    loanch_row = find_first_cell_containing_below(grid, lendermarket_row, geo_col, "Loanch")
+    if not loanch_row:
+        raise RuntimeError(
+            "La cellule 'Loanch' n'a pas été trouvée sous 'Lendermarket' "
+            "(elle délimite la fin du bloc Lendermarket)."
+        )
+
+    caps = _read_originator_caps(grid, geo_col, geo_col, lendermarket_row, loanch_row)
+    logger.info("Plafonds par lender Lendermarket lus : %s", caps)
+    return caps
+
+
+def get_swaper_originator_caps() -> dict:
+    """
+    Plafond par loan originator Swaper (ajouté le 2026-08-05, en plus du
+    plafond par pays existant) - même logique exacte que
+    get_peerberry_originator_caps(), adaptée au bloc Swaper (borné par
+    "Swaper"/"Crowdlending savings", mêmes bornes que
+    get_selected_swaper_loan_originators()).
+
+    Retourne {nom_loan_originator: {"max_percentage": float|None,
+    "invested_amount": float}}.
+    """
+    logger.info("Lecture des plafonds par loan originator Swaper depuis la feuille")
+
+    worksheet = get_latest_dashboard_worksheet(SPREADSHEET_ID)
+
+    grid = _call_with_retry(worksheet.get_all_values)
+
+    geo_pos = find_cell_by_value(grid, "Répartition géographique")
+    if not geo_pos:
+        raise RuntimeError(
+            "La section 'Répartition géographique' n'a pas été trouvée."
+        )
+
+    geo_row, geo_col = geo_pos
+
+    swaper_row = find_first_cell_containing_below(grid, geo_row, geo_col, "Swaper")
+    if not swaper_row:
+        raise RuntimeError(
+            "La cellule 'Swaper' n'a pas été trouvée sous 'Répartition géographique'."
+        )
+
+    crowdlending_row = find_first_cell_containing_below(grid, swaper_row, geo_col, "Crowdlending savings")
+    if not crowdlending_row:
+        raise RuntimeError(
+            "La cellule 'Crowdlending savings' n'a pas été trouvée sous 'Swaper' "
+            "(elle délimite la fin du bloc Swaper)."
+        )
+
+    caps = _read_originator_caps(grid, geo_col, geo_col, swaper_row, crowdlending_row)
+    logger.info("Plafonds par loan originator Swaper lus : %s", caps)
+    return caps
 
 
 if __name__ == "__main__":
