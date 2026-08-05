@@ -45,7 +45,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 from shared.google_sheet import fill_current_month_amounts, fill_geographic_repartition_amounts
-from shared.report_date import get_report_now
+from shared.report_date import get_report_now, is_current_month
 from monitors.peerberry_monitor import login, PEERBERRY_EMAIL, PEERBERRY_PASSWORD, _HEADERS
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
@@ -191,9 +191,12 @@ def run() -> None:
         "bonus_cashback_contest": 0.0,
         "interest_income": interest_income,
     }
+    current_month = is_current_month()
+
     fill_current_month_amounts(
         platform="PeerBerry",
-        amounts=amounts
+        amounts=amounts,
+        skip_total=not current_month,
     )
 
     loan_originators = [
@@ -201,7 +204,8 @@ def run() -> None:
         for o in originators
     ]
 
-    fill_geographic_repartition_amounts(loan_originators, platform="Peerberry")
+    if current_month:
+        fill_geographic_repartition_amounts(loan_originators, platform="Peerberry")
 
 
 if __name__ == "__main__":

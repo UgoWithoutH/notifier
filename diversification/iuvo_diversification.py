@@ -103,7 +103,7 @@ import requests
 
 try:
     from shared.google_sheet import fill_current_month_amounts, fill_geographic_repartition_amounts
-    from shared.report_date import get_report_now
+    from shared.report_date import get_report_now, is_current_month
 except ModuleNotFoundError:
     # Support direct execution (python diversification/iuvo_diversification.py)
     # where the project root may not be on sys.path.
@@ -111,7 +111,7 @@ except ModuleNotFoundError:
     if str(project_root) not in sys.path:
         sys.path.insert(0, str(project_root))
     from shared.google_sheet import fill_current_month_amounts, fill_geographic_repartition_amounts
-    from shared.report_date import get_report_now
+    from shared.report_date import get_report_now, is_current_month
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger("iuvo_diversification")
@@ -358,9 +358,12 @@ def run() -> None:
         "receivables_p2p": balance_data["receivables_p2p"],
     }
 
-    fill_current_month_amounts(platform="Iuvo", amounts=amounts)
+    current_month = is_current_month()
 
-    fill_geographic_repartition_amounts(balance_data["originators"], platform="Iuvo")
+    fill_current_month_amounts(platform="Iuvo", amounts=amounts, skip_total=not current_month)
+
+    if current_month:
+        fill_geographic_repartition_amounts(balance_data["originators"], platform="Iuvo")
 
 
 if __name__ == "__main__":

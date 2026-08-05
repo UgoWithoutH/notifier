@@ -96,7 +96,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 from shared.google_sheet import fill_current_month_amounts, fill_current_month_bonus_breakdown, fill_geographic_repartition_amounts
-from shared.report_date import get_report_now
+from shared.report_date import get_report_now, is_current_month
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger("loanch_diversification")
@@ -365,9 +365,12 @@ def run() -> None:
         "interest_paid": statement_totals["interest_paid"],
         "rewards": statement_totals["rewards"],
     }
+    current_month = is_current_month()
+
     fill_current_month_amounts(
         platform="Loanch",
-        amounts=amounts
+        amounts=amounts,
+        skip_total=not current_month,
     )
 
     # Loanch's "total_bonus" ("rewards") is a promotional/referral reward -
@@ -384,7 +387,8 @@ def run() -> None:
         for o in originators
     ]
 
-    fill_geographic_repartition_amounts(loan_originators, platform="Loanch")
+    if current_month:
+        fill_geographic_repartition_amounts(loan_originators, platform="Loanch")
 
 
 if __name__ == "__main__":

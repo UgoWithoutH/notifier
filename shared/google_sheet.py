@@ -224,11 +224,20 @@ def find_first_cell_containing_below(grid, start_row, start_col, search_text: st
     return None
 
 
-def fill_current_month_amounts(platform: str, amounts: dict, section: str = "Crowdlending"):
+def fill_current_month_amounts(
+    platform: str, amounts: dict, section: str = "Crowdlending", skip_total: bool = False
+):
     """
     `section` : libellé de la cellule sous laquelle chercher `platform`
     (ex. "Crowdlending" pour la plupart des plateformes, "Crowdlending
     savings" pour Monefit).
+
+    `skip_total` : si True, n'écrit PAS `amounts["total"]` sur la ligne de
+    la plateforme - utilisé pour un backfill d'un mois passé (via
+    REPORT_DATE) : `total` reflète le solde/montant investi ACTUEL de la
+    plateforme, pas une vraie donnée historique de ce mois-là (seul
+    `gross_interest_received`, calculé sur une vraie plage de dates, a un
+    sens pour un mois passé).
     """
     logger.info("Début mise à jour Google Sheet pour %s (section '%s')", platform, section)
 
@@ -260,6 +269,21 @@ def fill_current_month_amounts(platform: str, amounts: dict, section: str = "Cro
     total_amount = amounts.get("total", 0)
     gross_interest_received = amounts.get("gross_interest_received", 0)
 
+    if skip_total:
+        address = rowcol_to_a1(platform_row + 1, current_month_col)
+        logger.info(
+            "skip_total=True (mois non courant) : écriture uniquement des intérêts = %s (%s), total ignoré",
+            gross_interest_received, address,
+        )
+        _call_with_retry(
+            worksheet.update,
+            address,
+            [[gross_interest_received]],
+            value_input_option="USER_ENTERED"
+        )
+        logger.info("Mise à jour terminée pour %s (%s écrit, total ignoré)", platform, address)
+        return
+
     # 1 seul appel API pour écrire les 2 valeurs (lignes adjacentes, même colonne)
     start_a1 = rowcol_to_a1(platform_row, current_month_col)
     end_a1 = rowcol_to_a1(platform_row + 1, current_month_col)
@@ -281,7 +305,8 @@ def fill_current_month_amounts(platform: str, amounts: dict, section: str = "Cro
 
 
 def fill_current_month_amounts_with_labels(
-    platform: str, total, labeled_amounts: dict, section: str = "Crowdlending", max_rows: int = 6
+    platform: str, total, labeled_amounts: dict, section: str = "Crowdlending", max_rows: int = 6,
+    skip_total: bool = False,
 ):
     """Like fill_current_month_amounts(), but for a platform whose block has
     been split into several individually-labeled sub-rows instead of a
@@ -325,8 +350,12 @@ def fill_current_month_amounts_with_labels(
             f"La plateforme '{platform}' n'a pas été trouvée sous '{section}'."
         )
 
-    updates = [{"range": rowcol_to_a1(platform_row, current_month_col), "values": [[total]]}]
-    logger.info("Préparation écriture : %s / total = %s", platform, total)
+    if skip_total:
+        updates = []
+        logger.info("skip_total=True (mois non courant) : total non écrit pour %s", platform)
+    else:
+        updates = [{"range": rowcol_to_a1(platform_row, current_month_col), "values": [[total]]}]
+        logger.info("Préparation écriture : %s / total = %s", platform, total)
 
     labels = list(labeled_amounts.keys())
     rows_by_label = find_rows_by_texts_below(
@@ -345,6 +374,10 @@ def fill_current_month_amounts_with_labels(
         address = rowcol_to_a1(row, current_month_col)
         updates.append({"range": address, "values": [[amount]]})
         logger.info("Préparation écriture : %s / %s = %s (%s)", platform, label, amount, address)
+
+    if not updates:
+        logger.info("Rien à écrire pour %s (par labels) - aucune mise à jour envoyée", platform)
+        return
 
     _call_with_retry(worksheet.batch_update, updates, value_input_option="USER_ENTERED")
 

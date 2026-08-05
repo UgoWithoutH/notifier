@@ -63,6 +63,7 @@ import requests
 from dotenv import load_dotenv
 
 from shared.google_sheet import fill_current_month_amounts, fill_current_month_bonus_breakdown, fill_geographic_repartition_amounts
+from shared.report_date import is_current_month
 
 load_dotenv()
 
@@ -229,10 +230,13 @@ def run() -> None:
         "rewards_bonuses": statement_totals["rewards_bonuses"],
         "matured_vaults": statement_totals["matured_vaults"],
     }
+    current_month = is_current_month()
+
     fill_current_month_amounts(
         platform="Monefit",
         amounts=amounts,
-        section="Crowdlending savings"
+        section="Crowdlending savings",
+        skip_total=not current_month,
     )
 
     # Monefit's "bonus" field ("Rewards & bonuses") maps to "prime" (a
@@ -251,7 +255,8 @@ def run() -> None:
 
     loan_originators = [{"name": LOAN_ORIGINATOR_LABEL, "amount": balance}]
 
-    fill_geographic_repartition_amounts(loan_originators)
+    if current_month:
+        fill_geographic_repartition_amounts(loan_originators)
 
 
 if __name__ == "__main__":
