@@ -92,6 +92,8 @@ jobs:
           key: swaper-diversification-state-${{ github.run_id }}
 
   iuvo:
+    needs: swaper
+    if: always()
     runs-on: ubuntu-22.04
     concurrency:
       group: iuvo-diversification
@@ -123,6 +125,8 @@ jobs:
         run: bash scripts/run_diversification_for_month_range.sh diversification.iuvo_diversification "${{ github.event.inputs.start_month }}" "${{ github.event.inputs.end_month }}"
 
   afranga:
+    needs: iuvo
+    if: always()
     runs-on: ubuntu-22.04
     concurrency:
       group: afranga-diversification
@@ -155,6 +159,8 @@ jobs:
         run: bash scripts/run_diversification_for_month_range.sh diversification.afranga_diversification "${{ github.event.inputs.start_month }}" "${{ github.event.inputs.end_month }}"
 
   bienpreter:
+    needs: afranga
+    if: always()
     runs-on: ubuntu-22.04
     concurrency:
       group: bienpreter-diversification
@@ -186,6 +192,8 @@ jobs:
         run: bash scripts/run_diversification_for_month_range.sh diversification.bienpreter_diversification "${{ github.event.inputs.start_month }}" "${{ github.event.inputs.end_month }}"
 
   lendermarket:
+    needs: bienpreter
+    if: always()
     runs-on: ubuntu-22.04
     concurrency:
       group: lendermarket-diversification
@@ -218,6 +226,8 @@ jobs:
         run: bash scripts/run_diversification_for_month_range.sh diversification.lendermarket_diversification "${{ github.event.inputs.start_month }}" "${{ github.event.inputs.end_month }}"
 
   loanch:
+    needs: lendermarket
+    if: always()
     runs-on: ubuntu-22.04
     concurrency:
       group: loanch-diversification
@@ -251,6 +261,8 @@ jobs:
         run: bash scripts/run_diversification_for_month_range.sh diversification.loanch_diversification "${{ github.event.inputs.start_month }}" "${{ github.event.inputs.end_month }}"
 
   monefit:
+    needs: loanch
+    if: always()
     runs-on: ubuntu-22.04
     concurrency:
       group: monefit-diversification
@@ -283,6 +295,8 @@ jobs:
         run: bash scripts/run_diversification_for_month_range.sh diversification.monefit_diversification "${{ github.event.inputs.start_month }}" "${{ github.event.inputs.end_month }}"
 
   peerberry:
+    needs: monefit
+    if: always()
     runs-on: ubuntu-22.04
     concurrency:
       group: peerberry-diversification
@@ -315,6 +329,8 @@ jobs:
         run: bash scripts/run_diversification_for_month_range.sh diversification.peerberry_diversification "${{ github.event.inputs.start_month }}" "${{ github.event.inputs.end_month }}"
 
   goandgrow:
+    needs: peerberry
+    if: always()
     runs-on: ubuntu-22.04
     concurrency:
       group: goandgrow-diversification
@@ -348,6 +364,8 @@ jobs:
         run: bash scripts/run_diversification_for_month_range.sh diversification.goandgrow_diversification "${{ github.event.inputs.start_month }}" "${{ github.event.inputs.end_month }}"
 
   bricks:
+    needs: goandgrow
+    if: always()
     runs-on: ubuntu-22.04
     concurrency:
       group: bricks-diversification
