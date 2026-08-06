@@ -368,6 +368,10 @@ def run() -> None:
     # asked again.
     current_month = is_current_month()
 
+    # "total" comes from home-metrics, a LIVE-only endpoint with no date
+    # param; the revenue endpoint (which does take a month) has no balance
+    # field either (2026-08-06 investigation) - skip total for a backfilled
+    # month.
     fill_current_month_amounts(
         platform="Bricks",
         amounts=amounts,

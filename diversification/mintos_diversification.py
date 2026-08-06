@@ -140,7 +140,7 @@ import requests
 from dotenv import load_dotenv
 
 from shared.google_sheet import fill_current_month_amounts_with_labels, fill_geographic_repartition_amounts
-from shared.report_date import get_report_date
+from shared.report_date import get_report_date, is_current_month
 
 load_dotenv()
 
@@ -443,6 +443,21 @@ def run(session: requests.Session | None = None) -> None:
     }
     log.info("Amounts to write: %s", amounts)
 
+    # "en cours prêts"/"en cours obligations" (like "total") only reflect the
+    # account's CURRENT balance - Mintos has no endpoint to fetch a past
+    # month's historical outstanding balance (unlike Lande's tax-report PDF),
+    # so these are only written for the real current month, same convention
+    # as skip_total elsewhere (see shared/report_date.is_current_month()).
+    current_month = is_current_month()
+    labeled_amounts = {
+        "intérêts brut prêts": statement_totals["gross_interest_received_loans"],
+        "intérêts brut obligations": statement_totals["gross_interest_received_obligations"],
+        "prélèvements": statement_totals["withholding_tax"],
+    }
+    if current_month:
+        labeled_amounts["en cours prêts"] = portfolio_split["loans"]
+        labeled_amounts["en cours obligations"] = portfolio_split["bonds"]
+
     # Mintos' Sheet block was split (2026-07-29) into 4 individually-labeled
     # sub-rows instead of a single merged "intérêts brut" row directly below
     # the platform - fill_current_month_amounts() assumes THAT single-row
@@ -453,21 +468,18 @@ def run(session: requests.Session | None = None) -> None:
     fill_current_month_amounts_with_labels(
         platform=PLATFORM_LABEL,
         total=total_outstanding,
-        labeled_amounts={
-            "en cours prêts": portfolio_split["loans"],
-            "en cours obligations": portfolio_split["bonds"],
-            "intérêts brut prêts": statement_totals["gross_interest_received_loans"],
-            "intérêts brut obligations": statement_totals["gross_interest_received_obligations"],
-            "prélèvements": statement_totals["withholding_tax"],
-        },
+        labeled_amounts=labeled_amounts,
         max_rows=10,
+        skip_total=not current_month,
     )
 
     # "Répartition géographique": the "Mintos" row itself is a computed
     # cell in the Sheet (sums its own sub-rows) - only write the per-issuer
-    # rows below it, same pattern as Swaper.
-    geo_entries = [{"name": name, "amount": round(amount, 2)} for name, amount in combined_originators.items()]
-    fill_geographic_repartition_amounts(geo_entries, platform="Mintos")
+    # rows below it, same pattern as Swaper. Per-issuer amounts are also
+    # only the CURRENT balance, so only written for the real current month.
+    if current_month:
+        geo_entries = [{"name": name, "amount": round(amount, 2)} for name, amount in combined_originators.items()]
+        fill_geographic_repartition_amounts(geo_entries, platform="Mintos")
 
 
 if __name__ == "__main__":

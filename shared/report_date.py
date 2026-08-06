@@ -12,14 +12,32 @@ workflow_dispatch calls, which don't set this input, and any local run).
 Expected format is the French "JJ/MM/AAAA" (e.g. "15/03/2026"), matching
 the workflow input's own format, NOT ISO "YYYY-MM-DD".
 
-NOTE: monefit_diversification.py's "this month" interest/statement figures
-are fetched by letting the Monefit site make its OWN request (already
-defaulting to its live "current month") and intercepting the response -
-there's no query-param-based date range to redirect there (see that
-module's docstring), so REPORT_DATE only affects WHICH Google Sheet
-column monefit's real (always current-month-to-date) figures get written
-to, not what data is actually fetched. Every other *_diversification.py
-computes its own explicit date range and fully respects REPORT_DATE.
+NOTE (OUTDATED, kept only for history - see 2026-08-06 below): this used to
+say monefit_diversification.py's "this month" figures came from
+intercepting the Monefit site's own live request with no date-range
+control. That was true of the original Playwright version only -
+monefit_diversification.py was rewritten to pure HTTP on 2026-07-18 and now
+builds its own `dateFrom`/`dateTo` request, fully respecting REPORT_DATE
+like every other *_diversification.py.
+
+FEATURE 2026-08-06: `is_current_month()` (below) also gates whether a
+platform's "total" (account balance) is written for a REPORT_DATE-backfilled
+month, since most platforms' "total" only ever comes from a LIVE-only
+snapshot (no historical figure for a past month). Monefit and Go & Grow are
+the two confirmed exceptions (their statement endpoints expose a real
+per-date/per-entry closing balance) - see their own module docstrings and
+`fill_current_month_amounts()`'s `skip_total` param in shared/google_sheet.py.
+Every other *_diversification.py still skips "total" entirely for a
+backfilled month. lande_diversification.py/mintos_diversification.py are
+NOT invoked by diversification.yml's month-range loop at all (Lande is
+local-only, Mintos needs MINTOS_PHPSESSID/MINTOS_MW_SESSION_ID refreshed by
+hand) but were checked too, for whoever runs them manually with REPORT_DATE
+set to a past date: Lande's "total" already comes from its own tax-report
+PDF for the SAME requested period (a real historical figure, no skip_total
+needed at all - see its module docstring), while Mintos has no such
+endpoint (its accounts/978 + user/overview balances are live-only) and
+keeps skipping "total"/"en cours prêts"/"en cours obligations" for a
+backfilled month, same as every other unsupported platform.
 """
 
 import os
@@ -28,6 +46,7 @@ from zoneinfo import ZoneInfo
 
 REPORT_DATE_ENV_VAR = "REPORT_DATE"
 REPORT_DATE_FORMAT = "%d/%m/%Y"  # French "JJ/MM/AAAA", e.g. "15/03/2026"
+REPORT_DATE_MONTHS_ENV_VAR = "REPORT_DATE_MONTHS"  # comma-separated REPORT_DATE values
 
 
 def get_report_date() -> date:
@@ -59,3 +78,18 @@ def is_current_month() -> bool:
     report = get_report_date()
     today = date.today()
     return (report.year, report.month) == (today.year, today.month)
+
+
+def get_report_date_list() -> list[str]:
+    """Returns the REPORT_DATE ("JJ/MM/AAAA") values to process, one per
+    call to a *_diversification.py's run(), for the *_get_session.py
+    manual-login helpers that support backfilling several months in one
+    run while logging in/capturing the session only ONCE (see
+    run_manual_platform.ps1's -StartMonth/-EndMonth). Reads
+    REPORT_DATE_MONTHS (comma-separated) if set/non-empty, else falls back
+    to a single-item list built from REPORT_DATE (possibly ""), matching
+    get_report_date()'s own single-date fallback to today."""
+    raw = os.environ.get(REPORT_DATE_MONTHS_ENV_VAR, "").strip()
+    if raw:
+        return [d.strip() for d in raw.split(",") if d.strip()]
+    return [os.environ.get(REPORT_DATE_ENV_VAR, "").strip()]
