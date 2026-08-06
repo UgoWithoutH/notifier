@@ -360,6 +360,10 @@ def run() -> None:
 
     current_month = is_current_month()
 
+    # "total" comes from the overview_page's embedded `investors` JS
+    # literal, a LIVE-only snapshot; the date-filtered account-statement
+    # endpoint has no balance field either (2026-08-06 investigation) -
+    # skip total for a backfilled month.
     fill_current_month_amounts(platform="Iuvo", amounts=amounts, skip_total=not current_month)
 
     if current_month:

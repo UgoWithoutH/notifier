@@ -390,6 +390,10 @@ def run(headless: bool = True) -> None:
     }
     current_month = is_current_month()
 
+    # "total" comes from the "Currently Allocated" DOM widget, a LIVE-only
+    # snapshot with no date param, and account-entries (the date-ranged
+    # interest API) has no balance field (2026-08-06 investigation) - skip
+    # total for a backfilled month.
     fill_current_month_amounts(
         platform="Swaper",
         amounts=amounts,

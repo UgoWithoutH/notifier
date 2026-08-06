@@ -73,6 +73,7 @@ from dotenv import load_dotenv
 from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
 
 from diversification.mintos_diversification import run as run_diversification
+from shared.report_date import REPORT_DATE_ENV_VAR, get_report_date_list
 
 load_dotenv()
 
@@ -206,9 +207,16 @@ def main() -> None:
         log.error("Could not find PHPSESSID/MW_SESSION_ID cookies after login - got: %r", list(wanted.keys()))
         sys.exit(1)
 
-    log.info("Session captured - taking over: running the Mintos diversification fetch now...")
     session = build_session_from_cookies(wanted)
-    run_diversification(session=session)
+    report_dates = get_report_date_list()
+    log.info("Session captured - reusing it for %d month(s) (no re-login needed)...", len(report_dates))
+    for i, report_date in enumerate(report_dates, start=1):
+        if report_date:
+            os.environ[REPORT_DATE_ENV_VAR] = report_date
+        else:
+            os.environ.pop(REPORT_DATE_ENV_VAR, None)
+        log.info("[%d/%d] Running the Mintos diversification fetch for %s...", i, len(report_dates), report_date or "today")
+        run_diversification(session=session)
 
     print("\nDone. To let the scheduled/cron-job.org-triggered workflow reuse this session")
     print("headlessly afterward, also update these in your local .env AND as GitHub repository secrets:\n")

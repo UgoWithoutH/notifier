@@ -119,7 +119,7 @@ import fitz
 import requests
 from dotenv import load_dotenv
 
-from shared.report_date import get_report_date
+from shared.report_date import get_report_date, is_current_month
 
 load_dotenv()
 
@@ -294,12 +294,17 @@ def run(session: requests.Session | None = None) -> None:
     log.info("Amounts to write: %s", amounts)
 
     from shared.google_sheet import fill_current_month_amounts, fill_geographic_repartition_amounts
+    # No skip_total here (unlike every other *_diversification.py): "total"
+    # already comes from the tax-report PDF for the SAME requested period
+    # (see module docstring), so it's a real historical figure for a
+    # REPORT_DATE-backfilled month too, not just a live snapshot.
     fill_current_month_amounts(platform=PLATFORM_LABEL, amounts=amounts)
 
     # "Répartition géographique" has a single "Lande" aggregate row (no
     # per-borrower sub-rows below it, unlike Mintos/Swaper) - same value as
     # the Crowdlending section's total.
-    fill_geographic_repartition_amounts([{"name": PLATFORM_LABEL, "amount": total}])
+    if is_current_month():
+        fill_geographic_repartition_amounts([{"name": PLATFORM_LABEL, "amount": total}])
 
 
 if __name__ == "__main__":

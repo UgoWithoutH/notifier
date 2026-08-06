@@ -510,6 +510,11 @@ def run() -> None:
 
     current_month = is_current_month()
 
+    # "total" is always the LIVE sum of active investments' outstanding
+    # amounts (see aggregate_by_originator() above) - no confirmed
+    # historical/closing-balance equivalent for a past month (2026-08-06
+    # investigation), so skip it for a backfilled month rather than write a
+    # live-today figure under a past month's column.
     fill_current_month_amounts(
         platform="Afranga",
         amounts=statement_totals,

@@ -247,6 +247,10 @@ def run() -> None:
 
     current_month = is_current_month()
 
+    # "total" comes from a live balance call/summed active investments, and
+    # getInvestorAccountStatementSummary (the date-ranged statement API) has
+    # no balance field (2026-08-06 investigation) - skip total for a
+    # backfilled month.
     fill_current_month_amounts(
         platform="Lendermarket",
         amounts=amounts,

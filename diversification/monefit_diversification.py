@@ -57,13 +57,13 @@ Optional:
 import os
 import sys
 import logging
-from datetime import date
+from zoneinfo import ZoneInfo
 
 import requests
 from dotenv import load_dotenv
 
 from shared.google_sheet import fill_current_month_amounts, fill_current_month_bonus_breakdown, fill_geographic_repartition_amounts
-from shared.report_date import is_current_month
+from shared.report_date import get_report_now, is_current_month
 
 load_dotenv()
 
@@ -75,6 +75,13 @@ LOGIN_URL = f"{API_BASE}/v1/auth/login"
 VAULTS_URL = f"{API_BASE}/v1/vaults"
 SUMMARY_URL = f"{API_BASE}/v1/account/summary"
 LOAN_ORIGINATOR_LABEL = "monefit"
+# Pin the timezone explicitly (rather than the executing machine's local
+# clock, e.g. UTC on a CI runner) so "today"/"this month" - and, for a
+# month-range backfill run, the REPORT_DATE-driven end-of-month date used
+# below to look up a past month's real closing balance - are computed in
+# the account's own local time, same pattern as every other
+# *_diversification.py.
+REPORT_TIMEZONE = ZoneInfo("Europe/Paris")
 
 MONEFIT_EMAIL = os.environ.get("MONEFIT_EMAIL")
 MONEFIT_PASSWORD = os.environ.get("MONEFIT_PASSWORD")
@@ -136,10 +143,21 @@ def fetch_balance(session: requests.Session) -> float:
 def fetch_current_month_statement_totals(session: requests.Session) -> dict:
     """Fetch this calendar month's "From daily returns" / "Rewards &
     bonuses" / "Matured Vaults" totals via the account/summary endpoint.
-    See module docstring for the verified endpoint/fields."""
-    today = date.today()
-    first = today.replace(day=1)
-    params = {"dateFrom": first.isoformat(), "dateTo": today.isoformat()}
+    See module docstring for the verified endpoint/fields.
+
+    Also returns "closing_balance": this same endpoint's `closingBalance`
+    field, which the module docstring already confirms matches the
+    account's own "Total Wealth" balance (the same figure `fetch_balance()`
+    reads live via /v1/vaults) - since `dateFrom`/`dateTo` here are
+    REPORT_DATE-aware (unlike the old hardcoded `date.today()`), a
+    month-range backfill run for a PAST month can use this to fill in that
+    month's real end-of-month total balance instead of only ever having a
+    live current balance available - `None` if the field is missing/
+    unparseable.
+    """
+    end_date = get_report_now(REPORT_TIMEZONE).date()
+    first = end_date.replace(day=1)
+    params = {"dateFrom": first.isoformat(), "dateTo": end_date.isoformat()}
     log.info("GET %s (fetching this month's statement totals)...", SUMMARY_URL)
     r = session.get(SUMMARY_URL, params=params, timeout=30)
     log.info("GET account/summary: status=%s", r.status_code)
@@ -162,15 +180,21 @@ def fetch_current_month_statement_totals(session: requests.Session) -> dict:
     except (TypeError, ValueError):
         log.warning("Could not parse 'maturedVaults' %r - defaulting to 0.0.", result.get("maturedVaults"))
         matured_vaults = 0.0
+    try:
+        closing_balance = round(float(result["closingBalance"]), 2) if result.get("closingBalance") is not None else None
+    except (TypeError, ValueError):
+        log.warning("Could not parse 'closingBalance' %r.", result.get("closingBalance"))
+        closing_balance = None
 
     log.info(
-        "Parsed statement totals: daily_returns=%.2f, rewards_bonuses=%.2f, matured_vaults=%.2f",
-        daily_returns, rewards_bonuses, matured_vaults,
+        "Parsed statement totals: daily_returns=%.2f, rewards_bonuses=%.2f, matured_vaults=%.2f, closing_balance=%s",
+        daily_returns, rewards_bonuses, matured_vaults, closing_balance,
     )
     return {
         "daily_returns": daily_returns,
         "rewards_bonuses": rewards_bonuses,
         "matured_vaults": matured_vaults,
+        "closing_balance": closing_balance,
     }
 
 
@@ -199,7 +223,7 @@ def run() -> None:
             "Failed to fetch this month's From daily returns/Rewards & bonuses/Matured Vaults - "
             "defaulting all three to 0.0."
         )
-        statement_totals = {"daily_returns": 0.0, "rewards_bonuses": 0.0, "matured_vaults": 0.0}
+        statement_totals = {"daily_returns": 0.0, "rewards_bonuses": 0.0, "matured_vaults": 0.0, "closing_balance": None}
 
     originators = [{"originator": LOAN_ORIGINATOR_LABEL, "outstanding": balance}]
     log.info("Monefit balance: %.2f EUR", balance)
@@ -220,8 +244,20 @@ def run() -> None:
     # surfaced under the standardized name - dissociated here too via
     # bonus_cashback_contest so it's ready to be written to its own Sheet
     # cell, separate from interest.
+    current_month = is_current_month()
+    closing_balance = statement_totals.get("closing_balance")
+    # For the real current month, always use the live "Total Wealth"
+    # balance (fetch_balance()). For a backfilled past month (a month-range
+    # run), the account/summary endpoint's own "closingBalance" for that
+    # month IS the real historical total (verified to match "Total Wealth"
+    # - see module docstring) - use it instead of skipping the total
+    # entirely, falling back to skip_total only if that field couldn't be
+    # fetched/parsed this run.
+    total = balance if current_month else (closing_balance if closing_balance is not None else balance)
+    skip_total = not current_month and closing_balance is None
+
     amounts = {
-        "total": balance,
+        "total": total,
         "gross_interest_received": statement_totals["daily_returns"],
         "net_interest_received": statement_totals["daily_returns"],
         "withholding_tax": 0.0,
@@ -230,13 +266,12 @@ def run() -> None:
         "rewards_bonuses": statement_totals["rewards_bonuses"],
         "matured_vaults": statement_totals["matured_vaults"],
     }
-    current_month = is_current_month()
 
     fill_current_month_amounts(
         platform="Monefit",
         amounts=amounts,
         section="Crowdlending savings",
-        skip_total=not current_month,
+        skip_total=skip_total,
     )
 
     # Monefit's "bonus" field ("Rewards & bonuses") maps to "prime" (a

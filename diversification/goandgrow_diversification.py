@@ -187,6 +187,15 @@ def fetch_current_month_statement_totals(session: requests.Session) -> dict:
     doesn't take a date-range query param (unlike most other platforms'
     equivalents) - it returns the full history, so REPORT_DATE-driven
     "this month" filtering happens locally here.
+
+    Also returns "closing_balance": each entry's own running `Balance`
+    field (see module docstring) as of the LATEST entry dated on or before
+    `end_date` - since the full history is already fetched here regardless
+    of REPORT_DATE, a month-range backfill run for a PAST month can reuse
+    this to fill in that month's real end-of-month total balance (instead
+    of only ever having a live current balance available), the same way
+    `ClientValue` reflects the live total today - `None` if no entry at or
+    before `end_date` was found.
     """
     now = get_report_now(REPORT_TIMEZONE)
     start_date = now.replace(day=1).date()
@@ -201,14 +210,25 @@ def fetch_current_month_statement_totals(session: requests.Session) -> dict:
     interest_received = 0.0
     bonus_cashback_contest = 0.0
     unknown_types = set()
+    latest_dt_at_or_before_end = None
+    closing_balance = None
 
     for entry in entries:
         raw_date = entry.get("Date")
         try:
-            entry_date = datetime.fromisoformat(raw_date).date()
+            entry_dt = datetime.fromisoformat(raw_date)
         except (TypeError, ValueError):
             log.warning("Could not parse statement entry date %r - skipping this entry.", raw_date)
             continue
+        entry_date = entry_dt.date()
+
+        if entry_date <= end_date and (latest_dt_at_or_before_end is None or entry_dt > latest_dt_at_or_before_end):
+            latest_dt_at_or_before_end = entry_dt
+            try:
+                closing_balance = round(float(entry["Balance"]), 2) if entry.get("Balance") is not None else None
+            except (TypeError, ValueError):
+                closing_balance = None
+
         if not (start_date <= entry_date <= end_date):
             continue
 
@@ -238,12 +258,13 @@ def fetch_current_month_statement_totals(session: requests.Session) -> dict:
     interest_received = round(interest_received, 2)
     bonus_cashback_contest = round(bonus_cashback_contest, 2)
     log.info(
-        "This month's (%s to %s) totals: interest_received=%.2f, bonus_cashback_contest=%.2f",
-        start_date, end_date, interest_received, bonus_cashback_contest,
+        "This month's (%s to %s) totals: interest_received=%.2f, bonus_cashback_contest=%.2f, closing_balance=%s",
+        start_date, end_date, interest_received, bonus_cashback_contest, closing_balance,
     )
     return {
         "interest_received": interest_received,
         "bonus_cashback_contest": bonus_cashback_contest,
+        "closing_balance": closing_balance,
     }
 
 
@@ -277,7 +298,7 @@ def run() -> None:
         statement_totals = fetch_current_month_statement_totals(session)
     except Exception:
         log.exception("Failed to fetch this month's statement totals - defaulting to 0.0.")
-        statement_totals = {"interest_received": 0.0, "bonus_cashback_contest": 0.0}
+        statement_totals = {"interest_received": 0.0, "bonus_cashback_contest": 0.0, "closing_balance": None}
 
     log.info("Go & Grow balance: %.2f EUR", balance)
     log.info(
@@ -285,25 +306,35 @@ def run() -> None:
         statement_totals["interest_received"], statement_totals["bonus_cashback_contest"],
     )
 
+    current_month = is_current_month()
+    closing_balance = statement_totals.get("closing_balance")
+    # For the real current month, always use the live goal balance
+    # (fetch_total_balance()). For a backfilled past month (a month-range
+    # run), the statements API's own running "Balance" as of that month's
+    # end IS the real historical total - use it instead of skipping the
+    # total entirely, falling back to skip_total only if no entry could be
+    # found/parsed for that date.
+    total = balance if current_month else (closing_balance if closing_balance is not None else balance)
+    skip_total = not current_month and closing_balance is None
+
     # Go & Grow's statements API has no gross/net/withholding-tax
     # breakdown - "interest_received" (summed "Return"-type entries) is
     # mapped to both gross_interest_received/net_interest_received,
     # withholding_tax defaults to 0.0. Same standardized dict shape as
     # every other *_diversification.py.
     amounts = {
-        "total": balance,
+        "total": total,
         "gross_interest_received": statement_totals["interest_received"],
         "net_interest_received": statement_totals["interest_received"],
         "withholding_tax": 0.0,
         "bonus_cashback_contest": statement_totals["bonus_cashback_contest"],
     }
-    current_month = is_current_month()
 
     fill_current_month_amounts(
         platform=PLATFORM_LABEL,
         amounts=amounts,
         section="Crowdlending savings",
-        skip_total=not current_month,
+        skip_total=skip_total,
     )
 
     # No bonus/cashback/contest statement entry Type has been observed yet

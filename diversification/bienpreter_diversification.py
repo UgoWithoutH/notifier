@@ -581,6 +581,10 @@ def run() -> None:
 
     current_month = is_current_month()
 
+    # "total" = solde disponible + capital à recevoir, both scraped from
+    # LIVE-only dashboard widgets with no date param and no historical/
+    # closing-balance equivalent found anywhere on the site (2026-08-06
+    # investigation) - skip it for a backfilled month.
     fill_current_month_amounts(
         platform="Bienprêter",
         amounts=interest_totals,
