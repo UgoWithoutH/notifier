@@ -20,8 +20,12 @@ HTTP on 2026-07-18): response is a JSON array of
 "companyId": 1, "iso2": "ZA", "amount": "1091.02", "part": "10.90"}`.
 
 Also fetches this calendar month's "Interest income" from the Account
-Summary API - see fetch_current_month_interest_income() below, same idea as
-swaper_diversification.fetch_current_month_interest_received().
+Summary API - see fetch_current_month_statement_totals() below, same idea as
+swaper_diversification.fetch_current_month_interest_received(). That same
+API also exposes a "closingBalance" field, used to fill in a real
+historical "total" for a backfilled past month (month-range run) instead
+of only ever having today's live originator-distribution total - see
+fetch_current_month_statement_totals()'s docstring.
 
 Required env vars:
     PEERBERRY_EMAIL, PEERBERRY_PASSWORD    -> PeerBerry account credentials
@@ -102,7 +106,7 @@ def normalize_originators(payload: list) -> list:
     return originators
 
 
-def fetch_current_month_interest_income(session: requests.Session) -> float:
+def fetch_current_month_statement_totals(session: requests.Session) -> dict:
     """Fetch this calendar month's "Interest income" total, as shown on the
     Account Summary page (https://peerberry.com/en/client/statement/account-summary).
 
@@ -116,6 +120,15 @@ def fetch_current_month_interest_income(session: requests.Session) -> float:
     "INTEREST": "9.88", "PRINCIPAL": "1563.61"}}` - `operations.INTEREST`
     matched the page's displayed "Interest income +€9.88" exactly (matches
     the user-supplied reference value).
+
+    Also returns "closing_balance": that same response's top-level
+    `closingBalance` field. `endDate` is REPORT_DATE-aware (the last day of
+    the target month for a month-range backfill run - see
+    scripts/run_diversification_for_month_range.sh), so `closingBalance` IS
+    the account's real total invested+cash balance as of that exact date -
+    same idea as Monefit/Go & Grow's own `closing_balance`, letting a
+    backfilled past month get a real historical "total" instead of
+    skip_total. `None` if the field is missing/unparseable.
     """
     now = get_report_now(REPORT_TIMEZONE)
     start_date = now.replace(day=1).strftime("%Y-%m-%d")
@@ -132,16 +145,22 @@ def fetch_current_month_interest_income(session: requests.Session) -> float:
     if not r.ok:
         raise RuntimeError(f"Account summary API request failed (status={r.status_code})")
 
-    operations = (r.json() or {}).get("operations") or {}
-    log.info("Raw 'operations' block from the account summary API: %r", operations)
+    body = r.json() or {}
+    operations = body.get("operations") or {}
+    log.info("Raw account-summary API body: %r", body)
     try:
         interest_income = float(operations.get("INTEREST") or 0.0)
     except (TypeError, ValueError):
         log.warning("Could not parse 'INTEREST' value %r as a float - defaulting to 0.0.", operations.get("INTEREST"))
         interest_income = 0.0
+    try:
+        closing_balance = round(float(body["closingBalance"]), 2) if body.get("closingBalance") is not None else None
+    except (TypeError, ValueError):
+        log.warning("Could not parse 'closingBalance' value %r.", body.get("closingBalance"))
+        closing_balance = None
 
-    log.info("Parsed this month's Interest income: %.2f EUR", interest_income)
-    return interest_income
+    log.info("Parsed this month's Interest income: %.2f EUR, closing_balance=%s", interest_income, closing_balance)
+    return {"interest_income": interest_income, "closing_balance": closing_balance}
 
 
 def run() -> None:
@@ -160,10 +179,11 @@ def run() -> None:
         sys.exit(1)
 
     try:
-        interest_income = fetch_current_month_interest_income(session)
+        statement_totals = fetch_current_month_statement_totals(session)
     except Exception:
         log.exception("Failed to fetch this month's Interest income - defaulting to 0.0.")
-        interest_income = 0.0
+        statement_totals = {"interest_income": 0.0, "closing_balance": None}
+    interest_income = statement_totals["interest_income"]
 
     originators = normalize_originators(payload)
     log.info("Fetched distribution for %d loan originator(s).", len(originators))
@@ -183,20 +203,31 @@ def run() -> None:
     # DEPOSIT/INVESTMENT/INTEREST/PRINCIPAL keys, no bonus/cashback/contest
     # category - bonus_cashback_contest defaults to 0.0, not a placeholder
     # for a future fetch.
+    current_month = is_current_month()
+    live_total = sum(o["amount"] for o in originators)
+    closing_balance = statement_totals["closing_balance"]
+    # For the real current month, always use the live originator-distribution
+    # total (matches the account's live invested balance). For a backfilled
+    # past month (a month-range run), the account-summary API's own
+    # `closingBalance` for that month's end date IS the real historical
+    # total - use it instead of skipping the total entirely, falling back to
+    # skip_total only if that field couldn't be fetched/parsed this run.
+    total = live_total if current_month else (closing_balance if closing_balance is not None else live_total)
+    skip_total = not current_month and closing_balance is None
+
     amounts = {
-        "total": sum(o["amount"] for o in originators),
+        "total": total,
         "gross_interest_received": interest_income,
         "net_interest_received": interest_income,
         "withholding_tax": 0.0,
         "bonus_cashback_contest": 0.0,
         "interest_income": interest_income,
     }
-    current_month = is_current_month()
 
     fill_current_month_amounts(
         platform="PeerBerry",
         amounts=amounts,
-        skip_total=not current_month,
+        skip_total=skip_total,
     )
 
     loan_originators = [
