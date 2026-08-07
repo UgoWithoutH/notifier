@@ -272,6 +272,26 @@ def fetch_current_month_statement_totals(session: requests.Session) -> dict:
        matched the "Total des interets payes" / "Total des recompenses"
        figures shown on the page exactly for July 2026.
 
+    The full response also has `opening_account`/`closing_account`,
+    `opening_portfolio`/`closing_portfolio`, `total_profit_start/end`,
+    `total_deposited`, `total_withdrawn`, `total_invested` (new money
+    invested during the period, not a running total) and `total_principal`
+    (principal repaid during the period) - checked live 2026-08-07 to see
+    if any of them could fill in a backfilled past month's "total"
+    (currently skip_total, unlike Monefit/Go & Grow/PeerBerry - see
+    shared/report_date.py): none of them is the currently-outstanding
+    invested principal per loan originator (what run()'s "total" needs).
+    `closing_portfolio` looked like the best candidate but does NOT match
+    even for the CURRENT still-open month (4667.86 vs the live
+    sum(principal_left)/`/api/v1/dashboard`'s `total_invested` of
+    2029.93) - it tracks cumulative portfolio activity, not the
+    currently-outstanding balance. `closing_account` instead matches
+    `/api/v1/dashboard`'s `balance_sum` (cash-side figure, not the
+    invested-principal one). Loanch has no endpoint exposing "outstanding
+    invested principal as of an arbitrary past date" - only the live-only
+    `/api/v1/dashboard` has it for today - so "total" keeps being skipped
+    for a backfilled month.
+
     Uses REPORT_TIMEZONE (Europe/Paris) rather than the executing machine's
     local clock to decide what "this month" means, so this stays correct
     regardless of where/when (e.g. a UTC CI runner around midnight) this

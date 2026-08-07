@@ -38,6 +38,15 @@ needed at all - see its module docstring), while Mintos has no such
 endpoint (its accounts/978 + user/overview balances are live-only) and
 keeps skipping "total"/"en cours prêts"/"en cours obligations" for a
 backfilled month, same as every other unsupported platform.
+
+UPDATE 2026-08-07: PeerBerry added as a third confirmed exception -
+its account-summary API's own `closingBalance` field (as of the requested
+`endDate`) is used as the backfilled month's "total" - see
+peerberry_diversification.fetch_current_month_statement_totals(). Loanch
+was checked too but has NO confirmed historical balance field (its
+statement-report API only returns total_interest/total_bonus, and its only
+balance figure, `total_invested` on /api/v1/dashboard, is live-only, same
+situation as Mintos) - it still skips "total" for a backfilled month.
 """
 
 import os
