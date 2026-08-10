@@ -894,12 +894,21 @@ def fill_bienpreter_borrower_geo_amounts(borrowers: dict):
     # `existing_rows` ci-dessous) - sert à décider quelles lignes supprimer :
     # une ligne dont le nom n'est plus dans `borrowers` est supprimée, même
     # si un doublon du même nom existe ailleurs dans le bloc.
+    #
+    # BUG FIXÉ 2026-08-10 : la ligne "non investi" (ajoutée le jour même,
+    # juste sous la ligne "Bienprêter") n'est PAS un emprunteur, mais son
+    # nom n'est jamais vide - sans l'exclusion ci-dessous, elle finissait
+    # systématiquement dans `rows_to_delete` (aucun emprunteur ne s'appelle
+    # "non investi") et était supprimée à chaque run, avant même que
+    # fill_geographic_repartition_uninvested_amount() ait pu y écrire quoi
+    # que ce soit - d'où un "non investi" introuvable/jamais rempli pour
+    # Bienprêter dans le mail récapitulatif.
     rows_to_delete = []
     existing_rows = {}
     for row_idx in range(bienpreter_row + 1, end_row):
         row = grid[row_idx - 1]
         name = row[geo_col - 1].strip() if geo_col - 1 < len(row) else ""
-        if not name:
+        if not name or name.lower() == "non investi":
             continue
         normalized = _normalize_borrower_name(name)
         existing_rows.setdefault(normalized, row_idx)
@@ -914,9 +923,16 @@ def fill_bienpreter_borrower_geo_amounts(borrowers: dict):
     )
 
     # Réécrit la formule SOMME sur les lignes du bloc qui restent (pas
-    # celles sur le point d'être supprimées).
+    # celles sur le point d'être supprimées, ni la ligne "non investi" -
+    # même exclusion/raison que ci-dessus : ce n'est pas une ligne
+    # emprunteur, sa colonne total (target_col) est alimentée séparément
+    # par fill_geographic_repartition_uninvested_amount()).
     for row_idx in range(bienpreter_row + 1, end_row):
         if row_idx in rows_to_delete:
+            continue
+        row = grid[row_idx - 1]
+        name = row[geo_col - 1].strip() if geo_col - 1 < len(row) else ""
+        if name.lower() == "non investi":
             continue
         formula = f"=SOMME({first_country_letter}{row_idx}:{row_idx})"
         address = rowcol_to_a1(row_idx, target_col)
