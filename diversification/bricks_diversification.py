@@ -114,7 +114,12 @@ load_dotenv()
 import requests
 
 try:
-    from shared.google_sheet import fill_current_month_amounts, fill_current_month_bonus_breakdown
+    from shared.google_sheet import (
+        fill_current_month_amounts,
+        fill_current_month_bonus_breakdown,
+        fill_geographic_repartition_amounts,
+        fill_geographic_repartition_uninvested_amount,
+    )
     from shared.report_date import get_report_now, is_current_month
 except ModuleNotFoundError:
     # Support direct execution (python diversification/bricks_diversification.py)
@@ -122,7 +127,12 @@ except ModuleNotFoundError:
     project_root = Path(__file__).resolve().parents[1]
     if str(project_root) not in sys.path:
         sys.path.insert(0, str(project_root))
-    from shared.google_sheet import fill_current_month_amounts, fill_current_month_bonus_breakdown
+    from shared.google_sheet import (
+        fill_current_month_amounts,
+        fill_current_month_bonus_breakdown,
+        fill_geographic_repartition_amounts,
+        fill_geographic_repartition_uninvested_amount,
+    )
     from shared.report_date import get_report_now, is_current_month
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
@@ -391,6 +401,18 @@ def run() -> None:
         },
         section="Crowdfunding immobilier",
     )
+
+    # "Répartition géographique" has a single "Bricks" aggregate row (no
+    # per-project/per-country breakdown, unlike Mintos/Swaper) - same value
+    # as the Crowdfunding immobilier section's total, mirroring Lande's
+    # single-row pattern. Also has its own "non investi" row (solde_total
+    # = balanceAvailable + giftBalance, i.e. cash not yet invested).
+    if current_month:
+        try:
+            fill_geographic_repartition_amounts([{"name": "Bricks", "amount": balances["investments_en_cours"]}])
+            fill_geographic_repartition_uninvested_amount("Bricks", balances["solde_total"])
+        except Exception:
+            log.exception("Failed to update Bricks' 'Répartition géographique' rows.")
 
 
 if __name__ == "__main__":

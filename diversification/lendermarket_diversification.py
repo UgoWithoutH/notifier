@@ -51,12 +51,17 @@ from zoneinfo import ZoneInfo
 import requests
 from dotenv import load_dotenv
 
-from shared.google_sheet import fill_current_month_amounts, fill_current_month_bonus_breakdown, fill_geographic_repartition_amounts
+from shared.google_sheet import (
+    fill_current_month_amounts,
+    fill_current_month_bonus_breakdown,
+    fill_geographic_repartition_amounts,
+    fill_geographic_repartition_uninvested_amount,
+)
 from shared.report_date import get_report_now, is_current_month
 
 load_dotenv()
 
-from monitors.lendermarket_monitor import login, LENDERMARKET_EMAIL, LENDERMARKET_PASSWORD, _xsrf_headers
+from monitors.lendermarket_monitor import login, LENDERMARKET_EMAIL, LENDERMARKET_PASSWORD, _xsrf_headers, fetch_account_balance
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger("lendermarket_diversification")
@@ -273,6 +278,15 @@ def run() -> None:
 
     if current_month:
         fill_geographic_repartition_amounts(loan_originators, platform="Lendermarket")
+
+        # "non investi" row (added 2026-08-10): reuses
+        # lendermarket_monitor.fetch_account_balance() (investorAvailableBalanceAmount),
+        # already relied on elsewhere in this repo to gate the invest bot.
+        available_balance = fetch_account_balance(session, investor_id)
+        if available_balance is not None:
+            fill_geographic_repartition_uninvested_amount("Lendermarket", available_balance)
+        else:
+            log.warning("Could not fetch Lendermarket's available balance - 'non investi' will not be updated.")
 
 
 if __name__ == "__main__":

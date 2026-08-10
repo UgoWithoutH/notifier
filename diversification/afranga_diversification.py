@@ -59,6 +59,16 @@ fetch_current_month_statement_totals() below, same idea as
 swaper_diversification.fetch_current_month_interest_received() /
 loanch_diversification.fetch_current_month_statement_totals().
 
+Also fetches the account's uninvested wallet balance ("non investi" row
+added 2026-08-10 under Afranga's block in "Répartition géographique") -
+found live 2026-08-10 on the /profile/overview page (the same page
+login() lands on): a Livewire component
+`id="walletUninvestedLiveWire"` renders "€ 4.60" right next to a
+"Balance:" label (also mirrored, same value, in the mobile nav menu) -
+see fetch_uninvested_balance() below. Cross-checked against the same
+page's "Account Balance" figure (invested total + this uninvested
+balance, confirmed to match exactly: 6015.24 + 4.60 = 6019.84).
+
 Required env vars:
     AFRANGA_EMAIL, AFRANGA_PASSWORD    -> Afranga account credentials
 Optional:
@@ -86,7 +96,12 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-from shared.google_sheet import fill_current_month_amounts, fill_current_month_bonus_breakdown, fill_geographic_repartition_amounts
+from shared.google_sheet import (
+    fill_current_month_amounts,
+    fill_current_month_bonus_breakdown,
+    fill_geographic_repartition_amounts,
+    fill_geographic_repartition_uninvested_amount,
+)
 from shared.report_date import get_report_now, is_current_month
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
@@ -94,6 +109,7 @@ log = logging.getLogger("afranga_diversification")
 
 LOGIN_URL = "https://afranga.com/login"
 TWO_FA_URL = "https://afranga.com/2fa/verify"
+PROFILE_OVERVIEW_URL = "https://afranga.com/profile/overview"
 MY_INVESTMENTS_URL = "https://afranga.com/profile/my-investments"
 REFRESH_URL = "https://afranga.com/profile/my-investments/refresh"
 STATEMENT_PAGE_URL = "https://afranga.com/profile/account-statement"
@@ -287,6 +303,18 @@ def _parse_amount(text: str) -> float:
         return float(cleaned)
     except ValueError:
         return 0.0
+
+
+def fetch_uninvested_balance(session: requests.Session) -> float:
+    """Fetch the wallet's uninvested balance ("non investi") from the
+    /profile/overview page's Livewire component. See module docstring."""
+    r = session.get(PROFILE_OVERVIEW_URL, headers=_HEADERS, timeout=20)
+    r.raise_for_status()
+
+    match = re.search(r'id="walletUninvestedLiveWire"[^>]*>\s*€\s*([\d\s.,]+?)\s*<', r.text)
+    if not match:
+        raise RuntimeError("Could not find the uninvested wallet balance ('walletUninvestedLiveWire') on the profile overview page.")
+    return _parse_amount(match.group(1))
 
 
 def aggregate_by_originator(investments: list) -> list:
@@ -491,6 +519,12 @@ def run() -> None:
         log.exception("Failed to fetch this month's Bonus Cashback total - defaulting to 0.0.")
         bonus_cashback = 0.0
 
+    try:
+        uninvested_balance = fetch_uninvested_balance(session)
+    except Exception:
+        log.exception("Failed to fetch the uninvested wallet balance - 'non investi' will not be updated.")
+        uninvested_balance = None
+
     originators = aggregate_by_originator(investments)
     log.info("Fetched %d active investment(s) across %d loan originator(s).", len(investments), len(originators))
     for o in originators:
@@ -541,6 +575,8 @@ def run() -> None:
 
     if current_month:
         fill_geographic_repartition_amounts(loan_originators, platform="Afranga")
+        if uninvested_balance is not None:
+            fill_geographic_repartition_uninvested_amount("Afranga", uninvested_balance)
 
 
 if __name__ == "__main__":

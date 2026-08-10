@@ -48,9 +48,13 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-from shared.google_sheet import fill_current_month_amounts, fill_geographic_repartition_amounts
+from shared.google_sheet import (
+    fill_current_month_amounts,
+    fill_geographic_repartition_amounts,
+    fill_geographic_repartition_uninvested_amount,
+)
 from shared.report_date import get_report_now, is_current_month
-from monitors.peerberry_monitor import login, PEERBERRY_EMAIL, PEERBERRY_PASSWORD, _HEADERS
+from monitors.peerberry_monitor import login, PEERBERRY_EMAIL, PEERBERRY_PASSWORD, _HEADERS, fetch_available_money
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger("peerberry_diversification")
@@ -237,6 +241,12 @@ def run() -> None:
 
     if current_month:
         fill_geographic_repartition_amounts(loan_originators, platform="Peerberry")
+
+        try:
+            available_money = fetch_available_money(session)
+            fill_geographic_repartition_uninvested_amount("Peerberry", available_money)
+        except Exception:
+            log.exception("Failed to fetch/update PeerBerry's 'non investi' row.")
 
 
 if __name__ == "__main__":
