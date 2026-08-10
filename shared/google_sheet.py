@@ -661,6 +661,51 @@ def fill_geographic_repartition_uninvested_amount(platform: str, amount):
     logger.info("Mise à jour 'non investi' terminée pour %s : %s = %s", platform, address, amount)
 
 
+def get_geographic_repartition_uninvested_amounts(platforms: list) -> dict:
+    """Relit (une seule lecture de la feuille) la ligne "non investi" déjà
+    écrite par fill_geographic_repartition_uninvested_amount() pour chaque
+    plateforme de `platforms`, sous "Répartition géographique" - utilisé par
+    le mail récapitulatif de fin de workflow GitHub (send_diversification_
+    recap_email.py) pour lister les montants non investis de toutes les
+    plateformes déjà passées ce run.
+
+    Retourne {platform: float} pour chaque plateforme dont la ligne "non
+    investi" a été trouvée et parsée avec succès ; les plateformes absentes
+    (ligne non trouvée, ou cellule vide/non-parsable) sont simplement omises
+    du dict.
+    """
+    worksheet = get_latest_dashboard_worksheet(SPREADSHEET_ID)
+    grid = _call_with_retry(worksheet.get_all_values)
+
+    geo_pos = find_cell_by_value(grid, "Répartition géographique")
+    if not geo_pos:
+        raise RuntimeError("La section 'Répartition géographique' n'a pas été trouvée.")
+    geo_row, geo_col = geo_pos
+
+    amounts = {}
+    for platform in platforms:
+        platform_row = find_first_cell_containing_below(grid, geo_row, geo_col, platform)
+        if not platform_row:
+            logger.warning("Plateforme '%s' non trouvée sous 'Répartition géographique'.", platform)
+            continue
+
+        uninvested_row = find_rows_by_texts_below(grid, platform_row, geo_col, ["non investi"], max_rows=3).get("non investi")
+        if not uninvested_row:
+            logger.warning("Ligne 'non investi' non trouvée sous '%s'.", platform)
+            continue
+
+        row = grid[uninvested_row - 1]
+        raw = row[geo_col] if geo_col < len(row) else ""
+        amount = _parse_french_amount(raw)
+        if amount is None:
+            logger.warning("Montant 'non investi' de '%s' vide/non-parsable (%r).", platform, raw)
+            continue
+
+        amounts[platform] = amount
+
+    return amounts
+
+
 def fill_geographic_repartition_amounts(loan_originators: list, platform: str | None = None):
     """
     loan_originators : liste de dicts, ex.
