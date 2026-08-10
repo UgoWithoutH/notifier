@@ -139,7 +139,7 @@ import logging
 import requests
 from dotenv import load_dotenv
 
-from shared.google_sheet import fill_current_month_amounts_with_labels, fill_geographic_repartition_amounts
+from shared.google_sheet import fill_current_month_amounts_with_labels, fill_geographic_repartition_amounts, fill_geographic_repartition_uninvested_amount
 from shared.report_date import get_report_date, is_current_month
 
 load_dotenv()
@@ -186,9 +186,10 @@ def _check_authenticated(r: requests.Response) -> None:
         raise RuntimeError(SESSION_EXPIRED_MESSAGE)
 
 
-def fetch_account_summary(session: requests.Session) -> float:
-    """Fetch this account's total invested (loans) amount. See module
-    docstring for the verified (nested) 'invested' field."""
+def fetch_account_summary(session: requests.Session) -> dict:
+    """Fetch this account's total invested (loans) amount and its
+    uninvested "available" cash balance ("non investi"). See module
+    docstring for the verified (nested) 'invested'/'available' fields."""
     log.info("GET %s (fetching account summary)...", ACCOUNT_URL)
     r = session.get(ACCOUNT_URL, timeout=20)
     log.info("GET accounts/%s: status=%s", CURRENCY_ID, r.status_code)
@@ -200,11 +201,15 @@ def fetch_account_summary(session: requests.Session) -> float:
     invested = (data.get("invested") or {}).get("amount")
     if invested is None:
         raise RuntimeError(f"Could not find 'invested.amount' in the accounts response: {data!r}")
+    available = (data.get("available") or {}).get("amount")
 
     try:
-        return float(invested)
+        invested = float(invested)
+        available = float(available) if available is not None else 0.0
     except (TypeError, ValueError):
-        raise RuntimeError(f"Could not parse 'invested.amount' out of {invested!r}.")
+        raise RuntimeError(f"Could not parse 'invested.amount'/'available.amount' out of {data!r}.")
+
+    return {"invested": invested, "available": available}
 
 
 def fetch_portfolio_split(session: requests.Session) -> dict:
@@ -401,7 +406,7 @@ def run(session: requests.Session | None = None) -> None:
     log.info("Starting Mintos diversification run (pure HTTP, no Playwright).")
 
     try:
-        invested = fetch_account_summary(session)
+        account_summary = fetch_account_summary(session)
         originators = fetch_loan_originator_breakdown(session)
         bond_issuers = fetch_bond_issuer_breakdown(session)
         portfolio_split = fetch_portfolio_split(session)
@@ -410,7 +415,7 @@ def run(session: requests.Session | None = None) -> None:
         log.exception("Failed to fetch Mintos account data.")
         sys.exit(1)
 
-    log.info("Total invested (loans): %.2f EUR", invested)
+    log.info("Total invested (loans): %.2f EUR, available (non investi): %.2f EUR", account_summary["invested"], account_summary["available"])
     for o in originators:
         log.info("  %s: %.2f EUR", o["originator"], o["outstanding"])
     for o in bond_issuers:
@@ -480,6 +485,7 @@ def run(session: requests.Session | None = None) -> None:
     if current_month:
         geo_entries = [{"name": name, "amount": round(amount, 2)} for name, amount in combined_originators.items()]
         fill_geographic_repartition_amounts(geo_entries, platform="Mintos")
+        fill_geographic_repartition_uninvested_amount("Mintos", account_summary["available"])
 
 
 if __name__ == "__main__":

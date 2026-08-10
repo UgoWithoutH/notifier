@@ -128,6 +128,7 @@ log = logging.getLogger("lande_diversification")
 
 TRANSACTIONS_URL = "https://lande.finance/fr/investor/transactions"
 TAX_REPORT_URL = "https://lande.finance/fr/investor/transactions/tax-report"
+OVERVIEW_URL = "https://lande.finance/fr/investor"
 PLATFORM_LABEL = "Lande"
 MAX_TRANSACTIONS_PAGES = 50  # safety net, see bienpreter_diversification.py's identical pattern
 
@@ -241,6 +242,25 @@ def fetch_current_month_interest(session: requests.Session, start_date: str, end
     return round(gross_interest, 2)
 
 
+def fetch_available_funds(session: requests.Session) -> float:
+    """Fetch the uninvested cash balance ("non investi") from the investor
+    overview page's "Fonds disponibles" figure (verified live 2026-08-10):
+    `GET /fr/investor` renders a "Valeur du compte" card with
+    `id="total_balance"` (always-CURRENT, see module docstring) followed by
+    a `<dl>` breaking it down into "Fonds disponibles" (uninvested cash) /
+    "Fonds investis" / "Fonds réservés", which sum back to total_balance."""
+    r = session.get(OVERVIEW_URL, timeout=20)
+    _check_authenticated(r)
+    if not r.ok:
+        raise RuntimeError(f"Investor overview page returned status {r.status_code}")
+
+    match = re.search(r"Fonds disponibles.*?€[\s\xa0]*([\d.,\s\xa0]+?)\s*</dd>", r.text, re.DOTALL)
+    if not match:
+        raise RuntimeError("Could not find 'Fonds disponibles' on the investor overview page.")
+
+    return _parse_amount(match.group(1))
+
+
 def run(session: requests.Session | None = None) -> None:
     """Runs the full fetch + Google Sheet write.
 
@@ -293,7 +313,11 @@ def run(session: requests.Session | None = None) -> None:
     }
     log.info("Amounts to write: %s", amounts)
 
-    from shared.google_sheet import fill_current_month_amounts, fill_geographic_repartition_amounts
+    from shared.google_sheet import (
+        fill_current_month_amounts,
+        fill_geographic_repartition_amounts,
+        fill_geographic_repartition_uninvested_amount,
+    )
     # No skip_total here (unlike every other *_diversification.py): "total"
     # already comes from the tax-report PDF for the SAME requested period
     # (see module docstring), so it's a real historical figure for a
@@ -305,6 +329,16 @@ def run(session: requests.Session | None = None) -> None:
     # the Crowdlending section's total.
     if is_current_month():
         fill_geographic_repartition_amounts([{"name": PLATFORM_LABEL, "amount": total}])
+
+        # "non investi" row (added 2026-08-10): "Fonds disponibles" on the
+        # investor overview page (/fr/investor) - a LIVE-only snapshot (no
+        # date param, like Afranga's walletUninvestedLiveWire), hence only
+        # written for the real current month.
+        try:
+            available_funds = fetch_available_funds(session)
+            fill_geographic_repartition_uninvested_amount(PLATFORM_LABEL, available_funds)
+        except Exception:
+            log.exception("Failed to fetch/update Lande's 'non investi' row.")
 
 
 if __name__ == "__main__":

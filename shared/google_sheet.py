@@ -536,8 +536,8 @@ def find_rows_by_texts_below(grid, start_row, start_col, texts: list, max_rows: 
 # via _zero_fill_missing_geo_rows().
 GEO_SECTION_BOUNDARY_LABELS = [
     "Afranga", "Bienprêter", "Iuvo", "Lendermarket", "Loanch", "Mintos", "Peerberry",
-    "Swaper", "Monefit", "Go & Grow", "Lande",
-    "Crowdlending savings", "Crowdlending agricole", "Bourse",
+    "Swaper", "Monefit", "Go & Grow", "Lande", "Bricks",
+    "Crowdlending savings", "Crowdlending agricole", "Crowdfunding immobilier", "Bourse",
 ]
 
 
@@ -599,7 +599,12 @@ def _zero_fill_missing_geo_rows(grid, geo_row: int, geo_col: int, target_col: in
     for row_idx in range(platform_row + 1, end_row):
         row = grid[row_idx - 1]
         name = row[geo_col - 1].strip() if geo_col - 1 < len(row) else ""
-        if not name or name in written_names:
+        # La ligne "non investi" (ajoutée 2026-08-10) n'est pas une société
+        # de prêt - elle est alimentée séparément par
+        # fill_geographic_repartition_uninvested_amount(), jamais mise à 0
+        # ici (elle ne fait pas partie de `written_names` puisque ce n'est
+        # pas un loan originator).
+        if not name or name in written_names or name.lower() == "non investi":
             continue
 
         address = rowcol_to_a1(row_idx, target_col)
@@ -613,6 +618,47 @@ def _zero_fill_missing_geo_rows(grid, geo_row: int, geo_col: int, target_col: in
         )
 
     return updates
+
+
+def fill_geographic_repartition_uninvested_amount(platform: str, amount):
+    """Écrit `amount` (le solde non investi/disponible de `platform`,
+    c'est-à-dire l'argent déposé mais pas encore prêté) sur la ligne
+    "non investi" trouvée juste sous la ligne de `platform`, dans la
+    section "Répartition géographique" (colonne total, geo_col + 1 - même
+    colonne que fill_geographic_repartition_amounts()).
+
+    Ajoutée 2026-08-10 : l'utilisateur a inséré une ligne "non investi"
+    sous chaque plateforme de cette section (sauf Monefit et Go & Grow,
+    qui n'ont pas de bloc de sociétés de prêt/pays et ne sont donc jamais
+    passées à cette fonction). Recherche bornée à 3 lignes sous la ligne
+    de la plateforme (le layout réel a toujours "non investi" en tout
+    premier, juste en dessous) pour ne jamais confondre avec une société
+    de prêt qui porterait un nom similaire plus bas dans le bloc.
+    """
+    logger.info("Début mise à jour 'non investi' pour %s (%s)", platform, amount)
+
+    worksheet = get_latest_dashboard_worksheet(SPREADSHEET_ID)
+    grid = _call_with_retry(worksheet.get_all_values)
+
+    geo_pos = find_cell_by_value(grid, "Répartition géographique")
+    if not geo_pos:
+        raise RuntimeError("La section 'Répartition géographique' n'a pas été trouvée.")
+    geo_row, geo_col = geo_pos
+
+    platform_row = find_first_cell_containing_below(grid, geo_row, geo_col, platform)
+    if not platform_row:
+        raise RuntimeError(f"La plateforme '{platform}' n'a pas été trouvée sous 'Répartition géographique'.")
+
+    uninvested_row = find_rows_by_texts_below(grid, platform_row, geo_col, ["non investi"], max_rows=3).get("non investi")
+    if not uninvested_row:
+        logger.warning(
+            "Ligne 'non investi' non trouvée sous '%s' - rien n'a été écrit.", platform
+        )
+        return
+
+    address = rowcol_to_a1(uninvested_row, geo_col + 1)
+    _call_with_retry(worksheet.update, address, [[amount]], value_input_option="USER_ENTERED")
+    logger.info("Mise à jour 'non investi' terminée pour %s : %s = %s", platform, address, amount)
 
 
 def fill_geographic_repartition_amounts(loan_originators: list, platform: str | None = None):
@@ -972,7 +1018,7 @@ def _read_originator_caps(grid, name_col: int, geo_col: int, start_row: int, end
         row = grid[row_idx - 1]
 
         name = row[name_col - 1].strip() if name_col - 1 < len(row) else ""
-        if not name:
+        if not name or name.lower() == "non investi":
             continue
 
         invested_raw = row[geo_col] if geo_col < len(row) else ""
@@ -1036,7 +1082,7 @@ def get_selected_peerberry_loan_originators() -> list:
         row = grid[row_idx - 1]
 
         name = row[geo_col - 1].strip() if geo_col - 1 < len(row) else ""
-        if not name:
+        if not name or name.lower() == "non investi":
             continue
 
         if _find_x_flag_left_of(row, geo_col):
@@ -1203,7 +1249,7 @@ def get_peerberry_country_allocations() -> dict:
         row = grid[row_idx - 1]
 
         name = row[geo_col - 1].strip() if geo_col - 1 < len(row) else ""
-        if not name:
+        if not name or name.lower() == "non investi":
             continue
 
         for col_idx, country_name in country_columns.items():
@@ -1280,7 +1326,7 @@ def get_selected_lendermarket_lenders() -> list:
         row = grid[row_idx - 1]
 
         name = row[geo_col - 1].strip() if geo_col - 1 < len(row) else ""
-        if not name:
+        if not name or name.lower() == "non investi":
             continue
 
         if _find_x_flag_left_of(row, geo_col):
@@ -1439,7 +1485,7 @@ def get_lendermarket_country_allocations() -> dict:
         row = grid[row_idx - 1]
 
         name = row[geo_col - 1].strip() if geo_col - 1 < len(row) else ""
-        if not name:
+        if not name or name.lower() == "non investi":
             continue
 
         for col_idx, country_name in country_columns.items():
@@ -1521,7 +1567,7 @@ def get_selected_swaper_loan_originators() -> list:
         row = grid[row_idx - 1]
 
         name = row[geo_col - 1].strip() if geo_col - 1 < len(row) else ""
-        if not name:
+        if not name or name.lower() == "non investi":
             continue
 
         if _find_x_flag_left_of(row, geo_col):
@@ -1683,7 +1729,7 @@ def get_swaper_country_allocations() -> dict:
         row = grid[row_idx - 1]
 
         name = row[geo_col - 1].strip() if geo_col - 1 < len(row) else ""
-        if not name:
+        if not name or name.lower() == "non investi":
             continue
 
         for col_idx, country_name in country_columns.items():

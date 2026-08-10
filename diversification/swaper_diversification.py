@@ -56,7 +56,12 @@ from zoneinfo import ZoneInfo
 
 from dotenv import load_dotenv
 
-from shared.google_sheet import fill_current_month_amounts, fill_current_month_bonus_breakdown, fill_geographic_repartition_amounts
+from shared.google_sheet import (
+    fill_current_month_amounts,
+    fill_current_month_bonus_breakdown,
+    fill_geographic_repartition_amounts,
+    fill_geographic_repartition_uninvested_amount,
+)
 from shared.report_date import get_report_now, is_current_month
 
 load_dotenv()
@@ -64,7 +69,7 @@ load_dotenv()
 from playwright.sync_api import sync_playwright
 
 from shared.browser_stealth import get_context_options, apply_stealth
-from monitors.swaper_monitor import login, SWAPER_EMAIL, SWAPER_PASSWORD
+from monitors.swaper_monitor import login, SWAPER_EMAIL, SWAPER_PASSWORD, fetch_loans, extract_balance
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger("swaper_diversification")
@@ -352,6 +357,14 @@ def run(headless: bool = True) -> None:
             log.exception("Failed to fetch the referral bonus earned - defaulting to 0.0.")
             referral_bonus_earned = 0.0
 
+        try:
+            log.info("Navigating to the loans page to fetch the uninvested account balance ('non investi')...")
+            loans_payload = fetch_loans(page, [])
+            uninvested_balance = extract_balance(loans_payload)
+        except Exception:
+            log.exception("Failed to fetch the uninvested account balance - 'non investi' will not be updated.")
+            uninvested_balance = None
+
         # Persist cookies/local storage so the next run can skip login (and
         # 2FA) while the session remains valid.
         context.storage_state(path=str(STORAGE_STATE_FILE))
@@ -415,6 +428,8 @@ def run(headless: bool = True) -> None:
 
     if current_month:
         fill_geographic_repartition_amounts(loan_originators, platform="Swaper")
+        if uninvested_balance is not None:
+            fill_geographic_repartition_uninvested_amount("Swaper", uninvested_balance)
 
 
 if __name__ == "__main__":
