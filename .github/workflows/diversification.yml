@@ -395,3 +395,35 @@ jobs:
           GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
           GOOGLE_CREDENTIALS: ${{ secrets.GOOGLE_CREDENTIALS }}
         run: bash scripts/run_diversification_for_month_range.sh diversification.bricks_diversification "${{ github.event.inputs.start_month }}" "${{ github.event.inputs.end_month }}"
+
+  recap_email:
+    needs: bricks
+    if: always()
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Python dependencies
+        run: pip install -r requirements.txt
+
+      # Runs after every platform job above ("if: always()", regardless of
+      # any individual job's success/failure) - re-reads each platform's
+      # already-written "non investi" row from the Sheet and sends one
+      # recap email (see scripts/send_diversification_recap_email.py).
+      - name: Send uninvested amounts recap email
+        env:
+          GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
+          GOOGLE_CREDENTIALS: ${{ secrets.GOOGLE_CREDENTIALS }}
+          SMTP_HOST: ${{ secrets.SMTP_HOST }}
+          SMTP_PORT: ${{ secrets.SMTP_PORT }}
+          SMTP_USER: ${{ secrets.SMTP_USER }}
+          SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
+          EMAIL_FROM: ${{ secrets.EMAIL_FROM }}
+          EMAIL_TO: ${{ secrets.EMAIL_TO }}
+        run: python -m scripts.send_diversification_recap_email

@@ -113,6 +113,7 @@ from shared.google_sheet import (
     fill_current_month_amounts,
     fill_current_month_bonus_breakdown,
     fill_bienpreter_borrower_geo_amounts,
+    fill_geographic_repartition_uninvested_amount,
 )
 from shared.report_date import get_report_now, is_current_month
 from shared.notifier import send_bienpreter_geo_issues_email
@@ -624,6 +625,14 @@ def run() -> None:
         except Exception as exc:
             log.exception("Failed to update the Bienprêter geographic breakdown by borrower.")
             geo_error = str(exc)
+
+        # "non investi" row (added 2026-08-10): the same "solde disponible"
+        # already scraped above for the Crowdlending section's "total".
+        try:
+            fill_geographic_repartition_uninvested_amount("Bienprêter", balances["available_balance"])
+        except Exception as exc:
+            log.exception("Failed to update Bienprêter's 'non investi' row.")
+            geo_error = geo_error or str(exc)
 
     if geo_issues or geo_error:
         send_bienpreter_geo_issues_email(geo_issues, error=geo_error)

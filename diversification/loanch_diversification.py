@@ -95,7 +95,12 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-from shared.google_sheet import fill_current_month_amounts, fill_current_month_bonus_breakdown, fill_geographic_repartition_amounts
+from shared.google_sheet import (
+    fill_current_month_amounts,
+    fill_current_month_bonus_breakdown,
+    fill_geographic_repartition_amounts,
+    fill_geographic_repartition_uninvested_amount,
+)
 from shared.report_date import get_report_now, is_current_month
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
@@ -108,6 +113,7 @@ API_LOGIN_URL = "https://api.loanch.com/_allauth/browser/v1/auth/login"
 API_2FA_URL = "https://api.loanch.com/_allauth/browser/v1/auth/2fa/authenticate"
 INVESTMENTS_API_URL = "https://api.loanch.com/api/v1/investments"
 STATEMENT_API_URL = "https://api.loanch.com/api/v1/statement-report"
+DASHBOARD_API_URL = "https://api.loanch.com/api/v1/dashboard"
 PAGE_SIZE = 100
 # Loanch is a French platform and its "Ce mois-ci" filter means the current
 # calendar month in French local time - pin the timezone explicitly instead
@@ -333,6 +339,28 @@ def fetch_current_month_statement_totals(session: requests.Session) -> dict:
     }
 
 
+def fetch_dashboard_uninvested_balance(session: requests.Session) -> float:
+    """Fetch the account's uninvested cash balance ("non investi") from
+    `GET /api/v1/dashboard`'s `total_balance` field.
+
+    Verified live 2026-08-10: the dashboard response is
+    `{"total_deposit", "total_withdrawal", "inprocess_withdrawal",
+    "total_balance", "total_invested", "paid_interest", "balance_sum",
+    "total_bonus"}` - `total_balance` (0 on the real account tested, fully
+    invested at the time) is used here rather than `balance_sum` (which
+    matched `total_invested` exactly on that same call - i.e. it tracks
+    invested capital, not idle cash, despite its generic-sounding name).
+    """
+    r = session.get(DASHBOARD_API_URL, headers=_HEADERS, timeout=20)
+    if not r.ok:
+        raise RuntimeError(f"Dashboard API returned status {r.status_code}")
+    body = r.json() or {}
+    try:
+        return float(body.get("total_balance") or 0.0)
+    except (TypeError, ValueError):
+        raise RuntimeError(f"Could not parse 'total_balance' out of {body!r}.")
+
+
 def run() -> None:
     if not LOANCH_EMAIL or not LOANCH_PASSWORD:
         log.error("LOANCH_EMAIL and LOANCH_PASSWORD environment variables are required.")
@@ -409,6 +437,12 @@ def run() -> None:
 
     if current_month:
         fill_geographic_repartition_amounts(loan_originators, platform="Loanch")
+
+        try:
+            uninvested_balance = fetch_dashboard_uninvested_balance(session)
+            fill_geographic_repartition_uninvested_amount("Loanch", uninvested_balance)
+        except Exception:
+            log.exception("Failed to fetch/update Loanch's 'non investi' row.")
 
 
 if __name__ == "__main__":

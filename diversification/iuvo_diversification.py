@@ -102,7 +102,7 @@ load_dotenv()
 import requests
 
 try:
-    from shared.google_sheet import fill_current_month_amounts, fill_geographic_repartition_amounts
+    from shared.google_sheet import fill_current_month_amounts, fill_geographic_repartition_amounts, fill_geographic_repartition_uninvested_amount
     from shared.report_date import get_report_now, is_current_month
 except ModuleNotFoundError:
     # Support direct execution (python diversification/iuvo_diversification.py)
@@ -110,7 +110,7 @@ except ModuleNotFoundError:
     project_root = Path(__file__).resolve().parents[1]
     if str(project_root) not in sys.path:
         sys.path.insert(0, str(project_root))
-    from shared.google_sheet import fill_current_month_amounts, fill_geographic_repartition_amounts
+    from shared.google_sheet import fill_current_month_amounts, fill_geographic_repartition_amounts, fill_geographic_repartition_uninvested_amount
     from shared.report_date import get_report_now, is_current_month
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
@@ -209,6 +209,7 @@ def fetch_balance_and_originators(session: requests.Session, session_token: str)
     log.info("Raw accountBalance payload: %r", balance)
     total = _parse_amount(str(balance.get("totalAmount")))
     invested_funds = _parse_amount(str(balance.get("investedFunds")))
+    available_funds = _parse_amount(str(balance.get("availableFunds")))
     if total is None or invested_funds is None:
         raise RuntimeError(f"Could not parse 'totalAmount'/'investedFunds' out of {balance!r}")
 
@@ -223,6 +224,7 @@ def fetch_balance_and_originators(session: requests.Session, session_token: str)
     return {
         "total": total,
         "receivables_p2p": invested_funds,
+        "available_funds": available_funds if available_funds is not None else 0.0,
         "originators": originators,
     }
 
@@ -368,6 +370,7 @@ def run() -> None:
 
     if current_month:
         fill_geographic_repartition_amounts(balance_data["originators"], platform="Iuvo")
+        fill_geographic_repartition_uninvested_amount("Iuvo", balance_data["available_funds"])
 
 
 if __name__ == "__main__":
