@@ -556,8 +556,8 @@ def find_rows_by_texts_below(grid, start_row, start_col, texts: list, max_rows: 
 # via _zero_fill_missing_geo_rows().
 GEO_SECTION_BOUNDARY_LABELS = [
     "Afranga", "Bienprêter", "Iuvo", "Lendermarket", "Loanch", "Mintos", "Peerberry",
-    "Swaper", "Monefit", "Go & Grow", "Lande",
-    "Crowdlending savings", "Crowdlending agricole", "Bourse",
+    "Swaper", "Monefit", "Go & Grow", "Lande", "Bricks",
+    "Crowdlending savings", "Crowdlending agricole", "Crowdfunding immobilier", "Bourse",
 ]
 
 
@@ -619,7 +619,12 @@ def _zero_fill_missing_geo_rows(grid, geo_row: int, geo_col: int, target_col: in
     for row_idx in range(platform_row + 1, end_row):
         row = grid[row_idx - 1]
         name = row[geo_col - 1].strip() if geo_col - 1 < len(row) else ""
-        if not name or name in written_names:
+        # La ligne "non investi" (ajoutée 2026-08-10) n'est pas une société
+        # de prêt - elle est alimentée séparément par
+        # fill_geographic_repartition_uninvested_amount(), jamais mise à 0
+        # ici (elle ne fait pas partie de `written_names` puisque ce n'est
+        # pas un loan originator).
+        if not name or name in written_names or name.lower() == "non investi":
             continue
 
         address = rowcol_to_a1(row_idx, target_col)
@@ -633,6 +638,92 @@ def _zero_fill_missing_geo_rows(grid, geo_row: int, geo_col: int, target_col: in
         )
 
     return updates
+
+
+def fill_geographic_repartition_uninvested_amount(platform: str, amount):
+    """Écrit `amount` (le solde non investi/disponible de `platform`,
+    c'est-à-dire l'argent déposé mais pas encore prêté) sur la ligne
+    "non investi" trouvée juste sous la ligne de `platform`, dans la
+    section "Répartition géographique" (colonne total, geo_col + 1 - même
+    colonne que fill_geographic_repartition_amounts()).
+
+    Ajoutée 2026-08-10 : l'utilisateur a inséré une ligne "non investi"
+    sous chaque plateforme de cette section (sauf Monefit et Go & Grow,
+    qui n'ont pas de bloc de sociétés de prêt/pays et ne sont donc jamais
+    passées à cette fonction). Recherche bornée à 3 lignes sous la ligne
+    de la plateforme (le layout réel a toujours "non investi" en tout
+    premier, juste en dessous) pour ne jamais confondre avec une société
+    de prêt qui porterait un nom similaire plus bas dans le bloc.
+    """
+    logger.info("Début mise à jour 'non investi' pour %s (%s)", platform, amount)
+
+    worksheet = get_latest_dashboard_worksheet(SPREADSHEET_ID)
+    grid = _call_with_retry(worksheet.get_all_values)
+
+    geo_pos = find_cell_by_value(grid, "Répartition géographique")
+    if not geo_pos:
+        raise RuntimeError("La section 'Répartition géographique' n'a pas été trouvée.")
+    geo_row, geo_col = geo_pos
+
+    platform_row = find_first_cell_containing_below(grid, geo_row, geo_col, platform)
+    if not platform_row:
+        raise RuntimeError(f"La plateforme '{platform}' n'a pas été trouvée sous 'Répartition géographique'.")
+
+    uninvested_row = find_rows_by_texts_below(grid, platform_row, geo_col, ["non investi"], max_rows=3).get("non investi")
+    if not uninvested_row:
+        logger.warning(
+            "Ligne 'non investi' non trouvée sous '%s' - rien n'a été écrit.", platform
+        )
+        return
+
+    address = rowcol_to_a1(uninvested_row, geo_col + 1)
+    _call_with_retry(worksheet.update, address, [[amount]], value_input_option="USER_ENTERED")
+    logger.info("Mise à jour 'non investi' terminée pour %s : %s = %s", platform, address, amount)
+
+
+def get_geographic_repartition_uninvested_amounts(platforms: list) -> dict:
+    """Relit (une seule lecture de la feuille) la ligne "non investi" déjà
+    écrite par fill_geographic_repartition_uninvested_amount() pour chaque
+    plateforme de `platforms`, sous "Répartition géographique" - utilisé par
+    le mail récapitulatif de fin de workflow GitHub (send_diversification_
+    recap_email.py) pour lister les montants non investis de toutes les
+    plateformes déjà passées ce run.
+
+    Retourne {platform: float} pour chaque plateforme dont la ligne "non
+    investi" a été trouvée et parsée avec succès ; les plateformes absentes
+    (ligne non trouvée, ou cellule vide/non-parsable) sont simplement omises
+    du dict.
+    """
+    worksheet = get_latest_dashboard_worksheet(SPREADSHEET_ID)
+    grid = _call_with_retry(worksheet.get_all_values)
+
+    geo_pos = find_cell_by_value(grid, "Répartition géographique")
+    if not geo_pos:
+        raise RuntimeError("La section 'Répartition géographique' n'a pas été trouvée.")
+    geo_row, geo_col = geo_pos
+
+    amounts = {}
+    for platform in platforms:
+        platform_row = find_first_cell_containing_below(grid, geo_row, geo_col, platform)
+        if not platform_row:
+            logger.warning("Plateforme '%s' non trouvée sous 'Répartition géographique'.", platform)
+            continue
+
+        uninvested_row = find_rows_by_texts_below(grid, platform_row, geo_col, ["non investi"], max_rows=3).get("non investi")
+        if not uninvested_row:
+            logger.warning("Ligne 'non investi' non trouvée sous '%s'.", platform)
+            continue
+
+        row = grid[uninvested_row - 1]
+        raw = row[geo_col] if geo_col < len(row) else ""
+        amount = _parse_french_amount(raw)
+        if amount is None:
+            logger.warning("Montant 'non investi' de '%s' vide/non-parsable (%r).", platform, raw)
+            continue
+
+        amounts[platform] = amount
+
+    return amounts
 
 
 def fill_geographic_repartition_amounts(loan_originators: list, platform: str | None = None):
@@ -830,12 +921,21 @@ def fill_bienpreter_borrower_geo_amounts(borrowers: dict):
     # `existing_rows` ci-dessous) - sert à décider quelles lignes supprimer :
     # une ligne dont le nom n'est plus dans `borrowers` est supprimée, même
     # si un doublon du même nom existe ailleurs dans le bloc.
+    #
+    # BUG FIXÉ 2026-08-10 : la ligne "non investi" (ajoutée le jour même,
+    # juste sous la ligne "Bienprêter") n'est PAS un emprunteur, mais son
+    # nom n'est jamais vide - sans l'exclusion ci-dessous, elle finissait
+    # systématiquement dans `rows_to_delete` (aucun emprunteur ne s'appelle
+    # "non investi") et était supprimée à chaque run, avant même que
+    # fill_geographic_repartition_uninvested_amount() ait pu y écrire quoi
+    # que ce soit - d'où un "non investi" introuvable/jamais rempli pour
+    # Bienprêter dans le mail récapitulatif.
     rows_to_delete = []
     existing_rows = {}
     for row_idx in range(bienpreter_row + 1, end_row):
         row = grid[row_idx - 1]
         name = row[geo_col - 1].strip() if geo_col - 1 < len(row) else ""
-        if not name:
+        if not name or name.lower() == "non investi":
             continue
         normalized = _normalize_borrower_name(name)
         existing_rows.setdefault(normalized, row_idx)
@@ -850,9 +950,16 @@ def fill_bienpreter_borrower_geo_amounts(borrowers: dict):
     )
 
     # Réécrit la formule SOMME sur les lignes du bloc qui restent (pas
-    # celles sur le point d'être supprimées).
+    # celles sur le point d'être supprimées, ni la ligne "non investi" -
+    # même exclusion/raison que ci-dessus : ce n'est pas une ligne
+    # emprunteur, sa colonne total (target_col) est alimentée séparément
+    # par fill_geographic_repartition_uninvested_amount()).
     for row_idx in range(bienpreter_row + 1, end_row):
         if row_idx in rows_to_delete:
+            continue
+        row = grid[row_idx - 1]
+        name = row[geo_col - 1].strip() if geo_col - 1 < len(row) else ""
+        if name.lower() == "non investi":
             continue
         formula = f"=SOMME({first_country_letter}{row_idx}:{row_idx})"
         address = rowcol_to_a1(row_idx, target_col)
@@ -999,7 +1106,7 @@ def _read_originator_caps(grid, name_col: int, geo_col: int, start_row: int, end
         row = grid[row_idx - 1]
 
         name = row[name_col - 1].strip() if name_col - 1 < len(row) else ""
-        if not name:
+        if not name or name.lower() == "non investi":
             continue
 
         invested_raw = row[geo_col] if geo_col < len(row) else ""
@@ -1063,7 +1170,7 @@ def get_selected_peerberry_loan_originators() -> list:
         row = grid[row_idx - 1]
 
         name = row[geo_col - 1].strip() if geo_col - 1 < len(row) else ""
-        if not name:
+        if not name or name.lower() == "non investi":
             continue
 
         if _find_x_flag_left_of(row, geo_col):
@@ -1230,7 +1337,7 @@ def get_peerberry_country_allocations() -> dict:
         row = grid[row_idx - 1]
 
         name = row[geo_col - 1].strip() if geo_col - 1 < len(row) else ""
-        if not name:
+        if not name or name.lower() == "non investi":
             continue
 
         for col_idx, country_name in country_columns.items():
@@ -1307,7 +1414,7 @@ def get_selected_lendermarket_lenders() -> list:
         row = grid[row_idx - 1]
 
         name = row[geo_col - 1].strip() if geo_col - 1 < len(row) else ""
-        if not name:
+        if not name or name.lower() == "non investi":
             continue
 
         if _find_x_flag_left_of(row, geo_col):
@@ -1466,7 +1573,7 @@ def get_lendermarket_country_allocations() -> dict:
         row = grid[row_idx - 1]
 
         name = row[geo_col - 1].strip() if geo_col - 1 < len(row) else ""
-        if not name:
+        if not name or name.lower() == "non investi":
             continue
 
         for col_idx, country_name in country_columns.items():
@@ -1548,7 +1655,7 @@ def get_selected_swaper_loan_originators() -> list:
         row = grid[row_idx - 1]
 
         name = row[geo_col - 1].strip() if geo_col - 1 < len(row) else ""
-        if not name:
+        if not name or name.lower() == "non investi":
             continue
 
         if _find_x_flag_left_of(row, geo_col):
@@ -1710,7 +1817,7 @@ def get_swaper_country_allocations() -> dict:
         row = grid[row_idx - 1]
 
         name = row[geo_col - 1].strip() if geo_col - 1 < len(row) else ""
-        if not name:
+        if not name or name.lower() == "non investi":
             continue
 
         for col_idx, country_name in country_columns.items():

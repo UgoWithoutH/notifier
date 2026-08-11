@@ -874,3 +874,64 @@ def send_bienpreter_geo_issues_email(issues: list, error: str | None = None) -> 
         log.info("Bienprêter geographic breakdown issues email sent to %s.", EMAIL_TO)
     except Exception:
         log.exception("Failed to send Bienprêter geographic breakdown issues email.")
+
+
+def send_diversification_recap_email(amounts: dict, missing_platforms: list | None = None, error: str | None = None) -> None:
+    """Sent once at the very end of the ".github/workflows/diversification.yml"
+    GitHub Actions workflow (a dedicated final job that runs after every
+    platform job, `if: always()`), summarizing the "non investi" (uninvested
+    cash) amount of every platform of that workflow, re-read straight from
+    the "Répartition géographique" section of the Sheet via
+    shared.google_sheet.get_geographic_repartition_uninvested_amounts()
+    (added 2026-08-10, per explicit user request).
+
+    `amounts` : {platform: float}, already-known uninvested amounts.
+    `missing_platforms` : platforms whose "non investi" row couldn't be
+    read (row not found, or cell empty/non-parsable) - listed separately
+    so a silent gap is never mistaken for a real 0.00 €.
+    `error` : set if reading the Sheet itself failed entirely; the email is
+    still sent (with just the error) so a broken recap step is never silent.
+    """
+    if not all([SMTP_HOST, SMTP_USER, SMTP_PASSWORD, EMAIL_TO]):
+        log.error(
+            "SMTP configuration is incomplete; cannot send email. "
+            "Required env vars: SMTP_HOST, SMTP_USER, SMTP_PASSWORD, EMAIL_TO."
+        )
+        return
+
+    total = sum(amounts.values())
+    subject = f"[Diversification] Récapitulatif montants non investis - {total:.2f} €"
+    if error:
+        subject += " - ERREUR"
+
+    body_lines = []
+    if error:
+        body_lines.append(f"⚠ ERREUR pendant la lecture du récapitulatif : {error}")
+        body_lines.append("")
+    body_lines.append("Montants non investis (disponibles, pas encore prêtés) par plateforme :")
+    body_lines.append("")
+    for platform, amount in sorted(amounts.items()):
+        body_lines.append(f"- {platform:<15s} : {amount:.2f} €")
+    body_lines.append("")
+    body_lines.append(f"Total : {total:.2f} €")
+
+    if missing_platforms:
+        body_lines.append("")
+        body_lines.append(f"Non disponible ce run : {', '.join(sorted(missing_platforms))}")
+
+    body = "\n".join(body_lines)
+
+    msg = MIMEMultipart()
+    msg["From"] = EMAIL_FROM
+    msg["To"] = EMAIL_TO
+    msg["Subject"] = subject
+    msg.attach(MIMEText(body, "plain"))
+
+    try:
+        with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=15) as server:
+            server.starttls()
+            server.login(SMTP_USER, SMTP_PASSWORD)
+            server.sendmail(EMAIL_FROM, [EMAIL_TO], msg.as_string())
+        log.info("Diversification recap email sent to %s.", EMAIL_TO)
+    except Exception:
+        log.exception("Failed to send diversification recap email.")
