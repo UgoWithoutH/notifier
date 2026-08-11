@@ -103,7 +103,16 @@ def get_google_credentials():
 
 
 def get_latest_dashboard_worksheet(spreadsheet_id: str):
-    logger.info("Recherche de la dernière feuille Dashboard...")
+    """Picks the "Dashboard <année>" worksheet matching get_report_date()'s
+    year (REPORT_DATE env var override, falls back to the real current
+    date) - e.g. a backfill run with a 2025 REPORT_DATE targets "Dashboard
+    2025", not whichever "Dashboard <year>" sheet happens to be newest. If
+    no sheet matches that exact year (e.g. the user hasn't created it yet),
+    falls back to the single most recent "Dashboard <year>" sheet found,
+    with a warning - same behavior as before this function became
+    year-aware."""
+    target_year = get_report_date().year
+    logger.info("Recherche de la feuille Dashboard pour l'année %s...", target_year)
 
     credentials = get_google_credentials()
     client = gspread.authorize(credentials)
@@ -126,9 +135,17 @@ def get_latest_dashboard_worksheet(spreadsheet_id: str):
         raise RuntimeError("Aucune feuille Dashboard trouvée.")
 
     dashboards.sort(key=lambda x: x[0], reverse=True)
-    worksheet = dashboards[0][1]
 
-    logger.info("Feuille Dashboard sélectionnée : %s", worksheet.title)
+    for year, worksheet in dashboards:
+        if year == target_year:
+            logger.info("Feuille Dashboard sélectionnée : %s", worksheet.title)
+            return worksheet
+
+    worksheet = dashboards[0][1]
+    logger.warning(
+        "Aucune feuille 'Dashboard %s' trouvée - utilisation de la plus récente à la place : %s",
+        target_year, worksheet.title
+    )
     return worksheet
 
 
@@ -248,13 +265,15 @@ def fill_current_month_amounts(
 
     section_pos = find_cell_by_value(grid, section)
     if not section_pos:
-        raise RuntimeError(f"La section '{section}' n'a pas été trouvée.")
+        logger.warning("La section '%s' n'a pas été trouvée (feuille sans doute plus ancienne) - rien écrit pour %s.", section, platform)
+        return
 
     section_row, section_col = section_pos
 
     current_month_cell = find_current_month_cell(grid, section_row)
     if not current_month_cell:
-        raise RuntimeError("La colonne du mois courant n'a pas été trouvée.")
+        logger.warning("La colonne du mois courant n'a pas été trouvée - rien écrit pour %s.", platform)
+        return
 
     current_month_col = current_month_cell["col"]
 
@@ -262,9 +281,8 @@ def fill_current_month_amounts(
         grid, section_row, section_col, platform
     )
     if not platform_row:
-        raise RuntimeError(
-            f"La plateforme '{platform}' n'a pas été trouvée sous '{section}'."
-        )
+        logger.warning("La plateforme '%s' n'a pas été trouvée sous '%s' - rien écrit.", platform, section)
+        return
 
     total_amount = amounts.get("total", 0)
     gross_interest_received = amounts.get("gross_interest_received", 0)
@@ -332,13 +350,15 @@ def fill_current_month_amounts_with_labels(
 
     section_pos = find_cell_by_value(grid, section)
     if not section_pos:
-        raise RuntimeError(f"La section '{section}' n'a pas été trouvée.")
+        logger.warning("La section '%s' n'a pas été trouvée (feuille sans doute plus ancienne) - rien écrit pour %s.", section, platform)
+        return
 
     section_row, section_col = section_pos
 
     current_month_cell = find_current_month_cell(grid, section_row)
     if not current_month_cell:
-        raise RuntimeError("La colonne du mois courant n'a pas été trouvée.")
+        logger.warning("La colonne du mois courant n'a pas été trouvée - rien écrit pour %s.", platform)
+        return
 
     current_month_col = current_month_cell["col"]
 
@@ -346,9 +366,8 @@ def fill_current_month_amounts_with_labels(
         grid, section_row, section_col, platform
     )
     if not platform_row:
-        raise RuntimeError(
-            f"La plateforme '{platform}' n'a pas été trouvée sous '{section}'."
-        )
+        logger.warning("La plateforme '%s' n'a pas été trouvée sous '%s' - rien écrit.", platform, section)
+        return
 
     if skip_total:
         updates = []
@@ -415,13 +434,15 @@ def fill_current_month_bonus_breakdown(platform: str, breakdown: dict, section: 
 
     section_pos = find_cell_by_value(grid, section)
     if not section_pos:
-        raise RuntimeError(f"La section '{section}' n'a pas été trouvée.")
+        logger.warning("La section '%s' n'a pas été trouvée (feuille sans doute plus ancienne) - rien écrit pour %s.", section, platform)
+        return
 
     section_row, section_col = section_pos
 
     current_month_cell = find_current_month_cell(grid, section_row)
     if not current_month_cell:
-        raise RuntimeError("La colonne du mois courant n'a pas été trouvée.")
+        logger.warning("La colonne du mois courant n'a pas été trouvée - rien écrit pour %s.", platform)
+        return
 
     current_month_col = current_month_cell["col"]
 
@@ -429,9 +450,8 @@ def fill_current_month_bonus_breakdown(platform: str, breakdown: dict, section: 
         grid, section_row, section_col, platform
     )
     if not platform_row:
-        raise RuntimeError(
-            f"La plateforme '{platform}' n'a pas été trouvée sous '{section}'."
-        )
+        logger.warning("La plateforme '%s' n'a pas été trouvée sous '%s' - rien écrit.", platform, section)
+        return
 
     labels = list(breakdown.keys())
     rows_by_label = find_rows_by_texts_below(
@@ -646,9 +666,10 @@ def fill_geographic_repartition_amounts(loan_originators: list, platform: str | 
     geo_pos = find_cell_by_value(grid, "Répartition géographique")
 
     if not geo_pos:
-        raise RuntimeError(
-            "La section 'Répartition géographique' n'a pas été trouvée."
+        logger.warning(
+            "La section 'Répartition géographique' n'a pas été trouvée (feuille sans doute plus ancienne) - rien écrit."
         )
+        return
 
     geo_row, geo_col = geo_pos
 
@@ -775,12 +796,18 @@ def fill_bienpreter_borrower_geo_amounts(borrowers: dict):
 
     geo_pos = find_cell_by_value(grid, "Répartition géographique")
     if not geo_pos:
-        raise RuntimeError("La section 'Répartition géographique' n'a pas été trouvée.")
+        message = "La section 'Répartition géographique' n'a pas été trouvée (feuille sans doute plus ancienne) - répartition par emprunteur non écrite."
+        logger.warning(message)
+        issues.append(message)
+        return issues
     geo_row, geo_col = geo_pos
 
     bienpreter_row = find_first_cell_containing_below(grid, geo_row, geo_col, "Bienprêter")
     if not bienpreter_row:
-        raise RuntimeError("La cellule 'Bienprêter' n'a pas été trouvée sous 'Répartition géographique'.")
+        message = "La cellule 'Bienprêter' n'a pas été trouvée sous 'Répartition géographique' - répartition par emprunteur non écrite."
+        logger.warning(message)
+        issues.append(message)
+        return issues
 
     end_row = _find_geo_block_end_row(grid, geo_row, geo_col, bienpreter_row, "Bienprêter")
 
