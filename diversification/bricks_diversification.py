@@ -393,11 +393,15 @@ def run() -> None:
     # "soldes boostés"), not the generic prime/cashback/concours trio used
     # elsewhere - map referrals/boostedBalanceGain to them directly, never
     # touching the "Bonus" row itself (a SUM formula over those sub-rows).
+    # "prélèvements" gets the real withholding tax on the obligationCoupons
+    # interest, same convention as Afranga/Bienprêter/Mintos's equivalent row
+    # - previously missing here, silently leaving that row blank for Bricks.
     fill_current_month_bonus_breakdown(
         platform="Bricks",
         breakdown={
             "parrainages": revenue_totals["referrals"],
             "soldes boost\u00e9s": revenue_totals["boosted_balance_gain"],
+            "pr\u00e9l\u00e8vements": revenue_totals["withholding_tax"],
         },
         section="Crowdfunding immobilier",
     )
