@@ -73,6 +73,7 @@ from dotenv import load_dotenv
 from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
 
 from diversification.mintos_diversification import run as run_diversification
+from shared.browser_stealth import human_mouse_wander, human_pause, human_type
 from shared.report_date import REPORT_DATE_ENV_VAR, get_report_date_list
 
 load_dotenv()
@@ -112,8 +113,10 @@ def _captcha_visible(page) -> bool:
 
 
 def _submit_credentials(page) -> None:
-    page.locator("#login-username").fill(MINTOS_EMAIL)
-    page.locator("#login-password").fill(MINTOS_PASSWORD)
+    human_type(page.locator("#login-username"), MINTOS_EMAIL)
+    human_pause()
+    human_type(page.locator("#login-password"), MINTOS_PASSWORD)
+    human_pause(0.3, 0.9)
     page.locator("[data-testid='login-button']").click()
     try:
         page.wait_for_url(_reached_twofactor_or_past_login, timeout=LOGIN_WAIT_TIMEOUT_MS)
@@ -146,7 +149,8 @@ def _submit_totp(page) -> bool:
     totp = pyotp.TOTP(MINTOS_TOTP_SECRET)
     now = int(time.time())
     for candidate in (totp.at(now), totp.at(now - 30), totp.at(now + 30)):
-        page.get_by_label("Code à 6\xa0chiffres").fill(candidate)
+        human_type(page.get_by_label("Code à 6\xa0chiffres"), candidate)
+        human_pause(0.3, 0.9)
         page.get_by_role("button", name="Se connecter").click()
         try:
             page.wait_for_url(lambda u: "/login/twofactor" not in u, timeout=8000)
@@ -181,6 +185,7 @@ def main() -> None:
         log.info("Navigating to the Mintos login page...")
         page.goto(LOGIN_URL, wait_until="domcontentloaded")
         _dismiss_cookie_banner(page)
+        human_mouse_wander(page)
 
         if "/login" in page.url and MINTOS_EMAIL and MINTOS_PASSWORD:
             log.info("Filling email/password automatically...")

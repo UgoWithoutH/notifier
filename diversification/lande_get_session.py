@@ -78,6 +78,7 @@ from dotenv import load_dotenv
 from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
 
 from diversification.lande_diversification import run as run_diversification
+from shared.browser_stealth import human_mouse_wander, human_pause, human_type
 from shared.report_date import REPORT_DATE_ENV_VAR, get_report_date_list
 
 load_dotenv()
@@ -120,8 +121,10 @@ def build_session_from_cookies(cookies: dict) -> requests.Session:
 
 
 def _submit_credentials(page) -> None:
-    page.locator("#inp-email").fill(LANDE_EMAIL)
-    page.locator("#password").fill(LANDE_PASSWORD)
+    human_type(page.locator("#inp-email"), LANDE_EMAIL)
+    human_pause()
+    human_type(page.locator("#password"), LANDE_PASSWORD)
+    human_pause(0.3, 0.9)
     page.locator("form#login button[type='submit']").click()
     try:
         page.wait_for_url(lambda u: "/login" not in u, timeout=20000)
@@ -136,7 +139,8 @@ def _submit_totp(page) -> bool:
     totp = pyotp.TOTP(LANDE_TOTP_SECRET)
     now = int(time.time())
     for candidate in (totp.at(now), totp.at(now - 30), totp.at(now + 30)):
-        page.locator("#two_factor_code").fill(candidate)
+        human_type(page.locator("#two_factor_code"), candidate)
+        human_pause(0.3, 0.9)
         page.locator("#two_factor_form_submit").click()
         try:
             page.wait_for_url(lambda u: "/2fa" not in u, timeout=8000)
@@ -169,6 +173,7 @@ def main() -> None:
         browser = p.chromium.connect_over_cdp(f"http://localhost:{DEBUG_PORT}")
         context = browser.contexts[0]
         page = context.pages[0] if context.pages else context.new_page()
+        human_mouse_wander(page)
 
         if "/login" in page.url and LANDE_EMAIL and LANDE_PASSWORD:
             log.info("Filling email/password automatically...")
