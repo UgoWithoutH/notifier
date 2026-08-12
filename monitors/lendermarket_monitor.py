@@ -886,9 +886,11 @@ def invest_selected_lenders(
 
     for lender_name, country, sheet_name in matched:
         loans = loans_by_lender[lender_name]
+        loan_lookup = {loan.get("uuid"): loan for loan in loans}
         budget_for_lender = lender_budget if lender_name in lenders_with_loans else 0.0
         lender_stat = {
             "budget": budget_for_lender,
+            "country": country,
             "loans_seen": len(loans),
             "attempts": 0,
             "successes": 0,
@@ -918,7 +920,11 @@ def invest_selected_lenders(
                 stats["balance_after"] -= amount
                 lender_stat["successes"] += 1
                 lender_stat["invested_amount"] += amount
-                lender_stat["invested_loans"].append({"loanUuid": loan_uuid, "amount": amount})
+                try:
+                    interest_rate = float((loan_lookup.get(loan_uuid) or {}).get("interestRate"))
+                except (TypeError, ValueError):
+                    interest_rate = None
+                lender_stat["invested_loans"].append({"amount": amount, "interestRate": interest_rate})
                 if country:
                     country_invested[country] = country_invested.get(country, 0.0) + amount
                 lender_invested[sheet_name] = lender_invested.get(sheet_name, 0.0) + amount
@@ -1027,6 +1033,19 @@ def run() -> None:
             invest_stats = {"balance_before": balance, "balance_after": balance, "invest_attempts": 0}
             _log_invest_diagnostics("run_error", error=invest_error, traceback=traceback.format_exc())
             log.exception("Unexpected error during the Lendermarket auto-invest step.")
+
+        # The bot runs BEFORE the loan-availability recap below - re-fetch
+        # the real balance from the server now (instead of reusing the
+        # pre-invest value, or invest_selected_lenders()'s own computed
+        # balance_after estimate) so the recap/notification email further
+        # down reflects the account's state AFTER this run's investments,
+        # per explicit user request.
+        refreshed_balance = fetch_account_balance(session, investor_id)
+        if refreshed_balance is not None:
+            balance = refreshed_balance
+        else:
+            log.warning("Could not refresh the Lendermarket balance after auto-invest, falling back to the estimated post-invest balance for the recap.")
+            balance = invest_stats.get("balance_after", balance)
 
         if invest_stats.get("invest_attempts", 0) > 0 or invest_error:
             log.info("Auto-invest run finished: %s", invest_stats)

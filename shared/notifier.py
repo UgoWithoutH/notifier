@@ -414,17 +414,21 @@ def send_lendermarket_invest_summary_email(stats: dict, error: str | None = None
     investment), `lender_budgets` (per-lender share of the balance, 0.0 for
     a selected lender with no loan available this run), `invest_attempts`,
     `invest_successes`, `invest_failures`, `total_invested`, `lender_stats`
-    (per-lender dict with `budget`, `loans_seen`, `attempts`, `successes`,
-    `failures`, `invested_amount`, `invested_loans`), `country_blocked`
+    (per-lender dict with `budget`, `country`, `loans_seen`, `attempts`,
+    `successes`, `failures`, `invested_amount`, `invested_loans` - each a
+    `{"amount", "interestRate"}` dict, no loan id), `country_blocked`
     (added 2026-07-31: list of lender names excluded this run because their
     country already hit the Google-Sheet-configured per-country cap - see
     get_lendermarket_country_allocations()), `min_interest_rate` (the rate
-    actually used this run) and `country_status` (per-country invested
-    amount vs. the EUR cap, added 2026-07-31 so the email shows exactly
-    where each relevant country stands, not just which lenders got
-    blocked). Also `originator_blocked`/`originator_cap_status` (added
-    2026-08-05): the SAME kind of cap, but per lender instead of per
-    country - see get_lendermarket_originator_caps().
+    actually used this run). Also `originator_blocked` (added 2026-08-05):
+    the SAME kind of cap, but per lender instead of per country - see
+    get_lendermarket_originator_caps().
+
+    Per explicit user request (2026-08-12), the email body is DELIBERATELY
+    kept lean: only the invested lender/country + the invested amount and
+    interest rate(s) are shown (no loan id, no per-lender budget/loans-seen
+    breakdown, no full per-country/per-lender cap status dump - just the
+    short "bloqué" lender-name lists when a cap was actually hit).
     `error`, if set, is a short description of an unexpected exception that
     interrupted the invest step early. Same convention as
     peerberry_invest_bot.py's summary email: the body never includes raw
@@ -463,45 +467,27 @@ def send_lendermarket_invest_summary_email(stats: dict, error: str | None = None
     if min_interest_rate is not None:
         body_parts.append(f"Taux d'intérêt minimum utilisé : {min_interest_rate}%")
 
-    threshold_percentage = stats.get("country_threshold_percentage")
-    country_status = stats.get("country_status") or {}
-    if country_status:
-        body_parts.append("")
-        if threshold_percentage is not None:
-            body_parts.append(f"=== Seuil par pays ({threshold_percentage}% du budget total) ===")
-        else:
-            body_parts.append("=== Seuil par pays (aucun seuil configuré) ===")
-        for country, s in sorted(country_status.items()):
-            threshold_amount = s.get("threshold_amount")
-            line = f"- {country} : investi {s.get('invested', 0.0):.2f} €"
-            if threshold_amount is not None:
-                line += f" / plafond {threshold_amount:.2f} €"
-            if s.get("blocked"):
-                line += " (BLOQUÉ)"
-            body_parts.append(line)
-
     lender_stats = stats.get("lender_stats") or {}
-    if lender_stats:
-        body_parts.append("")
-        body_parts.append("=== Détail par lender ===")
-        for name, s in lender_stats.items():
-            body_parts.append("")
-            body_parts.append(f"- {name}")
+    invested_lenders = {
+        name: s for name, s in lender_stats.items() if s.get("successes", 0) > 0
+    }
+    body_parts.append("")
+    body_parts.append("=== Investissements (taux et lender) ===")
+    if invested_lenders:
+        for name, s in sorted(invested_lenders.items()):
+            country = s.get("country")
+            label = f"{name} ({country})" if country else name
+            rates = [
+                lo.get("interestRate")
+                for lo in (s.get("invested_loans") or [])
+                if lo.get("interestRate") is not None
+            ]
+            rate_str = ", ".join(f"{rate:.2f}%" for rate in rates) if rates else "n/a"
             body_parts.append(
-                f"    Budget (part du solde) : {s.get('budget', 0.0):.2f} € | "
-                f"investi : {s.get('invested_amount', 0.0):.2f} €"
+                f"- {label} : {s.get('invested_amount', 0.0):.2f} € @ {rate_str}"
             )
-            body_parts.append(
-                f"    Prêts disponibles vus : {s.get('loans_seen', 0)} | "
-                f"tentatives : {s.get('attempts', 0)} "
-                f"(réussies : {s.get('successes', 0)}, échouées : {s.get('failures', 0)})"
-            )
-            invested_loans = s.get("invested_loans") or []
-            if invested_loans:
-                details = ", ".join(f"{lo['loanUuid']} ({lo['amount']:.2f} €)" for lo in invested_loans)
-                body_parts.append(f"    Prêts investis : {details}")
-            else:
-                body_parts.append("    Prêts investis : aucun")
+    else:
+        body_parts.append("Aucun investissement réussi ce run.")
 
     country_blocked = stats.get("country_blocked") or []
     if country_blocked:
@@ -510,19 +496,6 @@ def send_lendermarket_invest_summary_email(stats: dict, error: str | None = None
             "Lenders bloqués ce run (seuil d'investissement par pays atteint) : "
             + ", ".join(country_blocked)
         )
-
-    originator_cap_status = stats.get("originator_cap_status") or {}
-    if originator_cap_status:
-        body_parts.append("")
-        body_parts.append("=== Plafond par lender (% du budget total) ===")
-        for name, s in sorted(originator_cap_status.items()):
-            threshold_amount = s.get("threshold_amount")
-            line = f"- {name} : investi {s.get('invested', 0.0):.2f} € / plafond {s.get('max_percentage', 0.0):.2f}%"
-            if threshold_amount is not None:
-                line += f" ({threshold_amount:.2f} €)"
-            if s.get("blocked"):
-                line += " (BLOQUÉ)"
-            body_parts.append(line)
 
     originator_blocked = stats.get("originator_blocked") or []
     if originator_blocked:
