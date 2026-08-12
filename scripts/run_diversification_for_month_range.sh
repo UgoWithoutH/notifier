@@ -54,4 +54,12 @@ while [[ "$current_epoch" -le "$end_epoch" ]]; do
   REPORT_DATE="$last_day" python -m "$MODULE"
   current=$(date -d "${current} +1 month" +%Y-%m-01)
   current_epoch=$(date -d "$current" +%s)
+  if [[ "$current_epoch" -le "$end_epoch" ]]; then
+    # Each iteration logs into the platform fresh (incl. a real 2FA/TOTP
+    # submission for platforms that need it) - looping many months
+    # back-to-back with zero delay looks like a rapid-fire login pattern
+    # that some platforms' anti-abuse/rate-limiting can start rejecting
+    # (even genuinely correct TOTP codes), not just a one-off flake.
+    sleep 10
+  fi
 done
