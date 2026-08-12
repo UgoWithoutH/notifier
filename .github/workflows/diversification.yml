@@ -11,12 +11,66 @@ on:
         description: "Mois de fin de la plage à traiter (MM/AAAA, inclus). Laisser vide (avec start_month) pour utiliser la date du jour."
         required: false
         default: ""
+      # All default to true so the cron-job.org trigger (which never sets
+      # inputs, only relying on defaults) keeps running every platform -
+      # decocher one here only affects a manual run.
+      run_swaper:
+        description: "Exécuter Swaper"
+        type: boolean
+        required: false
+        default: true
+      run_iuvo:
+        description: "Exécuter Iuvo"
+        type: boolean
+        required: false
+        default: true
+      run_afranga:
+        description: "Exécuter Afranga"
+        type: boolean
+        required: false
+        default: true
+      run_bienpreter:
+        description: "Exécuter Bienprêter"
+        type: boolean
+        required: false
+        default: true
+      run_lendermarket:
+        description: "Exécuter Lendermarket"
+        type: boolean
+        required: false
+        default: true
+      run_loanch:
+        description: "Exécuter Loanch"
+        type: boolean
+        required: false
+        default: true
+      run_monefit:
+        description: "Exécuter Monefit"
+        type: boolean
+        required: false
+        default: true
+      run_peerberry:
+        description: "Exécuter PeerBerry"
+        type: boolean
+        required: false
+        default: true
+      run_goandgrow:
+        description: "Exécuter Go & Grow"
+        type: boolean
+        required: false
+        default: true
+      run_bricks:
+        description: "Exécuter Bricks"
+        type: boolean
+        required: false
+        default: true
 
 permissions:
   contents: read
 
 jobs:
   swaper:
+    if: ${{ inputs.run_swaper }}
     runs-on: ubuntu-22.04
     concurrency:
       group: swaper-diversification
@@ -93,7 +147,7 @@ jobs:
 
   iuvo:
     needs: swaper
-    if: always()
+    if: ${{ always() && inputs.run_iuvo }}
     runs-on: ubuntu-22.04
     concurrency:
       group: iuvo-diversification
@@ -126,7 +180,7 @@ jobs:
 
   afranga:
     needs: iuvo
-    if: always()
+    if: ${{ always() && inputs.run_afranga }}
     runs-on: ubuntu-22.04
     concurrency:
       group: afranga-diversification
@@ -160,7 +214,7 @@ jobs:
 
   bienpreter:
     needs: afranga
-    if: always()
+    if: ${{ always() && inputs.run_bienpreter }}
     runs-on: ubuntu-22.04
     concurrency:
       group: bienpreter-diversification
@@ -193,7 +247,7 @@ jobs:
 
   lendermarket:
     needs: bienpreter
-    if: always()
+    if: ${{ always() && inputs.run_lendermarket }}
     runs-on: ubuntu-22.04
     concurrency:
       group: lendermarket-diversification
@@ -227,7 +281,7 @@ jobs:
 
   loanch:
     needs: lendermarket
-    if: always()
+    if: ${{ always() && inputs.run_loanch }}
     runs-on: ubuntu-22.04
     concurrency:
       group: loanch-diversification
@@ -262,7 +316,7 @@ jobs:
 
   monefit:
     needs: loanch
-    if: always()
+    if: ${{ always() && inputs.run_monefit }}
     runs-on: ubuntu-22.04
     concurrency:
       group: monefit-diversification
@@ -296,7 +350,7 @@ jobs:
 
   peerberry:
     needs: monefit
-    if: always()
+    if: ${{ always() && inputs.run_peerberry }}
     runs-on: ubuntu-22.04
     concurrency:
       group: peerberry-diversification
@@ -330,7 +384,7 @@ jobs:
 
   goandgrow:
     needs: peerberry
-    if: always()
+    if: ${{ always() && inputs.run_goandgrow }}
     runs-on: ubuntu-22.04
     concurrency:
       group: goandgrow-diversification
@@ -365,7 +419,7 @@ jobs:
 
   bricks:
     needs: goandgrow
-    if: always()
+    if: ${{ always() && inputs.run_bricks }}
     runs-on: ubuntu-22.04
     concurrency:
       group: bricks-diversification
