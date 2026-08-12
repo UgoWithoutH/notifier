@@ -85,8 +85,10 @@ Optional:
 import calendar
 import os
 import sys
+import time
 import logging
-from datetime import datetime
+from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 from zoneinfo import ZoneInfo
 
 import pyotp
@@ -182,15 +184,48 @@ def login(session: requests.Session) -> None:
         )
 
     log.info("2FA prompt detected, generating and submitting TOTP code...")
-    code = pyotp.TOTP(LOANCH_TOTP_SECRET).now()
+    totp = pyotp.TOTP(LOANCH_TOTP_SECRET)
+
+    # Diagnostic only (no secret/code values logged): compare Loanch's
+    # server-reported clock (Date response header) to our local clock -
+    # helps distinguish a genuine clock-skew issue from a wrong
+    # LOANCH_TOTP_SECRET if this still fails below.
+    server_date_header = r.headers.get("Date")
+    if server_date_header:
+        try:
+            server_time = parsedate_to_datetime(server_date_header)
+            skew = (datetime.now(timezone.utc) - server_time).total_seconds()
+            log.info("Clock check: local vs. Loanch server Date header skew = %.1fs", skew)
+        except Exception:
+            pass
+
+    # Guard against submitting a code right as its 30s window is about to
+    # roll over.
+    remaining = 30 - (int(time.time()) % 30)
+    if remaining < 5:
+        time.sleep(remaining + 1)
+
+    # A single totp.now() call rejected once is NOT resilient to a
+    # boundary-rollover/mild clock-skew - this exact anti-pattern was
+    # already found and fixed for Afranga (2026-07-18) and Lendermarket
+    # (2026-07-27), but was never applied here. Try 3 distinct candidate
+    # codes (current/previous/next 30s window) instead of one.
+    now = time.time()
+    candidates = [totp.at(now), totp.at(now - 30), totp.at(now + 30)]
     csrf_token = session.cookies.get("csrftoken") or csrf_token
-    r = session.post(
-        API_2FA_URL,
-        json={"code": code},
-        headers={**_HEADERS, "X-CSRFToken": csrf_token},
-        timeout=20,
-    )
-    data = r.json() if r.content else {}
+    r = None
+    data = {}
+    for attempt, code in enumerate(candidates, start=1):
+        r = session.post(
+            API_2FA_URL,
+            json={"code": code},
+            headers={**_HEADERS, "X-CSRFToken": csrf_token},
+            timeout=20,
+        )
+        data = r.json() if r.content else {}
+        if r.status_code == 200 and (data.get("meta") or {}).get("is_authenticated"):
+            break
+        log.info("TOTP code rejected (attempt %d/%d)...", attempt, len(candidates))
     if r.status_code != 200 or not (data.get("meta") or {}).get("is_authenticated"):
         raise RuntimeError(f"Loanch rejected the TOTP code (status={r.status_code}): {r.text[:500]}")
     log.info("Logged in successfully (with 2FA).")
