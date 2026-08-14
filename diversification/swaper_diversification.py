@@ -50,7 +50,7 @@ Optional:
 import re
 import logging
 import sys
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -90,7 +90,11 @@ STORAGE_STATE_FILE = Path(__file__).parent / "swaper_diversification_storage_sta
 # non-linear equation over all historical cashflows, it cannot be derived
 # from last month's XIRR value plus just this month's new flows.
 XIRR_CASHFLOWS_STATE_FILE = Path(__file__).parent / "swaper_xirr_cashflows_state.json"
-XIRR_CASHFLOWS_STATE_DEFAULT = {"cashflows": [], "last_fetched_date": None}
+# "all_entries" (every transactionType, unfiltered) is cached alongside
+# "cashflows" (FUNDING/WITHDRAW*-only, for XIRR) so compute_average_idle_cash()'s
+# Cash drag reconstruction reuses the SAME incremental fetch instead of
+# re-fetching the whole history every run - see get_cached_account_cashflows().
+XIRR_CASHFLOWS_STATE_DEFAULT = {"cashflows": [], "all_entries": [], "last_fetched_date": None}
 # Verified live 2026-08-14 (full-history probe): pageSize=1000 returned this
 # account's entire history (352 records) in one page - a larger pageSize
 # (5000) was REJECTED by the API with HTTP 400 (undocumented server-side
@@ -311,47 +315,16 @@ def fetch_statement_totals(page, start_date: str, end_date: str) -> dict:
     return {"earned_interest": earned_interest, "opening_balance": opening_balance, "closing_balance": closing_balance}
 
 
-def fetch_account_cashflows(page, start_date: str, end_date: str) -> list:
-    """Fetch every real EXTERNAL cashflow (money moving in/out of the
-    Swaper account itself, not just reallocated between cash and loans
-    within it) within [start_date, end_date], via the same
-    `account-entries` API used by fetch_current_month_interest_received()
-    (see that function's docstring for the endpoint/auth details). Called
-    by run() with the account's FULL history (XIRR_HISTORY_START_DATE to
-    today) - XIRR is a since-inception money-weighted return, not a
-    per-month one.
-
-    Needed to reconstruct the cashflow list for the XIRR (money-weighted
-    annualized return) calculation: only a DEPOSIT into the account (the
-    `FUNDING` transaction type) or a WITHDRAWAL out of it are real external
-    cashflows from the investor's own point of view - every other type
-    observed on this API (`INVESTMENT`, `REPAYMENT_PRINCIPAL`,
-    `REPAYMENT_INTEREST`, `BUYBACK_PRINCIPAL`, `BUYBACK_INTEREST`,
-    `EXTENSION_INTEREST`, ...) just moves money between "uninvested cash"
-    and "invested in a loan" WITHIN the account, so they must NOT be
-    counted as separate cashflows (double-counting them would badly skew
-    the result) - the account's final total value already reflects their
-    net effect.
-
-    Verified live 2026-08-14 against the real account: this account has 4
-    `FUNDING` entries (all deposits, dates 2025-08-25 to 2026-07-03,
-    5000.00 EUR total) and no `WITHDRAWAL`-type entry has ever appeared
-    (this account has never withdrawn) - matched here via an exact
-    case-insensitive "FUNDING" check for deposits and a case-insensitive
-    "WITHDRAW" substring check for withdrawals (never actually observed,
-    kept as a forward-looking safety net in case this account, or a future
-    one, ever does withdraw). Returns a list of
-    `{"date": "YYYY-MM-DD", "amount": float, "transactionType": str}`
-    dicts - `amount` is always the ABSOLUTE value here (the caller decides
-    the sign for XIRR purposes based on `transactionType`, since the raw
-    API sign for a withdrawal-type entry has never actually been observed).
+def _fetch_account_entries_pages(page, start_date: str, end_date: str) -> list:
+    """Fetch EVERY raw account-entries row within [start_date, end_date]
+    (no type filtering at all), paginated via XIRR_PAGE_SIZE/MAX_XIRR_PAGES.
+    Shared by _split_cashflows_from_entries() (which keeps only FUNDING/WITHDRAW*
+    rows for the XIRR cashflow list) and compute_average_idle_cash()'s
+    caller in run() (which needs EVERY row - INVESTMENT/REPAYMENT_*/
+    BUYBACK_*/EXTENSION_INTEREST too - to reconstruct the day-by-day
+    uninvested-cash balance for "Cash drag").
     """
-    log.info(
-        "Requesting the account-entries history (%s to %s) for the since-inception XIRR cashflow reconstruction...",
-        start_date, end_date,
-    )
-
-    cashflows = []
+    entries = []
     page_number = 1
     total_records = None
     while page_number <= MAX_XIRR_PAGES:
@@ -386,20 +359,7 @@ def fetch_account_cashflows(page, start_date: str, end_date: str) -> list:
         results = data.get("results") or []
         total_records = data.get("totalRecords")
         log.info("Page %d: %d entrie(s) found (totalRecords=%s).", page_number, len(results), total_records)
-
-        for entry in results:
-            transaction_type = (entry.get("transactionType") or "").strip()
-            raw_date = entry.get("bookingDate")
-            raw_amount = entry.get("amount")
-            is_deposit = transaction_type.upper() == "FUNDING"
-            is_withdrawal = "WITHDRAW" in transaction_type.upper()
-            if not (is_deposit or is_withdrawal) or not raw_date or raw_amount is None:
-                continue
-            cashflows.append({
-                "date": raw_date,
-                "amount": abs(float(raw_amount)),
-                "transactionType": transaction_type,
-            })
+        entries.extend(results)
 
         if total_records is None or len(results) == 0:
             break
@@ -407,17 +367,143 @@ def fetch_account_cashflows(page, start_date: str, end_date: str) -> list:
             break
         page_number += 1
     else:
-        log.warning("Hit MAX_XIRR_PAGES (%d) without exhausting totalRecords=%s - cashflow history may be incomplete.", MAX_XIRR_PAGES, total_records)
+        log.warning("Hit MAX_XIRR_PAGES (%d) without exhausting totalRecords=%s - entry history may be incomplete.", MAX_XIRR_PAGES, total_records)
 
-    log.info("Found %d deposit/withdrawal entrie(s) for XIRR out of totalRecords=%s.", len(cashflows), total_records)
+    return entries
+
+
+def _split_cashflows_from_entries(raw_entries: list) -> list:
+    """Filter raw (unfiltered) account-entries rows down to just the real
+    EXTERNAL cashflows (FUNDING deposits / WITHDRAW* withdrawals) needed
+    for the XIRR calculation - every other transactionType (`INVESTMENT`,
+    `REPAYMENT_PRINCIPAL`, `REPAYMENT_INTEREST`, `BUYBACK_PRINCIPAL`,
+    `BUYBACK_INTEREST`, `EXTENSION_INTEREST`, ...) just moves money between
+    "uninvested cash" and "invested in a loan" WITHIN the account, so must
+    NOT be counted as a separate XIRR cashflow (the account's final total
+    value already reflects their net effect). `amount` is always the
+    ABSOLUTE value (the caller decides the sign based on `transactionType`).
+    """
+    cashflows = []
+    for entry in raw_entries:
+        transaction_type = (entry.get("transactionType") or "").strip()
+        raw_date = entry.get("bookingDate")
+        raw_amount = entry.get("amount")
+        is_deposit = transaction_type.upper() == "FUNDING"
+        is_withdrawal = "WITHDRAW" in transaction_type.upper()
+        if not (is_deposit or is_withdrawal) or not raw_date or raw_amount is None:
+            continue
+        cashflows.append({
+            "date": raw_date,
+            "amount": abs(float(raw_amount)),
+            "transactionType": transaction_type,
+        })
     return cashflows
 
 
-def get_cached_account_cashflows(page, end_date: str) -> list:
-    """Return every deposit/withdrawal cashflow since account inception,
-    fetching from the account-entries API only the entries NOT already
-    cached locally (in XIRR_CASHFLOWS_STATE_FILE), instead of re-fetching
-    the account's full history on every run.
+# transactionTypes that DEBIT the uninvested-cash balance (money leaving cash
+# to fund a loan) - WITHDRAW*-type rows are also a debit, matched separately
+# via a substring check since Swaper's own casing/exact label isn't fixed.
+_CASH_DEBIT_TRANSACTION_TYPES = {"INVESTMENT"}
+# transactionTypes that CREDIT the uninvested-cash balance (money returning
+# from a loan, or a deposit) - verified real types from the account's full
+# history (see _split_cashflows_from_entries()'s docstring).
+_CASH_CREDIT_TRANSACTION_TYPES = {
+    "FUNDING", "REPAYMENT_PRINCIPAL", "REPAYMENT_INTEREST",
+    "BUYBACK_PRINCIPAL", "BUYBACK_INTEREST", "EXTENSION_INTEREST",
+}
+
+
+def _cash_delta_for_entry(transaction_type: str, amount: float) -> float:
+    """Signed change to the uninvested-cash balance a single account-entries
+    row represents - an unrecognized/future transactionType is treated as
+    cash-neutral (logged) rather than guessed at.
+    """
+    upper = transaction_type.strip().upper()
+    if "WITHDRAW" in upper or upper in _CASH_DEBIT_TRANSACTION_TYPES:
+        return -abs(amount)
+    if upper in _CASH_CREDIT_TRANSACTION_TYPES:
+        return abs(amount)
+    log.warning(
+        "Unrecognized account-entries transactionType %r while reconstructing the daily cash balance - treating as cash-neutral (0 impact).",
+        transaction_type,
+    )
+    return 0.0
+
+
+def compute_average_idle_cash(entries: list, opening_balance: float, closing_balance: float, start_date: str, end_date: str) -> float:
+    """Reconstruct the uninvested-cash balance for EVERY day in
+    [start_date, end_date] from the raw account-entries rows (every
+    transaction type - INVESTMENT/REPAYMENT_*/BUYBACK_*/EXTENSION_INTEREST
+    too, not just FUNDING/WITHDRAWAL) and return the day-weighted average.
+
+    This replaces a naive `(opening_balance + closing_balance) / 2` average,
+    which can badly understate "Cash drag" whenever idle cash both
+    APPEARS and gets invested INSIDE the period (e.g. a deposit that sits
+    uninvested for a real day mid-month before being invested - opening AND
+    closing balance can both be ~0 even though cash genuinely sat idle for
+    a day in between). Per explicit user request 2026-08-14.
+
+    Each day's entries are assumed to settle by end of that day (matching
+    how the API's own closing_balance for a range already reflects the
+    last day's own transactions). Falls back to the simple 2-point average
+    if `entries` is empty (e.g. the unfiltered fetch failed) or the dates
+    can't be parsed - never raises.
+    """
+    if not entries:
+        return (opening_balance + closing_balance) / 2
+
+    try:
+        start = datetime.strptime(start_date, "%Y-%m-%d").date()
+        end = datetime.strptime(end_date, "%Y-%m-%d").date()
+    except ValueError:
+        return (opening_balance + closing_balance) / 2
+
+    daily_deltas: dict = {}
+    for entry in entries:
+        raw_date = entry.get("bookingDate")
+        raw_amount = entry.get("amount")
+        transaction_type = entry.get("transactionType")
+        if not raw_date or raw_amount is None or not transaction_type:
+            continue
+        try:
+            amount = float(raw_amount)
+        except (TypeError, ValueError):
+            continue
+        daily_deltas[raw_date] = daily_deltas.get(raw_date, 0.0) + _cash_delta_for_entry(transaction_type, amount)
+
+    running_balance = opening_balance
+    total_balance = 0.0
+    day_count = 0
+    current = start
+    while current <= end:
+        running_balance += daily_deltas.get(current.strftime("%Y-%m-%d"), 0.0)
+        total_balance += running_balance
+        day_count += 1
+        current += timedelta(days=1)
+
+    if day_count == 0:
+        return (opening_balance + closing_balance) / 2
+
+    if abs(running_balance - closing_balance) > 0.05:
+        log.warning(
+            "Reconstructed closing balance (%.2f EUR) from all account-entries types doesn't match the API's own closing_balance (%.2f EUR) - "
+            "an unmapped transactionType may exist; the average idle cash below may be slightly off.",
+            running_balance, closing_balance,
+        )
+
+    return total_balance / day_count
+
+
+def get_cached_account_cashflows(page, end_date: str) -> tuple:
+    """Return `(cashflows, all_entries)` since account inception, fetching
+    from the account-entries API only the entries NOT already cached
+    locally (in XIRR_CASHFLOWS_STATE_FILE), instead of re-fetching the
+    account's full history on every run. `cashflows` = FUNDING/WITHDRAW*-only
+    (for XIRR, unchanged shape). `all_entries` = EVERY raw row regardless of
+    type (INVESTMENT/REPAYMENT_*/BUYBACK_*/EXTENSION_INTEREST included),
+    needed by compute_average_idle_cash() for "Cash drag" - both come from
+    the SAME single incremental fetch/cache, so adding the Cash drag
+    reconstruction didn't cost a second full-history API call per run.
 
     IMPORTANT: this only optimizes AWAY the redundant API calls - the XIRR
     itself must still be computed from the FULL merged list every time
@@ -430,30 +516,54 @@ def get_cached_account_cashflows(page, end_date: str) -> list:
     Re-fetches starting from the cached `last_fetched_date` itself (not the
     day after) so an entry booked on that same day, added on Swaper's side
     after the previous run already fetched it, isn't missed - duplicates
-    are then dropped by de-duplicating on (date, amount, transactionType).
+    are then dropped by de-duplicating on (date, amount, transactionType)
+    for cashflows, and on transactionId (falling back to a date/type/amount
+    tuple if absent) for all_entries.
     """
     state = load_state(XIRR_CASHFLOWS_STATE_FILE, XIRR_CASHFLOWS_STATE_DEFAULT)
     cached_cashflows = state["cashflows"]
+    cached_all_entries = state.get("all_entries", [])
     start_date = state["last_fetched_date"] or XIRR_HISTORY_START_DATE
+    if not cached_all_entries and cached_cashflows and start_date != XIRR_HISTORY_START_DATE:
+        # Migration from a pre-"all_entries" cache file: last_fetched_date is
+        # already advanced but all_entries was never populated - force ONE
+        # full-history re-fetch this run so Cash drag's day-by-day
+        # reconstruction isn't missing years of INVESTMENT/REPAYMENT_*/etc.
+        # entries (cashflows would just re-merge harmlessly, already deduped).
+        log.info("Cached 'all_entries' is empty despite existing cashflows - backfilling the full history once.")
+        start_date = XIRR_HISTORY_START_DATE
 
     log.info(
         "Found %d cached XIRR cashflow(s) (last fetched up to %s) - fetching only new entries from %s to %s...",
         len(cached_cashflows), state["last_fetched_date"], start_date, end_date,
     )
-    new_cashflows = fetch_account_cashflows(page, start_date, end_date)
+    new_raw_entries = _fetch_account_entries_pages(page, start_date, end_date)
+    new_cashflows = _split_cashflows_from_entries(new_raw_entries)
 
     seen = set()
-    merged = []
+    merged_cashflows = []
     for entry in cached_cashflows + new_cashflows:
         key = (entry["date"], entry["amount"], entry["transactionType"])
         if key in seen:
             continue
         seen.add(key)
-        merged.append(entry)
+        merged_cashflows.append(entry)
 
-    save_state(XIRR_CASHFLOWS_STATE_FILE, {"cashflows": merged, "last_fetched_date": end_date})
-    log.info("XIRR cashflow cache now holds %d entrie(s) (was %d before this run).", len(merged), len(cached_cashflows))
-    return merged
+    seen_entries = set()
+    merged_all_entries = []
+    for entry in cached_all_entries + new_raw_entries:
+        key = entry.get("transactionId") or (entry.get("bookingDate"), entry.get("transactionType"), entry.get("amount"))
+        if key in seen_entries:
+            continue
+        seen_entries.add(key)
+        merged_all_entries.append(entry)
+
+    save_state(XIRR_CASHFLOWS_STATE_FILE, {"cashflows": merged_cashflows, "all_entries": merged_all_entries, "last_fetched_date": end_date})
+    log.info(
+        "XIRR cashflow cache now holds %d cashflow(s)/%d total entrie(s) (was %d/%d before this run).",
+        len(merged_cashflows), len(merged_all_entries), len(cached_cashflows), len(cached_all_entries),
+    )
+    return merged_cashflows, merged_all_entries
 
 
 def fetch_referral_bonus_earned(page) -> float:
@@ -576,11 +686,17 @@ def run(headless: bool = True) -> None:
         # share of XIRR is computed over the SAME since-inception period as
         # XIRR itself, not just this month extrapolated.
         lifetime_statement_totals = None
+        # Raw (unfiltered, every transactionType) account-entries rows for
+        # the current month / since-inception, fetched here (still inside
+        # the Playwright session) so compute_average_idle_cash() can
+        # reconstruct a real day-by-day idle-cash balance further below,
+        # instead of just interpolating opening/closing.
+        all_account_entries = None
         if current_month:
             try:
                 today_date = get_report_now(REPORT_TIMEZONE).strftime("%Y-%m-%d")
-                log.info("Fetching the since-inception XIRR cashflows (cached where possible)...")
-                xirr_cashflow_entries = get_cached_account_cashflows(page, today_date)
+                log.info("Fetching the since-inception XIRR cashflows + all account entries (cached where possible)...")
+                xirr_cashflow_entries, all_account_entries = get_cached_account_cashflows(page, today_date)
 
                 funding_dates = [
                     e["date"] for e in xirr_cashflow_entries
@@ -632,7 +748,7 @@ def run(headless: bool = True) -> None:
     }
 
     # XIRR is a since-inception money-weighted return: every real
-    # deposit/withdrawal ever made (see fetch_account_cashflows()'s
+    # deposit/withdrawal ever made (see _split_cashflows_from_entries()'s
     # docstring for why every OTHER transaction type is excluded) is a
     # signed cashflow at its real date, plus today's real total account
     # value as the final "as if withdrawn today" positive cashflow.
@@ -690,11 +806,9 @@ def run(headless: bool = True) -> None:
     # i.e. the number of percentage points THIS MONTH's return was reduced
     # by, assuming the idle cash would otherwise have earned the same rate
     # as the capital that WAS invested this month. `avg_idle_cash_this_month`
-    # = (opening_balance + closing_balance) / 2 from the SAME account-
-    # entries response already fetched above for interest_received -
-    # closing_balance is the account's real uninvested cash balance
-    # (verified live 2026-08-14 to match extract_balance()'s "non investi"
-    # figure exactly).
+    # is now a real day-weighted average (see compute_average_idle_cash()) -
+    # a naive (opening+closing)/2 misses idle cash that appears AND gets
+    # invested within the same month, per user request 2026-08-14.
     cash_drag_value = None
     # Cash drag/taxes' own share of XIRR, on the same since-inception,
     # annualized percentage-point scale as XIRR itself (unlike "Cash drag"
@@ -711,7 +825,12 @@ def run(headless: bool = True) -> None:
     # inception or not, so no lifetime reconstruction is needed here.
     taxes_xirr_contribution = 0.0 if current_month else None
     if current_month and statement_totals is not None and breakdown["total_invested"] > 0:
-        avg_idle_cash = (statement_totals["opening_balance"] + statement_totals["closing_balance"]) / 2
+        month_start_date = get_report_now(REPORT_TIMEZONE).replace(day=1).strftime("%Y-%m-%d")
+        today_date_str = get_report_now(REPORT_TIMEZONE).strftime("%Y-%m-%d")
+        avg_idle_cash = compute_average_idle_cash(
+            all_account_entries or [], statement_totals["opening_balance"], statement_totals["closing_balance"],
+            month_start_date, today_date_str,
+        )
         cash_weight = avg_idle_cash / (avg_idle_cash + breakdown["total_invested"])
         monthly_yield_rate = interest_received / breakdown["total_invested"]
         cash_drag_value = cash_weight * monthly_yield_rate
@@ -728,15 +847,35 @@ def run(headless: bool = True) -> None:
             if funding_dates:
                 since_inception_date = datetime.strptime(min(funding_dates), "%Y-%m-%d").date()
                 years_elapsed = max((get_report_now(REPORT_TIMEZONE).date() - since_inception_date).days / 365.25, 1 / 365.25)
-                avg_idle_cash_lifetime = (lifetime_statement_totals["opening_balance"] + lifetime_statement_totals["closing_balance"]) / 2
+                avg_idle_cash_lifetime = compute_average_idle_cash(
+                    all_account_entries or [], lifetime_statement_totals["opening_balance"], lifetime_statement_totals["closing_balance"],
+                    since_inception_date.strftime("%Y-%m-%d"), get_report_now(REPORT_TIMEZONE).strftime("%Y-%m-%d"),
+                )
                 cash_weight_lifetime = avg_idle_cash_lifetime / (avg_idle_cash_lifetime + breakdown["total_invested"])
                 lifetime_yield_rate = lifetime_statement_totals["earned_interest"] / breakdown["total_invested"]
                 cash_drag_lifetime_total = cash_weight_lifetime * lifetime_yield_rate
-                cash_drag_xirr_contribution = -(cash_drag_lifetime_total / years_elapsed)
-                log.info(
-                    "XIRR share - cash drag: %.4f points (since-inception, %.2f years), taxes/frais: %.2f points.",
-                    cash_drag_xirr_contribution * 100, years_elapsed, taxes_xirr_contribution * 100,
-                )
+                # Same counterfactual-XIRR technique as bonus_xirr_contribution
+                # above, instead of linearly dividing cash_drag_lifetime_total by
+                # years_elapsed: XIRR compounds (compute_xirr() solves a non-linear
+                # equation over real dates), so a plain division mixes a cumulative
+                # % with an annualized (compounding) one. Here: convert the
+                # cumulative drag into the EUR amount the idle cash would have
+                # earned at the SAME yield as the rest of the portfolio, add it
+                # back to today's final value, recompute XIRR on that higher
+                # counterfactual value, and diff vs. the real XIRR - same scale/
+                # methodology as xirr_value itself.
+                if xirr_value is not None:
+                    missed_earnings = cash_drag_lifetime_total * (avg_idle_cash_lifetime + breakdown["total_invested"])
+                    cashflows_with_cash_invested = signed_cashflows[:-1] + [
+                        (today_date, total_account_value + missed_earnings)
+                    ]
+                    xirr_with_cash_invested = compute_xirr(cashflows_with_cash_invested)
+                    if xirr_with_cash_invested is not None:
+                        cash_drag_xirr_contribution = xirr_value - xirr_with_cash_invested
+                        log.info(
+                            "XIRR share - cash drag: %.4f points (since-inception, %.2f years, missed earnings ~%.2f EUR), taxes/frais: %.2f points.",
+                            cash_drag_xirr_contribution * 100, years_elapsed, missed_earnings, taxes_xirr_contribution * 100,
+                        )
 
     # "total" comes from the "Currently Allocated" DOM widget, a LIVE-only
     # snapshot with no date param, and account-entries (the date-ranged
