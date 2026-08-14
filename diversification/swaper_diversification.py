@@ -738,8 +738,13 @@ def run(headless: bool = True) -> None:
     # of account-entries transactionTypes only, which missed this page
     # entirely. See that function's docstring for the lifetime-vs-monthly
     # caveat.
+    # "total" ("en cours") written to the Sheet is invested + uninvested,
+    # per user request 2026-08-14 (matching Bienprêter/Iuvo/Bricks/Lande's
+    # own convention) - falls back to invested-only if the uninvested
+    # balance couldn't be fetched. `breakdown["total_invested"]` itself
+    # stays invested-only, since it feeds the Cash drag/XIRR math below.
     amounts = {
-        "total": breakdown["total_invested"],
+        "total": breakdown["total_invested"] + uninvested_balance if uninvested_balance is not None else breakdown["total_invested"],
         "gross_interest_received": interest_received,
         "net_interest_received": interest_received,
         "withholding_tax": 0.0,
@@ -877,10 +882,11 @@ def run(headless: bool = True) -> None:
                             cash_drag_xirr_contribution * 100, years_elapsed, missed_earnings, taxes_xirr_contribution * 100,
                         )
 
-    # "total" comes from the "Currently Allocated" DOM widget, a LIVE-only
-    # snapshot with no date param, and account-entries (the date-ranged
-    # interest API) has no balance field (2026-08-06 investigation) - skip
-    # total for a backfilled month.
+    # "total" comes from the "Currently Allocated" DOM widget plus the
+    # uninvested balance (see above), a LIVE-only snapshot with no date
+    # param, and account-entries (the date-ranged interest API) has no
+    # balance field (2026-08-06 investigation) - skip total for a
+    # backfilled month.
     fill_current_month_amounts(
         platform="Swaper",
         amounts=amounts,

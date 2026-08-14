@@ -358,9 +358,21 @@ jobs:
       # pure-HTTP replay of its django-allauth "headless" login/2FA API
       # flow instead (see diversification/loanch_diversification.py's
       # module docstring) - just `requests`/`pyotp`, already in
-      # requirements.txt. No session/cookie persistence either. The
-      # login endpoints were confirmed with a real network capture on
+      # requirements.txt. No session/cookie persistence needed for LOGIN
+      # (that flow is lightweight enough to run fresh every time) - the
+      # XIRR cashflow cache below is unrelated to login, it just avoids
+      # re-fetching the account's entire transaction ledger every run.
+      # The login endpoints were confirmed with a real network capture on
       # 2026-07-27 (see the module docstring).
+
+      - name: Restore persisted state (XIRR cashflow cache)
+        uses: actions/cache/restore@v4
+        with:
+          path: diversification/loanch_xirr_cashflows_state.json
+          key: loanch-diversification-state-${{ github.run_id }}
+          restore-keys: |
+            loanch-diversification-state-
+
       - name: Run Loanch diversification report
         env:
           LOANCH_EMAIL: ${{ secrets.LOANCH_EMAIL }}
@@ -369,6 +381,13 @@ jobs:
           GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
           GOOGLE_CREDENTIALS: ${{ secrets.GOOGLE_CREDENTIALS }}
         run: bash scripts/run_diversification_for_month_range.sh diversification.loanch_diversification "${{ github.event.inputs.start_month }}" "${{ github.event.inputs.end_month }}"
+
+      - name: Save persisted state (XIRR cashflow cache) for the next run
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: diversification/loanch_xirr_cashflows_state.json
+          key: loanch-diversification-state-${{ github.run_id }}
 
   monefit:
     needs: loanch
@@ -427,8 +446,19 @@ jobs:
       # pure-HTTP replay of its login/2FA API flow instead (see
       # monitors/peerberry_monitor.py's module docstring) - just
       # `requests`/`pyotp`, already in requirements.txt. No session/cookie
-      # persistence either (that login flow is lightweight enough to run
-      # fresh every time).
+      # persistence needed for LOGIN (that flow is lightweight enough to
+      # run fresh every time) - the XIRR cashflow cache below is unrelated
+      # to login, it just avoids re-fetching the account's entire
+      # transaction history every run.
+
+      - name: Restore persisted state (XIRR cashflow cache)
+        uses: actions/cache/restore@v4
+        with:
+          path: diversification/peerberry_xirr_cashflows_state.json
+          key: peerberry-diversification-state-${{ github.run_id }}
+          restore-keys: |
+            peerberry-diversification-state-
+
       - name: Run PeerBerry diversification report
         env:
           PEERBERRY_EMAIL: ${{ secrets.PEERBERRY_EMAIL }}
@@ -437,6 +467,13 @@ jobs:
           GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
           GOOGLE_CREDENTIALS: ${{ secrets.GOOGLE_CREDENTIALS }}
         run: bash scripts/run_diversification_for_month_range.sh diversification.peerberry_diversification "${{ github.event.inputs.start_month }}" "${{ github.event.inputs.end_month }}"
+
+      - name: Save persisted state (XIRR cashflow cache) for the next run
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: diversification/peerberry_xirr_cashflows_state.json
+          key: peerberry-diversification-state-${{ github.run_id }}
 
   goandgrow:
     needs: peerberry

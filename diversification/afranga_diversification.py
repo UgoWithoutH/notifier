@@ -851,7 +851,13 @@ def run() -> None:
     for o in originators:
         log.info("  %s: %.2f EUR", o["originator"], o["outstanding"])
 
-    statement_totals["total"] = sum(o["outstanding"] for o in originators)
+    total_invested = sum(o["outstanding"] for o in originators)
+    # "total" ("en cours") written to the Sheet is invested + uninvested,
+    # per user request 2026-08-14 (matching Bienprêter/Iuvo/Bricks/Lande's
+    # own convention) - falls back to invested-only if the uninvested
+    # balance couldn't be fetched. `total_invested` itself stays
+    # invested-only below, since it feeds the Cash drag/XIRR math.
+    statement_totals["total"] = total_invested + uninvested_balance if uninvested_balance is not None else total_invested
     statement_totals["net_interest_received"] = (
         statement_totals["gross_interest_received"] - statement_totals["withholding_tax"]
     )
@@ -862,8 +868,6 @@ def run() -> None:
         statement_totals["total"], statement_totals["gross_interest_received"],
         statement_totals["net_interest_received"], statement_totals["withholding_tax"],
     )
-
-    total_invested = statement_totals["total"]
 
     # Since-inception "Deposited funds"/"Withdrawn funds" cashflows (for
     # XIRR) + every Details row (for compute_average_idle_cash()'s Cash
@@ -1005,8 +1009,8 @@ def run() -> None:
             else:
                 taxes_xirr_contribution = 0.0
 
-    # "total" is always the LIVE sum of active investments' outstanding
-    # amounts (see aggregate_by_originator() above) - no confirmed
+    # "total" is the LIVE sum of active investments' outstanding amounts
+    # PLUS the uninvested wallet balance (see above) - no confirmed
     # historical/closing-balance equivalent for a past month (2026-08-06
     # investigation), so skip it for a backfilled month rather than write a
     # live-today figure under a past month's column.

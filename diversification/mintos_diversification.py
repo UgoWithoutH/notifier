@@ -434,12 +434,18 @@ def run(session: requests.Session | None = None) -> None:
     )
 
     # "invested" (from accounts/978) only reflects the loans portfolio, not
-    # bonds - the Mintos row's total must be loans+obligations combined so
-    # it matches the sum of the two "en cours" sub-rows below it.
+    # bonds - the two "en cours" sub-rows below the Mintos row must sum to
+    # loans+obligations only (invested, no cash).
     total_outstanding = portfolio_split["loans"] + portfolio_split["bonds"]
+    # The "Mintos" row's own "total" cell represents the account's whole
+    # balance including uninvested cash (per user request 2026-08-14,
+    # matching Bienprêter/Iuvo/Bricks/Lande/etc.'s own convention) - it no
+    # longer equals the sum of the "en cours prêts"/"en cours obligations"
+    # sub-rows below it (those stay invested-only).
+    total_with_cash = total_outstanding + account_summary["available"]
 
     amounts = {
-        "total": total_outstanding,
+        "total": total_with_cash,
         "gross_interest_received": statement_totals["gross_interest_received"],
         "net_interest_received": net_interest_received,
         "withholding_tax": statement_totals["withholding_tax"],
@@ -472,7 +478,7 @@ def run(session: requests.Session | None = None) -> None:
     # "Mintos" row - past the default max_rows=6 bound - hence max_rows=10.
     fill_current_month_amounts_with_labels(
         platform=PLATFORM_LABEL,
-        total=total_outstanding,
+        total=total_with_cash,
         labeled_amounts=labeled_amounts,
         max_rows=10,
         skip_total=not current_month,
