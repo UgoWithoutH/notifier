@@ -124,6 +124,7 @@ jobs:
         with:
           path: |
             diversification/swaper_diversification_storage_state.json
+            diversification/swaper_xirr_cashflows_state.json
           key: swaper-diversification-state-${{ github.run_id }}
           restore-keys: |
             swaper-diversification-state-
@@ -143,6 +144,7 @@ jobs:
         with:
           path: |
             diversification/swaper_diversification_storage_state.json
+            diversification/swaper_xirr_cashflows_state.json
           key: swaper-diversification-state-${{ github.run_id }}
 
   iuvo:
