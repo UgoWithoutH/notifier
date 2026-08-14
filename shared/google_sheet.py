@@ -403,7 +403,7 @@ def fill_current_month_amounts_with_labels(
     logger.info("Mise à jour terminée pour %s (par labels)", platform)
 
 
-def fill_current_month_bonus_breakdown(platform: str, breakdown: dict, section: str = "Crowdlending"):
+def fill_current_month_bonus_breakdown(platform: str, breakdown: dict, section: str = "Crowdlending", max_rows: int = 6):
     """Write this month's bonus/cashback/contest figures to their own
     dedicated sub-rows under a platform's block, instead of the merged
     "Bonus" row (which is a SUM formula over those sub-rows in the Sheet
@@ -418,12 +418,14 @@ def fill_current_month_bonus_breakdown(platform: str, breakdown: dict, section: 
     (the common case) only ever touches that one row, leaving the other
     sibling rows (and "Bonus" itself) untouched.
 
-    The search for each label is bounded to the 6 rows directly below the
-    platform's own row (covers "intérêts brut" / "Bonus" / up to 3 category
-    rows / "Rendements %" in every verified block layout) so it can never
-    cross into the next platform's block below and misattribute a value
-    (e.g. writing into a different platform's "cashback" row just because
-    this platform doesn't have one).
+    `max_rows` : how many rows below the platform's own row to search
+    (default 6, covers "intérêts brut" / "Bonus" / up to 3 category rows /
+    "Rendements %" in every verified block layout) so it can never cross
+    into the next platform's block below and misattribute a value (e.g.
+    writing into a different platform's "cashback" row just because this
+    platform doesn't have one). Pass a larger value for a block with more
+    sub-rows below the platform's own row (e.g. Swaper's "XIRR" row, which
+    sits further down than the usual 6-row bound).
     """
     logger.info("Début mise à jour de la répartition bonus/cashback/concours pour %s (section '%s')", platform, section)
 
@@ -455,7 +457,7 @@ def fill_current_month_bonus_breakdown(platform: str, breakdown: dict, section: 
 
     labels = list(breakdown.keys())
     rows_by_label = find_rows_by_texts_below(
-        grid, platform_row, section_col, labels, max_rows=6
+        grid, platform_row, section_col, labels, max_rows=max_rows
     )
 
     missing = [label for label in labels if label not in rows_by_label]
