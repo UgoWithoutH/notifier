@@ -63,6 +63,7 @@ from shared.google_sheet import (
     fill_geographic_repartition_uninvested_amount,
 )
 from shared.report_date import get_report_now, is_current_month
+from shared.state import load_state, save_state
 from shared.xirr import compute_xirr
 
 load_dotenv()
@@ -80,14 +81,26 @@ STATEMENT_PAGE_URL = "https://swaper.com/en/investments/account-statement"
 ACCOUNT_ENTRIES_API_URL = "https://swaper.com/rest/public/profile/account-entries"
 REFERRAL_BONUS_PAGE_URL = "https://swaper.com/en/bonuses/refer-friends"
 STORAGE_STATE_FILE = Path(__file__).parent / "swaper_diversification_storage_state.json"
+# Cache of every deposit/withdrawal cashflow ever fetched for the XIRR
+# calculation (see get_cached_account_cashflows() below) - avoids
+# re-fetching the account's ENTIRE history from the account-entries API on
+# every monthly run; only entries since the last run's cutoff are fetched
+# and merged in. The XIRR itself is still recomputed from scratch (see
+# compute_xirr()) over the FULL merged list every run - XIRR is a root of a
+# non-linear equation over all historical cashflows, it cannot be derived
+# from last month's XIRR value plus just this month's new flows.
+XIRR_CASHFLOWS_STATE_FILE = Path(__file__).parent / "swaper_xirr_cashflows_state.json"
+XIRR_CASHFLOWS_STATE_DEFAULT = {"cashflows": [], "last_fetched_date": None}
 # Verified live 2026-08-14 (full-history probe): pageSize=1000 returned this
 # account's entire history (352 records) in one page - a larger pageSize
 # (5000) was REJECTED by the API with HTTP 400 (undocumented server-side
-# cap). Kept as a generous page size/safety net even though only one
-# calendar month's worth of entries is fetched now (see
-# fetch_account_cashflows()).
+# cap). Kept as a generous page size/safety net for accounts with more
+# history than this one.
 XIRR_PAGE_SIZE = 1000
 MAX_XIRR_PAGES = 20
+# XIRR is a since-inception money-weighted return (not per-month) - this
+# start date is early enough to cover any real account's full history.
+XIRR_HISTORY_START_DATE = "2000-01-01"
 # Swaper's own "This Month" quick filter (verified 2026-07-10 by capturing its
 # request) uses the CURRENT calendar month up to TODAY (bookingDateFrom = 1st
 # of the month, bookingDateTo = today) - not the full month like Loanch's
@@ -293,11 +306,9 @@ def fetch_account_cashflows(page, start_date: str, end_date: str) -> list:
     within it) within [start_date, end_date], via the same
     `account-entries` API used by fetch_current_month_interest_received()
     (see that function's docstring for the endpoint/auth details). Called
-    by run() with THIS CALENDAR MONTH's own range, not the account's full
-    history - see run() for why XIRR is now a per-month figure rather than
-    a since-inception one (recomputing a since-inception XIRR every month
-    would already be an "overall" number each time, making an average
-    across months meaningless).
+    by run() with the account's FULL history (XIRR_HISTORY_START_DATE to
+    today) - XIRR is a since-inception money-weighted return, not a
+    per-month one.
 
     Needed to reconstruct the cashflow list for the XIRR (money-weighted
     annualized return) calculation: only a DEPOSIT into the account (the
@@ -325,7 +336,7 @@ def fetch_account_cashflows(page, start_date: str, end_date: str) -> list:
     API sign for a withdrawal-type entry has never actually been observed).
     """
     log.info(
-        "Requesting the account-entries history (%s to %s) for this month's XIRR cashflow reconstruction...",
+        "Requesting the account-entries history (%s to %s) for the since-inception XIRR cashflow reconstruction...",
         start_date, end_date,
     )
 
@@ -389,6 +400,49 @@ def fetch_account_cashflows(page, start_date: str, end_date: str) -> list:
 
     log.info("Found %d deposit/withdrawal entrie(s) for XIRR out of totalRecords=%s.", len(cashflows), total_records)
     return cashflows
+
+
+def get_cached_account_cashflows(page, end_date: str) -> list:
+    """Return every deposit/withdrawal cashflow since account inception,
+    fetching from the account-entries API only the entries NOT already
+    cached locally (in XIRR_CASHFLOWS_STATE_FILE), instead of re-fetching
+    the account's full history on every run.
+
+    IMPORTANT: this only optimizes AWAY the redundant API calls - the XIRR
+    itself must still be computed from the FULL merged list every time
+    (see compute_xirr()). XIRR is the root of a non-linear equation over
+    every historical cashflow's own date/amount; there is no way to derive
+    a new XIRR from last month's XIRR value plus just this month's new
+    cashflows without silently dropping the date-weighting of every past
+    cashflow, which would produce a wrong number.
+
+    Re-fetches starting from the cached `last_fetched_date` itself (not the
+    day after) so an entry booked on that same day, added on Swaper's side
+    after the previous run already fetched it, isn't missed - duplicates
+    are then dropped by de-duplicating on (date, amount, transactionType).
+    """
+    state = load_state(XIRR_CASHFLOWS_STATE_FILE, XIRR_CASHFLOWS_STATE_DEFAULT)
+    cached_cashflows = state["cashflows"]
+    start_date = state["last_fetched_date"] or XIRR_HISTORY_START_DATE
+
+    log.info(
+        "Found %d cached XIRR cashflow(s) (last fetched up to %s) - fetching only new entries from %s to %s...",
+        len(cached_cashflows), state["last_fetched_date"], start_date, end_date,
+    )
+    new_cashflows = fetch_account_cashflows(page, start_date, end_date)
+
+    seen = set()
+    merged = []
+    for entry in cached_cashflows + new_cashflows:
+        key = (entry["date"], entry["amount"], entry["transactionType"])
+        if key in seen:
+            continue
+        seen.add(key)
+        merged.append(entry)
+
+    save_state(XIRR_CASHFLOWS_STATE_FILE, {"cashflows": merged, "last_fetched_date": end_date})
+    log.info("XIRR cashflow cache now holds %d entrie(s) (was %d before this run).", len(merged), len(cached_cashflows))
+    return merged
 
 
 def fetch_referral_bonus_earned(page) -> float:
@@ -507,10 +561,9 @@ def run(headless: bool = True) -> None:
         xirr_cashflow_entries = None
         if current_month:
             try:
-                month_start_date = get_report_now(REPORT_TIMEZONE).replace(day=1).strftime("%Y-%m-%d")
-                month_end_date = get_report_now(REPORT_TIMEZONE).strftime("%Y-%m-%d")
-                log.info("Fetching this month's account-entries to reconstruct this month's XIRR cashflows...")
-                xirr_cashflow_entries = fetch_account_cashflows(page, month_start_date, month_end_date)
+                today_date = get_report_now(REPORT_TIMEZONE).strftime("%Y-%m-%d")
+                log.info("Fetching the since-inception XIRR cashflows (cached where possible)...")
+                xirr_cashflow_entries = get_cached_account_cashflows(page, today_date)
             except Exception:
                 log.exception("Failed to fetch the XIRR cashflow history - XIRR will not be updated.")
                 xirr_cashflow_entries = None
@@ -552,42 +605,22 @@ def run(headless: bool = True) -> None:
         "interest_received": interest_received,
     }
 
-    # XIRR is computed for THIS CALENDAR MONTH ONLY (not since account
-    # inception) so it can be meaningfully averaged across months to get an
-    # "overall" figure - a since-inception XIRR recomputed every month
-    # would already BE an overall figure each time, making a later average
-    # across months double-count the past and be misleading.
-    #
-    # A period (monthly) XIRR is obtained the same way any money-weighted
-    # return is restricted to a sub-period: the account's total value at
-    # the START of the month is treated as if it were "invested" on day 1
-    # of the month (a synthetic negative cashflow), the REAL deposit/
-    # withdrawal cashflows that happened during the month are kept at
-    # their real dates (see fetch_account_cashflows()'s docstring for why
-    # every OTHER transaction type is excluded), and today's real total
-    # value is the final "as if withdrawn today" positive cashflow - same
-    # idea as a since-inception XIRR, just anchored at the start of the
-    # month instead of at the account's opening.
-    #
-    # The start-of-month total value isn't directly observable (Swaper
-    # exposes no historical invested-principal figure), so it's derived
-    # from the fundamental value identity instead - external cashflows and
-    # interest earned are the only two things that change the account's
-    # TOTAL value (money moving between "invested" and "uninvested cash"
-    # internally, e.g. buying a new loan or a loan being repaid, does not):
-    #   end_value = start_value + net_external_cashflows + interest_earned
-    # rearranged to:
-    #   start_value = end_value - net_external_cashflows - interest_earned
-    # NOTE: this ignores a referral bonus credited as cash DURING the month
-    # (not covered by interest_received nor by a FUNDING cashflow) - not a
-    # concern today since this account's referral bonus has always been
-    # 0.0 (see fetch_referral_bonus_earned()'s docstring), but would skew
-    # start_value slightly too high the month one is first earned.
+    # XIRR is a since-inception money-weighted return: every real
+    # deposit/withdrawal ever made (see fetch_account_cashflows()'s
+    # docstring for why every OTHER transaction type is excluded) is a
+    # signed cashflow at its real date, plus today's real total account
+    # value as the final "as if withdrawn today" positive cashflow.
     xirr_value = None
+    # Bonus's own share of XIRR (percentage points, same scale as xirr_value
+    # itself) - isolated by recomputing XIRR with the lifetime referral bonus
+    # (already baked into the account's live balance) subtracted from the
+    # final "as if withdrawn today" cashflow; the difference vs. the real
+    # XIRR is how many points came from the bonus. Feeds the pie-chart
+    # breakdown requested alongside "Cash drag"/"XIRR" below.
+    bonus_xirr_contribution = None
     if current_month and xirr_cashflow_entries is not None and uninvested_balance is not None:
         total_account_value = breakdown["total_invested"] + uninvested_balance
         signed_cashflows = []
-        net_external_cashflows = 0.0
         for entry in xirr_cashflow_entries:
             try:
                 entry_date = datetime.strptime(entry["date"], "%Y-%m-%d").date()
@@ -597,28 +630,29 @@ def run(headless: bool = True) -> None:
             is_deposit = entry["transactionType"].strip().upper() == "FUNDING"
             signed_amount = -entry["amount"] if is_deposit else entry["amount"]
             signed_cashflows.append((entry_date, signed_amount))
-            net_external_cashflows += -signed_amount
 
-        month_start = get_report_now(REPORT_TIMEZONE).replace(day=1).date()
-        start_value = total_account_value - net_external_cashflows - interest_received
-        if start_value <= 0:
-            log.warning(
-                "Computed start-of-month account value (%.2f EUR) isn't positive (likely the first month "
-                "any money was ever deposited) - omitting the start-of-month synthetic cashflow.",
-                start_value,
-            )
-        else:
-            signed_cashflows.append((month_start, -start_value))
-        signed_cashflows.append((get_report_now(REPORT_TIMEZONE).date(), total_account_value))
+        today_date = get_report_now(REPORT_TIMEZONE).date()
+        signed_cashflows.append((today_date, total_account_value))
 
         xirr_value = compute_xirr(signed_cashflows)
         if xirr_value is None:
-            log.warning("Could not compute this month's XIRR from %d cashflow(s) - XIRR row will not be updated.", len(signed_cashflows))
+            log.warning("Could not compute XIRR from %d cashflow(s) - XIRR row will not be updated.", len(signed_cashflows))
         else:
             log.info(
-                "Computed this month's XIRR: %.2f%% (start-of-month value %.2f EUR, %d deposit/withdrawal cashflow(s) this month, current total value %.2f EUR).",
-                xirr_value * 100, start_value, len(xirr_cashflow_entries), total_account_value,
+                "Computed since-inception XIRR: %.2f%% (%d deposit/withdrawal cashflow(s), current total value %.2f EUR).",
+                xirr_value * 100, len(xirr_cashflow_entries), total_account_value,
             )
+
+            if referral_bonus_earned:
+                cashflows_without_bonus = signed_cashflows[:-1] + [
+                    (today_date, total_account_value - referral_bonus_earned)
+                ]
+                xirr_without_bonus = compute_xirr(cashflows_without_bonus)
+                if xirr_without_bonus is not None:
+                    bonus_xirr_contribution = xirr_value - xirr_without_bonus
+                    log.info("Bonus's own share of XIRR: %.2f points.", bonus_xirr_contribution * 100)
+            else:
+                bonus_xirr_contribution = 0.0
 
     # Cash drag: how much this month's return was diluted by cash sitting
     # idle (not invested) instead of earning interest. Defined here as
@@ -636,6 +670,14 @@ def run(headless: bool = True) -> None:
     # (verified live 2026-08-14 to match extract_balance()'s "non investi"
     # figure exactly).
     cash_drag_value = None
+    # Cash drag/taxes' own share of XIRR, on the same annualized percentage-
+    # point scale as XIRR itself (unlike "Cash drag" above, which is a
+    # monthly-only figure) - linearly annualized (*12, same convention as
+    # this Sheet's own "Rendement %" formula) since only this month's idle-
+    # cash figures are available, not a real since-inception average. Feeds
+    # the pie-chart breakdown requested alongside bonus_xirr_contribution.
+    cash_drag_xirr_contribution = None
+    taxes_xirr_contribution = None
     if current_month and statement_totals is not None and breakdown["total_invested"] > 0:
         avg_idle_cash = (statement_totals["opening_balance"] + statement_totals["closing_balance"]) / 2
         cash_weight = avg_idle_cash / (avg_idle_cash + breakdown["total_invested"])
@@ -644,6 +686,13 @@ def run(headless: bool = True) -> None:
         log.info(
             "Computed Cash drag: %.2f%% (avg idle cash %.2f EUR, cash weight %.2f%%, monthly yield %.2f%%).",
             cash_drag_value * 100, avg_idle_cash, cash_weight * 100, monthly_yield_rate * 100,
+        )
+
+        cash_drag_xirr_contribution = -(cash_drag_value * 12)
+        taxes_xirr_contribution = -((amounts["withholding_tax"] / breakdown["total_invested"]) * 12)
+        log.info(
+            "XIRR share - cash drag: %.2f points, taxes/frais: %.2f points.",
+            cash_drag_xirr_contribution * 100, taxes_xirr_contribution * 100,
         )
 
     # "total" comes from the "Currently Allocated" DOM widget, a LIVE-only
@@ -671,10 +720,20 @@ def run(headless: bool = True) -> None:
         bonus_breakdown["XIRR"] = xirr_value
     if cash_drag_value is not None:
         bonus_breakdown["Cash drag"] = cash_drag_value
+    # Pie-chart source data (percentage points, same scale as XIRR): each
+    # component's own share of the since-inception XIRR - written to new
+    # sub-rows only if the user has added them to the Sheet (soft-fail
+    # label lookup, same as every other key in this dict).
+    if bonus_xirr_contribution is not None:
+        bonus_breakdown["XIRR Bonus"] = bonus_xirr_contribution
+    if cash_drag_xirr_contribution is not None:
+        bonus_breakdown["XIRR Cash drag"] = cash_drag_xirr_contribution
+    if taxes_xirr_contribution is not None:
+        bonus_breakdown["XIRR Taxes/Frais"] = taxes_xirr_contribution
     fill_current_month_bonus_breakdown(
         platform="Swaper",
         breakdown=bonus_breakdown,
-        max_rows=12,
+        max_rows=18,
     )
 
     loan_originators = [
