@@ -70,6 +70,57 @@ the `csrftoken` cookie set by api.loanch.com is readable via
 the same way the browser's own `fetch(..., {credentials: 'include'})`
 calls did, as long as login() succeeds in setting it.
 
+Also computes a since-inception XIRR (money-weighted return) plus this
+month's Cash drag and the XIRR Bonus / XIRR Cash drag / XIRR Taxes/Frais
+pie-chart shares, mirroring afranga_diversification.py/
+swaper_diversification.py/peerberry_diversification.py's own XIRR block -
+added 2026-08-14, per explicit user request. Unlike Lendermarket (no
+per-transaction ledger at all), Loanch DOES expose a genuine per-transaction
+dated ledger - the same one shown under "Transactions" on
+https://loanch.com/fr/dashboard/statement - found via a real browser network
+capture (login automated with LOANCH_EMAIL/PASSWORD/TOTP_SECRET from .env,
+see the throwaway probe technique in git history if this ever needs to be
+redone for another platform):
+
+    GET https://api.loanch.com/api/v1/transaction?page=<N>&page_size=<N>&transaction_type=0&transaction_type=1&...&transaction_type=10
+    -> {"count", "total_pages", "next", "previous", "results": [...]}, one
+    entry per transaction, newest first: {"id", "transaction_type_display":
+    "Placed Investment"|"Paid interest"|"Paid principal"|"Deposit"|
+    "Withdrawal"|"Bonus", "transaction_type": <int>, "amount": "<already
+    SIGNED for its cash-balance impact, no per-type sign lookup needed>",
+    "date": "YYYY-MM-DD", "deposit"/"withdrawal"/"investment"/"bonus"/
+    "exchange": <linked object id or null>}. transaction_type is a small
+    int enum - probed live 2026-08-14 by requesting each value 0-15
+    individually: 0=Deposit, 1=Withdrawal, 2=Placed Investment, 3=Paid
+    principal, 6=Paid interest, 10=Bonus are the ones actually observed on
+    this account (summing to the API's own `count` exactly); 4/5/7/8/9 are
+    valid choices (200, not 400) but had zero occurrences on this account -
+    their real label is unconfirmed, so if any of them ever appear they are
+    conservatively bucketed as an unclassified Taxes/Frais-style cost/
+    adjustment (same add-back-and-recompute-XIRR technique as every other
+    platform's Taxes/Frais share - sign-agnostic, safe even though untested
+    at 0.00, same reasoning as PeerBerry's untested INVESTMENT_SALE_FEE/
+    REFERRAL_FEE). page_size is capped server-side at 200 regardless of the
+    value requested (verified live: page_size=500 still only returned 200
+    rows/page). No date-range filter exists on this endpoint (unlike
+    PeerBerry's transactions API) - pagination is by `page` only, newest
+    first, so the incremental cache below stops fetching as soon as it
+    reaches an already-cached transaction id instead of always re-fetching
+    the entire history.
+
+    Since Loanch's transaction ledger is fetched back to the very first
+    transaction (account inception), the daily uninvested-cash balance used
+    for Cash drag is reconstructed by accumulating every entry's own signed
+    `amount` starting from a true zero balance at inception - no separate
+    "opening balance" API call is needed (unlike PeerBerry, which seeds
+    from its account-summary API's openingBalance). Loanch's own
+    statement-report opening_account/closing_account fields were
+    considered as that anchor but ruled out (see the loanch-login-api repo
+    memory note, 2026-08-07 investigation): they match /api/v1/dashboard's
+    balance_sum, which itself equals total_invested on this platform - i.e.
+    they track invested capital, not idle cash despite the generic name -
+    so they're not used here.
+
 Required env vars:
     LOANCH_EMAIL, LOANCH_PASSWORD      -> Loanch account credentials
 Optional:
@@ -87,8 +138,9 @@ import os
 import sys
 import time
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
+from pathlib import Path
 from zoneinfo import ZoneInfo
 
 import pyotp
@@ -104,6 +156,8 @@ from shared.google_sheet import (
     fill_geographic_repartition_uninvested_amount,
 )
 from shared.report_date import get_report_now, is_current_month
+from shared.state import load_state, save_state
+from shared.xirr import compute_xirr
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger("loanch_diversification")
@@ -116,7 +170,25 @@ API_2FA_URL = "https://api.loanch.com/_allauth/browser/v1/auth/2fa/authenticate"
 INVESTMENTS_API_URL = "https://api.loanch.com/api/v1/investments"
 STATEMENT_API_URL = "https://api.loanch.com/api/v1/statement-report"
 DASHBOARD_API_URL = "https://api.loanch.com/api/v1/dashboard"
+TRANSACTIONS_API_URL = "https://api.loanch.com/api/v1/transaction"
 PAGE_SIZE = 100
+# Every valid `transaction_type` choice as of 2026-08-14 (probed live by
+# requesting each value individually - 11+ all returned 400
+# "invalid_choice") - see module docstring for what each observed value means.
+TRANSACTION_TYPES = list(range(0, 11))
+DEPOSIT_TYPE = 0
+WITHDRAWAL_TYPE = 1
+INTEREST_TYPE = 6
+BONUS_TYPE = 10
+# Server caps page_size at 200 regardless of the value requested (verified
+# live 2026-08-14: page_size=500 still returned only 200 rows/page).
+TRANSACTIONS_PAGE_SIZE = 200
+MAX_TRANSACTIONS_PAGES = 100
+# Cache of every transaction row ever fetched (see get_cached_transactions()
+# below) - avoids re-fetching the account's entire history every run, same
+# idea as peerberry_diversification.XIRR_CASHFLOWS_STATE_FILE.
+XIRR_CASHFLOWS_STATE_FILE = Path(__file__).parent / "loanch_xirr_cashflows_state.json"
+XIRR_CASHFLOWS_STATE_DEFAULT = {"all_entries": []}
 # Loanch is a French platform and its "Ce mois-ci" filter means the current
 # calendar month in French local time - pin the timezone explicitly instead
 # of relying on the executing machine's local clock (e.g. UTC on a CI
@@ -396,10 +468,128 @@ def fetch_dashboard_uninvested_balance(session: requests.Session) -> float:
         raise RuntimeError(f"Could not parse 'total_balance' out of {body!r}.")
 
 
+def fetch_transactions_page(session: requests.Session, page_number: int) -> dict:
+    """Fetch one page of the account's own transaction-ledger API (see
+    module docstring for the verified request/response shape)."""
+    params = [("page", page_number), ("page_size", TRANSACTIONS_PAGE_SIZE)]
+    params += [("transaction_type", t) for t in TRANSACTION_TYPES]
+    r = session.get(TRANSACTIONS_API_URL, params=params, headers=_HEADERS, timeout=20)
+    if not r.ok:
+        raise RuntimeError(f"Transaction API returned status {r.status_code} on page {page_number}")
+    return r.json() or {}
+
+
+def get_cached_transactions(session: requests.Session) -> list:
+    """Return every transaction row since account inception, fetching from
+    the transaction API only the newest pages not already cached locally
+    (in XIRR_CASHFLOWS_STATE_FILE) - unlike PeerBerry's equivalent, this
+    endpoint has no date-range filter, only `page` (newest first), so this
+    stops paginating as soon as it encounters an id already present in the
+    cache instead of always walking the entire history.
+    """
+    state = load_state(XIRR_CASHFLOWS_STATE_FILE, XIRR_CASHFLOWS_STATE_DEFAULT)
+    cached_entries = state.get("all_entries") or []
+    cached_ids = {entry.get("id") for entry in cached_entries}
+
+    log.info("Found %d cached transaction(s) - fetching newest page(s) until an already-cached one is seen...", len(cached_entries))
+    new_entries = []
+    page_number = 1
+    reached_cached_entry = False
+    while page_number <= MAX_TRANSACTIONS_PAGES:
+        body = fetch_transactions_page(session, page_number)
+        page_entries = body.get("results") or []
+        log.info("Page %d: %d entrie(s) found.", page_number, len(page_entries))
+        for entry in page_entries:
+            if entry.get("id") in cached_ids:
+                reached_cached_entry = True
+                break
+            new_entries.append(entry)
+        if reached_cached_entry or not body.get("next"):
+            break
+        page_number += 1
+    else:
+        log.warning("Hit MAX_TRANSACTIONS_PAGES (%d) without reaching a cached entry or the end of the ledger - it may be incomplete.", MAX_TRANSACTIONS_PAGES)
+
+    seen = set()
+    merged = []
+    for entry in new_entries + cached_entries:
+        key = entry.get("id")
+        if key in seen:
+            continue
+        seen.add(key)
+        merged.append(entry)
+
+    save_state(XIRR_CASHFLOWS_STATE_FILE, {"all_entries": merged})
+    log.info("Transaction ledger cache now holds %d entrie(s) (was %d before this run, %d new).", len(merged), len(cached_entries), len(new_entries))
+    return merged
+
+
+def compute_average_idle_cash(entries: list, start_date: str, end_date: str) -> float:
+    """Reconstruct the uninvested-cash/wallet balance for every day up to
+    end_date from the raw transaction rows (every entry's own `amount` is
+    already signed for its real cash-balance impact - see module
+    docstring, no per-type sign lookup needed) and return the day-weighted
+    average over [start_date, end_date].
+
+    Unlike PeerBerry's equivalent, this doesn't need an `opening_balance`
+    seed fetched from another API - the ledger is fetched back to account
+    inception (see get_cached_transactions()), so the running balance
+    simply starts at 0 on the day of the very first transaction.
+    """
+    try:
+        start = datetime.strptime(start_date, "%Y-%m-%d").date()
+        end = datetime.strptime(end_date, "%Y-%m-%d").date()
+    except ValueError:
+        return 0.0
+
+    daily_deltas: dict = {}
+    for entry in entries:
+        raw_date = entry.get("date")
+        raw_amount = entry.get("amount")
+        if not raw_date or raw_amount is None:
+            continue
+        try:
+            entry_date = datetime.strptime(raw_date, "%Y-%m-%d").date()
+        except ValueError:
+            continue
+        if entry_date > end:
+            continue
+        try:
+            amount = float(raw_amount)
+        except (TypeError, ValueError):
+            continue
+        daily_deltas[entry_date] = daily_deltas.get(entry_date, 0.0) + amount
+
+    if not daily_deltas:
+        return 0.0
+
+    running_balance = 0.0
+    total_balance = 0.0
+    day_count = 0
+    current = min(daily_deltas)
+    while current <= end:
+        running_balance += daily_deltas.get(current, 0.0)
+        if current >= start:
+            total_balance += running_balance
+            day_count += 1
+        current += timedelta(days=1)
+
+    if day_count == 0:
+        return running_balance
+    return total_balance / day_count
+
+
 def run() -> None:
     if not LOANCH_EMAIL or not LOANCH_PASSWORD:
         log.error("LOANCH_EMAIL and LOANCH_PASSWORD environment variables are required.")
         sys.exit(1)
+
+    # XIRR (like "total" elsewhere in this repo) is a LIVE-only snapshot
+    # metric (needs TODAY's real total account value as its final
+    # cashflow) - only ever computed/written for the real current month,
+    # same convention as Afranga/Swaper/Lendermarket/PeerBerry.
+    current_month = is_current_month()
+    today_date = get_report_now(REPORT_TIMEZONE).date()
 
     log.info("Starting Loanch diversification run (pure HTTP, no browser - see module docstring for the login() flow).")
 
@@ -428,6 +618,133 @@ def run() -> None:
         statement_totals["interest_paid"], statement_totals["rewards"],
     )
 
+    try:
+        uninvested_balance = fetch_dashboard_uninvested_balance(session)
+    except Exception:
+        log.exception("Failed to fetch Loanch's uninvested balance - 'total' will be invested-only, 'non investi' will not be updated.")
+        uninvested_balance = None
+
+    total_invested = sum(o["amount"] for o in originators)
+
+    # Since-inception XIRR (money-weighted return) + this month's Cash drag
+    # + the XIRR Bonus/Cash drag/Taxes-Frais pie-chart shares - see module
+    # docstring for the real per-transaction ledger this is built from.
+    all_entries = None
+    if current_month:
+        try:
+            log.info("Fetching the since-inception transaction ledger (cached where possible)...")
+            all_entries = get_cached_transactions(session)
+        except Exception:
+            log.exception("Failed to fetch the transaction ledger - XIRR/Cash drag will not be updated.")
+            all_entries = None
+
+    def _entry_date(entry: dict):
+        raw = entry.get("date")
+        if not raw:
+            return None
+        try:
+            return datetime.strptime(raw, "%Y-%m-%d").date()
+        except ValueError:
+            return None
+
+    def _entry_amount(entry: dict) -> float:
+        try:
+            return float(entry.get("amount") or 0.0)
+        except (TypeError, ValueError):
+            return 0.0
+
+    xirr_value = None
+    signed_cashflows = None
+    total_account_value = None
+    bonus_xirr_contribution = None
+    since_inception_date = None
+    lifetime_bonus = 0.0
+    if current_month and all_entries and uninvested_balance is not None:
+        total_account_value = total_invested + uninvested_balance
+        signed_cashflows = []
+        deposit_dates = []
+        for entry in all_entries:
+            entry_date = _entry_date(entry)
+            ttype = entry.get("transaction_type")
+            if entry_date is None or ttype not in (DEPOSIT_TYPE, WITHDRAWAL_TYPE):
+                continue
+            # `amount` is already signed for its cash-balance impact
+            # (Deposit positive, Withdrawal negative) - negate it for
+            # XIRR's own convention (money going INTO the platform is a
+            # negative cashflow, money coming back OUT is positive).
+            signed_cashflows.append((entry_date, -_entry_amount(entry)))
+            if ttype == DEPOSIT_TYPE:
+                deposit_dates.append(entry_date)
+
+        since_inception_date = min(deposit_dates) if deposit_dates else None
+        lifetime_bonus = sum(_entry_amount(e) for e in all_entries if e.get("transaction_type") == BONUS_TYPE)
+
+        signed_cashflows.append((today_date, total_account_value))
+
+        xirr_value = compute_xirr(signed_cashflows)
+        if xirr_value is None:
+            log.warning("Could not compute XIRR from %d cashflow(s) - XIRR row will not be updated.", len(signed_cashflows) - 1)
+        else:
+            log.info(
+                "Computed since-inception XIRR: %.2f%% (%d deposit/withdrawal cashflow(s), current total value %.2f EUR).",
+                xirr_value * 100, len(signed_cashflows) - 1, total_account_value,
+            )
+
+            if lifetime_bonus:
+                cashflows_without_bonus = signed_cashflows[:-1] + [(today_date, total_account_value - lifetime_bonus)]
+                xirr_without_bonus = compute_xirr(cashflows_without_bonus)
+                if xirr_without_bonus is not None:
+                    bonus_xirr_contribution = xirr_value - xirr_without_bonus
+                    log.info("Bonus's own share of XIRR: %.2f points.", bonus_xirr_contribution * 100)
+            else:
+                bonus_xirr_contribution = 0.0
+
+    cash_drag_value = None
+    cash_drag_xirr_contribution = None
+    taxes_xirr_contribution = None
+    if current_month and total_invested > 0 and all_entries is not None:
+        month_start_str = today_date.replace(day=1).strftime("%Y-%m-%d")
+        today_str = today_date.strftime("%Y-%m-%d")
+        avg_idle_cash_this_month = compute_average_idle_cash(all_entries, month_start_str, today_str)
+        cash_weight = avg_idle_cash_this_month / (avg_idle_cash_this_month + total_invested)
+        monthly_yield_rate = statement_totals["interest_paid"] / total_invested
+        cash_drag_value = cash_weight * monthly_yield_rate
+        log.info(
+            "Computed Cash drag: %.2f%% (avg idle cash %.2f EUR, cash weight %.2f%%, monthly yield %.2f%%).",
+            cash_drag_value * 100, avg_idle_cash_this_month, cash_weight * 100, monthly_yield_rate * 100,
+        )
+
+        if xirr_value is not None and signed_cashflows is not None and since_inception_date is not None:
+            avg_idle_cash_lifetime = compute_average_idle_cash(all_entries, since_inception_date.strftime("%Y-%m-%d"), today_str)
+            cash_weight_lifetime = avg_idle_cash_lifetime / (avg_idle_cash_lifetime + total_invested)
+            lifetime_interest_paid = sum(_entry_amount(e) for e in all_entries if e.get("transaction_type") == INTEREST_TYPE)
+            lifetime_yield_rate = lifetime_interest_paid / total_invested
+            cash_drag_lifetime_total = cash_weight_lifetime * lifetime_yield_rate
+            missed_earnings = cash_drag_lifetime_total * (avg_idle_cash_lifetime + total_invested)
+            cashflows_with_cash_invested = signed_cashflows[:-1] + [(today_date, total_account_value + missed_earnings)]
+            xirr_with_cash_invested = compute_xirr(cashflows_with_cash_invested)
+            if xirr_with_cash_invested is not None:
+                cash_drag_xirr_contribution = xirr_value - xirr_with_cash_invested
+                log.info(
+                    "XIRR share - cash drag: %.4f points (since-inception, avg idle cash %.2f EUR, missed earnings ~%.2f EUR).",
+                    cash_drag_xirr_contribution * 100, avg_idle_cash_lifetime, missed_earnings,
+                )
+
+            # transaction_type not in the confirmed set (see module
+            # docstring - 4/5/7/8/9 were never observed on this account) is
+            # conservatively bucketed here as an unclassified Taxes/Frais-
+            # style cost/adjustment.
+            known_types = (DEPOSIT_TYPE, WITHDRAWAL_TYPE, 2, 3, INTEREST_TYPE, BONUS_TYPE)
+            lifetime_unclassified = sum(_entry_amount(e) for e in all_entries if e.get("transaction_type") not in known_types)
+            if lifetime_unclassified:
+                cashflows_with_fees_cancelled = signed_cashflows[:-1] + [(today_date, total_account_value - lifetime_unclassified)]
+                xirr_with_fees_cancelled = compute_xirr(cashflows_with_fees_cancelled)
+                if xirr_with_fees_cancelled is not None:
+                    taxes_xirr_contribution = xirr_value - xirr_with_fees_cancelled
+                    log.info("XIRR share - taxes/frais: %.4f points (lifetime unclassified amount %.2f EUR).", taxes_xirr_contribution * 100, lifetime_unclassified)
+            else:
+                taxes_xirr_contribution = 0.0
+
     # Loanch's statement-report API has no gross/net/withholding-tax
     # breakdown (unlike Afranga/Bienpreter) - interest_paid is mapped to
     # both gross_interest_received/net_interest_received since it's the
@@ -439,8 +756,12 @@ def run() -> None:
     # surfaced under the standardized name - dissociated here too via
     # bonus_cashback_contest so it's ready to be written to its own Sheet
     # cell, separate from interest.
+    # "total" ("en cours") written to the Sheet is invested + uninvested,
+    # per user request 2026-08-14 (matching Bienprêter/Iuvo/Bricks/Lande's
+    # own convention) - falls back to invested-only if the uninvested
+    # balance couldn't be fetched.
     amounts = {
-        "total": sum(o["amount"] for o in originators),
+        "total": total_invested + uninvested_balance if uninvested_balance is not None else total_invested,
         "gross_interest_received": statement_totals["interest_paid"],
         "net_interest_received": statement_totals["interest_paid"],
         "withholding_tax": 0.0,
@@ -448,7 +769,6 @@ def run() -> None:
         "interest_paid": statement_totals["interest_paid"],
         "rewards": statement_totals["rewards"],
     }
-    current_month = is_current_month()
 
     fill_current_month_amounts(
         platform="Loanch",
@@ -459,10 +779,26 @@ def run() -> None:
     # Loanch's "total_bonus" ("rewards") is a promotional/referral reward -
     # a "prime", not a cashback/concours - written to its own dedicated
     # sub-row, never to the "Bonus" row itself (a SUM formula over
-    # prime/cashback/concours).
+    # prime/cashback/concours). "XIRR"/"Cash drag" and the XIRR
+    # Bonus/Cash drag/Taxes-Frais pie-chart shares (rows already added by
+    # the user, mirroring Afranga/Swaper/Lendermarket/PeerBerry's own
+    # blocks) are appended past the default max_rows=6 bound - only
+    # included when actually computed.
+    bonus_breakdown = {"prime": statement_totals["rewards"]}
+    if xirr_value is not None:
+        bonus_breakdown["XIRR"] = xirr_value
+    if cash_drag_value is not None:
+        bonus_breakdown["Cash drag"] = cash_drag_value
+    if bonus_xirr_contribution is not None:
+        bonus_breakdown["XIRR Bonus"] = bonus_xirr_contribution
+    if cash_drag_xirr_contribution is not None:
+        bonus_breakdown["XIRR Cash drag"] = cash_drag_xirr_contribution
+    if taxes_xirr_contribution is not None:
+        bonus_breakdown["XIRR Taxes/Frais"] = taxes_xirr_contribution
     fill_current_month_bonus_breakdown(
         platform="Loanch",
-        breakdown={"prime": statement_totals["rewards"]},
+        breakdown=bonus_breakdown,
+        max_rows=14,
     )
 
     loan_originators = [
@@ -473,11 +809,8 @@ def run() -> None:
     if current_month:
         fill_geographic_repartition_amounts(loan_originators, platform="Loanch")
 
-        try:
-            uninvested_balance = fetch_dashboard_uninvested_balance(session)
+        if uninvested_balance is not None:
             fill_geographic_repartition_uninvested_amount("Loanch", uninvested_balance)
-        except Exception:
-            log.exception("Failed to fetch/update Loanch's 'non investi' row.")
 
 
 if __name__ == "__main__":

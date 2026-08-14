@@ -411,8 +411,22 @@ def run() -> None:
     # never surfaced under the standardized name - dissociated here too
     # via bonus_cashback_contest so it's ready to be written to its own
     # Sheet cell, separate from interest.
+    total_invested = sum(l["remaining_principal"] for l in lenders)
+
+    # Needed both for "total"/"non investi" AND as part of XIRR's final "as
+    # if withdrawn today" total account value below - fetched once here,
+    # ahead of all three uses.
+    available_balance = fetch_account_balance(session, investor_id)
+    if available_balance is None:
+        log.warning("Could not fetch Lendermarket's available balance - 'total'/'non investi' and XIRR will not be updated.")
+
+    # "total" ("en cours") written to the Sheet is invested + uninvested,
+    # per user request 2026-08-14 (matching Bienprêter/Iuvo/Bricks/Lande's
+    # own convention) - falls back to invested-only if the available
+    # balance couldn't be fetched. `total_invested` itself stays
+    # invested-only, since it feeds the Cash drag/XIRR math below.
     amounts = {
-        "total": sum(l["remaining_principal"] for l in lenders),
+        "total": total_invested + available_balance if available_balance is not None else total_invested,
         "gross_interest_received": statement_totals["interest_received"],
         "net_interest_received": statement_totals["interest_received"],
         "withholding_tax": 0.0,
@@ -420,15 +434,6 @@ def run() -> None:
         "interest_received": statement_totals["interest_received"],
         "bonuses": statement_totals["bonuses"],
     }
-
-    total_invested = amounts["total"]
-
-    # Needed both for "non investi" (unchanged, existing feature) AND as
-    # part of XIRR's final "as if withdrawn today" total account value
-    # below - fetched once here, ahead of both uses.
-    available_balance = fetch_account_balance(session, investor_id)
-    if available_balance is None:
-        log.warning("Could not fetch Lendermarket's available balance - 'non investi' and XIRR will not be updated.")
 
     # Since-inception XIRR (money-weighted return) + this month's Cash
     # drag + the XIRR Bonus/Cash drag/Taxes-Frais pie-chart shares - see
@@ -523,7 +528,8 @@ def run() -> None:
             else:
                 taxes_xirr_contribution = 0.0
 
-    # "total" comes from a live balance call/summed active investments, and
+    # "total" comes from a live balance call/summed active investments plus
+    # the available (uninvested) balance, and
     # getInvestorAccountStatementSummary (the date-ranged statement API) has
     # no balance field (2026-08-06 investigation) - skip total for a
     # backfilled month.
