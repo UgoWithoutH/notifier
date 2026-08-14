@@ -252,6 +252,17 @@ def fetch_current_month_interest_received(page) -> dict:
     now = get_report_now(REPORT_TIMEZONE)
     start_date = now.replace(day=1).strftime("%Y-%m-%d")
     end_date = now.strftime("%Y-%m-%d")
+    return fetch_statement_totals(page, start_date, end_date)
+
+
+def fetch_statement_totals(page, start_date: str, end_date: str) -> dict:
+    """Same account-entries API call as fetch_current_month_interest_received()
+    (see that function's docstring for the endpoint/auth/field details),
+    generalized to an arbitrary [start_date, end_date] range (both
+    "YYYY-MM-DD") - used by run() to fetch SINCE-INCEPTION opening/closing
+    balance + earned interest (needed for a genuine since-inception "Cash
+    drag" share of XIRR), not just the current calendar month.
+    """
     log.info("Requesting account-entries API for booking dates %s to %s...", start_date, end_date)
 
     result = page.evaluate(
@@ -559,11 +570,26 @@ def run(headless: bool = True) -> None:
             uninvested_balance = None
 
         xirr_cashflow_entries = None
+        # Since-inception opening/closing balance + earned interest (same
+        # account-entries call as the monthly one above, just widened to
+        # the account's real start date) - needed so "Cash drag"'s own
+        # share of XIRR is computed over the SAME since-inception period as
+        # XIRR itself, not just this month extrapolated.
+        lifetime_statement_totals = None
         if current_month:
             try:
                 today_date = get_report_now(REPORT_TIMEZONE).strftime("%Y-%m-%d")
                 log.info("Fetching the since-inception XIRR cashflows (cached where possible)...")
                 xirr_cashflow_entries = get_cached_account_cashflows(page, today_date)
+
+                funding_dates = [
+                    e["date"] for e in xirr_cashflow_entries
+                    if e["transactionType"].strip().upper() == "FUNDING"
+                ]
+                if funding_dates:
+                    since_inception_date = min(funding_dates)
+                    log.info("Fetching since-inception statement totals (%s to %s)...", since_inception_date, today_date)
+                    lifetime_statement_totals = fetch_statement_totals(page, since_inception_date, today_date)
             except Exception:
                 log.exception("Failed to fetch the XIRR cashflow history - XIRR will not be updated.")
                 xirr_cashflow_entries = None
@@ -670,14 +696,20 @@ def run(headless: bool = True) -> None:
     # (verified live 2026-08-14 to match extract_balance()'s "non investi"
     # figure exactly).
     cash_drag_value = None
-    # Cash drag/taxes' own share of XIRR, on the same annualized percentage-
-    # point scale as XIRR itself (unlike "Cash drag" above, which is a
-    # monthly-only figure) - linearly annualized (*12, same convention as
-    # this Sheet's own "Rendement %" formula) since only this month's idle-
-    # cash figures are available, not a real since-inception average. Feeds
-    # the pie-chart breakdown requested alongside bonus_xirr_contribution.
+    # Cash drag/taxes' own share of XIRR, on the same since-inception,
+    # annualized percentage-point scale as XIRR itself (unlike "Cash drag"
+    # above, which is a monthly-only figure) - computed from
+    # lifetime_statement_totals (same account-entries call, widened to the
+    # account's real start date, fetched earlier in run()) instead of
+    # extrapolating this month x12, so it decomposes the SAME real XIRR
+    # value rather than a hypothetical "if every month looked like this
+    # one". Feeds the pie-chart breakdown requested alongside
+    # bonus_xirr_contribution.
     cash_drag_xirr_contribution = None
-    taxes_xirr_contribution = None
+    # Swaper has no withholding-tax data at all (never charged on this
+    # platform, see amounts["withholding_tax"] above) - always 0, since-
+    # inception or not, so no lifetime reconstruction is needed here.
+    taxes_xirr_contribution = 0.0 if current_month else None
     if current_month and statement_totals is not None and breakdown["total_invested"] > 0:
         avg_idle_cash = (statement_totals["opening_balance"] + statement_totals["closing_balance"]) / 2
         cash_weight = avg_idle_cash / (avg_idle_cash + breakdown["total_invested"])
@@ -688,12 +720,23 @@ def run(headless: bool = True) -> None:
             cash_drag_value * 100, avg_idle_cash, cash_weight * 100, monthly_yield_rate * 100,
         )
 
-        cash_drag_xirr_contribution = -(cash_drag_value * 12)
-        taxes_xirr_contribution = -((amounts["withholding_tax"] / breakdown["total_invested"]) * 12)
-        log.info(
-            "XIRR share - cash drag: %.2f points, taxes/frais: %.2f points.",
-            cash_drag_xirr_contribution * 100, taxes_xirr_contribution * 100,
-        )
+        if lifetime_statement_totals is not None and xirr_cashflow_entries:
+            funding_dates = [
+                e["date"] for e in xirr_cashflow_entries
+                if e["transactionType"].strip().upper() == "FUNDING"
+            ]
+            if funding_dates:
+                since_inception_date = datetime.strptime(min(funding_dates), "%Y-%m-%d").date()
+                years_elapsed = max((get_report_now(REPORT_TIMEZONE).date() - since_inception_date).days / 365.25, 1 / 365.25)
+                avg_idle_cash_lifetime = (lifetime_statement_totals["opening_balance"] + lifetime_statement_totals["closing_balance"]) / 2
+                cash_weight_lifetime = avg_idle_cash_lifetime / (avg_idle_cash_lifetime + breakdown["total_invested"])
+                lifetime_yield_rate = lifetime_statement_totals["earned_interest"] / breakdown["total_invested"]
+                cash_drag_lifetime_total = cash_weight_lifetime * lifetime_yield_rate
+                cash_drag_xirr_contribution = -(cash_drag_lifetime_total / years_elapsed)
+                log.info(
+                    "XIRR share - cash drag: %.4f points (since-inception, %.2f years), taxes/frais: %.2f points.",
+                    cash_drag_xirr_contribution * 100, years_elapsed, taxes_xirr_contribution * 100,
+                )
 
     # "total" comes from the "Currently Allocated" DOM widget, a LIVE-only
     # snapshot with no date param, and account-entries (the date-ranged
