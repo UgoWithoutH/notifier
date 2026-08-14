@@ -203,8 +203,19 @@ jobs:
       # pure-HTTP replay of its Laravel CSRF `_token` + TOTP login flow
       # instead (see diversification/afranga_diversification.py's module
       # docstring) - just `requests`/`pyotp`, already in requirements.txt.
-      # No session/cookie persistence either (that login flow is
-      # lightweight enough to run fresh every time).
+      # No session/cookie persistence needed (that login flow is
+      # lightweight enough to run fresh every time) - the XIRR cashflow
+      # cache below is unrelated to login, it just avoids re-fetching the
+      # account's entire Details history every run.
+
+      - name: Restore persisted state (XIRR cashflow cache)
+        uses: actions/cache/restore@v4
+        with:
+          path: diversification/afranga_xirr_cashflows_state.json
+          key: afranga-diversification-state-${{ github.run_id }}
+          restore-keys: |
+            afranga-diversification-state-
+
       - name: Run Afranga diversification report
         env:
           AFRANGA_EMAIL: ${{ secrets.AFRANGA_EMAIL }}
@@ -213,6 +224,13 @@ jobs:
           GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
           GOOGLE_CREDENTIALS: ${{ secrets.GOOGLE_CREDENTIALS }}
         run: bash scripts/run_diversification_for_month_range.sh diversification.afranga_diversification "${{ github.event.inputs.start_month }}" "${{ github.event.inputs.end_month }}"
+
+      - name: Save persisted state (XIRR cashflow cache) for the next run
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: diversification/afranga_xirr_cashflows_state.json
+          key: afranga-diversification-state-${{ github.run_id }}
 
   bienpreter:
     needs: afranga
@@ -237,8 +255,19 @@ jobs:
       # pure-HTTP replay of its login form instead (see
       # diversification/bienpreter_diversification.py's module docstring) -
       # just `requests`, already in requirements.txt. No session/cookie
-      # persistence either (that login flow is lightweight enough to run
-      # fresh every time).
+      # persistence needed for login (that flow is lightweight enough to
+      # run fresh every time) - the XIRR cashflow cache below is unrelated
+      # to login, it just avoids re-fetching the account's entire
+      # /u/operations history every run.
+
+      - name: Restore persisted state (XIRR cashflow cache)
+        uses: actions/cache/restore@v4
+        with:
+          path: diversification/bienpreter_xirr_cashflows_state.json
+          key: bienpreter-diversification-state-${{ github.run_id }}
+          restore-keys: |
+            bienpreter-diversification-state-
+
       - name: Run Bienpreter diversification report
         env:
           BIENPRETER_EMAIL: ${{ secrets.BIENPRETER_EMAIL }}
@@ -246,6 +275,13 @@ jobs:
           GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
           GOOGLE_CREDENTIALS: ${{ secrets.GOOGLE_CREDENTIALS }}
         run: bash scripts/run_diversification_for_month_range.sh diversification.bienpreter_diversification "${{ github.event.inputs.start_month }}" "${{ github.event.inputs.end_month }}"
+
+      - name: Save persisted state (XIRR cashflow cache) for the next run
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: diversification/bienpreter_xirr_cashflows_state.json
+          key: bienpreter-diversification-state-${{ github.run_id }}
 
   lendermarket:
     needs: bienpreter
@@ -270,8 +306,19 @@ jobs:
       # pure-HTTP replay of its CSRF/XSRF + TOTP login flow instead (see
       # monitors/lendermarket_monitor.py's module docstring) - just
       # `requests`/`pyotp`, already in requirements.txt. No session/cookie
-      # persistence either (that login flow is lightweight enough to run
-      # fresh every time).
+      # persistence needed for LOGIN (that flow is lightweight enough to
+      # run fresh every time) - the XIRR cache below is unrelated to
+      # login, it just avoids re-fetching the account's entire monthly
+      # statement history every run.
+
+      - name: Restore persisted state (XIRR cashflow cache)
+        uses: actions/cache/restore@v4
+        with:
+          path: diversification/lendermarket_xirr_cashflows_state.json
+          key: lendermarket-diversification-state-${{ github.run_id }}
+          restore-keys: |
+            lendermarket-diversification-state-
+
       - name: Run Lendermarket diversification report
         env:
           LENDERMARKET_EMAIL: ${{ secrets.LENDERMARKET_EMAIL }}
@@ -280,6 +327,13 @@ jobs:
           GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
           GOOGLE_CREDENTIALS: ${{ secrets.GOOGLE_CREDENTIALS }}
         run: bash scripts/run_diversification_for_month_range.sh diversification.lendermarket_diversification "${{ github.event.inputs.start_month }}" "${{ github.event.inputs.end_month }}"
+
+      - name: Save persisted state (XIRR cashflow cache) for the next run
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: diversification/lendermarket_xirr_cashflows_state.json
+          key: lendermarket-diversification-state-${{ github.run_id }}
 
   loanch:
     needs: lendermarket
