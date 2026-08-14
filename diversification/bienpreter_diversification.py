@@ -89,7 +89,36 @@ tax rate). Verified this page is ALSO plain server-rendered HTML reachable
 via a normal `session.get(...)` with the same date-range/page query params
 used in the original Playwright build - same row markup
 (`.transaction__name`/`.transaction__amount`/`.transaction__interests`),
-same "one placeholder row on out-of-range pages" pagination quirk.
+same "one placeholder row on out-of-range pages" pagination quirk. Also
+sums a real "Bonus" row type (confirmed live 2026-08-14 - a genuine
+transaction label, not a placeholder) into `bonus_total`, replacing the
+old hardcoded 0.0 placeholder that predated this discovery.
+
+Added 2026-08-14: since-inception XIRR (money-weighted return) plus this
+month's Cash drag and the XIRR Bonus / XIRR Cash drag / XIRR Taxes/Frais
+pie-chart shares, mirroring swaper_diversification.py's/
+afranga_diversification.py's own XIRR blocks (see those modules'
+docstrings for the full methodology) - see fetch_all_operations()/
+get_cached_operations()/compute_average_idle_cash() below. IMPORTANT
+DIFFERENCE from Swaper/Afranga: Bienpreter's own operations table already
+carries a real per-row "Solde indicatif" running balance right after
+every transaction (`.transaction__balance`, verified live to match the
+dashboard's own "Solde disponible" exactly for the most recent row) - so
+Cash drag's day-by-day idle-cash reconstruction here just REPLAYS those
+real balance snapshots instead of reconstructing a running total from
+signed per-type deltas the way Swaper/Afranga have to (neither of those
+platforms expose a real per-transaction balance). Every operation type's
+amount here is ALSO already signed correctly by the site itself (deposits
+positive, investments/withdrawals/withholding tax negative, etc. -
+verified live across all 10 distinct transaction types this account has
+ever had) - no direction-class/type-to-sign mapping needed either, unlike
+Afranga's Details table. "Dépôt de fonds"/"Retrait de fonds" are the only
+real EXTERNAL cashflows (XIRR); "Vente de prêt" (loan resold on the
+secondary market) and "Rétractation de l'intention de prêt" (a loan
+commitment reversed) are internal reallocations, same treatment as
+Swaper's INVESTMENT/REPAYMENT/BUYBACK types - never treated as XIRR
+cashflows, but DO count for the day-by-day balance replay (their real
+"Solde indicatif" is used as-is).
 
 Required env vars:
     BIENPRETER_EMAIL, BIENPRETER_PASSWORD -> Bienpreter account credentials
@@ -105,6 +134,8 @@ import os
 import sys
 import html
 import logging
+from datetime import date, datetime, timedelta
+from pathlib import Path
 
 import requests
 from dotenv import load_dotenv
@@ -117,6 +148,8 @@ from shared.google_sheet import (
 )
 from shared.report_date import get_report_now, is_current_month
 from shared.notifier import send_bienpreter_geo_issues_email
+from shared.state import load_state, save_state
+from shared.xirr import compute_xirr
 
 load_dotenv()
 
@@ -134,6 +167,16 @@ MAX_OPERATIONS_PAGES = 300  # safety cap against an infinite loop if pagination 
 # "Current Month" quick filters. Pinned explicitly rather than relying on
 # the executing machine's local clock (e.g. UTC on a CI runner).
 REPORT_TIMEZONE = ZoneInfo("Europe/Paris")
+
+# Cache of every /u/operations row ever fetched (see get_cached_operations()
+# below) - same incremental-fetch idea as afranga_diversification.py's
+# XIRR_CASHFLOWS_STATE_FILE, avoids re-fetching the account's entire
+# history (77+ pages) on every run.
+XIRR_CASHFLOWS_STATE_FILE = Path(__file__).parent / "bienpreter_xirr_cashflows_state.json"
+XIRR_CASHFLOWS_STATE_DEFAULT = {"rows": [], "last_fetched_date": None}
+# XIRR is a since-inception money-weighted return (not per-month) - this
+# start date is early enough to cover any real account's full history.
+XIRR_HISTORY_START_DATE = date(2000, 1, 1)
 
 BIENPRETER_EMAIL = os.environ.get("BIENPRETER_EMAIL")
 BIENPRETER_PASSWORD = os.environ.get("BIENPRETER_PASSWORD")
@@ -454,7 +497,19 @@ def _fetch_operations_page(session: requests.Session, start_date: str, end_date:
     server-rendered HTML, no JSON API) filtered to the given date range,
     and extract each transaction row. See module docstring for the
     verified row markup (`.transaction__name`/`.transaction__amount`/
-    `.transaction__interests`)."""
+    `.transaction__interests`).
+
+    Also parses (added 2026-08-14, needed for XIRR/Cash drag below):
+    - "date": the row's own transaction date ("YYYY-MM-DD"), read from the
+      `.transaction__date` cell's `title` attribute (e.g.
+      "14/08/26 13:32", `%d/%m/%y %H:%M`) rather than its visible
+      "14/08/26" text - same value, just avoids a second regex+strip.
+    - "balance": the real "Solde indicatif" running balance right AFTER
+      this transaction (`.transaction__balance` cell) - verified live to
+      match the dashboard's own "Solde disponible" exactly for the most
+      recent row, so this can be replayed directly instead of
+      reconstructing a balance from summed per-type deltas.
+    """
     url = f"{OPERATIONS_URL}?selected-tab=1&startDate={start_date}&endDate={end_date}&page={page_number}"
     log.info("GET operations page %d for %s to %s...", page_number, start_date, end_date)
     r = session.get(url, timeout=30)
@@ -467,68 +522,192 @@ def _fetch_operations_page(session: requests.Session, start_date: str, end_date:
         name_match = re.search(r'transaction__name">(.*?)</p>', row_html, re.DOTALL)
         amount_match = re.search(r'transaction__amount[^"]*">(.*?)</', row_html, re.DOTALL)
         interest_matches = re.findall(r'transaction__interests[^"]*">(.*?)</', row_html, re.DOTALL)
+        date_match = re.search(r'transaction__date"\s+title="([^"]+)"', row_html, re.DOTALL)
+        balance_match = re.search(r'transaction__balance">(.*?)</', row_html, re.DOTALL)
+
+        row_date = None
+        if date_match:
+            try:
+                row_date = datetime.strptime(date_match.group(1).strip(), "%d/%m/%y %H:%M").strftime("%Y-%m-%d")
+            except ValueError:
+                row_date = None
+
         rows.append(
             {
                 "label": _strip_tags(name_match.group(1)) if name_match else None,
                 "amountText": _strip_tags(amount_match.group(1)) if amount_match else None,
                 "interestTexts": [_strip_tags(t) for t in interest_matches],
+                "date": row_date,
+                "balance": _parse_amount(_strip_tags(balance_match.group(1))) if balance_match else None,
             }
         )
     return rows
 
 
+def fetch_all_operations(session: requests.Session, start_date: str, end_date: str) -> list:
+    """Fetch EVERY /u/operations row within [start_date, end_date]
+    ("YYYY-MM-DD" strings), paginating via the `page` query param until a
+    page returns no real rows (bounded by MAX_OPERATIONS_PAGES as a safety
+    net) - the shared pagination loop behind both
+    fetch_current_month_interest_totals() (this month only) and
+    get_cached_operations() (full/incremental history, for XIRR/Cash drag).
+    """
+    all_rows = []
+    for page_number in range(1, MAX_OPERATIONS_PAGES + 1):
+        rows = _fetch_operations_page(session, start_date, end_date, page_number)
+        rows = [r for r in rows if r.get("label")]
+        log.info("Operations page %d (%s to %s): %d real row(s) found.", page_number, start_date, end_date, len(rows))
+        if not rows:
+            break
+        all_rows.extend(rows)
+    else:
+        log.warning(
+            "Hit MAX_OPERATIONS_PAGES (%d) without an empty page (%s to %s) - results may be truncated.",
+            MAX_OPERATIONS_PAGES, start_date, end_date,
+        )
+    return all_rows
+
+
+def get_cached_operations(session: requests.Session, end_date: date) -> list:
+    """Return every /u/operations row since account inception through
+    `end_date`, fetching from the site only the rows NOT already cached
+    locally (in XIRR_CASHFLOWS_STATE_FILE) - same incremental-fetch idea
+    as afranga_diversification.get_cached_account_details()/
+    swaper_diversification.get_cached_account_cashflows() (see those
+    docstrings for the full rationale). Re-fetches starting from the
+    cached `last_fetched_date` itself (not the day after) so a row booked
+    on that same day, added after the previous run already fetched it,
+    isn't missed - duplicates are dropped by deduplicating on
+    (date, label, amountText, balance): the real "balance" (a precise
+    running total) makes an accidental collision between two genuinely
+    different transactions extremely unlikely.
+    """
+    state = load_state(XIRR_CASHFLOWS_STATE_FILE, XIRR_CASHFLOWS_STATE_DEFAULT)
+    cached_rows = state.get("rows", [])
+    start_date = (
+        datetime.strptime(state["last_fetched_date"], "%Y-%m-%d").date()
+        if state.get("last_fetched_date") else XIRR_HISTORY_START_DATE
+    )
+
+    log.info(
+        "Found %d cached operation row(s) (last fetched up to %s) - fetching only %s to %s...",
+        len(cached_rows), state.get("last_fetched_date"), start_date, end_date,
+    )
+    new_rows = fetch_all_operations(session, start_date.strftime("%Y-%m-%d"), end_date.strftime("%Y-%m-%d"))
+
+    seen = set()
+    merged = []
+    for row in cached_rows + new_rows:
+        key = (row.get("date"), row.get("label"), row.get("amountText"), row.get("balance"))
+        if key in seen:
+            continue
+        seen.add(key)
+        merged.append(row)
+
+    save_state(XIRR_CASHFLOWS_STATE_FILE, {"rows": merged, "last_fetched_date": end_date.strftime("%Y-%m-%d")})
+    log.info("Operations cache now holds %d row(s) (was %d before this run).", len(merged), len(cached_rows))
+    return merged
+
+
+def compute_average_idle_cash(rows: list, start_date: str, end_date: str) -> float:
+    """Day-weighted average uninvested-cash balance across [start_date,
+    end_date] ("YYYY-MM-DD" strings). Unlike
+    swaper_diversification.compute_average_idle_cash()/
+    afranga_diversification.compute_average_idle_cash() (which both
+    reconstruct a running balance from summed signed per-type deltas,
+    since neither platform exposes a real per-transaction balance),
+    Bienpreter's own operations rows already carry the REAL "Solde
+    indicatif" balance right after every transaction (see
+    _fetch_operations_page()'s "balance" field) - so this just replays
+    those real snapshots day-by-day instead of reconstructing anything.
+    `rows` should be the FULL history (or at least back to before
+    `start_date`) so the balance carried INTO `start_date` is accurate -
+    passing only rows already restricted to [start_date, end_date] would
+    wrongly start the average from 0.0. Returns 0.0 if no dated/balanced
+    row is available at all (e.g. before the account's very first
+    transaction).
+    """
+    dated_balances = sorted(
+        ((r["date"], r["balance"]) for r in rows if r.get("date") and r.get("balance") is not None),
+        key=lambda t: t[0],
+    )
+    if not dated_balances:
+        return 0.0
+
+    try:
+        start = datetime.strptime(start_date, "%Y-%m-%d").date()
+        end = datetime.strptime(end_date, "%Y-%m-%d").date()
+    except ValueError:
+        return 0.0
+
+    balance_by_day = {}
+    for day_str, balance in dated_balances:
+        balance_by_day[day_str] = balance  # ascending order -> last write = latest same-day transaction
+
+    running_balance = 0.0  # before the account's very first transaction, balance is genuinely 0
+    start_str = start.strftime("%Y-%m-%d")
+    for day_str, balance in dated_balances:
+        if day_str >= start_str:
+            break
+        running_balance = balance
+
+    total_balance = 0.0
+    day_count = 0
+    current = start
+    while current <= end:
+        key = current.strftime("%Y-%m-%d")
+        if key in balance_by_day:
+            running_balance = balance_by_day[key]
+        total_balance += running_balance
+        day_count += 1
+        current += timedelta(days=1)
+
+    return total_balance / day_count if day_count else 0.0
+
+
 def fetch_current_month_interest_totals(session: requests.Session) -> dict:
     """Fetch this calendar month's interest received, split into net/gross/
-    withholding tax, from the "Toutes mes opérations" page. See module
-    docstring / historical Playwright-version docstring (kept in repo
-    memory) for the full reasoning behind reconstructing gross/net from
-    `.transaction__interests` + "Prélèvements fiscaux" rows instead of
-    `.transaction__amount` directly (Bienpreter loans are "In Fine" -
-    capital bundled into a repayment row's total would otherwise
-    contaminate the interest figure).
+    withholding tax (plus this month's real "Bonus" total, see below), from
+    the "Toutes mes op\u00e9rations" page. See module docstring / historical
+    Playwright-version docstring (kept in repo memory) for the full
+    reasoning behind reconstructing gross/net from `.transaction__interests`
+    + "Pr\u00e9l\u00e8vements fiscaux" rows instead of `.transaction__amount` directly
+    (Bienpreter loans are "In Fine" - capital bundled into a repayment
+    row's total would otherwise contaminate the interest figure).
 
-    Paginates via the `page` query param, stopping once a page returns no
-    real rows (bounded by MAX_OPERATIONS_PAGES as a safety net; out-of-
-    range pages render exactly one placeholder row with no `.transaction__name`,
-    filtered out before checking emptiness). Uses REPORT_TIMEZONE
-    (Europe/Paris) to decide "this month" (1st of the current month
-    through TODAY, not the full month).
+    Uses REPORT_TIMEZONE (Europe/Paris) to decide "this month" (1st of the
+    current month through TODAY, not the full month).
     """
     now = get_report_now(REPORT_TIMEZONE)
     start_date = now.replace(day=1).strftime("%Y-%m-%d")
     end_date = now.strftime("%Y-%m-%d")
 
+    rows = fetch_all_operations(session, start_date, end_date)
+
     gross_interest_received = 0.0
     withholding_tax = 0.0
+    bonus_total = 0.0
+    for row in rows:
+        for interest_text in row.get("interestTexts") or []:
+            gross_interest_received += _parse_amount(interest_text) or 0.0
 
-    for page_number in range(1, MAX_OPERATIONS_PAGES + 1):
-        rows = _fetch_operations_page(session, start_date, end_date, page_number)
-        rows = [r for r in rows if r.get("label")]
-        log.info("Operations page %d: %d real row(s) found.", page_number, len(rows))
-        if not rows:
-            break
-
-        for row in rows:
-            for interest_text in row.get("interestTexts") or []:
-                gross_interest_received += _parse_amount(interest_text) or 0.0
-
-            if (row.get("label") or "") == "Prélèvements fiscaux":
-                withholding_tax += abs(_parse_amount(row.get("amountText")) or 0.0)
-    else:
-        log.warning(
-            "Hit MAX_OPERATIONS_PAGES (%d) without an empty page - results may be truncated.",
-            MAX_OPERATIONS_PAGES,
-        )
+        label = row.get("label") or ""
+        if label == "Pr\u00e9l\u00e8vements fiscaux":
+            withholding_tax += abs(_parse_amount(row.get("amountText")) or 0.0)
+        elif label == "Bonus":
+            bonus_total += abs(_parse_amount(row.get("amountText")) or 0.0)
 
     net_interest_received = gross_interest_received - withholding_tax
     log.info(
-        "Parsed interest totals: gross_interest_received=%.2f, withholding_tax=%.2f, net_interest_received=%.2f",
-        gross_interest_received, withholding_tax, net_interest_received,
+        "Parsed interest totals: gross_interest_received=%.2f, withholding_tax=%.2f, "
+        "net_interest_received=%.2f, bonus_total=%.2f",
+        gross_interest_received, withholding_tax, net_interest_received, bonus_total,
     )
     return {
         "net_interest_received": net_interest_received,
         "withholding_tax": withholding_tax,
         "gross_interest_received": gross_interest_received,
+        "bonus_total": bonus_total,
     }
 
 
@@ -554,33 +733,149 @@ def run() -> None:
         interest_totals = fetch_current_month_interest_totals(session)
     except Exception:
         log.exception("Failed to fetch this month's interest totals - defaulting all figures to 0.0.")
-        interest_totals = {"net_interest_received": 0.0, "withholding_tax": 0.0, "gross_interest_received": 0.0}
+        interest_totals = {
+            "net_interest_received": 0.0, "withholding_tax": 0.0,
+            "gross_interest_received": 0.0, "bonus_total": 0.0,
+        }
 
     total = balances["available_balance"] + balances["capital_to_receive"]
     interest_totals["total"] = total
-    # Verified 2026-07-17 (dumping every distinct .transaction__name label
-    # over the last 180 days): no bonus/cashback/contest TRANSACTION shows
-    # up in /u/operations (only Dépôt de fonds/Intention de prêt acceptée/
-    # Prélèvements fiscaux/Remboursement anticipé partiel-total/
-    # Remboursement mensuel/Retrait de fonds). HOWEVER this does NOT rule
-    # out a separate referral/parrainage page (/u/parrainage) the way it
-    # did for Swaper/Afranga - that page's investigation is BLOCKED by a
-    # reproducible Bienpreter-side server error on login ("DÉSOLÉ, IL
-    # SEMBLERAIT QUE NOUS AYONS RENCONTRÉ UN PROBLÈME"), not yet resolved.
-    # 0.0 here is a PLACEHOLDER pending that investigation, not a verified
-    # real value like the other platforms - revisit once the site recovers.
-    interest_totals["bonus_cashback_contest"] = 0.0
+    # UPDATED 2026-08-14: the 2026-07-17 "no bonus/cashback/contest
+    # TRANSACTION shows up in /u/operations" finding turned out to be
+    # stale - a real "Bonus" transaction type DOES exist on this account
+    # now (confirmed live 2026-08-14, 3 lifetime rows of 500/100/10 EUR) -
+    # bonus_total (this month's real sum, from fetch_current_month_interest_totals())
+    # replaces the old hardcoded 0.0 placeholder.
+    interest_totals["bonus_cashback_contest"] = interest_totals.get("bonus_total", 0.0)
     log.info(
         "Bienpreter: solde disponible=%.2f EUR + capital à recevoir=%.2f EUR = %.2f EUR",
         balances["available_balance"], balances["capital_to_receive"], total,
     )
     log.info(
         "This month's interest totals: gross_interest_received=%.2f EUR, net_interest_received=%.2f EUR, "
-        "withholding_tax=%.2f EUR",
-        interest_totals["gross_interest_received"], interest_totals["net_interest_received"], interest_totals["withholding_tax"],
+        "withholding_tax=%.2f EUR, bonus_total=%.2f EUR",
+        interest_totals["gross_interest_received"], interest_totals["net_interest_received"],
+        interest_totals["withholding_tax"], interest_totals["bonus_total"],
     )
 
+    # XIRR (like "total" elsewhere in this repo) is a LIVE-only snapshot
+    # metric (needs TODAY's real total account value as its final
+    # cashflow) - it can't be meaningfully backfilled for a past REPORT_DATE
+    # month, so it's only ever computed/written for the real current month.
     current_month = is_current_month()
+
+    # Since-inception XIRR (money-weighted return) + this month's/lifetime
+    # Cash drag + the XIRR Bonus/Cash drag/Taxes-Frais pie-chart shares -
+    # mirrors swaper_diversification.py's/afranga_diversification.py's own
+    # XIRR blocks (see those modules' docstrings for the full methodology;
+    # see THIS module's docstring for the Bienpreter-specific differences -
+    # a real per-transaction "Solde indicatif" balance is already on every
+    # /u/operations row, so no delta-reconstruction is needed here).
+    today_date = get_report_now(REPORT_TIMEZONE).date()
+    xirr_value = None
+    bonus_xirr_contribution = None
+    cash_drag_value = None
+    cash_drag_xirr_contribution = None
+    taxes_xirr_contribution = None
+
+    all_operations = None
+    if current_month:
+        try:
+            log.info("Fetching the since-inception operations history (cached where possible) for XIRR/Cash drag...")
+            all_operations = get_cached_operations(session, today_date)
+        except Exception:
+            log.exception("Failed to fetch the operations history - XIRR/Cash drag will not be updated.")
+            all_operations = None
+
+    total_invested = balances["capital_to_receive"]
+    if current_month and all_operations:
+        total_account_value = total  # solde disponible + capital à recevoir, same "as if withdrawn today" value used elsewhere in this repo
+
+        signed_cashflows = []
+        for row in all_operations:
+            if not row.get("date"):
+                continue
+            row_date = datetime.strptime(row["date"], "%Y-%m-%d").date()
+            amount = abs(_parse_amount(row.get("amountText")) or 0.0)
+            if row["label"] == "Dépôt de fonds":
+                signed_cashflows.append((row_date, -amount))
+            elif row["label"] == "Retrait de fonds":
+                signed_cashflows.append((row_date, amount))
+        signed_cashflows.sort(key=lambda t: t[0])
+        signed_cashflows.append((today_date, total_account_value))
+
+        xirr_value = compute_xirr(signed_cashflows)
+        if xirr_value is None:
+            log.warning("Could not compute XIRR from %d cashflow(s) - XIRR row will not be updated.", len(signed_cashflows) - 1)
+        else:
+            log.info(
+                "Computed since-inception XIRR: %.2f%% (%d deposit/withdrawal cashflow(s), current total value %.2f EUR).",
+                xirr_value * 100, len(signed_cashflows) - 1, total_account_value,
+            )
+
+            lifetime_bonus_total = sum(
+                abs(_parse_amount(r.get("amountText")) or 0.0) for r in all_operations if r["label"] == "Bonus"
+            )
+            if lifetime_bonus_total:
+                cashflows_without_bonus = signed_cashflows[:-1] + [(today_date, total_account_value - lifetime_bonus_total)]
+                xirr_without_bonus = compute_xirr(cashflows_without_bonus)
+                if xirr_without_bonus is not None:
+                    bonus_xirr_contribution = xirr_value - xirr_without_bonus
+                    log.info("Bonus's own share of XIRR: %.2f points.", bonus_xirr_contribution * 100)
+            else:
+                bonus_xirr_contribution = 0.0
+
+            lifetime_withholding_tax = sum(
+                abs(_parse_amount(r.get("amountText")) or 0.0) for r in all_operations if r["label"] == "Prélèvements fiscaux"
+            )
+            if lifetime_withholding_tax:
+                cashflows_with_taxes_cancelled = signed_cashflows[:-1] + [(today_date, total_account_value + lifetime_withholding_tax)]
+                xirr_with_taxes_cancelled = compute_xirr(cashflows_with_taxes_cancelled)
+                if xirr_with_taxes_cancelled is not None:
+                    taxes_xirr_contribution = xirr_value - xirr_with_taxes_cancelled
+                    log.info(
+                        "XIRR share - taxes/frais: %.4f points (lifetime withholding tax %.2f EUR).",
+                        taxes_xirr_contribution * 100, lifetime_withholding_tax,
+                    )
+            else:
+                taxes_xirr_contribution = 0.0
+
+            if total_invested > 0:
+                month_start_str = today_date.replace(day=1).strftime("%Y-%m-%d")
+                today_str = today_date.strftime("%Y-%m-%d")
+                avg_idle_cash = compute_average_idle_cash(all_operations, month_start_str, today_str)
+                cash_weight = avg_idle_cash / (avg_idle_cash + total_invested)
+                monthly_yield_rate = interest_totals["gross_interest_received"] / total_invested
+                cash_drag_value = cash_weight * monthly_yield_rate
+                log.info(
+                    "Computed Cash drag: %.2f%% (avg idle cash %.2f EUR, cash weight %.2f%%, monthly yield %.2f%%).",
+                    cash_drag_value * 100, avg_idle_cash, cash_weight * 100, monthly_yield_rate * 100,
+                )
+
+                deposit_dates = [r["date"] for r in all_operations if r.get("date") and r["label"] == "Dépôt de fonds"]
+                if deposit_dates:
+                    since_inception_date = datetime.strptime(min(deposit_dates), "%Y-%m-%d").date()
+                    years_elapsed = max((today_date - since_inception_date).days / 365.25, 1 / 365.25)
+                    lifetime_gross_interest = sum(
+                        _parse_amount(t) or 0.0 for r in all_operations for t in (r.get("interestTexts") or [])
+                    )
+                    avg_idle_cash_lifetime = compute_average_idle_cash(
+                        all_operations, since_inception_date.strftime("%Y-%m-%d"), today_str
+                    )
+                    cash_weight_lifetime = avg_idle_cash_lifetime / (avg_idle_cash_lifetime + total_invested)
+                    lifetime_yield_rate = lifetime_gross_interest / total_invested
+                    cash_drag_lifetime_total = cash_weight_lifetime * lifetime_yield_rate
+                    missed_earnings = cash_drag_lifetime_total * (avg_idle_cash_lifetime + total_invested)
+                    cashflows_with_cash_invested = signed_cashflows[:-1] + [
+                        (today_date, total_account_value + missed_earnings)
+                    ]
+                    xirr_with_cash_invested = compute_xirr(cashflows_with_cash_invested)
+                    if xirr_with_cash_invested is not None:
+                        cash_drag_xirr_contribution = xirr_value - xirr_with_cash_invested
+                        log.info(
+                            "XIRR share - cash drag: %.4f points (since-inception, %.2f years, missed earnings ~%.2f EUR).",
+                            cash_drag_xirr_contribution * 100, years_elapsed, missed_earnings,
+                        )
 
     # "total" = solde disponible + capital à recevoir, both scraped from
     # LIVE-only dashboard widgets with no date param and no historical/
@@ -592,19 +887,33 @@ def run() -> None:
         skip_total=not current_month,
     )
 
-    # Placeholder write (see the comment above bonus_cashback_contest) -
-    # writes 0.0 into "prime" for now (a referral bonus, if one is ever
-    # confirmed, would be a "prime" - not a cashback/concours). Update the
-    # breakdown/category once /u/parrainage can actually be investigated.
-    # "prélèvements" (withholding tax on interest, real figure - see
-    # fetch_current_month_interest_totals()) is a separate sub-row in the
-    # same block, right before "Rendements %" - verified live 2026-08-05.
+    # "prime" now gets the real "Bonus" transaction total (see above -
+    # replaces the old placeholder). "prélèvements" (withholding tax on
+    # interest, real figure - see fetch_current_month_interest_totals())
+    # is a separate sub-row in the same block, right before "Rendements %"
+    # - verified live 2026-08-05. "Cash drag"/"XIRR"/"XIRR Bonus"/
+    # "XIRR Cash drag"/"XIRR Taxes/Frais" (added 2026-08-14, only included
+    # when actually computed) sit right after "concours" - verified live
+    # at platform_row+9 through +13, `max_rows=14` keeps the search bounded
+    # before the next platform block ("Hive5", platform_row+16).
+    bonus_breakdown = {
+        "prime": interest_totals["bonus_cashback_contest"],
+        "prélèvements": interest_totals["withholding_tax"],
+    }
+    if cash_drag_value is not None:
+        bonus_breakdown["Cash drag"] = cash_drag_value
+    if xirr_value is not None:
+        bonus_breakdown["XIRR"] = xirr_value
+    if bonus_xirr_contribution is not None:
+        bonus_breakdown["XIRR Bonus"] = bonus_xirr_contribution
+    if cash_drag_xirr_contribution is not None:
+        bonus_breakdown["XIRR Cash drag"] = cash_drag_xirr_contribution
+    if taxes_xirr_contribution is not None:
+        bonus_breakdown["XIRR Taxes/Frais"] = taxes_xirr_contribution
     fill_current_month_bonus_breakdown(
         platform="Bienprêter",
-        breakdown={
-            "prime": interest_totals["bonus_cashback_contest"],
-            "prélèvements": interest_totals["withholding_tax"],
-        },
+        breakdown=bonus_breakdown,
+        max_rows=14,
     )
 
     # "Répartition géographique" per-borrower breakdown (added 2026-07-31,

@@ -32,6 +32,49 @@ bienpreter_diversification.fetch_current_month_interest_totals(). Unlike
 Bienpreter, Lendermarket has a clean, ready-made JSON summary endpoint for
 this - no gross/net/tax reconstruction needed here.
 
+Also computes a since-inception XIRR (money-weighted return) plus this
+month's Cash drag and the XIRR Bonus / XIRR Cash drag / XIRR Taxes/Frais
+pie-chart shares, mirroring afranga_diversification.py/
+swaper_diversification.py's own XIRR block (see those modules' docstrings
+for the full methodology) - with ONE real difference, confirmed live
+2026-08-14: getInvestorAccountStatementSummary (the ONLY statement-history
+endpoint Lendermarket exposes - verified live by probing a dozen
+plausible per-transaction/"ledger"/"payments" endpoint names, all 404,
+and by grepping the /fr/statement SPA's own loaded JS bundles for any
+`/ledger|claims|payments|wallet/v*/...` path literal, none found) only
+ever returns AGGREGATE totals for an arbitrary [startDate, endDate] range
+(openingBalance/closingBalance/investorDepositsAmount/
+investorWithdrawalsAmount/investorReceivedInterestsAmount/
+investorReceivedDelayedInterestsAmount/investorBonusesAmount/
+investorFeeAmount/...) - there is NO per-transaction dated ledger like
+Afranga's "Details" table or Swaper's account-entries API. So instead of
+real per-transaction dates, this queries the summary endpoint ONCE PER
+CALENDAR MONTH since account inception (cached incrementally, see
+get_cached_monthly_summaries()/lendermarket_xirr_cashflows_state.json
+below) and:
+  - builds ONE XIRR cashflow per month with a nonzero net
+    deposit/withdrawal, dated on the 15th of that month (a deliberate
+    mid-month approximation - the best available without real per-day
+    dates - capped to the month's own queried end date so a still-open
+    current month never gets a "future" cashflow date);
+  - reconstructs "Cash drag" using each month's own (opening+closing)/2
+    balance, day-weighted by how many days that month's query actually
+    covered - a MONTHLY-granularity idle-cash average, not the day-by-day
+    reconstruction Afranga/Swaper's Cash drag uses (their platforms expose
+    a real per-transaction ledger, Lendermarket doesn't) - documented here
+    as a known, deliberate approximation, not a bug;
+  - sums each month's own real `investorBonusesAmount`/`investorFeeAmount`
+    for the lifetime Bonus/Taxes-Frais XIRR counterfactual shares (same
+    add-back-and-recompute-XIRR technique as Afranga) - `investorFeeAmount`
+    is a REAL field (confirmed 0.00 on the live test account so far, same
+    "genuinely zero, not a placeholder" convention as every other verified-
+    but-currently-zero figure elsewhere in this repo).
+The account's inception month is found via a short yearly-then-monthly
+scan (see _find_first_active_year()) rather than assuming a fixed start
+date, since Lendermarket accounts are typically much younger than e.g.
+Swaper's - looping monthly from an arbitrarily old fixed date would waste
+many empty-month API calls on the very first run.
+
 Required env vars:
     LENDERMARKET_EMAIL, LENDERMARKET_PASSWORD  -> Lendermarket credentials
 Optional:
@@ -44,8 +87,11 @@ Optional:
                                                    (see google_sheet.py)
 """
 
+import calendar
 import logging
 import sys
+from datetime import date, datetime
+from pathlib import Path
 from zoneinfo import ZoneInfo
 
 import requests
@@ -58,6 +104,8 @@ from shared.google_sheet import (
     fill_geographic_repartition_uninvested_amount,
 )
 from shared.report_date import get_report_now, is_current_month
+from shared.state import load_state, save_state
+from shared.xirr import compute_xirr
 
 load_dotenv()
 
@@ -76,6 +124,18 @@ STATEMENT_SUMMARY_API_URL = "https://api.lendermarket.com/ledger/v1/investor/get
 # sends. Pinned explicitly rather than relying on the executing machine's
 # local clock (e.g. UTC on a CI runner).
 REPORT_TIMEZONE = ZoneInfo("Europe/Paris")
+
+# Cache of one aggregate summary per calendar month since account
+# inception (see get_cached_monthly_summaries() below) - same incremental-
+# fetch idea as afranga_diversification.py's XIRR_CASHFLOWS_STATE_FILE,
+# just keyed by month instead of by individual dated row (Lendermarket has
+# no per-transaction ledger - see module docstring).
+XIRR_CASHFLOWS_STATE_FILE = Path(__file__).parent / "lendermarket_xirr_cashflows_state.json"
+XIRR_CASHFLOWS_STATE_DEFAULT = {"monthly_summaries": {}, "last_fetched_month": None}
+# Conservative floor for the one-time yearly scan used to find the
+# account's real inception year (see _find_first_active_year()) - well
+# before Lendermarket existed, just a safety bound on the scan length.
+XIRR_HISTORY_FALLBACK_START_YEAR = 2015
 
 
 def fetch_investments(session: requests.Session, investor_id: str) -> list:
@@ -130,39 +190,31 @@ def aggregate_by_lender(investments: list) -> list:
     return lenders
 
 
-def fetch_current_month_statement_totals(session: requests.Session, investor_id: str) -> dict:
-    """Fetch this calendar month's "Intérêts reçus", "Intérêts de retard
-    reçus" and "Primes promotionnelles et bonus", as shown in the summary
-    panel of the Account Statement page
-    (https://app.lendermarket.com/fr/statement), via the same JSON API the
-    page's own "Mois en cours" quick filter calls.
+def fetch_statement_summary(session: requests.Session, investor_id: str, start_date: date, end_date: date) -> dict:
+    """Fetch getInvestorAccountStatementSummary for an arbitrary
+    [start_date, end_date] range - generalized 2026-08-14 (was
+    fetch_current_month_statement_totals(), hardcoded to the current
+    calendar month - kept below as a thin wrapper) so run() can ALSO query
+    this once per calendar month since account inception, needed to build
+    XIRR's monthly-approximated cashflows/Cash drag reconstruction (see
+    module docstring - this endpoint has no per-transaction dated ledger).
 
-    Verified against the real account on 2026-07-10 (and re-verified via
-    pure HTTP on 2026-07-18):
+    Verified against the real account on 2026-07-10/2026-08-14:
 
-        GET https://api.lendermarket.com/ledger/v1/investor/getInvestorAccountStatementSummary?currency=EUR&startDate=2026-07-01&endDate=2026-07-10
-        -> {"data": {"investorReceivedInterestsAmount": "7.32",
-                     "investorReceivedDelayedInterestsAmount": "0.03",
-                     "investorBonusesAmount": "0.00", ...}}
-
-    which matched the page's own displayed "Intérêts reçus" (7,32 €),
-    "Intérêts de retard reçus" (0,03 €) and "Primes promotionnelles et
-    bonus" (0,00 €) figures exactly. Per explicit user instructions, the
-    first two are summed into a single "interest received" figure.
-
-    Uses REPORT_TIMEZONE (Europe/Paris) rather than the executing machine's
-    local clock to decide what "this month" means, so this stays correct
-    regardless of where/when (e.g. a UTC CI runner around midnight) this
-    script actually runs.
+        GET .../ledger/v1/investor/getInvestorAccountStatementSummary?currency=EUR&startDate=...&endDate=...
+        -> {"data": {"openingBalance": "0.00", "investorDepositsAmount": "6001.00",
+                     "investorInvestmentAmount": "12385.57", "investorReceivedPrincipalAmount": "6200.35",
+                     "investorReceivedInterestsAmount": "161.79", "investorReceivedDelayedInterestsAmount": "13.48",
+                     "investorWithdrawalsAmount": "0.00", "investorBonusesAmount": "17.00",
+                     "investorFeeAmount": "0.00", "closingBalance": "8.05", ...}}
     """
-    now = get_report_now(REPORT_TIMEZONE)
-    start_date = now.replace(day=1).strftime("%Y-%m-%d")
-    end_date = now.strftime("%Y-%m-%d")
-    log.info("Requesting account statement summary API for %s to %s...", start_date, end_date)
+    start_str = start_date.strftime("%Y-%m-%d")
+    end_str = end_date.strftime("%Y-%m-%d")
+    log.info("Requesting account statement summary API for %s to %s...", start_str, end_str)
 
     r = session.get(
         STATEMENT_SUMMARY_API_URL,
-        params={"currency": "EUR", "startDate": start_date, "endDate": end_date},
+        params={"currency": "EUR", "startDate": start_str, "endDate": end_str},
         headers=_xsrf_headers(session, investor_id),
         timeout=20,
     )
@@ -172,36 +224,152 @@ def fetch_current_month_statement_totals(session: requests.Session, investor_id:
 
     data = (r.json() or {}).get("data") or {}
     log.info("Raw statement summary data: %r", data)
-    try:
-        interest_received = float(data.get("investorReceivedInterestsAmount") or 0.0)
-    except (TypeError, ValueError):
-        log.warning("Could not parse 'investorReceivedInterestsAmount' %r - defaulting to 0.0.", data.get("investorReceivedInterestsAmount"))
-        interest_received = 0.0
-    try:
-        delayed_interest_received = float(data.get("investorReceivedDelayedInterestsAmount") or 0.0)
-    except (TypeError, ValueError):
-        log.warning("Could not parse 'investorReceivedDelayedInterestsAmount' %r - defaulting to 0.0.", data.get("investorReceivedDelayedInterestsAmount"))
-        delayed_interest_received = 0.0
-    try:
-        bonuses = float(data.get("investorBonusesAmount") or 0.0)
-    except (TypeError, ValueError):
-        log.warning("Could not parse 'investorBonusesAmount' %r - defaulting to 0.0.", data.get("investorBonusesAmount"))
-        bonuses = 0.0
+
+    def _amount(key):
+        try:
+            return float(data.get(key) or 0.0)
+        except (TypeError, ValueError):
+            log.warning("Could not parse %r %r - defaulting to 0.0.", key, data.get(key))
+            return 0.0
+
+    interest_received = _amount("investorReceivedInterestsAmount") + _amount("investorReceivedDelayedInterestsAmount")
+    bonuses = _amount("investorBonusesAmount")
+    fees = _amount("investorFeeAmount")
+    opening_balance = _amount("openingBalance")
+    closing_balance = _amount("closingBalance")
+    deposits = _amount("investorDepositsAmount")
+    withdrawals = _amount("investorWithdrawalsAmount")
 
     log.info(
-        "Parsed statement totals: interest_received=%.2f (incl. delayed=%.2f), bonuses=%.2f",
-        interest_received + delayed_interest_received, delayed_interest_received, bonuses,
+        "Parsed statement totals: interest_received=%.2f, bonuses=%.2f, fees=%.2f, "
+        "opening_balance=%.2f, closing_balance=%.2f, deposits=%.2f, withdrawals=%.2f",
+        interest_received, bonuses, fees, opening_balance, closing_balance, deposits, withdrawals,
     )
     return {
-        "interest_received": interest_received + delayed_interest_received,
+        "interest_received": interest_received,
         "bonuses": bonuses,
+        "fees": fees,
+        "opening_balance": opening_balance,
+        "closing_balance": closing_balance,
+        "deposits": deposits,
+        "withdrawals": withdrawals,
     }
+
+
+def fetch_current_month_statement_totals(session: requests.Session, investor_id: str) -> dict:
+    """Thin wrapper around fetch_statement_summary() for the current
+    calendar month (1st of the month through today) - see that function's
+    docstring for the endpoint/parsing details."""
+    now = get_report_now(REPORT_TIMEZONE)
+    return fetch_statement_summary(session, investor_id, now.replace(day=1).date(), now.date())
+
+
+def _find_first_active_year(session: requests.Session, investor_id: str, today: date) -> int:
+    """Find the account's real inception year via a short yearly scan
+    (Jan 1 through Dec 31, or today for the current year) starting at
+    XIRR_HISTORY_FALLBACK_START_YEAR - returns the first year with a
+    nonzero opening balance, deposit, or withdrawal. Falls back to
+    `today.year` (a young/brand-new account) if none is found - this only
+    ever runs ONCE (the very first time the cache file doesn't exist yet),
+    every later run reuses the cached `last_fetched_month` instead."""
+    for year in range(XIRR_HISTORY_FALLBACK_START_YEAR, today.year + 1):
+        year_start = date(year, 1, 1)
+        year_end = min(date(year, 12, 31), today)
+        summary = fetch_statement_summary(session, investor_id, year_start, year_end)
+        if summary["opening_balance"] or summary["deposits"] or summary["withdrawals"]:
+            log.info("First active year found: %d.", year)
+            return year
+    log.info("No activity found back to %d - treating %d as the inception year.", XIRR_HISTORY_FALLBACK_START_YEAR, today.year)
+    return today.year
+
+
+def get_cached_monthly_summaries(session: requests.Session, investor_id: str, today: date) -> dict:
+    """Return `{"YYYY-MM": {...fetch_statement_summary()'s dict..., "days_covered": N}}`
+    since account inception, fetching from getInvestorAccountStatementSummary
+    only the calendar months not already cached locally (in
+    XIRR_CASHFLOWS_STATE_FILE) - same incremental-fetch idea as
+    afranga_diversification.get_cached_account_details(), just keyed by
+    month instead of by individual dated row (see module docstring for
+    why: Lendermarket has no per-transaction ledger, only range
+    aggregates).
+
+    Re-fetches starting from the cached `last_fetched_month` itself (not
+    the month after) so a still-partial current month gets its totals
+    refreshed on every run, not just newly-added months - overwrites that
+    one cache entry rather than appending a duplicate.
+    """
+    state = load_state(XIRR_CASHFLOWS_STATE_FILE, XIRR_CASHFLOWS_STATE_DEFAULT)
+    monthly_summaries = dict(state.get("monthly_summaries") or {})
+    last_fetched_month = state.get("last_fetched_month")
+
+    if last_fetched_month:
+        start_year, start_month = (int(part) for part in last_fetched_month.split("-"))
+    else:
+        log.info("No cached monthly summaries found - scanning for the account's inception year...")
+        start_year = _find_first_active_year(session, investor_id, today)
+        start_month = 1
+
+    log.info(
+        "Found %d cached monthly summary(ies) (last fetched: %s) - fetching from %04d-%02d through %04d-%02d...",
+        len(monthly_summaries), last_fetched_month, start_year, start_month, today.year, today.month,
+    )
+
+    year, month = start_year, start_month
+    while (year, month) <= (today.year, today.month):
+        month_start = date(year, month, 1)
+        last_day_of_month = calendar.monthrange(year, month)[1]
+        month_end = min(date(year, month, last_day_of_month), today)
+        summary = fetch_statement_summary(session, investor_id, month_start, month_end)
+        summary["days_covered"] = (month_end - month_start).days + 1
+        summary["end_date"] = month_end.strftime("%Y-%m-%d")
+        monthly_summaries[f"{year:04d}-{month:02d}"] = summary
+
+        if month == 12:
+            year, month = year + 1, 1
+        else:
+            month += 1
+
+    save_state(XIRR_CASHFLOWS_STATE_FILE, {
+        "monthly_summaries": monthly_summaries,
+        "last_fetched_month": f"{today.year:04d}-{today.month:02d}",
+    })
+    log.info("Monthly summaries cache now holds %d month(s).", len(monthly_summaries))
+    return monthly_summaries
+
+
+def compute_average_idle_cash(monthly_summaries: dict) -> float:
+    """Day-weighted average of each cached month's own (opening+closing)/2
+    balance, weighted by how many days that month's own query covered -
+    the best idle-cash reconstruction available at Lendermarket's real
+    data granularity (monthly aggregates only, no per-transaction ledger -
+    see module docstring). NOT a day-by-day reconstruction like Afranga/
+    Swaper's own compute_average_idle_cash() - deliberately documented
+    here as a coarser approximation, not a bug."""
+    total_weighted = 0.0
+    total_days = 0
+    for summary in monthly_summaries.values():
+        days = summary.get("days_covered") or 0
+        if days <= 0:
+            continue
+        midpoint = (summary["opening_balance"] + summary["closing_balance"]) / 2
+        total_weighted += midpoint * days
+        total_days += days
+    if total_days == 0:
+        return 0.0
+    return total_weighted / total_days
 
 
 def run() -> None:
     if not LENDERMARKET_EMAIL or not LENDERMARKET_PASSWORD:
         log.error("LENDERMARKET_EMAIL and LENDERMARKET_PASSWORD environment variables are required.")
         sys.exit(1)
+
+    # XIRR (like "total" elsewhere in this repo) is a LIVE-only snapshot
+    # metric (needs TODAY's real total account value as its final
+    # cashflow) - only ever computed/written for the real current month,
+    # same convention as Afranga/Swaper.
+    current_month = is_current_month()
+    today_date = get_report_now(REPORT_TIMEZONE).date()
 
     log.info("Starting Lendermarket diversification run (pure HTTP, no browser).")
 
@@ -216,8 +384,11 @@ def run() -> None:
     try:
         statement_totals = fetch_current_month_statement_totals(session, investor_id)
     except Exception:
-        log.exception("Failed to fetch this month's interest received/bonuses - defaulting both to 0.0.")
-        statement_totals = {"interest_received": 0.0, "bonuses": 0.0}
+        log.exception("Failed to fetch this month's interest received/bonuses - defaulting to 0.0.")
+        statement_totals = {
+            "interest_received": 0.0, "bonuses": 0.0, "fees": 0.0,
+            "opening_balance": 0.0, "closing_balance": 0.0, "deposits": 0.0, "withdrawals": 0.0,
+        }
 
     lenders = aggregate_by_lender(investments)
     log.info("Fetched %d active investment(s) across %d loan originator(s).", len(investments), len(lenders))
@@ -250,7 +421,107 @@ def run() -> None:
         "bonuses": statement_totals["bonuses"],
     }
 
-    current_month = is_current_month()
+    total_invested = amounts["total"]
+
+    # Needed both for "non investi" (unchanged, existing feature) AND as
+    # part of XIRR's final "as if withdrawn today" total account value
+    # below - fetched once here, ahead of both uses.
+    available_balance = fetch_account_balance(session, investor_id)
+    if available_balance is None:
+        log.warning("Could not fetch Lendermarket's available balance - 'non investi' and XIRR will not be updated.")
+
+    # Since-inception XIRR (money-weighted return) + this month's Cash
+    # drag + the XIRR Bonus/Cash drag/Taxes-Frais pie-chart shares - see
+    # module docstring for the monthly-aggregate methodology (Lendermarket
+    # has no per-transaction dated ledger, unlike Afranga/Swaper).
+    monthly_summaries = None
+    if current_month:
+        try:
+            log.info("Fetching the since-inception monthly statement summaries (cached where possible)...")
+            monthly_summaries = get_cached_monthly_summaries(session, investor_id, today_date)
+        except Exception:
+            log.exception("Failed to fetch the monthly statement summary history - XIRR will not be updated.")
+            monthly_summaries = None
+
+    xirr_value = None
+    signed_cashflows = None
+    total_account_value = None
+    bonus_xirr_contribution = None
+    if current_month and monthly_summaries and available_balance is not None:
+        total_account_value = total_invested + available_balance
+        signed_cashflows = []
+        for month_key in sorted(monthly_summaries):
+            summary = monthly_summaries[month_key]
+            net_deposit = summary["deposits"] - summary["withdrawals"]
+            if abs(net_deposit) < 0.005:
+                continue
+            year, month = (int(part) for part in month_key.split("-"))
+            try:
+                month_end = datetime.strptime(summary["end_date"], "%Y-%m-%d").date()
+            except (KeyError, ValueError):
+                month_end = date(year, month, calendar.monthrange(year, month)[1])
+            cashflow_day = min(15, month_end.day)
+            signed_cashflows.append((date(year, month, cashflow_day), -net_deposit))
+
+        signed_cashflows.append((today_date, total_account_value))
+
+        xirr_value = compute_xirr(signed_cashflows)
+        if xirr_value is None:
+            log.warning("Could not compute XIRR from %d monthly cashflow(s) - XIRR row will not be updated.", len(signed_cashflows) - 1)
+        else:
+            log.info(
+                "Computed since-inception XIRR: %.2f%% (%d monthly cashflow(s), current total value %.2f EUR).",
+                xirr_value * 100, len(signed_cashflows) - 1, total_account_value,
+            )
+
+            lifetime_bonus_total = sum(s["bonuses"] for s in monthly_summaries.values())
+            if lifetime_bonus_total:
+                cashflows_without_bonus = signed_cashflows[:-1] + [(today_date, total_account_value - lifetime_bonus_total)]
+                xirr_without_bonus = compute_xirr(cashflows_without_bonus)
+                if xirr_without_bonus is not None:
+                    bonus_xirr_contribution = xirr_value - xirr_without_bonus
+                    log.info("Bonus's own share of XIRR: %.2f points.", bonus_xirr_contribution * 100)
+            else:
+                bonus_xirr_contribution = 0.0
+
+    cash_drag_value = None
+    cash_drag_xirr_contribution = None
+    taxes_xirr_contribution = None
+    if current_month and total_invested > 0:
+        avg_idle_cash_this_month = (statement_totals["opening_balance"] + statement_totals["closing_balance"]) / 2
+        cash_weight = avg_idle_cash_this_month / (avg_idle_cash_this_month + total_invested)
+        monthly_yield_rate = statement_totals["interest_received"] / total_invested
+        cash_drag_value = cash_weight * monthly_yield_rate
+        log.info(
+            "Computed Cash drag: %.2f%% (avg idle cash %.2f EUR, cash weight %.2f%%, monthly yield %.2f%%).",
+            cash_drag_value * 100, avg_idle_cash_this_month, cash_weight * 100, monthly_yield_rate * 100,
+        )
+
+        if xirr_value is not None and signed_cashflows is not None and monthly_summaries:
+            avg_idle_cash_lifetime = compute_average_idle_cash(monthly_summaries)
+            cash_weight_lifetime = avg_idle_cash_lifetime / (avg_idle_cash_lifetime + total_invested)
+            lifetime_interest_total = sum(s["interest_received"] for s in monthly_summaries.values())
+            lifetime_yield_rate = lifetime_interest_total / total_invested
+            cash_drag_lifetime_total = cash_weight_lifetime * lifetime_yield_rate
+            missed_earnings = cash_drag_lifetime_total * (avg_idle_cash_lifetime + total_invested)
+            cashflows_with_cash_invested = signed_cashflows[:-1] + [(today_date, total_account_value + missed_earnings)]
+            xirr_with_cash_invested = compute_xirr(cashflows_with_cash_invested)
+            if xirr_with_cash_invested is not None:
+                cash_drag_xirr_contribution = xirr_value - xirr_with_cash_invested
+                log.info(
+                    "XIRR share - cash drag: %.4f points (since-inception, avg idle cash %.2f EUR, missed earnings ~%.2f EUR).",
+                    cash_drag_xirr_contribution * 100, avg_idle_cash_lifetime, missed_earnings,
+                )
+
+            lifetime_fees_total = sum(s["fees"] for s in monthly_summaries.values())
+            if lifetime_fees_total:
+                cashflows_with_fees_cancelled = signed_cashflows[:-1] + [(today_date, total_account_value + lifetime_fees_total)]
+                xirr_with_fees_cancelled = compute_xirr(cashflows_with_fees_cancelled)
+                if xirr_with_fees_cancelled is not None:
+                    taxes_xirr_contribution = xirr_value - xirr_with_fees_cancelled
+                    log.info("XIRR share - taxes/frais: %.4f points (lifetime fees %.2f EUR).", taxes_xirr_contribution * 100, lifetime_fees_total)
+            else:
+                taxes_xirr_contribution = 0.0
 
     # "total" comes from a live balance call/summed active investments, and
     # getInvestorAccountStatementSummary (the date-ranged statement API) has
@@ -266,9 +537,26 @@ def run() -> None:
     # promotionnelles et bonus" on the platform itself - a "prime", not a
     # cashback/concours - written to its own dedicated sub-row, never to
     # the "Bonus" row itself (a SUM formula over prime/cashback/concours).
+    # "XIRR"/"Cash drag" and the XIRR Bonus/Cash drag/Taxes-Frais pie-chart
+    # shares (rows already added by the user, platform_row+9 through +13 -
+    # confirmed live 2026-08-14) are appended past the default max_rows=6
+    # bound, same convention as afranga_diversification.py - only included
+    # when actually computed.
+    bonus_breakdown = {"prime": statement_totals["bonuses"]}
+    if xirr_value is not None:
+        bonus_breakdown["XIRR"] = xirr_value
+    if cash_drag_value is not None:
+        bonus_breakdown["Cash drag"] = cash_drag_value
+    if bonus_xirr_contribution is not None:
+        bonus_breakdown["XIRR Bonus"] = bonus_xirr_contribution
+    if cash_drag_xirr_contribution is not None:
+        bonus_breakdown["XIRR Cash drag"] = cash_drag_xirr_contribution
+    if taxes_xirr_contribution is not None:
+        bonus_breakdown["XIRR Taxes/Frais"] = taxes_xirr_contribution
     fill_current_month_bonus_breakdown(
         platform="Lendermarket",
-        breakdown={"prime": statement_totals["bonuses"]},
+        breakdown=bonus_breakdown,
+        max_rows=14,
     )
 
     loan_originators = [
@@ -282,12 +570,10 @@ def run() -> None:
         # "non investi" row (added 2026-08-10): reuses
         # lendermarket_monitor.fetch_account_balance() (investorAvailableBalanceAmount),
         # already relied on elsewhere in this repo to gate the invest bot.
-        available_balance = fetch_account_balance(session, investor_id)
         if available_balance is not None:
             fill_geographic_repartition_uninvested_amount("Lendermarket", available_balance)
-        else:
-            log.warning("Could not fetch Lendermarket's available balance - 'non investi' will not be updated.")
 
 
 if __name__ == "__main__":
     run()
+
