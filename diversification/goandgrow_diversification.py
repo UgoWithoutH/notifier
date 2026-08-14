@@ -48,12 +48,14 @@ discovered by grepping that SPA's JS bundle for the string "api.prd.goandgrow":
       returns"); "Deposit" AND any "Withdraw"/"Withdrawal"-labelled entry
       (matched case-insensitively by substring, e.g. found live 2026-08-14
       on a real withdrawal) are capital movements, not income - both are
-      excluded from every bucket below. Any entry whose Type contains
-      "fee" (case-insensitive) is summed (absolute value) into a separate
-      "fees" total (`bonus_cashback_contest`'s sibling in the returned
-      dict), written to the Sheet's "frais" sub-row. No bonus/cashback/
+      excluded from every bucket below. IMPORTANT: confirmed 2026-08-14
+      there is NO separate "fee"-labelled Type/entry for the flat 1 EUR
+      fee Go & Grow charges on every withdrawal - it's silently deducted,
+      never itemized in the statement - so "fees" is instead INFERRED as
+      `(number of Withdraw*-Type entries this month) * WITHDRAWAL_FEE_EUR`
+      and written to the Sheet's "frais" sub-row. No bonus/cashback/
       contest-labelled entry TYPE has been observed yet on this account -
-      any entry whose Type is none of Deposit/Return/Withdraw*/fee* is
+      any entry whose Type is neither Deposit/Return nor Withdraw* is
       treated as bonus/cashback/contest income by default (see
       fetch_current_month_statement_totals() below), so a real one will be
       picked up automatically once it occurs; its exact Type label should
@@ -105,6 +107,12 @@ REPORT_TIMEZONE = ZoneInfo("Europe/Paris")
 
 GOANDGROW_EMAIL = os.environ.get("GOANDGROW_EMAIL") or os.environ.get("GOANDGROW_EMAIL")
 GOANDGROW_PASSWORD = os.environ.get("GOANDGROW_PASSWORD") or os.environ.get("GOANDGROW_PASSWORD")
+
+# Go & Grow charges a flat 1 EUR fee on every withdrawal - NOT its own
+# statement entry/Type (confirmed 2026-08-14: no "fee"-labelled Type exists
+# in the statements API), so it can't be read directly and must be inferred
+# as (number of withdrawals this month) * WITHDRAWAL_FEE_EUR instead.
+WITHDRAWAL_FEE_EUR = 1.0
 
 
 class _LoginFormParser(HTMLParser):
@@ -214,7 +222,7 @@ def fetch_current_month_statement_totals(session: requests.Session) -> dict:
 
     interest_received = 0.0
     bonus_cashback_contest = 0.0
-    fees = 0.0
+    withdrawal_count = 0
     unknown_types = set()
     latest_dt_at_or_before_end = None
     closing_balance = None
@@ -247,11 +255,11 @@ def fetch_current_month_statement_totals(session: requests.Session) -> dict:
 
         if entry_type == "Return":
             interest_received += amount
-        elif entry_type == "Deposit" or "withdraw" in entry_type_lower:
-            continue  # capital movement (deposit/withdrawal), not income
-        elif "fee" in entry_type_lower:
-            fees += abs(amount)
-            unknown_types.add(entry_type)
+        elif entry_type == "Deposit":
+            continue  # capital movement, not income
+        elif "withdraw" in entry_type_lower:
+            withdrawal_count += 1
+            continue  # capital movement, not income (fee handled separately below)
         else:
             # No bonus/cashback/contest-labelled entry Type has been seen
             # yet on this account (see module docstring) - treat anything
@@ -267,10 +275,10 @@ def fetch_current_month_statement_totals(session: requests.Session) -> dict:
 
     interest_received = round(interest_received, 2)
     bonus_cashback_contest = round(bonus_cashback_contest, 2)
-    fees = round(fees, 2)
+    fees = round(withdrawal_count * WITHDRAWAL_FEE_EUR, 2)
     log.info(
-        "This month's (%s to %s) totals: interest_received=%.2f, bonus_cashback_contest=%.2f, fees=%.2f, closing_balance=%s",
-        start_date, end_date, interest_received, bonus_cashback_contest, fees, closing_balance,
+        "This month's (%s to %s) totals: interest_received=%.2f, bonus_cashback_contest=%.2f, withdrawals=%d, fees=%.2f, closing_balance=%s",
+        start_date, end_date, interest_received, bonus_cashback_contest, withdrawal_count, fees, closing_balance,
     )
     return {
         "interest_received": interest_received,
