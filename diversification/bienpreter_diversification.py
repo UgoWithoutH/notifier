@@ -816,12 +816,29 @@ def run() -> None:
             lifetime_bonus_total = sum(
                 abs(_parse_amount(r.get("amountText")) or 0.0) for r in all_operations if r["label"] == "Bonus"
             )
+            bonus_rows = [r for r in all_operations if r["label"] == "Bonus"]
+            log.info(
+                "Bonus: %d transaction(s) trouvée(s), total lifetime = %.2f EUR (dates: %s).",
+                len(bonus_rows), lifetime_bonus_total,
+                [r.get("date") for r in bonus_rows],
+            )
             if lifetime_bonus_total:
                 cashflows_without_bonus = signed_cashflows[:-1] + [(today_date, total_account_value - lifetime_bonus_total)]
+                log.info(
+                    "XIRR Bonus - valeur du compte réelle=%.2f EUR, valeur contre-factuelle (sans bonus)=%.2f EUR (delta=%.2f EUR, soit %.1f%% de la valeur totale).",
+                    total_account_value, total_account_value - lifetime_bonus_total, lifetime_bonus_total,
+                    100 * lifetime_bonus_total / total_account_value if total_account_value else 0,
+                )
                 xirr_without_bonus = compute_xirr(cashflows_without_bonus)
+                log.info("XIRR contre-factuel sans bonus = %s", f"{xirr_without_bonus*100:.2f}%" if xirr_without_bonus is not None else "None (non calculable)")
                 if xirr_without_bonus is not None:
                     bonus_xirr_contribution = xirr_value - xirr_without_bonus
                     log.info("Bonus's own share of XIRR: %.2f points.", bonus_xirr_contribution * 100)
+                    log.info(
+                        "-> XIRR réel=%.2f%%, XIRR sans bonus=%.2f%%, écart=%.2f points, sur %.2f an(s) depuis le premier dépôt.",
+                        xirr_value * 100, xirr_without_bonus * 100, bonus_xirr_contribution * 100,
+                        (today_date - min(d for d, a in signed_cashflows[:-1] if a < 0)).days / 365.25,
+                    )
             else:
                 bonus_xirr_contribution = 0.0
 
