@@ -42,14 +42,19 @@ discovered by grepping that SPA's JS bundle for the string "api.prd.goandgrow":
       `ClientValue` (current balance), `TotalDeposits`, `TotalEarnings`,
       `AnnualTargetReturnRate`.
     - `GET https://api.prd.goandgrow.eu/investor/api/v2/statements` -> a
-      JSON array of ledger entries: `{"Type": "Deposit"|"Return", ...,
+      JSON array of ledger entries: `{"Type": "Deposit"|"Return"|..., ...,
       "Amount": <float>, "Date": <ISO datetime>, "Balance": <float>}`.
       "Return" entries are Go & Grow's daily interest accrual ("Go & Grow
-      returns"); "Deposit" entries are capital movements, not income.
-      No bonus/cashback/contest-labelled entry TYPE has been observed yet
-      on this brand-new account (created 2026-07-13) - any entry whose
-      Type is neither "Deposit" nor "Return" is treated as
-      bonus/cashback/contest income by default (see
+      returns"); "Deposit" AND any "Withdraw"/"Withdrawal"-labelled entry
+      (matched case-insensitively by substring, e.g. found live 2026-08-14
+      on a real withdrawal) are capital movements, not income - both are
+      excluded from every bucket below. Any entry whose Type contains
+      "fee" (case-insensitive) is summed (absolute value) into a separate
+      "fees" total (`bonus_cashback_contest`'s sibling in the returned
+      dict), written to the Sheet's "frais" sub-row. No bonus/cashback/
+      contest-labelled entry TYPE has been observed yet on this account -
+      any entry whose Type is none of Deposit/Return/Withdraw*/fee* is
+      treated as bonus/cashback/contest income by default (see
       fetch_current_month_statement_totals() below), so a real one will be
       picked up automatically once it occurs; its exact Type label should
       be double-checked against the log output at that point.
@@ -209,6 +214,7 @@ def fetch_current_month_statement_totals(session: requests.Session) -> dict:
 
     interest_received = 0.0
     bonus_cashback_contest = 0.0
+    fees = 0.0
     unknown_types = set()
     latest_dt_at_or_before_end = None
     closing_balance = None
@@ -233,6 +239,7 @@ def fetch_current_month_statement_totals(session: requests.Session) -> dict:
             continue
 
         entry_type = (entry.get("Type") or "").strip()
+        entry_type_lower = entry_type.lower()
         try:
             amount = float(entry.get("Amount") or 0.0)
         except (TypeError, ValueError):
@@ -240,8 +247,11 @@ def fetch_current_month_statement_totals(session: requests.Session) -> dict:
 
         if entry_type == "Return":
             interest_received += amount
-        elif entry_type == "Deposit":
-            continue  # capital movement, not income
+        elif entry_type == "Deposit" or "withdraw" in entry_type_lower:
+            continue  # capital movement (deposit/withdrawal), not income
+        elif "fee" in entry_type_lower:
+            fees += abs(amount)
+            unknown_types.add(entry_type)
         else:
             # No bonus/cashback/contest-labelled entry Type has been seen
             # yet on this account (see module docstring) - treat anything
@@ -257,13 +267,15 @@ def fetch_current_month_statement_totals(session: requests.Session) -> dict:
 
     interest_received = round(interest_received, 2)
     bonus_cashback_contest = round(bonus_cashback_contest, 2)
+    fees = round(fees, 2)
     log.info(
-        "This month's (%s to %s) totals: interest_received=%.2f, bonus_cashback_contest=%.2f, closing_balance=%s",
-        start_date, end_date, interest_received, bonus_cashback_contest, closing_balance,
+        "This month's (%s to %s) totals: interest_received=%.2f, bonus_cashback_contest=%.2f, fees=%.2f, closing_balance=%s",
+        start_date, end_date, interest_received, bonus_cashback_contest, fees, closing_balance,
     )
     return {
         "interest_received": interest_received,
         "bonus_cashback_contest": bonus_cashback_contest,
+        "fees": fees,
         "closing_balance": closing_balance,
     }
 
@@ -298,12 +310,12 @@ def run() -> None:
         statement_totals = fetch_current_month_statement_totals(session)
     except Exception:
         log.exception("Failed to fetch this month's statement totals - defaulting to 0.0.")
-        statement_totals = {"interest_received": 0.0, "bonus_cashback_contest": 0.0, "closing_balance": None}
+        statement_totals = {"interest_received": 0.0, "bonus_cashback_contest": 0.0, "fees": 0.0, "closing_balance": None}
 
     log.info("Go & Grow balance: %.2f EUR", balance)
     log.info(
-        "This month's interest: %.2f EUR, bonus/cashback/contest: %.2f EUR",
-        statement_totals["interest_received"], statement_totals["bonus_cashback_contest"],
+        "This month's interest: %.2f EUR, bonus/cashback/contest: %.2f EUR, fees: %.2f EUR",
+        statement_totals["interest_received"], statement_totals["bonus_cashback_contest"], statement_totals["fees"],
     )
 
     current_month = is_current_month()
@@ -341,10 +353,12 @@ def run() -> None:
     # on this account (see module docstring) - everything currently
     # defaults into "prime", same catch-all convention used by
     # monefit_diversification.py until a real one shows up and its exact
-    # Type label can be mapped to the right sub-row.
+    # Type label can be mapped to the right sub-row. "frais" is a real,
+    # confirmed fee bucket (see module docstring) - written on the
+    # existing "frais" sub-row under the Go & Grow block.
     fill_current_month_bonus_breakdown(
         platform=PLATFORM_LABEL,
-        breakdown={"prime": statement_totals["bonus_cashback_contest"]},
+        breakdown={"prime": statement_totals["bonus_cashback_contest"], "frais": statement_totals["fees"]},
         section="Crowdlending savings",
     )
 
