@@ -79,14 +79,43 @@ verified live 2026-07-29):
   today's balance. Verified live 2026-08-04 (period 01.07.2026-31.07.2026):
   946.57 EUR, matching the previously-verified 2026-07-29 live balance.
 
-No bonus/cashback data has been observed on this account (only
-Intérêt/Principal/Demande de retrait transaction types seen in the range
-checked) - `bonus_cashback_contest` defaults to 0.0, same "not a discovered
-bug" convention as every other platform with no such feature confirmed yet.
-The Sheet's "Lande" block (Crowdlending section) already has its own
-"cashback" sub-row, so if a real cashback transaction type is ever
-observed on this account, wire it up via fill_current_month_bonus_breakdown()
-(see google_sheet.py) - deliberately NOT done here yet, no real data seen.
+Real bonus transactions DO occur on this account (confirmed live
+2026-08-14, correcting the earlier claim here that none had been seen):
+"Bonus d'affiliation" and "Bonus de parrainage" entries on the
+transactions page, both positive amounts. `bonus_cashback_contest` still
+defaults to 0.0 (no dedicated cashback-style transaction type has been
+seen, only bonus) - the two real bonus types are instead folded into the
+XIRR Bonus share below, same as Loanch's "prime"/Loanch's `total_bonus`.
+
+Also computes a since-inception XIRR (money-weighted return) plus this
+month's Cash drag and the XIRR Bonus / XIRR Cash drag / XIRR Taxes/Frais
+pie-chart shares - added 2026-08-14 per explicit user request, mirroring
+Afranga/Swaper/Lendermarket/PeerBerry/Loanch/Mintos's own XIRR blocks.
+Unlike those platforms, Lande has no JSON transaction API - every
+transaction type is scraped straight off the server-rendered
+`<article>` blocks on /investor/transactions (same markup already used
+by fetch_current_month_interest()), enumerated live 2026-08-14 by
+paginating the ENTIRE account history (01.01.2015 to today): `Intérêt`
+(interest, internal), `Principal` (principal repaid, internal),
+`Investissement` (money moved into a loan, internal), `Demande de
+retrait` (withdrawal - EXTERNAL cashflow), `Dépôt par virement bancaire`
+(deposit - EXTERNAL cashflow), `Bonus d'affiliation` / `Bonus de
+parrainage` (real bonus money, own XIRR Bonus share). Every entry's
+amount is already SIGNED for its real cash-balance impact (green "+"
+increases the wallet, red "-" decreases it - verified against the
+"Fonds disponibles" figure), so `compute_average_idle_cash()` can
+reconstruct a running daily wallet balance from scratch (starting at 0
+on the very first transaction's date, same trick as
+loanch_diversification.py - no separate opening-balance anchor needed).
+No withholding-tax-style transaction has ever been observed on this
+account - any future/unrecognized label (i.e. none of the 7 known ones
+above) is conservatively folded into the XIRR Taxes/Frais share instead
+of being silently dropped, same defensive catch-all as Loanch's
+unclassified `transaction_type` bucket. Since this account's full history
+is currently only ~11 pages (~160 rows), the full range is simply
+re-fetched every run - no incremental cache file, unlike the much larger
+Mintos/PeerBerry/Loanch ledgers (revisit this if Lande's history ever
+grows large enough to make that slow).
 
 The "Répartition géographique" section also already has a single "Lande"
 aggregate row (under a "Crowdlending agricole" sub-header, verified live
@@ -110,16 +139,25 @@ Required env vars:
                                                (see google_sheet.py)
 """
 
+import html
 import os
 import re
 import sys
 import logging
+from datetime import datetime, timedelta
 
 import fitz
 import requests
 from dotenv import load_dotenv
 
+from shared.google_sheet import (
+    fill_current_month_amounts,
+    fill_current_month_bonus_breakdown,
+    fill_geographic_repartition_amounts,
+    fill_geographic_repartition_uninvested_amount,
+)
 from shared.report_date import get_report_date, is_current_month
+from shared.xirr import compute_xirr
 
 load_dotenv()
 
@@ -130,7 +168,16 @@ TRANSACTIONS_URL = "https://lande.finance/fr/investor/transactions"
 TAX_REPORT_URL = "https://lande.finance/fr/investor/transactions/tax-report"
 OVERVIEW_URL = "https://lande.finance/fr/investor"
 PLATFORM_LABEL = "Lande"
-MAX_TRANSACTIONS_PAGES = 50  # safety net, see bienpreter_diversification.py's identical pattern
+MAX_TRANSACTIONS_PAGES = 200  # safety net, see bienpreter_diversification.py's identical pattern
+TRANSACTIONS_PAGE_SIZE = 15  # confirmed via the page's own "Showing X to Y of Z" footer
+# Since-inception range used by the XIRR/Cash drag block below (see module
+# docstring) - well before this account's real inception (~Sept 2025), just
+# needs to be far enough back to capture the entire history.
+SINCE_INCEPTION_START_DATE = "01.01.2015"
+
+_TRANSACTION_LABEL_RE = re.compile(r'class="capitalize">([^<]+)<')
+_TRANSACTION_DATE_RE = re.compile(r'<p class="mt-1 m-0 text-xs text-neutral-500">([\d.]+)</p>')
+_TRANSACTION_AMOUNT_RE = re.compile(r'<span class="text-(?:brand-green|rose-600)">([+-])€[\s\xa0]*([\d.,\s\xa0]+?)</span>')
 
 LANDE_CF_CLEARANCE = os.environ.get("LANDE_CF_CLEARANCE")
 LANDE_LANDE_SESSION = os.environ.get("LANDE_LANDE_SESSION")
@@ -193,17 +240,46 @@ def fetch_account_value_at_period_end(session: requests.Session, start_date: str
         raise RuntimeError(f"Could not parse account value out of {match.group(1)!r}.")
 
 
-def fetch_current_month_interest(session: requests.Session, start_date: str, end_date: str) -> float:
-    """Fetch the given period's (same French DD.MM.YYYY dates as
-    fetch_account_value_at_period_end()) gross interest received by
-    paginating the transactions page and summing every "Intérêt"-labelled
-    entry's amount. See module docstring for the verified markup/
-    pagination behavior."""
-    gross_interest = 0.0
+def _parse_transaction_article(body: str) -> dict | None:
+    """Parse one <article> block's label/date/signed-amount - see module
+    docstring for the verified markup and the 7 known labels. Returns None
+    if any of the 3 pieces can't be found/parsed (defensive, should not
+    normally happen)."""
+    label_match = _TRANSACTION_LABEL_RE.search(body)
+    date_match = _TRANSACTION_DATE_RE.search(body)
+    amount_match = _TRANSACTION_AMOUNT_RE.search(body)
+    if not label_match or not date_match or not amount_match:
+        return None
+
+    label = html.unescape(label_match.group(1))
+    try:
+        entry_date = datetime.strptime(date_match.group(1), "%d.%m.%Y").date()
+    except ValueError:
+        return None
+
+    sign = -1 if amount_match.group(1) == "-" else 1
+    try:
+        amount = sign * _parse_amount(amount_match.group(2))
+    except ValueError:
+        return None
+
+    return {"date": entry_date, "label": label, "amount": amount}
+
+
+def fetch_transactions(session: requests.Session, start_date: str, end_date: str) -> list:
+    """Fetch EVERY transaction row (all types, not just interest) in
+    [start_date, end_date] (French DD.MM.YYYY), paginating the
+    transactions page (generalized 2026-08-14 from what used to be
+    fetch_current_month_interest()'s inline interest-only scan - see
+    fetch_current_month_interest() below and module docstring's XIRR/Cash
+    drag section). Returns a list of {"date": <date>, "label": <str,
+    already HTML-unescaped>, "amount": <float, already SIGNED for its real
+    cash-balance impact>}."""
+    entries = []
     page = 1
     while page <= MAX_TRANSACTIONS_PAGES:
         params = {"search": "1", "start_date": start_date, "end_date": end_date, "page": page}
-        log.info("GET %s (page %s, fetching this month's transactions)...", TRANSACTIONS_URL, page)
+        log.info("GET %s (page %s, fetching transactions %s - %s)...", TRANSACTIONS_URL, page, start_date, end_date)
         r = session.get(TRANSACTIONS_URL, params=params, timeout=20)
         log.info("GET transactions page %s: status=%s", page, r.status_code)
         _check_authenticated(r)
@@ -215,31 +291,100 @@ def fetch_current_month_interest(session: requests.Session, start_date: str, end
             log.info("Page %s has no transactions - stopping pagination.", page)
             break
 
-        page_interest_count = 0
+        page_parsed = 0
         for article in articles:
             body = article.split("</article>")[0]
-            if ">Intérêt<" not in body:
-                continue
-            amount_match = re.search(r'\+€[\s\xa0]*([\d.,\s\xa0]+?)</span>', body)
-            if not amount_match:
-                continue
-            try:
-                gross_interest += _parse_amount(amount_match.group(1))
-                page_interest_count += 1
-            except ValueError:
-                log.warning("Could not parse interest amount %r on page %s.", amount_match.group(1), page)
+            parsed = _parse_transaction_article(body)
+            if parsed:
+                entries.append(parsed)
+                page_parsed += 1
+            else:
+                log.warning("Could not parse a transaction article on page %s - skipping it.", page)
 
-        log.info("Page %s: %s transaction(s), %s interest entrie(s) found (running total: %.2f).",
-                  page, len(articles), page_interest_count, gross_interest)
+        log.info("Page %s: %s transaction(s), %s parsed (running total: %s).", page, len(articles), page_parsed, len(entries))
 
-        if len(articles) < 15:
+        if len(articles) < TRANSACTIONS_PAGE_SIZE:
             # Fewer than a full page's worth of rows -> this was the last page.
             break
         page += 1
     else:
         log.warning("Hit MAX_TRANSACTIONS_PAGES (%s) without an empty/partial page.", MAX_TRANSACTIONS_PAGES)
 
+    return entries
+
+
+def fetch_current_month_interest(session: requests.Session, start_date: str, end_date: str) -> float:
+    """Fetch the given period's (same French DD.MM.YYYY dates as
+    fetch_account_value_at_period_end()) gross interest received by
+    summing every "Intérêt"-labelled entry's amount from fetch_transactions()."""
+    entries = fetch_transactions(session, start_date, end_date)
+    gross_interest = sum(e["amount"] for e in entries if _is_interest(e["label"]))
     return round(gross_interest, 2)
+
+
+def _is_deposit(label: str) -> bool:
+    return "dépôt" in label.lower() or "depot" in label.lower()
+
+
+def _is_withdrawal(label: str) -> bool:
+    return "retrait" in label.lower()
+
+
+def _is_bonus(label: str) -> bool:
+    """Real (not hypothetical) transaction types on this account -
+    "Bonus d'affiliation" and "Bonus de parrainage" (confirmed live
+    2026-08-14, see module docstring) - matched by the generic "bonus"
+    keyword so any future bonus-style label is also caught."""
+    return "bonus" in label.lower()
+
+
+def _is_interest(label: str) -> bool:
+    return "intér" in label.lower() or "inter" in label.lower()
+
+
+def _is_known_internal_movement(label: str) -> bool:
+    """"Principal" (repaid principal) / "Investissement" (money moved into
+    a loan) - internal movements between cash and the invested portfolio,
+    already reflected via the running balance used by
+    compute_average_idle_cash(), never external cashflows for XIRR."""
+    l = label.lower()
+    return "principal" in l or "investissement" in l
+
+
+def compute_average_idle_cash(entries: list, start_date, end_date) -> float:
+    """Day-weighted average uninvested-cash/wallet balance over
+    [start_date, end_date] (date objects), reconstructed from scratch off
+    every transaction's own signed `amount` - same trick as
+    loanch_diversification.py's equivalent (Lande has no separate
+    "balance" field per transaction, unlike Mintos/PeerBerry). Since
+    fetch_transactions() is always called back to
+    SINCE_INCEPTION_START_DATE (i.e. real account inception, see module
+    docstring), the running balance can simply start at 0 on the day of
+    the account's very first transaction."""
+    daily_deltas: dict = {}
+    for entry in entries:
+        entry_date = entry.get("date")
+        if entry_date is None or entry_date > end_date:
+            continue
+        daily_deltas[entry_date] = daily_deltas.get(entry_date, 0.0) + entry["amount"]
+
+    if not daily_deltas:
+        return 0.0
+
+    running_balance = 0.0
+    total_balance = 0.0
+    day_count = 0
+    current = min(daily_deltas)
+    while current <= end_date:
+        running_balance += daily_deltas.get(current, 0.0)
+        if current >= start_date:
+            total_balance += running_balance
+            day_count += 1
+        current += timedelta(days=1)
+
+    if day_count == 0:
+        return running_balance
+    return total_balance / day_count
 
 
 def fetch_available_funds(session: requests.Session) -> float:
@@ -313,32 +458,155 @@ def run(session: requests.Session | None = None) -> None:
     }
     log.info("Amounts to write: %s", amounts)
 
-    from shared.google_sheet import (
-        fill_current_month_amounts,
-        fill_geographic_repartition_amounts,
-        fill_geographic_repartition_uninvested_amount,
-    )
     # No skip_total here (unlike every other *_diversification.py): "total"
     # already comes from the tax-report PDF for the SAME requested period
     # (see module docstring), so it's a real historical figure for a
     # REPORT_DATE-backfilled month too, not just a live snapshot.
     fill_current_month_amounts(platform=PLATFORM_LABEL, amounts=amounts)
 
+    current_month = is_current_month()
+
     # "Répartition géographique" has a single "Lande" aggregate row (no
     # per-borrower sub-rows below it, unlike Mintos/Swaper) - same value as
     # the Crowdlending section's total.
-    if is_current_month():
+    if current_month:
         fill_geographic_repartition_amounts([{"name": PLATFORM_LABEL, "amount": total}])
 
         # "non investi" row (added 2026-08-10): "Fonds disponibles" on the
         # investor overview page (/fr/investor) - a LIVE-only snapshot (no
         # date param, like Afranga's walletUninvestedLiveWire), hence only
         # written for the real current month.
+        available_funds = None
         try:
             available_funds = fetch_available_funds(session)
             fill_geographic_repartition_uninvested_amount(PLATFORM_LABEL, available_funds)
         except Exception:
             log.exception("Failed to fetch/update Lande's 'non investi' row.")
+
+        # Since-inception XIRR (money-weighted return) + this month's Cash
+        # drag + the XIRR Bonus/Cash drag/Taxes-Frais pie-chart shares -
+        # LIVE-only snapshot metrics (need TODAY's real total account
+        # value as the final cashflow), see module docstring for the
+        # scraped transaction ledger this is built from.
+        today_date = report_date
+        all_entries = None
+        try:
+            log.info("Fetching the since-inception transaction ledger (%s - %s)...", SINCE_INCEPTION_START_DATE, end_date)
+            all_entries = fetch_transactions(session, SINCE_INCEPTION_START_DATE, end_date)
+        except Exception:
+            log.exception("Failed to fetch the transaction ledger - XIRR/Cash drag will not be updated.")
+
+        total_invested = (total - available_funds) if available_funds is not None else None
+
+        xirr_value = None
+        signed_cashflows = None
+        bonus_xirr_contribution = None
+        since_inception_date = None
+        lifetime_bonus = 0.0
+        if all_entries:
+            signed_cashflows = []
+            deposit_dates = []
+            for entry in all_entries:
+                label = entry["label"]
+                # `amount` is already signed for its cash-balance impact
+                # (deposit positive, withdrawal negative) - negate for
+                # XIRR's own convention (money going INTO the platform is
+                # negative, money coming back OUT is positive).
+                if _is_deposit(label):
+                    signed_cashflows.append((entry["date"], -entry["amount"]))
+                    deposit_dates.append(entry["date"])
+                elif _is_withdrawal(label):
+                    signed_cashflows.append((entry["date"], -entry["amount"]))
+                elif _is_bonus(label):
+                    lifetime_bonus += entry["amount"]
+
+            since_inception_date = min(deposit_dates) if deposit_dates else None
+            signed_cashflows.append((today_date, total))
+
+            xirr_value = compute_xirr(signed_cashflows)
+            if xirr_value is None:
+                log.warning("Could not compute XIRR from %d cashflow(s) - XIRR row will not be updated.", len(signed_cashflows) - 1)
+            else:
+                log.info(
+                    "Computed since-inception XIRR: %.2f%% (%d deposit/withdrawal cashflow(s), current total value %.2f EUR).",
+                    xirr_value * 100, len(signed_cashflows) - 1, total,
+                )
+                if lifetime_bonus:
+                    cashflows_without_bonus = signed_cashflows[:-1] + [(today_date, total - lifetime_bonus)]
+                    xirr_without_bonus = compute_xirr(cashflows_without_bonus)
+                    if xirr_without_bonus is not None:
+                        bonus_xirr_contribution = xirr_value - xirr_without_bonus
+                        log.info("Bonus's own share of XIRR: %.2f points.", bonus_xirr_contribution * 100)
+                else:
+                    bonus_xirr_contribution = 0.0
+
+        cash_drag_value = None
+        cash_drag_xirr_contribution = None
+        taxes_xirr_contribution = None
+        if all_entries is not None and total_invested is not None and total_invested > 0:
+            month_start = today_date.replace(day=1)
+            avg_idle_cash_this_month = compute_average_idle_cash(all_entries, month_start, today_date)
+            cash_weight = avg_idle_cash_this_month / (avg_idle_cash_this_month + total_invested)
+            monthly_yield_rate = gross_interest_received / total_invested
+            cash_drag_value = cash_weight * monthly_yield_rate
+            log.info(
+                "Computed Cash drag: %.2f%% (avg idle cash %.2f EUR, cash weight %.2f%%, monthly yield %.2f%%).",
+                cash_drag_value * 100, avg_idle_cash_this_month, cash_weight * 100, monthly_yield_rate * 100,
+            )
+
+            if xirr_value is not None and signed_cashflows is not None and since_inception_date is not None:
+                avg_idle_cash_lifetime = compute_average_idle_cash(all_entries, since_inception_date, today_date)
+                cash_weight_lifetime = avg_idle_cash_lifetime / (avg_idle_cash_lifetime + total_invested)
+                lifetime_interest = sum(e["amount"] for e in all_entries if _is_interest(e["label"]))
+                lifetime_yield_rate = lifetime_interest / total_invested
+                cash_drag_lifetime_total = cash_weight_lifetime * lifetime_yield_rate
+                missed_earnings = cash_drag_lifetime_total * (avg_idle_cash_lifetime + total_invested)
+                cashflows_with_cash_invested = signed_cashflows[:-1] + [(today_date, total + missed_earnings)]
+                xirr_with_cash_invested = compute_xirr(cashflows_with_cash_invested)
+                if xirr_with_cash_invested is not None:
+                    cash_drag_xirr_contribution = xirr_value - xirr_with_cash_invested
+                    log.info(
+                        "XIRR share - cash drag: %.4f points (since-inception, avg idle cash %.2f EUR, missed earnings ~%.2f EUR).",
+                        cash_drag_xirr_contribution * 100, avg_idle_cash_lifetime, missed_earnings,
+                    )
+
+                # No withholding-tax-style transaction has ever been
+                # observed on this account (see module docstring) - any
+                # future/unrecognized label (none of the 7 known ones) is
+                # conservatively bucketed here as Taxes/Frais, same
+                # defensive catch-all as Loanch's unclassified
+                # transaction_type bucket.
+                def _is_classified(label: str) -> bool:
+                    return _is_interest(label) or _is_deposit(label) or _is_withdrawal(label) or _is_bonus(label) or _is_known_internal_movement(label)
+
+                lifetime_unclassified = sum(e["amount"] for e in all_entries if not _is_classified(e["label"]))
+                if lifetime_unclassified:
+                    cashflows_with_fees_cancelled = signed_cashflows[:-1] + [(today_date, total - lifetime_unclassified)]
+                    xirr_with_fees_cancelled = compute_xirr(cashflows_with_fees_cancelled)
+                    if xirr_with_fees_cancelled is not None:
+                        taxes_xirr_contribution = xirr_value - xirr_with_fees_cancelled
+                        log.info("XIRR share - taxes/frais: %.4f points (lifetime unclassified amount %.2f EUR).", taxes_xirr_contribution * 100, lifetime_unclassified)
+                else:
+                    taxes_xirr_contribution = 0.0
+
+        # "Cash drag"/"XIRR" and the XIRR Bonus/Cash drag/Taxes-Frais
+        # pie-chart shares sit further below Lande's block (rows already
+        # added by the user, verified live at rows 242-246 under "Lande"),
+        # past "Bonus"/"cashback"/"Rendements %" - hence max_rows=12. Only
+        # included when actually computed.
+        bonus_breakdown = {}
+        if xirr_value is not None:
+            bonus_breakdown["XIRR"] = xirr_value
+        if cash_drag_value is not None:
+            bonus_breakdown["Cash drag"] = cash_drag_value
+        if bonus_xirr_contribution is not None:
+            bonus_breakdown["XIRR Bonus"] = bonus_xirr_contribution
+        if cash_drag_xirr_contribution is not None:
+            bonus_breakdown["XIRR Cash drag"] = cash_drag_xirr_contribution
+        if taxes_xirr_contribution is not None:
+            bonus_breakdown["XIRR Taxes/Frais"] = taxes_xirr_contribution
+        if bonus_breakdown:
+            fill_current_month_bonus_breakdown(platform=PLATFORM_LABEL, breakdown=bonus_breakdown, max_rows=12)
 
 
 if __name__ == "__main__":
