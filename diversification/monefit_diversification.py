@@ -56,7 +56,10 @@ Optional:
 
 import os
 import sys
+import calendar
 import logging
+from datetime import date, datetime
+from pathlib import Path
 from zoneinfo import ZoneInfo
 
 import requests
@@ -64,6 +67,8 @@ from dotenv import load_dotenv
 
 from shared.google_sheet import fill_current_month_amounts, fill_current_month_bonus_breakdown, fill_geographic_repartition_amounts
 from shared.report_date import get_report_now, is_current_month
+from shared.state import load_state, save_state
+from shared.xirr import compute_xirr
 
 load_dotenv()
 
@@ -85,6 +90,27 @@ REPORT_TIMEZONE = ZoneInfo("Europe/Paris")
 
 MONEFIT_EMAIL = os.environ.get("MONEFIT_EMAIL")
 MONEFIT_PASSWORD = os.environ.get("MONEFIT_PASSWORD")
+
+# Cache of one aggregate account/summary per calendar month since account
+# inception (see get_cached_monthly_summaries() below) - Monefit's own
+# account/summary endpoint only returns AGGREGATE totals for an arbitrary
+# date range (openingBalance/closingBalance/depositSum/withdrawalSum/
+# interestIncome/bonus/fees/...), no per-transaction dated ledger - same
+# monthly-aggregate approximation already used for Lendermarket's/Iuvo's
+# XIRR block (see lendermarket_diversification.py's module docstring for
+# the full methodology this mirrors). IMPORTANT DIFFERENCE from those two:
+# this endpoint's openingBalance/closingBalance is the WHOLE ACCOUNT value
+# (verified live 2026-08-14: closingBalance over the account's full
+# history matches "totalWealth" exactly), NOT an uninvested-wallet-only
+# balance - so it is NOT used for Cash drag's avg-idle-cash reconstruction
+# (see compute_average_idle_cash() below, which uses the live `mainAccount`
+# snapshot instead).
+XIRR_CASHFLOWS_STATE_FILE = Path(__file__).parent / "monefit_xirr_cashflows_state.json"
+XIRR_CASHFLOWS_STATE_DEFAULT = {"monthly_summaries": {}, "last_fetched_month": None}
+# Conservative floor for the one-time yearly scan used to find the
+# account's real inception year (see _find_first_active_year()) - well
+# before Monefit SmartSaver existed, just a safety bound on the scan length.
+XIRR_HISTORY_FALLBACK_START_YEAR = 2015
 
 _HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
@@ -124,7 +150,20 @@ def login(session: requests.Session) -> None:
 def fetch_balance(session: requests.Session) -> float:
     """Fetch the account's "Total Wealth" balance via the vaults endpoint.
     See module docstring for the verified `totalWealth` field."""
-    log.info("GET %s (fetching balance)...", VAULTS_URL)
+    return fetch_vaults_breakdown(session)["total_wealth"]
+
+
+def fetch_vaults_breakdown(session: requests.Session) -> dict:
+    """Fetch the vaults endpoint's full balance breakdown: `total_wealth`
+    (the whole account, same as fetch_balance()'s return value),
+    `invested` (`total` field - sum of all vault balances, i.e. the money
+    actually earning a vault's own rate), and `main_account` (cash sitting
+    OUTSIDE any vault, not yet earning - verified live 2026-08-14:
+    `total_wealth - main_account == invested` exactly). `main_account` is
+    the real "idle cash" figure used by Cash drag below - typically tiny
+    on this account (SmartSaver auto-allocates deposits into vaults almost
+    immediately)."""
+    log.info("GET %s (fetching balance breakdown)...", VAULTS_URL)
     r = session.get(VAULTS_URL, timeout=30)
     log.info("GET vaults: status=%s", r.status_code)
     r.raise_for_status()
@@ -133,53 +172,50 @@ def fetch_balance(session: requests.Session) -> float:
     total_wealth = result.get("totalWealth")
     if total_wealth is None:
         raise RuntimeError(f"Could not find 'totalWealth' in the vaults response: {result!r}")
-
     try:
-        return float(total_wealth)
+        total_wealth = float(total_wealth)
+        invested = float(result.get("total") if result.get("total") is not None else total_wealth)
+        main_account = float(result.get("mainAccount") or 0.0)
     except (TypeError, ValueError):
-        raise RuntimeError(f"Could not parse 'totalWealth' out of {total_wealth!r}.")
+        raise RuntimeError(f"Could not parse vaults response: {result!r}")
+
+    return {"total_wealth": total_wealth, "invested": invested, "main_account": main_account}
 
 
-def fetch_current_month_statement_totals(session: requests.Session) -> dict:
-    """Fetch this calendar month's "From daily returns" / "Rewards &
-    bonuses" / "Matured Vaults" totals via the account/summary endpoint.
-    See module docstring for the verified endpoint/fields.
-
-    Also returns "closing_balance": this same endpoint's `closingBalance`
-    field, which the module docstring already confirms matches the
-    account's own "Total Wealth" balance (the same figure `fetch_balance()`
-    reads live via /v1/vaults) - since `dateFrom`/`dateTo` here are
-    REPORT_DATE-aware (unlike the old hardcoded `date.today()`), a
-    month-range backfill run for a PAST month can use this to fill in that
-    month's real end-of-month total balance instead of only ever having a
-    live current balance available - `None` if the field is missing/
-    unparseable.
+def fetch_statement_summary(session: requests.Session, start_date: date, end_date: date) -> dict:
+    """Fetch account/summary for an arbitrary [start_date, end_date] range -
+    generalized 2026-08-14 (was fetch_current_month_statement_totals(),
+    hardcoded to the current calendar month - kept below as a thin
+    wrapper) so run() can ALSO query this once per calendar month since
+    account inception, needed to build XIRR's monthly-approximated
+    cashflows (see module docstring). Also parses `depositSum`/
+    `withdrawalSum`/`fees`/`openingBalance` - real fields, verified live
+    2026-08-14 over a wide multi-year range (`depositSum=5000.00,
+    withdrawalSum=38.42, fees=0`).
     """
-    end_date = get_report_now(REPORT_TIMEZONE).date()
-    first = end_date.replace(day=1)
-    params = {"dateFrom": first.isoformat(), "dateTo": end_date.isoformat()}
-    log.info("GET %s (fetching this month's statement totals)...", SUMMARY_URL)
+    params = {"dateFrom": start_date.isoformat(), "dateTo": end_date.isoformat()}
+    log.info("GET %s (fetching statement totals for %s to %s)...", SUMMARY_URL, start_date, end_date)
     r = session.get(SUMMARY_URL, params=params, timeout=30)
     log.info("GET account/summary: status=%s", r.status_code)
     r.raise_for_status()
 
     result = (r.json() or {}).get("data", {}).get("result") or {}
     log.info("Raw account/summary result: %r", result)
-    try:
-        daily_returns = round(float(result.get("interestIncome") or 0.0), 2)
-    except (TypeError, ValueError):
-        log.warning("Could not parse 'interestIncome' %r - defaulting to 0.0.", result.get("interestIncome"))
-        daily_returns = 0.0
-    try:
-        rewards_bonuses = round(float(result.get("bonus") or 0.0), 2)
-    except (TypeError, ValueError):
-        log.warning("Could not parse 'bonus' %r - defaulting to 0.0.", result.get("bonus"))
-        rewards_bonuses = 0.0
-    try:
-        matured_vaults = round(float(result.get("maturedVaults") or 0.0), 2)
-    except (TypeError, ValueError):
-        log.warning("Could not parse 'maturedVaults' %r - defaulting to 0.0.", result.get("maturedVaults"))
-        matured_vaults = 0.0
+
+    def _amount(key):
+        try:
+            return round(float(result.get(key) or 0.0), 2)
+        except (TypeError, ValueError):
+            log.warning("Could not parse %r %r - defaulting to 0.0.", key, result.get(key))
+            return 0.0
+
+    daily_returns = _amount("interestIncome")
+    rewards_bonuses = _amount("bonus")
+    matured_vaults = _amount("maturedVaults")
+    deposits = _amount("depositSum")
+    withdrawals = _amount("withdrawalSum")
+    fees = _amount("fees")
+    opening_balance = _amount("openingBalance")
     try:
         closing_balance = round(float(result["closingBalance"]), 2) if result.get("closingBalance") is not None else None
     except (TypeError, ValueError):
@@ -187,15 +223,90 @@ def fetch_current_month_statement_totals(session: requests.Session) -> dict:
         closing_balance = None
 
     log.info(
-        "Parsed statement totals: daily_returns=%.2f, rewards_bonuses=%.2f, matured_vaults=%.2f, closing_balance=%s",
-        daily_returns, rewards_bonuses, matured_vaults, closing_balance,
+        "Parsed statement totals: daily_returns=%.2f, rewards_bonuses=%.2f, matured_vaults=%.2f, "
+        "deposits=%.2f, withdrawals=%.2f, fees=%.2f, opening_balance=%.2f, closing_balance=%s",
+        daily_returns, rewards_bonuses, matured_vaults, deposits, withdrawals, fees, opening_balance, closing_balance,
     )
     return {
         "daily_returns": daily_returns,
         "rewards_bonuses": rewards_bonuses,
         "matured_vaults": matured_vaults,
+        "deposits": deposits,
+        "withdrawals": withdrawals,
+        "fees": fees,
+        "opening_balance": opening_balance,
         "closing_balance": closing_balance,
     }
+
+
+def fetch_current_month_statement_totals(session: requests.Session) -> dict:
+    """Thin wrapper around fetch_statement_summary() for the current
+    calendar month (1st of the month through today)."""
+    end_date = get_report_now(REPORT_TIMEZONE).date()
+    return fetch_statement_summary(session, end_date.replace(day=1), end_date)
+
+
+def _find_first_active_year(session: requests.Session, today: date) -> int:
+    """Find the account's real inception year via a short yearly scan (Jan
+    1 through Dec 31, or today for the current year) starting at
+    XIRR_HISTORY_FALLBACK_START_YEAR - returns the first year with a
+    nonzero opening balance or deposit. Falls back to `today.year` (a
+    young/brand-new account) if none is found - only runs ONCE (the very
+    first time the cache file doesn't exist yet)."""
+    for year in range(XIRR_HISTORY_FALLBACK_START_YEAR, today.year + 1):
+        year_start = date(year, 1, 1)
+        year_end = min(date(year, 12, 31), today)
+        summary = fetch_statement_summary(session, year_start, year_end)
+        if summary["opening_balance"] or summary["deposits"] or summary["withdrawals"]:
+            log.info("First active year found: %d.", year)
+            return year
+    log.info("No activity found back to %d - treating %d as the inception year.", XIRR_HISTORY_FALLBACK_START_YEAR, today.year)
+    return today.year
+
+
+def get_cached_monthly_summaries(session: requests.Session, today: date) -> dict:
+    """Return `{"YYYY-MM": {...fetch_statement_summary()'s dict..., "days_covered": N}}`
+    since account inception, fetching from account/summary only the
+    calendar months not already cached locally - same incremental idea as
+    lendermarket_diversification.get_cached_monthly_summaries()/
+    iuvo_diversification.get_cached_monthly_summaries()."""
+    state = load_state(XIRR_CASHFLOWS_STATE_FILE, XIRR_CASHFLOWS_STATE_DEFAULT)
+    monthly_summaries = dict(state.get("monthly_summaries") or {})
+    last_fetched_month = state.get("last_fetched_month")
+
+    if last_fetched_month:
+        start_year, start_month = (int(part) for part in last_fetched_month.split("-"))
+    else:
+        log.info("No cached monthly summaries found - scanning for the account's inception year...")
+        start_year = _find_first_active_year(session, today)
+        start_month = 1
+
+    log.info(
+        "Found %d cached monthly summary(ies) (last fetched: %s) - fetching from %04d-%02d through %04d-%02d...",
+        len(monthly_summaries), last_fetched_month, start_year, start_month, today.year, today.month,
+    )
+
+    year, month = start_year, start_month
+    while (year, month) <= (today.year, today.month):
+        month_start = date(year, month, 1)
+        last_day_of_month = calendar.monthrange(year, month)[1]
+        month_end = min(date(year, month, last_day_of_month), today)
+        summary = fetch_statement_summary(session, month_start, month_end)
+        summary["days_covered"] = (month_end - month_start).days + 1
+        summary["end_date"] = month_end.strftime("%Y-%m-%d")
+        monthly_summaries[f"{year:04d}-{month:02d}"] = summary
+
+        if month == 12:
+            year, month = year + 1, 1
+        else:
+            month += 1
+
+    save_state(XIRR_CASHFLOWS_STATE_FILE, {
+        "monthly_summaries": monthly_summaries,
+        "last_fetched_month": f"{today.year:04d}-{today.month:02d}",
+    })
+    log.info("Monthly summaries cache now holds %d month(s).", len(monthly_summaries))
+    return monthly_summaries
 
 
 def run() -> None:
@@ -210,7 +321,8 @@ def run() -> None:
 
     try:
         login(session)
-        balance = fetch_balance(session)
+        vaults = fetch_vaults_breakdown(session)
+        balance = vaults["total_wealth"]
     except Exception:
         log.exception("Failed to log in or fetch the Monefit balance.")
         sys.exit(1)
@@ -223,7 +335,7 @@ def run() -> None:
             "Failed to fetch this month's From daily returns/Rewards & bonuses/Matured Vaults - "
             "defaulting all three to 0.0."
         )
-        statement_totals = {"daily_returns": 0.0, "rewards_bonuses": 0.0, "matured_vaults": 0.0, "closing_balance": None}
+        statement_totals = {"daily_returns": 0.0, "rewards_bonuses": 0.0, "matured_vaults": 0.0, "deposits": 0.0, "withdrawals": 0.0, "fees": 0.0, "opening_balance": 0.0, "closing_balance": None}
 
     originators = [{"originator": LOAN_ORIGINATOR_LABEL, "outstanding": balance}]
     log.info("Monefit balance: %.2f EUR", balance)
@@ -245,6 +357,8 @@ def run() -> None:
     # bonus_cashback_contest so it's ready to be written to its own Sheet
     # cell, separate from interest.
     current_month = is_current_month()
+    today_date = get_report_now(REPORT_TIMEZONE).date()
+    end_date = today_date
     closing_balance = statement_totals.get("closing_balance")
     # For the real current month, always use the live "Total Wealth"
     # balance (fetch_balance()). For a backfilled past month (a month-range
@@ -274,6 +388,106 @@ def run() -> None:
         skip_total=skip_total,
     )
 
+    # Since-inception XIRR (money-weighted return) + this month's Cash
+    # drag + the XIRR Bonus/Cash drag/Taxes-Frais pie-chart shares - same
+    # monthly-aggregate methodology as lendermarket_diversification.py/
+    # iuvo_diversification.py (Monefit's account/summary endpoint only
+    # returns aggregate totals for a queried range, no per-transaction
+    # dated ledger). Cash drag's avg-idle-cash uses the LIVE `mainAccount`
+    # snapshot (see fetch_vaults_breakdown()'s docstring for why the
+    # monthly opening/closing balance can't be reused here - it's the
+    # WHOLE account, not an idle-cash-only figure) - a real, but
+    # current-snapshot-only (not a true historical average), figure.
+    xirr_value = None
+    signed_cashflows = None
+    total_account_value = None
+    bonus_xirr_contribution = None
+    cash_drag_value = None
+    cash_drag_xirr_contribution = None
+    taxes_xirr_contribution = None
+    monthly_summaries = None
+    total_invested = vaults["invested"]
+    avg_idle_cash = vaults["main_account"]
+
+    if current_month:
+        try:
+            log.info("Fetching the since-inception monthly statement summaries (cached where possible)...")
+            monthly_summaries = get_cached_monthly_summaries(session, end_date)
+        except Exception:
+            log.exception("Failed to fetch the monthly statement summary history - XIRR will not be updated.")
+            monthly_summaries = None
+
+    if current_month and monthly_summaries:
+        total_account_value = balance
+        signed_cashflows = []
+        for month_key in sorted(monthly_summaries):
+            summary = monthly_summaries[month_key]
+            net_deposit = summary["deposits"] - summary["withdrawals"]
+            if abs(net_deposit) < 0.005:
+                continue
+            year, month = (int(part) for part in month_key.split("-"))
+            try:
+                month_end = datetime.strptime(summary["end_date"], "%Y-%m-%d").date()
+            except (KeyError, ValueError):
+                month_end = date(year, month, calendar.monthrange(year, month)[1])
+            cashflow_day = min(15, month_end.day)
+            signed_cashflows.append((date(year, month, cashflow_day), -net_deposit))
+
+        signed_cashflows.append((end_date, total_account_value))
+
+        xirr_value = compute_xirr(signed_cashflows)
+        if xirr_value is None:
+            log.warning("Could not compute XIRR from %d monthly cashflow(s) - XIRR row will not be updated.", len(signed_cashflows) - 1)
+        else:
+            log.info(
+                "Computed since-inception XIRR: %.2f%% (%d monthly cashflow(s), current total value %.2f EUR).",
+                xirr_value * 100, len(signed_cashflows) - 1, total_account_value,
+            )
+
+            lifetime_bonus_total = sum(s["rewards_bonuses"] for s in monthly_summaries.values())
+            if lifetime_bonus_total:
+                cashflows_without_bonus = signed_cashflows[:-1] + [(end_date, total_account_value - lifetime_bonus_total)]
+                xirr_without_bonus = compute_xirr(cashflows_without_bonus)
+                if xirr_without_bonus is not None:
+                    bonus_xirr_contribution = xirr_value - xirr_without_bonus
+                    log.info("Bonus's own share of XIRR: %.2f points.", bonus_xirr_contribution * 100)
+            else:
+                bonus_xirr_contribution = 0.0
+
+            lifetime_fees_total = sum(s["fees"] for s in monthly_summaries.values())
+            if lifetime_fees_total:
+                cashflows_with_fees_cancelled = signed_cashflows[:-1] + [(end_date, total_account_value + lifetime_fees_total)]
+                xirr_with_fees_cancelled = compute_xirr(cashflows_with_fees_cancelled)
+                if xirr_with_fees_cancelled is not None:
+                    taxes_xirr_contribution = xirr_value - xirr_with_fees_cancelled
+                    log.info("XIRR share - taxes/frais: %.4f points (lifetime fees %.2f EUR).", taxes_xirr_contribution * 100, lifetime_fees_total)
+            else:
+                taxes_xirr_contribution = 0.0
+
+    if current_month and total_invested > 0:
+        cash_weight = avg_idle_cash / (avg_idle_cash + total_invested)
+        monthly_yield_rate = statement_totals["daily_returns"] / total_invested
+        cash_drag_value = cash_weight * monthly_yield_rate
+        log.info(
+            "Computed Cash drag: %.2f%% (avg idle cash %.2f EUR, cash weight %.2f%%, monthly yield %.2f%%).",
+            cash_drag_value * 100, avg_idle_cash, cash_weight * 100, monthly_yield_rate * 100,
+        )
+
+        if xirr_value is not None and signed_cashflows is not None and monthly_summaries:
+            cash_weight_lifetime = cash_weight  # no real historical idle-cash time series - reuse the live snapshot (see comment above).
+            lifetime_interest_total = sum(s["daily_returns"] for s in monthly_summaries.values())
+            lifetime_yield_rate = lifetime_interest_total / total_invested
+            cash_drag_lifetime_total = cash_weight_lifetime * lifetime_yield_rate
+            missed_earnings = cash_drag_lifetime_total * (avg_idle_cash + total_invested)
+            cashflows_with_cash_invested = signed_cashflows[:-1] + [(end_date, total_account_value + missed_earnings)]
+            xirr_with_cash_invested = compute_xirr(cashflows_with_cash_invested)
+            if xirr_with_cash_invested is not None:
+                cash_drag_xirr_contribution = xirr_value - xirr_with_cash_invested
+                log.info(
+                    "XIRR share - cash drag: %.4f points (since-inception, avg idle cash %.2f EUR, missed earnings ~%.2f EUR).",
+                    cash_drag_xirr_contribution * 100, avg_idle_cash, missed_earnings,
+                )
+
     # Monefit's "bonus" field ("Rewards & bonuses") maps to "prime" (a
     # referral-style reward) - written to its own dedicated sub-row, never
     # to the "Bonus" row itself (a SUM formula over prime/cashback/
@@ -281,11 +495,26 @@ def run() -> None:
     # ("concours"-style lottery, confirmed via live page text: "5 winners
     # ... picked at random") but the account/summary API has no distinct
     # field for draw winnings - only "prime" is written here, "concours"
-    # is left untouched pending a dedicated data source.
+    # is left untouched pending a dedicated data source. "XIRR"/"Cash
+    # drag" and the XIRR Bonus/Cash drag/Taxes-Frais pie-chart shares
+    # (rows already added by the user, platform_row+9 through +13) are
+    # only included when actually computed.
+    bonus_breakdown = {"prime": statement_totals["rewards_bonuses"]}
+    if xirr_value is not None:
+        bonus_breakdown["XIRR"] = xirr_value
+    if cash_drag_value is not None:
+        bonus_breakdown["Cash drag"] = cash_drag_value
+    if bonus_xirr_contribution is not None:
+        bonus_breakdown["XIRR Bonus"] = bonus_xirr_contribution
+    if cash_drag_xirr_contribution is not None:
+        bonus_breakdown["XIRR Cash drag"] = cash_drag_xirr_contribution
+    if taxes_xirr_contribution is not None:
+        bonus_breakdown["XIRR Taxes/Frais"] = taxes_xirr_contribution
     fill_current_month_bonus_breakdown(
         platform="Monefit",
-        breakdown={"prime": statement_totals["rewards_bonuses"]},
+        breakdown=bonus_breakdown,
         section="Crowdlending savings",
+        max_rows=14,
     )
 
     loan_originators = [{"name": LOAN_ORIGINATOR_LABEL, "amount": balance}]
