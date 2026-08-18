@@ -120,6 +120,22 @@ Swaper's INVESTMENT/REPAYMENT/BUYBACK types - never treated as XIRR
 cashflows, but DO count for the day-by-day balance replay (their real
 "Solde indicatif" is used as-is).
 
+Added 2026-08-18: XIRR Intérêts, the counterfactual XIRR share
+attributable to real net interest received (mirrors XIRR Bonus's own
+counterfactual pattern exactly, just with the lifetime net interest total
+- gross interest received minus withholding tax, both already reconstructed
+from real /u/operations rows - subtracted from today's total account value
+instead of the lifetime bonus total). This exists because "Intérêts" was
+previously only ever a RESIDUAL on the spreadsheet/dashboard side (XIRR -
+XIRR Bonus - XIRR Cash drag - XIRR Taxes/Frais), which can legitimately go
+negative when the bonus's counterfactual XIRR share is disproportionately
+large relative to the account's real underlying (non-bonus) performance -
+that's not a bug, it's the correct signal that the account's return is
+propped up almost entirely by the bonus. XIRR Intérêts instead gives a
+genuine, independently-measured figure (same category of computation as
+Bonus/Taxes, not a derived leftover), so the two can be compared/sanity-
+checked against each other on the sheet/dashboard side.
+
 Required env vars:
     BIENPRETER_EMAIL, BIENPRETER_PASSWORD -> Bienpreter account credentials
 Optional:
@@ -765,18 +781,20 @@ def run() -> None:
     current_month = is_current_month()
 
     # Since-inception XIRR (money-weighted return) + this month's/lifetime
-    # Cash drag + the XIRR Bonus/Cash drag/Taxes-Frais pie-chart shares -
-    # mirrors swaper_diversification.py's/afranga_diversification.py's own
-    # XIRR blocks (see those modules' docstrings for the full methodology;
-    # see THIS module's docstring for the Bienpreter-specific differences -
-    # a real per-transaction "Solde indicatif" balance is already on every
-    # /u/operations row, so no delta-reconstruction is needed here).
+    # Cash drag + the XIRR Bonus/Cash drag/Taxes-Frais/Intérêts pie-chart
+    # shares - mirrors swaper_diversification.py's/afranga_diversification.py's
+    # own XIRR blocks (see those modules' docstrings for the full
+    # methodology; see THIS module's docstring for the Bienpreter-specific
+    # differences - a real per-transaction "Solde indicatif" balance is
+    # already on every /u/operations row, so no delta-reconstruction is
+    # needed here).
     today_date = get_report_now(REPORT_TIMEZONE).date()
     xirr_value = None
     bonus_xirr_contribution = None
     cash_drag_value = None
     cash_drag_xirr_contribution = None
     taxes_xirr_contribution = None
+    interest_xirr_contribution = None
 
     all_operations = None
     if current_month:
@@ -811,6 +829,16 @@ def run() -> None:
             log.info(
                 "Computed since-inception XIRR: %.2f%% (%d deposit/withdrawal cashflow(s), current total value %.2f EUR).",
                 xirr_value * 100, len(signed_cashflows) - 1, total_account_value,
+            )
+
+            # Lifetime gross interest received (real "Intérêts" amount
+            # credited to the account since inception, from every
+            # /u/operations row's `.transaction__interests` cell) - used
+            # below both for XIRR Intérêts (right away) and for Cash
+            # drag's lifetime yield rate (further down, reused instead of
+            # recomputed).
+            lifetime_gross_interest = sum(
+                _parse_amount(t) or 0.0 for r in all_operations for t in (r.get("interestTexts") or [])
             )
 
             lifetime_bonus_total = sum(
@@ -857,6 +885,32 @@ def run() -> None:
             else:
                 taxes_xirr_contribution = 0.0
 
+            # XIRR Intérêts (added 2026-08-18): same counterfactual pattern
+            # as XIRR Bonus above, but for the real net interest received
+            # since inception (lifetime gross interest minus lifetime
+            # withholding tax, both already computed above) instead of the
+            # lifetime bonus total. Gives an independently-measured figure
+            # instead of leaving "Intérêts" as a pure residual on the
+            # spreadsheet/dashboard side (XIRR - Bonus - Cash drag -
+            # Taxes/Frais), which can legitimately go negative when the
+            # bonus's own share is disproportionately large - see module
+            # docstring.
+            lifetime_net_interest = lifetime_gross_interest - lifetime_withholding_tax
+            if lifetime_net_interest:
+                cashflows_without_interest = signed_cashflows[:-1] + [
+                    (today_date, total_account_value - lifetime_net_interest)
+                ]
+                xirr_without_interest = compute_xirr(cashflows_without_interest)
+                if xirr_without_interest is not None:
+                    interest_xirr_contribution = xirr_value - xirr_without_interest
+                    log.info(
+                        "XIRR share - intérêts: %.4f points (lifetime net interest %.2f EUR = %.2f gross - %.2f taxes).",
+                        interest_xirr_contribution * 100, lifetime_net_interest,
+                        lifetime_gross_interest, lifetime_withholding_tax,
+                    )
+            else:
+                interest_xirr_contribution = 0.0
+
             if total_invested > 0:
                 month_start_str = today_date.replace(day=1).strftime("%Y-%m-%d")
                 today_str = today_date.strftime("%Y-%m-%d")
@@ -873,9 +927,8 @@ def run() -> None:
                 if deposit_dates:
                     since_inception_date = datetime.strptime(min(deposit_dates), "%Y-%m-%d").date()
                     years_elapsed = max((today_date - since_inception_date).days / 365.25, 1 / 365.25)
-                    lifetime_gross_interest = sum(
-                        _parse_amount(t) or 0.0 for r in all_operations for t in (r.get("interestTexts") or [])
-                    )
+                    # lifetime_gross_interest already computed above (used
+                    # by XIRR Intérêts too) - reused here, not recomputed.
                     avg_idle_cash_lifetime = compute_average_idle_cash(
                         all_operations, since_inception_date.strftime("%Y-%m-%d"), today_str
                     )
@@ -911,8 +964,16 @@ def run() -> None:
     # - verified live 2026-08-05. "Cash drag"/"XIRR"/"XIRR Bonus"/
     # "XIRR Cash drag"/"XIRR Taxes/Frais" (added 2026-08-14, only included
     # when actually computed) sit right after "concours" - verified live
-    # at platform_row+9 through +13, `max_rows=14` keeps the search bounded
-    # before the next platform block ("Hive5", platform_row+16).
+    # at platform_row+9 through +13.
+    # UPDATED 2026-08-18: "XIRR Intérêts" (also only included when
+    # actually computed) sits right after "XIRR Taxes/Frais" - this pushes
+    # the block one row taller than it was verified at 2026-08-14, so
+    # `max_rows` is bumped 14 -> 15 to keep the search bounded before the
+    # next platform block ("Hive5", now platform_row+17 instead of +16).
+    # IMPORTANT: a "XIRR Intérêts" row must exist in the Bienprêter block
+    # on the sheet itself (right after "XIRR Taxes/Frais") for this new
+    # value to actually land somewhere - this script fills an existing
+    # row by label, it doesn't insert new labelled rows into this block.
     bonus_breakdown = {
         "prime": interest_totals["bonus_cashback_contest"],
         "prélèvements": interest_totals["withholding_tax"],
@@ -927,10 +988,12 @@ def run() -> None:
         bonus_breakdown["XIRR Cash drag"] = cash_drag_xirr_contribution
     if taxes_xirr_contribution is not None:
         bonus_breakdown["XIRR Taxes/Frais"] = taxes_xirr_contribution
+    if interest_xirr_contribution is not None:
+        bonus_breakdown["XIRR Intérêts"] = interest_xirr_contribution
     fill_current_month_bonus_breakdown(
         platform="Bienprêter",
         breakdown=bonus_breakdown,
-        max_rows=14,
+        max_rows=16,
     )
 
     # "Répartition géographique" per-borrower breakdown (added 2026-07-31,
