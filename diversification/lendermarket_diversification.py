@@ -75,6 +75,27 @@ date, since Lendermarket accounts are typically much younger than e.g.
 Swaper's - looping monthly from an arbitrarily old fixed date would waste
 many empty-month API calls on the very first run.
 
+Added 2026-08-18: XIRR Intérêts, the counterfactual XIRR share
+attributable to real net interest received (mirrors
+bienpreter_diversification.py's/afranga_diversification.py's/
+iuvo_diversification.py's own XIRR Intérêts blocks). Lendermarket has no
+separate gross/withholding-tax split on interest either (same convention
+as `net_interest_received == gross_interest_received` used for `amounts`
+above) - fees ("investorFeeAmount") are already isolated on their own as
+"XIRR Taxes/Frais", so "lifetime net interest" here is simply the sum of
+each cached month's own `interest_received` (Intérêts reçus + Intérêts de
+retard reçus), with no further adjustment. This exists because "Intérêts"
+was previously only ever a RESIDUAL on the spreadsheet/dashboard side
+(XIRR - XIRR Bonus - XIRR Cash drag - XIRR Taxes/Frais), which can
+legitimately go negative when the bonus's counterfactual XIRR share is
+disproportionately large relative to the account's real underlying
+(non-bonus) performance - that's not a bug, it's the correct signal that
+the account's return is propped up almost entirely by the bonus. XIRR
+Intérêts instead gives a genuine, independently-measured figure (same
+category of computation as Bonus/Taxes, not a derived leftover), so the
+two can be compared/sanity-checked against each other on the sheet/
+dashboard side.
+
 Required env vars:
     LENDERMARKET_EMAIL, LENDERMARKET_PASSWORD  -> Lendermarket credentials
 Optional:
@@ -436,9 +457,10 @@ def run() -> None:
     }
 
     # Since-inception XIRR (money-weighted return) + this month's Cash
-    # drag + the XIRR Bonus/Cash drag/Taxes-Frais pie-chart shares - see
-    # module docstring for the monthly-aggregate methodology (Lendermarket
-    # has no per-transaction dated ledger, unlike Afranga/Swaper).
+    # drag + the XIRR Bonus/Cash drag/Taxes-Frais/Intérêts pie-chart shares
+    # - see module docstring for the monthly-aggregate methodology
+    # (Lendermarket has no per-transaction dated ledger, unlike Afranga/
+    # Swaper).
     monthly_summaries = None
     if current_month:
         try:
@@ -492,6 +514,15 @@ def run() -> None:
     cash_drag_value = None
     cash_drag_xirr_contribution = None
     taxes_xirr_contribution = None
+    # XIRR Intérêts (added 2026-08-18, mirrors bienpreter_diversification.py's/
+    # afranga_diversification.py's/iuvo_diversification.py's own XIRR
+    # Intérêts blocks): counterfactual XIRR share attributable to real net
+    # interest received since inception. Lendermarket has no separate
+    # gross/withholding-tax split (fees are already isolated as their own
+    # "Taxes/Frais" figure below), so "lifetime net interest" here is just
+    # the sum of each cached month's own `interest_received` - computed
+    # further down, once monthly_summaries/signed_cashflows are available.
+    interest_xirr_contribution = None
     if current_month and total_invested > 0:
         avg_idle_cash_this_month = (statement_totals["opening_balance"] + statement_totals["closing_balance"]) / 2
         cash_weight = avg_idle_cash_this_month / (avg_idle_cash_this_month + total_invested)
@@ -528,6 +559,24 @@ def run() -> None:
             else:
                 taxes_xirr_contribution = 0.0
 
+            # XIRR Intérêts (added 2026-08-18): same counterfactual pattern
+            # as XIRR Bonus/XIRR Taxes-Frais above - lifetime net interest
+            # here is just lifetime_interest_total (already summed above
+            # for Cash drag's lifetime yield rate, reused here rather than
+            # recomputed), since Lendermarket has no separate withholding
+            # tax on interest.
+            if lifetime_interest_total:
+                cashflows_without_interest = signed_cashflows[:-1] + [(today_date, total_account_value - lifetime_interest_total)]
+                xirr_without_interest = compute_xirr(cashflows_without_interest)
+                if xirr_without_interest is not None:
+                    interest_xirr_contribution = xirr_value - xirr_without_interest
+                    log.info(
+                        "XIRR share - intérêts: %.4f points (lifetime net interest %.2f EUR, no withholding tax on Lendermarket).",
+                        interest_xirr_contribution * 100, lifetime_interest_total,
+                    )
+            else:
+                interest_xirr_contribution = 0.0
+
     # "total" comes from a live balance call/summed active investments plus
     # the available (uninvested) balance, and
     # getInvestorAccountStatementSummary (the date-ranged statement API) has
@@ -543,11 +592,19 @@ def run() -> None:
     # promotionnelles et bonus" on the platform itself - a "prime", not a
     # cashback/concours - written to its own dedicated sub-row, never to
     # the "Bonus" row itself (a SUM formula over prime/cashback/concours).
-    # "XIRR"/"Cash drag" and the XIRR Bonus/Cash drag/Taxes-Frais pie-chart
-    # shares (rows already added by the user, platform_row+9 through +13 -
-    # confirmed live 2026-08-14) are appended past the default max_rows=6
-    # bound, same convention as afranga_diversification.py - only included
-    # when actually computed.
+    # "XIRR"/"Cash drag" and the XIRR Bonus/Cash drag/Taxes-Frais/Intérêts
+    # pie-chart shares are appended past the default max_rows=6 bound, same
+    # convention as afranga_diversification.py - only included when
+    # actually computed.
+    # UPDATED 2026-08-18: "XIRR Intérêts" sits right after "XIRR
+    # Taxes/Frais" (mirrors Bienprêter's/Afranga's/Iuvo's own block
+    # layout) - this pushes the block one row taller than it was before
+    # (platform_row+9 through +13 previously), so `max_rows` is bumped
+    # 14 -> 15 to keep the search bounded before the next platform block.
+    # IMPORTANT: a "XIRR Intérêts" row must exist in the Lendermarket block
+    # on the sheet itself (right after "XIRR Taxes/Frais") for this new
+    # value to actually land somewhere - this script fills an existing row
+    # by label, it doesn't insert new labelled rows into this block.
     bonus_breakdown = {"prime": statement_totals["bonuses"]}
     if xirr_value is not None:
         bonus_breakdown["XIRR"] = xirr_value
@@ -559,10 +616,12 @@ def run() -> None:
         bonus_breakdown["XIRR Cash drag"] = cash_drag_xirr_contribution
     if taxes_xirr_contribution is not None:
         bonus_breakdown["XIRR Taxes/Frais"] = taxes_xirr_contribution
+    if interest_xirr_contribution is not None:
+        bonus_breakdown["XIRR Intérêts"] = interest_xirr_contribution
     fill_current_month_bonus_breakdown(
         platform="Lendermarket",
         breakdown=bonus_breakdown,
-        max_rows=14,
+        max_rows=15,
     )
 
     loan_originators = [
@@ -582,4 +641,3 @@ def run() -> None:
 
 if __name__ == "__main__":
     run()
-
