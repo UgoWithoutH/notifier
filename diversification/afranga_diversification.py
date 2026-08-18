@@ -94,6 +94,30 @@ back the lifetime withholding tax to today's final value, recompute XIRR,
 NEGATIVE value (same sign convention as Cash drag: a cost already baked
 into xirr_real, not a hypothetical gain).
 
+Added 2026-08-18: XIRR Intérêts, the counterfactual XIRR share
+attributable to real net interest received since inception (mirrors
+bienpreter_diversification.py's own XIRR Intérêts block exactly - same
+counterfactual-XIRR pattern as Bonus/Cash drag/Taxes above, just with the
+lifetime net interest total - lifetime gross interest received minus
+lifetime withholding tax, both already available on
+`lifetime_statement_totals` here, no extra fetch needed - subtracted from
+today's total account value instead of the lifetime bonus total). This
+exists because "Intérêts" was previously only ever a RESIDUAL on the
+spreadsheet/dashboard side (XIRR - XIRR Bonus - XIRR Cash drag - XIRR
+Taxes/Frais), which can legitimately go negative when the bonus's
+counterfactual XIRR share is disproportionately large relative to the
+account's real underlying (non-bonus) performance - that's not a bug,
+it's the correct signal that the account's return is propped up almost
+entirely by the bonus. XIRR Intérêts instead gives a genuine,
+independently-measured figure (same category of computation as
+Bonus/Taxes, not a derived leftover), so the two can be compared/sanity-
+checked against each other on the sheet/dashboard side. As with
+Bienprêter, a "XIRR Intérêts" row must already exist in the Afranga block
+on the sheet itself (right after "XIRR Taxes/Frais") for this new value to
+land anywhere - fill_current_month_bonus_breakdown() fills an existing row
+by label, it doesn't insert new labelled rows. `max_rows` is bumped
+18 -> 19 to keep the search bounded past this now-taller block.
+
 Required env vars:
     AFRANGA_EMAIL, AFRANGA_PASSWORD    -> Afranga account credentials
 Optional:
@@ -378,8 +402,8 @@ def fetch_statement_totals(session: requests.Session, start_date: date, end_date
     2026-08-14 (was fetch_current_month_statement_totals(), hardcoded to
     the current calendar month - kept below as a thin wrapper) so run()
     can ALSO fetch since-inception ("lifetime") totals, needed to compute
-    the XIRR Bonus / XIRR Taxes/Frais counterfactual shares over the SAME
-    since-inception period as XIRR itself.
+    the XIRR Bonus / XIRR Taxes/Frais / XIRR Intérêts counterfactual
+    shares over the SAME since-inception period as XIRR itself.
 
     Verified against the real account on 2026-07-10 (and re-verified via
     pure HTTP on 2026-07-18):
@@ -947,9 +971,9 @@ def run() -> None:
     #   cash_weight        = avg_idle_cash_this_month / (avg_idle_cash_this_month + total_invested)
     #   monthly_yield_rate = gross_interest_received_this_month / total_invested
     cash_drag_value = None
-    # Cash drag/taxes' own share of XIRR, on the same since-inception,
-    # annualized percentage-point scale as XIRR itself - same counterfactual
-    # technique as bonus_xirr_contribution above.
+    # Cash drag/taxes/interest's own share of XIRR, on the same
+    # since-inception, annualized percentage-point scale as XIRR itself -
+    # same counterfactual technique as bonus_xirr_contribution above.
     cash_drag_xirr_contribution = None
     # Unlike Swaper (never charged any withholding tax), Afranga DOES have
     # real withholding tax - genuinely computed here (not hardcoded to
@@ -958,6 +982,14 @@ def run() -> None:
     # `taxes_xirr_contribution = xirr_real - xirr_with_taxes_cancelled` -
     # NEGATIVE, same sign convention as Cash drag (a cost, not a gain).
     taxes_xirr_contribution = None
+    # XIRR Intérêts (added 2026-08-18, mirrors
+    # bienpreter_diversification.py's own XIRR Intérêts): counterfactual
+    # XIRR share attributable to real net interest received since
+    # inception (lifetime gross interest minus lifetime withholding tax) -
+    # an independently-measured figure rather than a pure residual on the
+    # spreadsheet/dashboard side. See module docstring for the full
+    # rationale.
+    interest_xirr_contribution = None
     if current_month and total_invested > 0:
         month_start_date = get_report_now(REPORT_TIMEZONE).replace(day=1).strftime("%Y-%m-%d")
         today_date_str = today_date.strftime("%Y-%m-%d")
@@ -1009,6 +1041,30 @@ def run() -> None:
             else:
                 taxes_xirr_contribution = 0.0
 
+            # XIRR Intérêts: same counterfactual pattern as Bonus/Cash
+            # drag/Taxes above, but for the real net interest received
+            # since inception (lifetime gross interest minus lifetime
+            # withholding tax, both already available on
+            # lifetime_statement_totals - no extra fetch needed here,
+            # unlike Bienprêter which has to re-sum its operations rows).
+            lifetime_net_interest = (
+                lifetime_statement_totals["gross_interest_received"] - lifetime_withholding_tax
+            )
+            if lifetime_net_interest:
+                cashflows_without_interest = signed_cashflows[:-1] + [
+                    (today_date, total_account_value - lifetime_net_interest)
+                ]
+                xirr_without_interest = compute_xirr(cashflows_without_interest)
+                if xirr_without_interest is not None:
+                    interest_xirr_contribution = xirr_value - xirr_without_interest
+                    log.info(
+                        "XIRR share - intérêts: %.4f points (lifetime net interest %.2f EUR = %.2f gross - %.2f taxes).",
+                        interest_xirr_contribution * 100, lifetime_net_interest,
+                        lifetime_statement_totals["gross_interest_received"], lifetime_withholding_tax,
+                    )
+            else:
+                interest_xirr_contribution = 0.0
+
     # "total" is the LIVE sum of active investments' outstanding amounts
     # PLUS the uninvested wallet balance (see above) - no confirmed
     # historical/closing-balance equivalent for a past month (2026-08-06
@@ -1025,9 +1081,17 @@ def run() -> None:
     # dedicated sub-row, never to the "Bonus" row itself (a SUM formula
     # over prime/cashback/concours). "prélèvements" gets the real
     # withholding tax on gross interest, same as Bienprêter's equivalent row.
-    # "XIRR"/"Cash drag" and the XIRR Bonus/Cash drag/Taxes-Frais
+    # "XIRR"/"Cash drag" and the XIRR Bonus/Cash drag/Taxes-Frais/Intérêts
     # pie-chart shares are appended past the default max_rows=6 bound (same
     # as swaper_diversification.py) - only included when actually computed.
+    # "XIRR Intérêts" (added 2026-08-18) sits right after "XIRR
+    # Taxes/Frais" - this pushes the block one row taller than before, so
+    # `max_rows` is bumped 18 -> 19 to keep the search bounded before the
+    # next platform block. IMPORTANT: a "XIRR Intérêts" row must exist in
+    # the Afranga block on the sheet itself (right after "XIRR
+    # Taxes/Frais") for this new value to actually land somewhere - this
+    # script fills an existing row by label, it doesn't insert new
+    # labelled rows into this block.
     bonus_breakdown = {
         "cashback": statement_totals["bonus_cashback_contest"],
         "prélèvements": statement_totals["withholding_tax"],
@@ -1042,10 +1106,12 @@ def run() -> None:
         bonus_breakdown["XIRR Cash drag"] = cash_drag_xirr_contribution
     if taxes_xirr_contribution is not None:
         bonus_breakdown["XIRR Taxes/Frais"] = taxes_xirr_contribution
+    if interest_xirr_contribution is not None:
+        bonus_breakdown["XIRR Intérêts"] = interest_xirr_contribution
     fill_current_month_bonus_breakdown(
         platform="Afranga",
         breakdown=bonus_breakdown,
-        max_rows=18,
+        max_rows=19,
     )
 
     loan_originators = [
