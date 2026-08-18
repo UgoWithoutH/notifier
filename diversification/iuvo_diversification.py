@@ -75,6 +75,24 @@ Playwright-driven browser's network traffic during exploration):
     and withholding_tax defaults to 0.0 (same convention as
     Swaper/Loanch/etc.).
 
+Added 2026-08-18: XIRR Intérêts, the counterfactual XIRR share
+attributable to real net interest received since inception (mirrors
+bienpreter_diversification.py's/afranga_diversification.py's own XIRR
+Intérêts blocks). Since Iuvo has no withholding tax at all (see above -
+net_interest_received == gross_interest_received always), "lifetime net
+interest" here is simply the sum of every cached month's own
+gross_interest_received - no separate gross/tax reconstruction needed,
+unlike Bienprêter/Afranga. This exists because "Intérêts" was previously
+only ever a RESIDUAL on the spreadsheet/dashboard side (XIRR - XIRR Bonus
+- XIRR Cash drag - XIRR Taxes/Frais), which can legitimately go negative
+when the bonus's counterfactual XIRR share is disproportionately large
+relative to the account's real underlying (non-bonus) performance - that's
+not a bug, it's the correct signal that the account's return is propped up
+almost entirely by the bonus. XIRR Intérêts instead gives a genuine,
+independently-measured figure (same category of computation as Bonus, not
+a derived leftover), so the two can be compared/sanity-checked against
+each other on the sheet/dashboard side.
+
 Required env vars:
     IUVO_EMAIL, IUVO_PASSWORD            -> Iuvo account credentials
 Optional:
@@ -510,13 +528,13 @@ def run() -> None:
     today_date = get_report_now(REPORT_TIMEZONE).date()
 
     # Since-inception XIRR (money-weighted return) + this month's Cash
-    # drag + the XIRR Bonus/Cash drag/Taxes-Frais pie-chart shares - same
-    # monthly-aggregate methodology as lendermarket_diversification.py
-    # (Iuvo's statement endpoint only returns type-grouped totals for a
-    # queried range, no per-transaction dated ledger - see module
-    # docstring). total_invested here = everything NOT sitting idle in the
-    # uninvested wallet (receivables in P2P + iuvoSAVE), i.e. total minus
-    # available_funds.
+    # drag + the XIRR Bonus/Cash drag/Taxes-Frais/Intérêts pie-chart shares
+    # - same monthly-aggregate methodology as
+    # lendermarket_diversification.py (Iuvo's statement endpoint only
+    # returns type-grouped totals for a queried range, no per-transaction
+    # dated ledger - see module docstring). total_invested here =
+    # everything NOT sitting idle in the uninvested wallet (receivables in
+    # P2P + iuvoSAVE), i.e. total minus available_funds.
     total_invested = balance_data["total"] - balance_data["available_funds"]
     xirr_value = None
     signed_cashflows = None
@@ -525,6 +543,14 @@ def run() -> None:
     cash_drag_value = None
     cash_drag_xirr_contribution = None
     taxes_xirr_contribution = 0.0  # Iuvo has no separate withholding-tax transaction type (see module docstring) - genuinely 0, not a placeholder.
+    # XIRR Intérêts (added 2026-08-18, mirrors bienpreter_diversification.py's/
+    # afranga_diversification.py's own XIRR Intérêts blocks): counterfactual
+    # XIRR share attributable to real net interest received since inception.
+    # Iuvo has no withholding tax at all (net == gross always - see module
+    # docstring), so "lifetime net interest" here is just the sum of every
+    # cached month's own gross_interest_received - computed below once
+    # monthly_summaries is available.
+    interest_xirr_contribution = None
     monthly_summaries = None
     if current_month:
         try:
@@ -572,6 +598,23 @@ def run() -> None:
             else:
                 bonus_xirr_contribution = 0.0
 
+            # XIRR Intérêts (added 2026-08-18): same counterfactual pattern
+            # as XIRR Bonus just above - lifetime net interest = lifetime
+            # gross interest here (no withholding tax on Iuvo at all), summed
+            # across every cached monthly summary.
+            lifetime_net_interest = sum(s["gross_interest_received"] for s in monthly_summaries.values())
+            if lifetime_net_interest:
+                cashflows_without_interest = signed_cashflows[:-1] + [(today_date, total_account_value - lifetime_net_interest)]
+                xirr_without_interest = compute_xirr(cashflows_without_interest)
+                if xirr_without_interest is not None:
+                    interest_xirr_contribution = xirr_value - xirr_without_interest
+                    log.info(
+                        "XIRR share - intérêts: %.4f points (lifetime net interest %.2f EUR, no withholding tax on Iuvo).",
+                        interest_xirr_contribution * 100, lifetime_net_interest,
+                    )
+            else:
+                interest_xirr_contribution = 0.0
+
     if current_month and total_invested > 0 and monthly_summaries:
         current_month_summary = monthly_summaries.get(f"{today_date.year:04d}-{today_date.month:02d}") or {}
         avg_idle_cash_this_month = (current_month_summary.get("opening_balance", 0.0) + current_month_summary.get("closing_balance", 0.0)) / 2
@@ -605,9 +648,17 @@ def run() -> None:
     # skip total for a backfilled month.
     fill_current_month_amounts(platform="Iuvo", amounts=amounts, skip_total=not current_month)
 
-    # "XIRR"/"Cash drag" and the XIRR Bonus/Cash drag/Taxes-Frais
-    # pie-chart shares (rows already added by the user, platform_row+10
-    # through +14) - only included when actually computed.
+    # "XIRR"/"Cash drag" and the XIRR Bonus/Cash drag/Taxes-Frais/Intérêts
+    # pie-chart shares - only included when actually computed.
+    # UPDATED 2026-08-18: "XIRR Intérêts" sits right after "XIRR
+    # Taxes/Frais" (mirrors Bienprêter's/Afranga's own block layout) - this
+    # pushes the block one row taller than it was before (platform_row+10
+    # through +14 previously), so `max_rows` is bumped 15 -> 16 to keep the
+    # search bounded before the next platform block. IMPORTANT: a "XIRR
+    # Intérêts" row must exist in the Iuvo block on the sheet itself (right
+    # after "XIRR Taxes/Frais") for this new value to actually land
+    # somewhere - this script fills an existing row by label, it doesn't
+    # insert new labelled rows into this block.
     bonus_breakdown = {}
     if xirr_value is not None:
         bonus_breakdown["XIRR"] = xirr_value
@@ -619,8 +670,10 @@ def run() -> None:
         bonus_breakdown["XIRR Cash drag"] = cash_drag_xirr_contribution
     if xirr_value is not None:
         bonus_breakdown["XIRR Taxes/Frais"] = taxes_xirr_contribution
+    if interest_xirr_contribution is not None:
+        bonus_breakdown["XIRR Intérêts"] = interest_xirr_contribution
     if bonus_breakdown:
-        fill_current_month_bonus_breakdown(platform="Iuvo", breakdown=bonus_breakdown, max_rows=15)
+        fill_current_month_bonus_breakdown(platform="Iuvo", breakdown=bonus_breakdown, max_rows=16)
 
     if current_month:
         fill_geographic_repartition_amounts(balance_data["originators"], platform="Iuvo")
