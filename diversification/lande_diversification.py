@@ -117,6 +117,26 @@ re-fetched every run - no incremental cache file, unlike the much larger
 Mintos/PeerBerry/Loanch ledgers (revisit this if Lande's history ever
 grows large enough to make that slow).
 
+Added 2026-08-19: XIRR Intérêts, the counterfactual XIRR share
+attributable to real net interest received since inception (mirrors
+loanch_diversification.py's/mintos_diversification.py's/
+bienpreter_diversification.py's/afranga_diversification.py's/
+iuvo_diversification.py's/lendermarket_diversification.py's own XIRR
+Intérêts blocks). Like Loanch (and unlike Mintos), Lande has no separate
+gross/withholding-tax split on interest (net == gross, tax = 0.0 - see
+above), so "lifetime net interest" here is simply the sum of every
+"Intérêt"-labelled entry's own signed amount since inception
+(`lifetime_interest`, already computed in the Cash drag lifetime block
+below for the lifetime yield rate - reused, not recomputed). Same
+reasoning as the other platforms: "Intérêts" was previously only ever a
+RESIDUAL on the spreadsheet/dashboard side (XIRR - XIRR Bonus - XIRR Cash
+drag - XIRR Taxes/Frais), which can legitimately go negative or misleading
+depending on the other shares' relative size - XIRR Intérêts instead
+gives a genuine, independently-measured figure (same category of
+computation as Bonus/Cash drag/Taxes, not a derived leftover), so the two
+can be compared/sanity-checked against each other on the sheet/dashboard
+side.
+
 The "Répartition géographique" section also already has a single "Lande"
 aggregate row (under a "Crowdlending agricole" sub-header, verified live
 2026-07-29) with NO per-borrower sub-rows below it (unlike Mintos/Swaper's
@@ -484,10 +504,10 @@ def run(session: requests.Session | None = None) -> None:
             log.exception("Failed to fetch/update Lande's 'non investi' row.")
 
         # Since-inception XIRR (money-weighted return) + this month's Cash
-        # drag + the XIRR Bonus/Cash drag/Taxes-Frais pie-chart shares -
-        # LIVE-only snapshot metrics (need TODAY's real total account
-        # value as the final cashflow), see module docstring for the
-        # scraped transaction ledger this is built from.
+        # drag + the XIRR Bonus/Cash drag/Taxes-Frais/Intérêts pie-chart
+        # shares - LIVE-only snapshot metrics (need TODAY's real total
+        # account value as the final cashflow), see module docstring for
+        # the scraped transaction ledger this is built from.
         today_date = report_date
         all_entries = None
         try:
@@ -543,6 +563,13 @@ def run(session: requests.Session | None = None) -> None:
         cash_drag_value = None
         cash_drag_xirr_contribution = None
         taxes_xirr_contribution = None
+        # XIRR Intérêts (added 2026-08-19, mirrors loanch/mintos/bienpreter/
+        # afranga/iuvo/lendermarket's own XIRR Intérêts blocks): Lande has
+        # no gross/withholding-tax split (net == gross here, see module
+        # docstring), so "lifetime net interest" is just lifetime_interest,
+        # already summed just below for the Cash drag lifetime yield rate -
+        # reused, not recomputed.
+        interest_xirr_contribution = None
         if all_entries is not None and total_invested is not None and total_invested > 0:
             month_start = today_date.replace(day=1)
             avg_idle_cash_this_month = compute_average_idle_cash(all_entries, month_start, today_date)
@@ -589,11 +616,38 @@ def run(session: requests.Session | None = None) -> None:
                 else:
                     taxes_xirr_contribution = 0.0
 
-        # "Cash drag"/"XIRR" and the XIRR Bonus/Cash drag/Taxes-Frais
-        # pie-chart shares sit further below Lande's block (rows already
-        # added by the user, verified live at rows 242-246 under "Lande"),
-        # past "Bonus"/"cashback"/"Rendements %" - hence max_rows=12. Only
-        # included when actually computed.
+                # XIRR Intérêts (added 2026-08-19): same counterfactual
+                # pattern as XIRR Bonus/XIRR Taxes-Frais above -
+                # lifetime_interest (real "Intérêt"-labelled entries since
+                # inception, already summed above for Cash drag's lifetime
+                # yield rate) is reused here rather than recomputed.
+                if lifetime_interest:
+                    cashflows_without_interest = signed_cashflows[:-1] + [(today_date, total - lifetime_interest)]
+                    xirr_without_interest = compute_xirr(cashflows_without_interest)
+                    if xirr_without_interest is not None:
+                        interest_xirr_contribution = xirr_value - xirr_without_interest
+                        log.info(
+                            "XIRR share - intérêts: %.4f points (lifetime net interest %.2f EUR, no withholding tax on Lande).",
+                            interest_xirr_contribution * 100, lifetime_interest,
+                        )
+                else:
+                    interest_xirr_contribution = 0.0
+
+        # "Cash drag"/"XIRR" and the XIRR Bonus/Cash drag/Taxes-Frais/
+        # Intérêts pie-chart shares sit further below Lande's block (rows
+        # already added by the user, verified live at rows 242-246 under
+        # "Lande"), past "Bonus"/"cashback"/"Rendements %". Only included
+        # when actually computed.
+        # UPDATED 2026-08-19: "XIRR Intérêts" sits right after "XIRR
+        # Taxes/Frais" (mirrors Loanch's/Mintos's/Bienprêter's/Afranga's/
+        # Iuvo's/Lendermarket's own block layout) - this pushes the block
+        # one row taller than it was before, so max_rows is bumped 12 -> 13
+        # to keep the search bounded before the next platform block.
+        # IMPORTANT: a "XIRR Intérêts" row must exist in the Lande block on
+        # the sheet itself (right after "XIRR Taxes/Frais") for this new
+        # value to actually land somewhere - this script fills an existing
+        # row by label, it doesn't insert new labelled rows into this
+        # block.
         bonus_breakdown = {}
         if xirr_value is not None:
             bonus_breakdown["XIRR"] = xirr_value
@@ -605,8 +659,10 @@ def run(session: requests.Session | None = None) -> None:
             bonus_breakdown["XIRR Cash drag"] = cash_drag_xirr_contribution
         if taxes_xirr_contribution is not None:
             bonus_breakdown["XIRR Taxes/Frais"] = taxes_xirr_contribution
+        if interest_xirr_contribution is not None:
+            bonus_breakdown["XIRR Intérêts"] = interest_xirr_contribution
         if bonus_breakdown:
-            fill_current_month_bonus_breakdown(platform=PLATFORM_LABEL, breakdown=bonus_breakdown, max_rows=12)
+            fill_current_month_bonus_breakdown(platform=PLATFORM_LABEL, breakdown=bonus_breakdown, max_rows=13)
 
 
 if __name__ == "__main__":
