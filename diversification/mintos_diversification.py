@@ -180,6 +180,28 @@ per-transaction dated ledger, found via a real browser network capture
     since-inception range, instead of re-deriving it from the ledger a
     second time.
 
+Added 2026-08-19: XIRR Intérêts, the counterfactual XIRR share attributable
+to real net interest received (mirrors loanch_diversification.py's/
+bienpreter_diversification.py's/afranga_diversification.py's/
+iuvo_diversification.py's/lendermarket_diversification.py's own XIRR
+Intérêts blocks). Unlike Loanch (no gross/withholding-tax split at all, so
+"net interest" there is just the raw "Paid interest" ledger sum), Mintos
+DOES have a genuine gross/withholding-tax split
+(fetch_statement_totals()'s "gross_interest_received"/"withholding_tax",
+5% rate) - so "lifetime net interest" here is
+`lifetime_statement_totals["gross_interest_received"] -
+lifetime_statement_totals["withholding_tax"]`, reusing the same
+`lifetime_statement_totals` dict already fetched (once, since-inception)
+for the Cash drag/XIRR Taxes-Frais block just above it, not recomputed a
+second time. Same reasoning as the other platforms: "Intérêts" was
+previously only ever a RESIDUAL (XIRR - XIRR Bonus - XIRR Cash drag - XIRR
+Taxes/Frais) on the spreadsheet/dashboard side, which can legitimately go
+negative or misleading depending on the other shares' relative size - XIRR
+Intérêts instead gives a genuine, independently-measured figure (same
+category of computation as Bonus/Cash drag/Taxes, not a derived leftover),
+so the two can be compared/sanity-checked against each other on the
+sheet/dashboard side.
+
 run() accepts an optional pre-built `requests.Session` (see
 mintos_get_session.py) for a one-shot "log in by hand, then let this take
 over" flow - the env vars below are only required when calling run() with
@@ -410,8 +432,8 @@ def fetch_statement_totals(session: requests.Session, from_date: date, to_date: 
     fetch_current_month_statement_totals(), hardcoded to the current
     calendar month - kept below as a thin wrapper) so run() can ALSO query
     this once for the account's full since-inception range, needed by the
-    XIRR/Cash drag block (see module docstring). See module docstring for
-    the verified endpoint/fields/CSRF mechanism."""
+    XIRR/Cash drag/XIRR Intérêts block (see module docstring). See module
+    docstring for the verified endpoint/fields/CSRF mechanism."""
     csrf_token = get_csrf_token(session)
 
     form = {
@@ -721,8 +743,9 @@ def run(session: requests.Session | None = None) -> None:
     current_month = is_current_month()
 
     # Since-inception XIRR (money-weighted return) + this month's Cash drag
-    # + the XIRR Bonus/Cash drag/Taxes-Frais pie-chart shares - see module
-    # docstring for the real per-transaction ledger this is built from.
+    # + the XIRR Bonus/Cash drag/Taxes-Frais/Intérêts pie-chart shares - see
+    # module docstring for the real per-transaction ledger this is built
+    # from.
     today_date = get_report_date()
     all_entries = None
     if current_month:
@@ -795,6 +818,19 @@ def run(session: requests.Session | None = None) -> None:
     cash_drag_value = None
     cash_drag_xirr_contribution = None
     taxes_xirr_contribution = None
+    # XIRR Intérêts (added 2026-08-19, mirrors loanch_diversification.py's/
+    # bienpreter_diversification.py's/afranga_diversification.py's/
+    # iuvo_diversification.py's/lendermarket_diversification.py's own XIRR
+    # Intérêts blocks): counterfactual XIRR share attributable to real net
+    # interest received since inception. Unlike Loanch (no gross/
+    # withholding-tax split), Mintos DOES have one
+    # (fetch_statement_totals()'s gross_interest_received/withholding_tax,
+    # 5% rate), so "lifetime net interest" here is
+    # lifetime_statement_totals["gross_interest_received"] -
+    # lifetime_statement_totals["withholding_tax"], reusing the same
+    # lifetime_statement_totals dict already fetched below for Cash
+    # drag/XIRR Taxes-Frais (not recomputed a second time).
+    interest_xirr_contribution = None
     if current_month and total_outstanding > 0 and all_entries is not None:
         month_start_str = today_date.replace(day=1).strftime("%Y-%m-%d")
         today_str = today_date.strftime("%Y-%m-%d")
@@ -813,7 +849,7 @@ def run(session: requests.Session | None = None) -> None:
             try:
                 lifetime_statement_totals = fetch_statement_totals(session, since_inception_date, today_date)
             except Exception:
-                log.exception("Failed to fetch lifetime statement totals - Cash drag/Taxes XIRR shares will not be updated.")
+                log.exception("Failed to fetch lifetime statement totals - Cash drag/Taxes/Intérêts XIRR shares will not be updated.")
                 lifetime_statement_totals = None
 
             if lifetime_statement_totals is not None:
@@ -839,6 +875,25 @@ def run(session: requests.Session | None = None) -> None:
                 else:
                     taxes_xirr_contribution = 0.0
 
+                # XIRR Intérêts (added 2026-08-19): same counterfactual
+                # pattern as XIRR Bonus/XIRR Taxes-Frais above - lifetime
+                # net interest reuses lifetime_statement_totals (already
+                # fetched just above for Cash drag/XIRR Taxes-Frais),
+                # rather than being recomputed from the ledger.
+                lifetime_net_interest = lifetime_statement_totals["gross_interest_received"] - lifetime_statement_totals["withholding_tax"]
+                if lifetime_net_interest:
+                    cashflows_without_interest = signed_cashflows[:-1] + [(today_date, total_with_cash - lifetime_net_interest)]
+                    xirr_without_interest = compute_xirr(cashflows_without_interest)
+                    if xirr_without_interest is not None:
+                        interest_xirr_contribution = xirr_value - xirr_without_interest
+                        log.info(
+                            "XIRR share - intérêts: %.4f points (lifetime net interest %.2f EUR, gross %.2f EUR, withholding tax %.2f EUR).",
+                            interest_xirr_contribution * 100, lifetime_net_interest,
+                            lifetime_statement_totals["gross_interest_received"], lifetime_withholding_tax,
+                        )
+                else:
+                    interest_xirr_contribution = 0.0
+
     labeled_amounts = {
         "intérêts brut prêts": statement_totals["gross_interest_received_loans"],
         "intérêts brut obligations": statement_totals["gross_interest_received_obligations"],
@@ -863,12 +918,21 @@ def run(session: requests.Session | None = None) -> None:
         skip_total=not current_month,
     )
 
-    # "Cash drag"/"XIRR" and the XIRR Bonus/Cash drag/Taxes-Frais pie-chart
-    # shares sit further below Mintos' block (rows already added by the
-    # user, mirroring Afranga/Swaper/Lendermarket/PeerBerry/Loanch's own
-    # blocks) - past "Bonus"/"prime"/"cashback"/"concours" (unused here,
-    # Mintos has no bonus/cashback feature), hence max_rows=18. Only
-    # included when actually computed (current month only).
+    # "Cash drag"/"XIRR" and the XIRR Bonus/Cash drag/Taxes-Frais/Intérêts
+    # pie-chart shares sit further below Mintos' block (rows already added
+    # by the user, mirroring Afranga/Swaper/Lendermarket/PeerBerry/Loanch's
+    # own blocks) - past "Bonus"/"prime"/"cashback"/"concours" (unused
+    # here, Mintos has no bonus/cashback feature). Only included when
+    # actually computed (current month only).
+    # UPDATED 2026-08-19: "XIRR Intérêts" sits right after "XIRR
+    # Taxes/Frais" (mirrors Loanch's/Bienprêter's/Afranga's/Iuvo's/
+    # Lendermarket's own block layout) - this pushes the block one row
+    # taller than it was before, so max_rows is bumped 18 -> 19 to keep the
+    # search bounded before the next platform block. IMPORTANT: a "XIRR
+    # Intérêts" row must exist in the Mintos block on the sheet itself
+    # (right after "XIRR Taxes/Frais") for this new value to actually land
+    # somewhere - this script fills an existing row by label, it doesn't
+    # insert new labelled rows into this block.
     bonus_breakdown = {}
     if xirr_value is not None:
         bonus_breakdown["XIRR"] = xirr_value
@@ -880,8 +944,10 @@ def run(session: requests.Session | None = None) -> None:
         bonus_breakdown["XIRR Cash drag"] = cash_drag_xirr_contribution
     if taxes_xirr_contribution is not None:
         bonus_breakdown["XIRR Taxes/Frais"] = taxes_xirr_contribution
+    if interest_xirr_contribution is not None:
+        bonus_breakdown["XIRR Intérêts"] = interest_xirr_contribution
     if bonus_breakdown:
-        fill_current_month_bonus_breakdown(platform=PLATFORM_LABEL, breakdown=bonus_breakdown, max_rows=18)
+        fill_current_month_bonus_breakdown(platform=PLATFORM_LABEL, breakdown=bonus_breakdown, max_rows=19)
 
     # "Répartition géographique": the "Mintos" row itself is a computed
     # cell in the Sheet (sums its own sub-rows) - only write the per-issuer
