@@ -84,6 +84,22 @@ correctly uses skip_total (no historical total data source exists for this
 platform, same as Lendermarket) instead of silently writing the wallet
 balance into the "total invested" cell.
 
+Added 2026-08-19: XIRR Intérêts, the counterfactual XIRR share
+attributable to real net interest received since inception (mirrors
+afranga_diversification.py's own XIRR Intérêts block exactly - same
+counterfactual-XIRR pattern as Bonus/Cash drag/Taxes above). Unlike
+Afranga (which has a real gross/withholding-tax split and must subtract
+the two to get a net figure), PeerBerry's account-summary API has no such
+split - `interest_income` (from fetch_statement_summary(), queried here
+over the since-inception range already fetched for Cash drag/Taxes-Frais,
+no extra fetch needed) already IS the lifetime net interest figure, so it
+is used directly as `lifetime_net_interest`. As with Afranga, a "XIRR
+Intérêts" row must already exist in the PeerBerry block on the sheet
+itself (right after "XIRR Taxes/Frais") for this new value to land
+anywhere - fill_current_month_bonus_breakdown() fills an existing row by
+label, it doesn't insert new labelled rows. `max_rows` is bumped 14 -> 15
+to keep the search bounded past this now-taller block.
+
 Required env vars:
     PEERBERRY_EMAIL, PEERBERRY_PASSWORD    -> PeerBerry account credentials
 Optional:
@@ -430,10 +446,10 @@ def run() -> None:
         available_money = None
 
     # Since-inception XIRR (money-weighted return) + this month's Cash drag
-    # + the XIRR Bonus/Cash drag/Taxes-Frais pie-chart shares - see module
-    # docstring for the real per-transaction ledger this is built from
-    # (unlike Lendermarket, which has no such ledger and must approximate
-    # monthly).
+    # + the XIRR Bonus/Cash drag/Taxes-Frais/Intérêts pie-chart shares - see
+    # module docstring for the real per-transaction ledger this is built
+    # from (unlike Lendermarket, which has no such ledger and must
+    # approximate monthly).
     all_entries = None
     if current_month:
         try:
@@ -513,6 +529,11 @@ def run() -> None:
     cash_drag_value = None
     cash_drag_xirr_contribution = None
     taxes_xirr_contribution = None
+    # XIRR Intérêts (added 2026-08-19, mirrors afranga_diversification.py's
+    # own XIRR Intérêts block - see module docstring for the full
+    # rationale): counterfactual XIRR share attributable to real net
+    # interest received since inception.
+    interest_xirr_contribution = None
     if current_month and total_invested > 0 and all_entries is not None:
         month_start_str = today_date.replace(day=1).strftime("%Y-%m-%d")
         today_str = today_date.strftime("%Y-%m-%d")
@@ -529,7 +550,7 @@ def run() -> None:
             try:
                 lifetime_statement = fetch_statement_summary(session, since_inception_date.strftime("%Y-%m-%d"), today_str)
             except Exception:
-                log.exception("Failed to fetch since-inception statement totals - Cash drag/Taxes-Frais XIRR shares will not be updated.")
+                log.exception("Failed to fetch since-inception statement totals - Cash drag/Taxes-Frais/Intérêts XIRR shares will not be updated.")
                 lifetime_statement = None
 
             if lifetime_statement is not None:
@@ -558,6 +579,25 @@ def run() -> None:
                         log.info("XIRR share - taxes/frais: %.4f points (lifetime fees %.2f EUR).", taxes_xirr_contribution * 100, lifetime_sale_fees)
                 else:
                     taxes_xirr_contribution = 0.0
+
+                # XIRR Intérêts: same counterfactual pattern as Bonus/Cash
+                # drag/Taxes above, but for the real net interest received
+                # since inception. Unlike Afranga (gross minus withholding
+                # tax), PeerBerry's account-summary API has no such split
+                # (see module docstring) - lifetime_statement["interest_income"]
+                # already IS the lifetime net interest figure, used directly.
+                lifetime_net_interest = lifetime_statement["interest_income"]
+                if lifetime_net_interest:
+                    cashflows_without_interest = signed_cashflows[:-1] + [(today_date, total_account_value - lifetime_net_interest)]
+                    xirr_without_interest = compute_xirr(cashflows_without_interest)
+                    if xirr_without_interest is not None:
+                        interest_xirr_contribution = xirr_value - xirr_without_interest
+                        log.info(
+                            "XIRR share - intérêts: %.4f points (lifetime net interest %.2f EUR).",
+                            interest_xirr_contribution * 100, lifetime_net_interest,
+                        )
+                else:
+                    interest_xirr_contribution = 0.0
 
     # PeerBerry's account-summary API has no gross/net/withholding-tax
     # breakdown (unlike Afranga/Bienpreter) - interest_income is mapped to
@@ -599,10 +639,17 @@ def run() -> None:
     # same convention as Swaper's referral bonus - written to its own
     # dedicated sub-row, never to the "Bonus" row itself (a SUM formula
     # over prime/cashback/concours). "XIRR"/"Cash drag" and the XIRR
-    # Bonus/Cash drag/Taxes-Frais pie-chart shares (rows already added by
-    # the user, mirroring Afranga/Swaper/Lendermarket's own blocks) are
-    # appended past the default max_rows=6 bound - only included when
-    # actually computed.
+    # Bonus/Cash drag/Taxes-Frais/Intérêts pie-chart shares (rows already
+    # added by the user, mirroring Afranga/Swaper/Lendermarket's own
+    # blocks) are appended past the default max_rows=6 bound - only
+    # included when actually computed. "XIRR Intérêts" (added 2026-08-19)
+    # sits right after "XIRR Taxes/Frais" - this pushes the block one row
+    # taller than before, so `max_rows` is bumped 14 -> 15 to keep the
+    # search bounded before the next platform block. IMPORTANT: a "XIRR
+    # Intérêts" row must exist in the PeerBerry block on the sheet itself
+    # (right after "XIRR Taxes/Frais") for this new value to actually land
+    # somewhere - this script fills an existing row by label, it doesn't
+    # insert new labelled rows into this block.
     bonus_breakdown = {"prime": monthly_referral_bonus}
     if xirr_value is not None:
         bonus_breakdown["XIRR"] = xirr_value
@@ -614,10 +661,12 @@ def run() -> None:
         bonus_breakdown["XIRR Cash drag"] = cash_drag_xirr_contribution
     if taxes_xirr_contribution is not None:
         bonus_breakdown["XIRR Taxes/Frais"] = taxes_xirr_contribution
+    if interest_xirr_contribution is not None:
+        bonus_breakdown["XIRR Intérêts"] = interest_xirr_contribution
     fill_current_month_bonus_breakdown(
         platform="PeerBerry",
         breakdown=bonus_breakdown,
-        max_rows=14,
+        max_rows=15,
     )
 
     loan_originators = [
@@ -634,4 +683,3 @@ def run() -> None:
 
 if __name__ == "__main__":
     run()
-
