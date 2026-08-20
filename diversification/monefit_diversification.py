@@ -45,6 +45,33 @@ old Playwright version's `page.expect_response()` capture of this same
 endpoint (the SPA calls it itself); "Current month" default window
 (1st of the current month through TODAY).
 
+Also computes a since-inception XIRR (money-weighted return) plus this
+month's Cash drag and the XIRR Bonus / XIRR Cash drag / XIRR Taxes/Frais /
+XIRR Intérêts pie-chart shares (see run() below) - same monthly-aggregate
+methodology as lendermarket_diversification.py/iuvo_diversification.py
+(Monefit's account/summary endpoint only returns aggregate totals for a
+queried range, no per-transaction dated ledger, unlike
+afranga/peerberry/swaper).
+
+Added 2026-08-19: XIRR Intérêts, the counterfactual XIRR share
+attributable to real net interest received since inception (mirrors
+afranga_diversification.py's/peerberry_diversification.py's/
+swaper_diversification.py's own XIRR Intérêts block exactly - same
+counterfactual-XIRR pattern as Bonus/Cash drag/Taxes above, computed in
+the same block as cash_drag_xirr_contribution, reusing the already-summed
+`lifetime_interest_total` - no extra fetch needed). Like Swaper/PeerBerry
+(and unlike Afranga, which has a real gross/withholding-tax split to
+subtract), Monefit's account/summary API has no withholding-tax data at
+all (withholding_tax defaults to 0.0 above) - so `lifetime_interest_total`
+(the sum of each cached month's "daily_returns"/interestIncome) already IS
+the lifetime net interest figure, used directly as `lifetime_net_interest`.
+As with the other platforms, a "XIRR Intérêts" row must already exist in
+the Monefit block on the sheet itself (right after "XIRR Taxes/Frais") for
+this new value to land anywhere - fill_current_month_bonus_breakdown()
+fills an existing row by label, it doesn't insert new labelled rows.
+`max_rows` is bumped 14 -> 15 to keep the search bounded past this now-
+taller block.
+
 Required env vars:
     MONEFIT_EMAIL, MONEFIT_PASSWORD    -> Monefit SmartSaver account credentials
 Optional:
@@ -389,15 +416,16 @@ def run() -> None:
     )
 
     # Since-inception XIRR (money-weighted return) + this month's Cash
-    # drag + the XIRR Bonus/Cash drag/Taxes-Frais pie-chart shares - same
-    # monthly-aggregate methodology as lendermarket_diversification.py/
-    # iuvo_diversification.py (Monefit's account/summary endpoint only
-    # returns aggregate totals for a queried range, no per-transaction
-    # dated ledger). Cash drag's avg-idle-cash uses the LIVE `mainAccount`
-    # snapshot (see fetch_vaults_breakdown()'s docstring for why the
-    # monthly opening/closing balance can't be reused here - it's the
-    # WHOLE account, not an idle-cash-only figure) - a real, but
-    # current-snapshot-only (not a true historical average), figure.
+    # drag + the XIRR Bonus/Cash drag/Taxes-Frais/Intérêts pie-chart
+    # shares - same monthly-aggregate methodology as
+    # lendermarket_diversification.py/iuvo_diversification.py (Monefit's
+    # account/summary endpoint only returns aggregate totals for a queried
+    # range, no per-transaction dated ledger). Cash drag's avg-idle-cash
+    # uses the LIVE `mainAccount` snapshot (see fetch_vaults_breakdown()'s
+    # docstring for why the monthly opening/closing balance can't be
+    # reused here - it's the WHOLE account, not an idle-cash-only figure)
+    # - a real, but current-snapshot-only (not a true historical average),
+    # figure.
     xirr_value = None
     signed_cashflows = None
     total_account_value = None
@@ -405,6 +433,16 @@ def run() -> None:
     cash_drag_value = None
     cash_drag_xirr_contribution = None
     taxes_xirr_contribution = None
+    # XIRR Intérêts (added 2026-08-19, mirrors afranga_diversification.py's/
+    # peerberry_diversification.py's/swaper_diversification.py's own XIRR
+    # Intérêts block - see module docstring for the full rationale):
+    # counterfactual XIRR share attributable to real net interest received
+    # since inception. Like Swaper/PeerBerry (and unlike Afranga, which has
+    # to subtract a real withholding tax), Monefit has no withholding-tax
+    # data at all, so the lifetime interest total already summed below for
+    # Cash drag's lifetime_yield_rate (`lifetime_interest_total`) IS the
+    # lifetime net interest figure, reused directly here.
+    interest_xirr_contribution = None
     monthly_summaries = None
     total_invested = vaults["invested"]
     avg_idle_cash = vaults["main_account"]
@@ -488,6 +526,24 @@ def run() -> None:
                     cash_drag_xirr_contribution * 100, avg_idle_cash, missed_earnings,
                 )
 
+            # XIRR Intérêts: same counterfactual pattern as Bonus/Cash drag
+            # above, but for the real net interest received since
+            # inception - lifetime_interest_total (already summed just
+            # above for cash_drag_lifetime_total's yield rate) is used
+            # directly (no withholding tax to subtract, see comment above
+            # interest_xirr_contribution's declaration).
+            if lifetime_interest_total:
+                cashflows_without_interest = signed_cashflows[:-1] + [(end_date, total_account_value - lifetime_interest_total)]
+                xirr_without_interest = compute_xirr(cashflows_without_interest)
+                if xirr_without_interest is not None:
+                    interest_xirr_contribution = xirr_value - xirr_without_interest
+                    log.info(
+                        "XIRR share - intérêts: %.4f points (lifetime net interest %.2f EUR).",
+                        interest_xirr_contribution * 100, lifetime_interest_total,
+                    )
+            else:
+                interest_xirr_contribution = 0.0
+
     # Monefit's "bonus" field ("Rewards & bonuses") maps to "prime" (a
     # referral-style reward) - written to its own dedicated sub-row, never
     # to the "Bonus" row itself (a SUM formula over prime/cashback/
@@ -496,9 +552,16 @@ def run() -> None:
     # ... picked at random") but the account/summary API has no distinct
     # field for draw winnings - only "prime" is written here, "concours"
     # is left untouched pending a dedicated data source. "XIRR"/"Cash
-    # drag" and the XIRR Bonus/Cash drag/Taxes-Frais pie-chart shares
-    # (rows already added by the user, platform_row+9 through +13) are
-    # only included when actually computed.
+    # drag" and the XIRR Bonus/Cash drag/Taxes-Frais/Intérêts pie-chart
+    # shares (rows already added by the user) are only included when
+    # actually computed. "XIRR Intérêts" (added 2026-08-19) sits right
+    # after "XIRR Taxes/Frais" - this pushes the block one row taller than
+    # before, so `max_rows` is bumped 14 -> 15 to keep the search bounded
+    # before the next platform block. IMPORTANT: a "XIRR Intérêts" row
+    # must exist in the Monefit block on the sheet itself (right after
+    # "XIRR Taxes/Frais") for this new value to actually land somewhere -
+    # this script fills an existing row by label, it doesn't insert new
+    # labelled rows into this block.
     bonus_breakdown = {"prime": statement_totals["rewards_bonuses"]}
     if xirr_value is not None:
         bonus_breakdown["XIRR"] = xirr_value
@@ -510,11 +573,13 @@ def run() -> None:
         bonus_breakdown["XIRR Cash drag"] = cash_drag_xirr_contribution
     if taxes_xirr_contribution is not None:
         bonus_breakdown["XIRR Taxes/Frais"] = taxes_xirr_contribution
+    if interest_xirr_contribution is not None:
+        bonus_breakdown["XIRR Intérêts"] = interest_xirr_contribution
     fill_current_month_bonus_breakdown(
         platform="Monefit",
         breakdown=bonus_breakdown,
         section="Crowdlending savings",
-        max_rows=14,
+        max_rows=15,
     )
 
     loan_originators = [{"name": LOAN_ORIGINATOR_LABEL, "amount": balance}]
