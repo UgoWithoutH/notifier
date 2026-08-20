@@ -34,6 +34,29 @@ Statement page (https://swaper.com/en/investments/account-statement) - see
 fetch_current_month_interest_received() below, same idea as
 loanch_diversification.fetch_current_month_statement_totals().
 
+Also computes a since-inception XIRR (money-weighted return) plus this
+month's Cash drag and the XIRR Bonus / XIRR Cash drag / XIRR Taxes/Frais /
+XIRR Intérêts pie-chart shares (see run() below, and
+afranga_diversification.py's own docstring for the full since-inception
+XIRR methodology, shared across every *_diversification.py that computes
+it).
+
+Added 2026-08-19: XIRR Intérêts, the counterfactual XIRR share
+attributable to real net interest received since inception (mirrors
+afranga_diversification.py's/peerberry_diversification.py's own XIRR
+Intérêts block exactly - same counterfactual-XIRR pattern as Bonus/Cash
+drag/Taxes above). Like PeerBerry (and unlike Afranga, which has a real
+gross/withholding-tax split to subtract), Swaper's account-entries API has
+no withholding-tax data at all (taxes_xirr_contribution is hardcoded to
+0.0 above for the same reason) - so `lifetime_statement_totals["earned_interest"]`
+already IS the lifetime net interest figure, used directly as
+`lifetime_net_interest`, no extra fetch/subtraction needed. As with
+Afranga/PeerBerry, a "XIRR Intérêts" row must already exist in the Swaper
+block on the sheet itself (right after "XIRR Taxes/Frais") for this new
+value to land anywhere - fill_current_month_bonus_breakdown() fills an
+existing row by label, it doesn't insert new labelled rows. `max_rows` is
+bumped 18 -> 19 to keep the search bounded past this now-taller block.
+
 Required env vars:
     SWAPER_EMAIL, SWAPER_PASSWORD      -> Swaper account credentials (shared
                                            with swaper_monitor.py)
@@ -829,6 +852,15 @@ def run(headless: bool = True) -> None:
     # platform, see amounts["withholding_tax"] above) - always 0, since-
     # inception or not, so no lifetime reconstruction is needed here.
     taxes_xirr_contribution = 0.0 if current_month else None
+    # XIRR Intérêts (added 2026-08-19, mirrors afranga_diversification.py's/
+    # peerberry_diversification.py's own XIRR Intérêts block - see module
+    # docstring for the full rationale): counterfactual XIRR share
+    # attributable to real net interest received since inception. Like
+    # PeerBerry (and unlike Afranga, which has to subtract a real
+    # withholding tax), Swaper has no withholding-tax data at all, so
+    # lifetime_statement_totals["earned_interest"] already IS the lifetime
+    # net interest figure, used directly.
+    interest_xirr_contribution = None
     if current_month and statement_totals is not None and breakdown["total_invested"] > 0:
         month_start_date = get_report_now(REPORT_TIMEZONE).replace(day=1).strftime("%Y-%m-%d")
         today_date_str = get_report_now(REPORT_TIMEZONE).strftime("%Y-%m-%d")
@@ -882,6 +914,27 @@ def run(headless: bool = True) -> None:
                             cash_drag_xirr_contribution * 100, years_elapsed, missed_earnings, taxes_xirr_contribution * 100,
                         )
 
+                    # XIRR Intérêts: same counterfactual pattern as
+                    # Bonus/Cash drag above, but for the real net interest
+                    # received since inception - lifetime_statement_totals["earned_interest"]
+                    # is used directly (no withholding tax to subtract, see
+                    # comment above interest_xirr_contribution's
+                    # declaration).
+                    lifetime_net_interest = lifetime_statement_totals["earned_interest"]
+                    if lifetime_net_interest:
+                        cashflows_without_interest = signed_cashflows[:-1] + [
+                            (today_date, total_account_value - lifetime_net_interest)
+                        ]
+                        xirr_without_interest = compute_xirr(cashflows_without_interest)
+                        if xirr_without_interest is not None:
+                            interest_xirr_contribution = xirr_value - xirr_without_interest
+                            log.info(
+                                "XIRR share - intérêts: %.4f points (lifetime net interest %.2f EUR).",
+                                interest_xirr_contribution * 100, lifetime_net_interest,
+                            )
+                    else:
+                        interest_xirr_contribution = 0.0
+
     # "total" comes from the "Currently Allocated" DOM widget plus the
     # uninvested balance (see above), a LIVE-only snapshot with no date
     # param, and account-entries (the date-ranged interest API) has no
@@ -898,11 +951,18 @@ def run(headless: bool = True) -> None:
     # the "Bonus" row itself (a SUM formula over prime/cashback/concours).
     # "Cash drag"/"XIRR" are written alongside it, further down the same
     # block (past fill_current_month_bonus_breakdown()'s default max_rows=6
-    # bound - hence the explicit max_rows=12 here, with a safety margin
-    # since the user has already inserted a row in this block once) - only
-    # included when actually computed, so a failed/skipped computation
+    # bound - hence the explicit max_rows=19 here, with a safety margin
+    # since the user has already inserted rows in this block a few times) -
+    # only included when actually computed, so a failed/skipped computation
     # leaves the existing cell untouched rather than overwriting it with a
-    # wrong/zero value.
+    # wrong/zero value. "XIRR Intérêts" (added 2026-08-19) sits right after
+    # "XIRR Taxes/Frais" - this pushes the block one row taller than
+    # before, so `max_rows` is bumped 18 -> 19 to keep the search bounded
+    # before the next platform block. IMPORTANT: a "XIRR Intérêts" row must
+    # exist in the Swaper block on the sheet itself (right after "XIRR
+    # Taxes/Frais") for this new value to actually land somewhere - this
+    # script fills an existing row by label, it doesn't insert new
+    # labelled rows into this block.
     bonus_breakdown = {"prime": referral_bonus_earned}
     if xirr_value is not None:
         bonus_breakdown["XIRR"] = xirr_value
@@ -918,10 +978,12 @@ def run(headless: bool = True) -> None:
         bonus_breakdown["XIRR Cash drag"] = cash_drag_xirr_contribution
     if taxes_xirr_contribution is not None:
         bonus_breakdown["XIRR Taxes/Frais"] = taxes_xirr_contribution
+    if interest_xirr_contribution is not None:
+        bonus_breakdown["XIRR Intérêts"] = interest_xirr_contribution
     fill_current_month_bonus_breakdown(
         platform="Swaper",
         breakdown=bonus_breakdown,
-        max_rows=18,
+        max_rows=19,
     )
 
     loan_originators = [
