@@ -100,6 +100,27 @@ anywhere - fill_current_month_bonus_breakdown() fills an existing row by
 label, it doesn't insert new labelled rows. `max_rows` is bumped 14 -> 15
 to keep the search bounded past this now-taller block.
 
+BUGFIX 2026-08-21: a backfill run (scripts/run_diversification_for_month_
+range.sh, which simulates get_report_now() as an arbitrary day within a
+target month) for the CURRENT calendar month was able to trigger the
+XIRR/transactions block below, because is_current_month() only compares
+the MONTH, not the exact simulated day. When the simulated day is in the
+future relative to the real wall-clock day (e.g. a backfill run using
+today_date=2026-08-31 while the real date is 2026-08-20), that future date
+got passed into get_cached_transactions() and persisted as
+last_fetched_date in XIRR_CASHFLOWS_STATE_FILE. The NEXT real run then
+called the transactions API with startDate (2026-08-31) AFTER endDate
+(2026-08-20) - an inverted range - which PeerBerry's API rejects with a
+422, breaking XIRR/Cash drag/Taxes-Frais/Intérêts for that run. Fixed by
+gating the transactions/XIRR block on a new `is_real_today` check (today_
+date must equal the REAL wall-clock day in REPORT_TIMEZONE, not just be in
+the current real month) in addition to `current_month`, and by making
+fetch_all_transactions() refuse to call the API at all with an inverted
+date range (defense in depth, in case a stale/poisoned cache slips through
+some other way). No change to any XIRR/Cash drag/Taxes-Frais/Intérêts
+calculation itself - only to when the fetch that feeds them is allowed to
+run and persist its cache.
+
 Required env vars:
     PEERBERRY_EMAIL, PEERBERRY_PASSWORD    -> PeerBerry account credentials
 Optional:
@@ -292,7 +313,23 @@ def fetch_all_transactions(session: requests.Session, start_date: str, end_date:
     """Fetch EVERY transaction row within [start_date, end_date], paginated
     via TRANSACTIONS_PAGE_SIZE/MAX_TRANSACTIONS_PAGES - the endpoint has no
     total-count field, so pagination stops as soon as a page comes back
-    shorter than the requested pageSize (or empty)."""
+    shorter than the requested pageSize (or empty).
+
+    BUGFIX 2026-08-21: refuse to call the API at all when start_date is
+    AFTER end_date - PeerBerry's API returns a 422 for an inverted range
+    (see module docstring for how a poisoned/future last_fetched_date could
+    end up here). Defense in depth on top of the is_real_today guard in
+    run()/get_cached_transactions(): treated as "no new entries" rather
+    than raising, so a stale cache can't hard-crash a real run.
+    """
+    if start_date > end_date:
+        log.warning(
+            "start_date %s is after end_date %s - skipping the transactions fetch "
+            "(returning no new entries) instead of calling the API with an inverted range.",
+            start_date, end_date,
+        )
+        return []
+
     entries = []
     offset = 0
     for page_number in range(1, MAX_TRANSACTIONS_PAGES + 1):
@@ -322,6 +359,12 @@ def get_cached_transactions(session: requests.Session, end_date: str) -> list:
     day after) so a same-day transaction added after the previous run
     already fetched it isn't missed - duplicates are then dropped by
     de-duplicating on the row's own `id`.
+
+    Callers must only invoke this with the REAL wall-clock day as
+    `end_date` (see run()'s `is_real_today` guard) - `end_date` is
+    persisted as the new `last_fetched_date` below, and a simulated/backfill
+    date here would poison the cache for future real runs (see module
+    docstring BUGFIX 2026-08-21).
     """
     state = load_state(XIRR_CASHFLOWS_STATE_FILE, XIRR_CASHFLOWS_STATE_DEFAULT)
     cached_entries = state.get("all_entries") or []
@@ -409,6 +452,17 @@ def run() -> None:
     # same convention as Afranga/Swaper/Lendermarket.
     current_month = is_current_month()
     today_date = get_report_now(REPORT_TIMEZONE).date()
+    # BUGFIX 2026-08-21: is_current_month() only compares the MONTH, not the
+    # exact day - a backfill run (scripts/run_diversification_for_month_
+    # range.sh) that simulates "now" as some other day within the current
+    # real calendar month (e.g. the month's last day, in the future
+    # relative to the real wall-clock day) would still satisfy
+    # current_month=True. The transactions/XIRR block below must only run
+    # against the REAL wall-clock day - get_cached_transactions() persists
+    # today_date as last_fetched_date, and a simulated/future date there
+    # poisons the cache for the next real run (inverted date range ->
+    # transactions API 422). See module docstring for the full incident.
+    is_real_today = today_date == datetime.now(REPORT_TIMEZONE).date()
 
     log.info("Starting PeerBerry diversification run (pure HTTP, no browser).")
 
@@ -451,7 +505,7 @@ def run() -> None:
     # from (unlike Lendermarket, which has no such ledger and must
     # approximate monthly).
     all_entries = None
-    if current_month:
+    if current_month and is_real_today:
         try:
             log.info("Fetching the since-inception transaction history (cached where possible)...")
             all_entries = get_cached_transactions(session, today_date.strftime("%Y-%m-%d"))
