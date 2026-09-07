@@ -93,21 +93,34 @@ independently-measured figure (same category of computation as Bonus, not
 a derived leftover), so the two can be compared/sanity-checked against
 each other on the sheet/dashboard side.
 
-NOTE 2026-09-07 (investigated, NOT implemented - genuine data-source
-limitation, mirrors afranga_diversification.py's own backfill feature for
-a past REPORT_DATE month but does NOT port here): `total_invested` here is
+UPDATE 2026-09-07 (implemented after all - backward reconstruction,
+supersedes the "NOT IMPLEMENTED" finding below): forward-reconstructing
+`total_invested` (the live `balance_data["total"] - available_funds`
+split for a past date) is still impossible for the reason below, but
+total_account_value at a past `today_date` CAN be derived BACKWARD from
+TODAY's known live `balance_data["total"]`: every cached month's own
+`deposits`/`withdrawals`/`gross_interest_received`/`bonus_cashback_contest`
+already capture every real external cashflow/earning that occurred - so
+subtracting the sum of those fields for every month AFTER `today_date`'s
+own month from today's live total gives that month's real
+total_account_value, with no need to ever know the live-only invested/
+wallet split for a past date at all. `total_invested` at that date then
+falls out as a remainder (that total minus the month's own real closing
+wallet balance, already cached). This is what now lets XIRR/Cash drag/the
+pie-chart shares be computed for a backfilled month too (previously
+current-month-only) - see run()'s `real_today`/`monthly_summaries_as_of`
+split. "total" itself still isn't written for a backfilled month (still
+skip_total, unchanged).
+
+ORIGINAL 2026-09-07 finding (still true, explains why FORWARD
+reconstruction specifically doesn't work): `total_invested` here is
 `balance_data["total"] - balance_data["available_funds"]`, itself built
 from the LIVE `investors[0].accountBalance` JS literal on the
 `overview_page` (no date param exists for it) - there is no way to know
 what this figure actually WAS on some past date without a genuine
 per-transaction dated ledger (the date-filtered `account_statement_grouped_page`
 call above only returns TYPE-GROUPED totals for a queried range, no
-running/closing-balance field). Reconstructing it for a past month would
-therefore have to guess, silently producing a WRONG historical outstanding
-figure (and therefore a wrong XIRR) with no warning - so XIRR/Cash
-drag/the pie-chart shares stay current-month-only (unchanged, still gated
-behind `is_current_month()`), same conclusion as Bienprêter's/
-Lendermarket's own equivalent notes.
+running/closing-balance field for the INVESTED portion specifically).
 
 Required env vars:
     IUVO_EMAIL, IUVO_PASSWORD            -> Iuvo account credentials
@@ -542,6 +555,7 @@ def run() -> None:
 
     current_month = is_current_month()
     today_date = get_report_now(REPORT_TIMEZONE).date()
+    real_today = date.today()  # always the actual current date - monthly summaries must be cached through here (not just today_date) so a backfilled month can subtract every later month's net cashflow/earnings from today's live total (see module docstring's 2026-09-07 backward-reconstruction note)
 
     # Since-inception XIRR (money-weighted return) + this month's Cash
     # drag + the XIRR Bonus/Cash drag/Taxes-Frais/Intérêts pie-chart shares
@@ -568,20 +582,52 @@ def run() -> None:
     # monthly_summaries is available.
     interest_xirr_contribution = None
     monthly_summaries = None
-    if current_month:
-        try:
-            investor_account_id = _fetch_investor_account_id(session, session_token)
-            log.info("Fetching the since-inception monthly statement summaries (cached where possible)...")
-            monthly_summaries = get_cached_monthly_summaries(session, session_token, investor_account_id, today_date)
-        except Exception:
-            log.exception("Failed to fetch the monthly statement summary history - XIRR will not be updated.")
-            monthly_summaries = None
+    try:
+        investor_account_id = _fetch_investor_account_id(session, session_token)
+        log.info("Fetching the since-inception monthly statement summaries (cached where possible)...")
+        monthly_summaries = get_cached_monthly_summaries(session, session_token, investor_account_id, real_today)
+    except Exception:
+        log.exception("Failed to fetch the monthly statement summary history - XIRR will not be updated.")
+        monthly_summaries = None
 
-    if current_month and monthly_summaries:
-        total_account_value = balance_data["total"]
+    # Months after today_date's own month belong to a backfilled month's
+    # future (real_today, not today_date) - excluded from every "as of
+    # today_date" figure below via monthly_summaries_as_of; the full
+    # unfiltered `monthly_summaries` is still needed for the backward
+    # reconstruction just below, which specifically looks PAST that month.
+    monthly_summaries_as_of = None
+    today_month_key = f"{today_date.year:04d}-{today_date.month:02d}"
+    if monthly_summaries:
+        monthly_summaries_as_of = {k: v for k, v in monthly_summaries.items() if k <= today_month_key}
+
+    if monthly_summaries_as_of:
+        if current_month:
+            total_account_value = balance_data["total"]
+        else:
+            # Backfilled month: reconstruct today_date's total account
+            # value by subtracting today's live total every real net
+            # deposit/withdrawal/interest/bonus from every month AFTER
+            # today_date's own month, then derive total_invested as a
+            # remainder (total minus that month's own real closing wallet
+            # figure) - sidesteps ever needing a past outstanding-balance
+            # history (see module docstring).
+            value_change_since = sum(
+                s["deposits"] - s["withdrawals"] + s["gross_interest_received"] + s["bonus_cashback_contest"]
+                for k, s in monthly_summaries.items() if k > today_month_key
+            )
+            total_account_value = balance_data["total"] - value_change_since
+            closing_balance_as_of = monthly_summaries_as_of[today_month_key]["closing_balance"]
+            total_invested = total_account_value - closing_balance_as_of
+            log.info(
+                "Backfilled month (%s): reconstructed total_account_value=%.2f EUR (live total %.2f EUR - "
+                "%.2f EUR net change since then), closing_balance_as_of=%.2f EUR, total_invested=%.2f EUR.",
+                today_date, total_account_value, balance_data["total"], value_change_since,
+                closing_balance_as_of, total_invested,
+            )
+
         signed_cashflows = []
-        for month_key in sorted(monthly_summaries):
-            summary = monthly_summaries[month_key]
+        for month_key in sorted(monthly_summaries_as_of):
+            summary = monthly_summaries_as_of[month_key]
             net_deposit = summary["deposits"] - summary["withdrawals"]
             if abs(net_deposit) < 0.005:
                 continue
@@ -604,7 +650,7 @@ def run() -> None:
                 xirr_value * 100, len(signed_cashflows) - 1, total_account_value,
             )
 
-            lifetime_bonus_total = sum(s["bonus_cashback_contest"] for s in monthly_summaries.values())
+            lifetime_bonus_total = sum(s["bonus_cashback_contest"] for s in monthly_summaries_as_of.values())
             if lifetime_bonus_total:
                 cashflows_without_bonus = signed_cashflows[:-1] + [(today_date, total_account_value - lifetime_bonus_total)]
                 xirr_without_bonus = compute_xirr(cashflows_without_bonus)
@@ -618,7 +664,7 @@ def run() -> None:
             # as XIRR Bonus just above - lifetime net interest = lifetime
             # gross interest here (no withholding tax on Iuvo at all), summed
             # across every cached monthly summary.
-            lifetime_net_interest = sum(s["gross_interest_received"] for s in monthly_summaries.values())
+            lifetime_net_interest = sum(s["gross_interest_received"] for s in monthly_summaries_as_of.values())
             if lifetime_net_interest:
                 cashflows_without_interest = signed_cashflows[:-1] + [(today_date, total_account_value - lifetime_net_interest)]
                 xirr_without_interest = compute_xirr(cashflows_without_interest)
@@ -631,8 +677,8 @@ def run() -> None:
             else:
                 interest_xirr_contribution = 0.0
 
-    if current_month and total_invested > 0 and monthly_summaries:
-        current_month_summary = monthly_summaries.get(f"{today_date.year:04d}-{today_date.month:02d}") or {}
+    if total_invested > 0 and monthly_summaries_as_of:
+        current_month_summary = monthly_summaries_as_of.get(today_month_key) or {}
         avg_idle_cash_this_month = (current_month_summary.get("opening_balance", 0.0) + current_month_summary.get("closing_balance", 0.0)) / 2
         cash_weight = avg_idle_cash_this_month / (avg_idle_cash_this_month + total_invested)
         monthly_yield_rate = current_month_summary.get("gross_interest_received", 0.0) / total_invested
@@ -643,9 +689,9 @@ def run() -> None:
         )
 
         if xirr_value is not None and signed_cashflows is not None:
-            avg_idle_cash_lifetime = compute_average_idle_cash(monthly_summaries)
+            avg_idle_cash_lifetime = compute_average_idle_cash(monthly_summaries_as_of)
             cash_weight_lifetime = avg_idle_cash_lifetime / (avg_idle_cash_lifetime + total_invested)
-            lifetime_interest_total = sum(s["gross_interest_received"] for s in monthly_summaries.values())
+            lifetime_interest_total = sum(s["gross_interest_received"] for s in monthly_summaries_as_of.values())
             lifetime_yield_rate = lifetime_interest_total / total_invested
             cash_drag_lifetime_total = cash_weight_lifetime * lifetime_yield_rate
             missed_earnings = cash_drag_lifetime_total * (avg_idle_cash_lifetime + total_invested)
