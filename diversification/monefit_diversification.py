@@ -72,6 +72,18 @@ fills an existing row by label, it doesn't insert new labelled rows.
 `max_rows` is bumped 14 -> 15 to keep the search bounded past this now-
 taller block.
 
+Added 2026-09-07: "XIRR"/"XIRR Bonus"/"XIRR Taxes/Frais"/"XIRR Intérêts"
+can now ALSO be computed for a BACKFILLED (past) REPORT_DATE month, not
+just the real current month - each cached monthly summary already carries
+a real `closing_balance` (verified to match live "Total Wealth"), which IS
+the terminal value for a backfilled month, so no reconstruction is needed
+the way afranga_diversification.py's own backfill support needs
+reconstruct_outstanding(). "Cash drag"/"XIRR Cash drag" STAY
+current-month-only (genuinely infeasible to backfill): they need
+`vaults["invested"]`/`vaults["main_account"]`, both LIVE-only snapshots
+with no historical per-date equivalent anywhere on this platform (see the
+comment above `avg_idle_cash`'s own docstring paragraph).
+
 Required env vars:
     MONEFIT_EMAIL, MONEFIT_PASSWORD    -> Monefit SmartSaver account credentials
 Optional:
@@ -447,60 +459,102 @@ def run() -> None:
     total_invested = vaults["invested"]
     avg_idle_cash = vaults["main_account"]
 
-    if current_month:
-        try:
-            log.info("Fetching the since-inception monthly statement summaries (cached where possible)...")
-            monthly_summaries = get_cached_monthly_summaries(session, end_date)
-        except Exception:
-            log.exception("Failed to fetch the monthly statement summary history - XIRR will not be updated.")
-            monthly_summaries = None
+    # Fetching the since-inception monthly summaries no longer requires
+    # `current_month` (added 2026-09-07, mirrors afranga_diversification.py's
+    # own backfill support): XIRR/XIRR Bonus/XIRR Taxes-Frais/XIRR Intérêts
+    # can all be computed for a BACKFILLED (past) REPORT_DATE month too,
+    # since each cached monthly summary already carries a real
+    # `closing_balance` for that month (fetch_statement_summary()'s
+    # account/summary call, verified to match live "Total Wealth" - see
+    # module docstring) - that IS the terminal value for a backfilled
+    # month, no live-only data needed for these 4 figures. "Cash drag"/
+    # "XIRR Cash drag" STAY current-month-only (unchanged) - they need
+    # `vaults["invested"]`/`vaults["main_account"]`, which only exist as a
+    # LIVE snapshot with no historical equivalent (see the comment above
+    # this block).
+    try:
+        log.info("Fetching the since-inception monthly statement summaries (cached where possible)...")
+        monthly_summaries = get_cached_monthly_summaries(session, end_date)
+    except Exception:
+        log.exception("Failed to fetch the monthly statement summary history - XIRR will not be updated.")
+        monthly_summaries = None
 
-    if current_month and monthly_summaries:
-        total_account_value = balance
-        signed_cashflows = []
-        for month_key in sorted(monthly_summaries):
-            summary = monthly_summaries[month_key]
-            net_deposit = summary["deposits"] - summary["withdrawals"]
-            if abs(net_deposit) < 0.005:
-                continue
-            year, month = (int(part) for part in month_key.split("-"))
-            try:
-                month_end = datetime.strptime(summary["end_date"], "%Y-%m-%d").date()
-            except (KeyError, ValueError):
-                month_end = date(year, month, calendar.monthrange(year, month)[1])
-            cashflow_day = min(15, month_end.day)
-            signed_cashflows.append((date(year, month, cashflow_day), -net_deposit))
+    if monthly_summaries:
+        # get_cached_monthly_summaries()'s cache accumulates every month
+        # ever fetched by ANY past run - for a backfilled month, filter out
+        # any month key AFTER this run's own target month (REPORT_DATE),
+        # in case a later real-current-month run already advanced the
+        # cache past it.
+        today_month_key = f"{end_date.year:04d}-{end_date.month:02d}"
+        relevant_summaries = {k: v for k, v in monthly_summaries.items() if k <= today_month_key}
+        total_account_value = balance if current_month else closing_balance
+        if total_account_value is not None:
+            signed_cashflows = []
+            for month_key in sorted(relevant_summaries):
+                summary = relevant_summaries[month_key]
+                net_deposit = summary["deposits"] - summary["withdrawals"]
+                if abs(net_deposit) < 0.005:
+                    continue
+                year, month = (int(part) for part in month_key.split("-"))
+                try:
+                    month_end = datetime.strptime(summary["end_date"], "%Y-%m-%d").date()
+                except (KeyError, ValueError):
+                    month_end = date(year, month, calendar.monthrange(year, month)[1])
+                cashflow_day = min(15, month_end.day)
+                signed_cashflows.append((date(year, month, cashflow_day), -net_deposit))
 
-        signed_cashflows.append((end_date, total_account_value))
+            signed_cashflows.append((end_date, total_account_value))
 
-        xirr_value = compute_xirr(signed_cashflows)
-        if xirr_value is None:
-            log.warning("Could not compute XIRR from %d monthly cashflow(s) - XIRR row will not be updated.", len(signed_cashflows) - 1)
-        else:
-            log.info(
-                "Computed since-inception XIRR: %.2f%% (%d monthly cashflow(s), current total value %.2f EUR).",
-                xirr_value * 100, len(signed_cashflows) - 1, total_account_value,
-            )
-
-            lifetime_bonus_total = sum(s["rewards_bonuses"] for s in monthly_summaries.values())
-            if lifetime_bonus_total:
-                cashflows_without_bonus = signed_cashflows[:-1] + [(end_date, total_account_value - lifetime_bonus_total)]
-                xirr_without_bonus = compute_xirr(cashflows_without_bonus)
-                if xirr_without_bonus is not None:
-                    bonus_xirr_contribution = xirr_value - xirr_without_bonus
-                    log.info("Bonus's own share of XIRR: %.2f points.", bonus_xirr_contribution * 100)
+            xirr_value = compute_xirr(signed_cashflows)
+            if xirr_value is None:
+                log.warning("Could not compute XIRR from %d monthly cashflow(s) - XIRR row will not be updated.", len(signed_cashflows) - 1)
             else:
-                bonus_xirr_contribution = 0.0
+                log.info(
+                    "Computed since-inception XIRR as of %s: %.2f%% (%d monthly cashflow(s), total value %.2f EUR).",
+                    end_date, xirr_value * 100, len(signed_cashflows) - 1, total_account_value,
+                )
 
-            lifetime_fees_total = sum(s["fees"] for s in monthly_summaries.values())
-            if lifetime_fees_total:
-                cashflows_with_fees_cancelled = signed_cashflows[:-1] + [(end_date, total_account_value + lifetime_fees_total)]
-                xirr_with_fees_cancelled = compute_xirr(cashflows_with_fees_cancelled)
-                if xirr_with_fees_cancelled is not None:
-                    taxes_xirr_contribution = xirr_value - xirr_with_fees_cancelled
-                    log.info("XIRR share - taxes/frais: %.4f points (lifetime fees %.2f EUR).", taxes_xirr_contribution * 100, lifetime_fees_total)
-            else:
-                taxes_xirr_contribution = 0.0
+                lifetime_bonus_total = sum(s["rewards_bonuses"] for s in relevant_summaries.values())
+                if lifetime_bonus_total:
+                    cashflows_without_bonus = signed_cashflows[:-1] + [(end_date, total_account_value - lifetime_bonus_total)]
+                    xirr_without_bonus = compute_xirr(cashflows_without_bonus)
+                    if xirr_without_bonus is not None:
+                        bonus_xirr_contribution = xirr_value - xirr_without_bonus
+                        log.info("Bonus's own share of XIRR: %.2f points.", bonus_xirr_contribution * 100)
+                else:
+                    bonus_xirr_contribution = 0.0
+
+                lifetime_fees_total = sum(s["fees"] for s in relevant_summaries.values())
+                if lifetime_fees_total:
+                    cashflows_with_fees_cancelled = signed_cashflows[:-1] + [(end_date, total_account_value + lifetime_fees_total)]
+                    xirr_with_fees_cancelled = compute_xirr(cashflows_with_fees_cancelled)
+                    if xirr_with_fees_cancelled is not None:
+                        taxes_xirr_contribution = xirr_value - xirr_with_fees_cancelled
+                        log.info("XIRR share - taxes/frais: %.4f points (lifetime fees %.2f EUR).", taxes_xirr_contribution * 100, lifetime_fees_total)
+                else:
+                    taxes_xirr_contribution = 0.0
+
+                # XIRR Intérêts: same counterfactual pattern as Bonus/Taxes
+                # above - lifetime net interest since inception (no
+                # withholding tax on Monefit, see comment above
+                # interest_xirr_contribution's declaration). Computed here
+                # (not gated on current_month/total_invested like the live
+                # Cash drag block below) since it only needs
+                # relevant_summaries, already filtered to this run's own
+                # target month.
+                lifetime_interest_total_as_of = sum(s["daily_returns"] for s in relevant_summaries.values())
+                if lifetime_interest_total_as_of:
+                    cashflows_without_interest = signed_cashflows[:-1] + [(end_date, total_account_value - lifetime_interest_total_as_of)]
+                    xirr_without_interest = compute_xirr(cashflows_without_interest)
+                    if xirr_without_interest is not None:
+                        interest_xirr_contribution = xirr_value - xirr_without_interest
+                        log.info(
+                            "XIRR share - intérêts: %.4f points (lifetime net interest %.2f EUR).",
+                            interest_xirr_contribution * 100, lifetime_interest_total_as_of,
+                        )
+                else:
+                    interest_xirr_contribution = 0.0
+
 
     if current_month and total_invested > 0:
         cash_weight = avg_idle_cash / (avg_idle_cash + total_invested)
@@ -525,22 +579,9 @@ def run() -> None:
                     "XIRR share - cash drag: %.4f points (since-inception, avg idle cash %.2f EUR, missed earnings ~%.2f EUR).",
                     cash_drag_xirr_contribution * 100, avg_idle_cash, missed_earnings,
                 )
-
-            # XIRR Intérêts: same counterfactual pattern as Bonus/Cash drag
-            # above, but for the real net interest received since
-            # inception - lifetime_interest_total (already summed just
-            # above for cash_drag_lifetime_total's yield rate) is used
-            # directly (no withholding tax to subtract, see comment above
-            # interest_xirr_contribution's declaration).
-            if lifetime_interest_total:
-                cashflows_without_interest = signed_cashflows[:-1] + [(end_date, total_account_value - lifetime_interest_total)]
-                xirr_without_interest = compute_xirr(cashflows_without_interest)
-                if xirr_without_interest is not None:
-                    interest_xirr_contribution = xirr_value - xirr_without_interest
-                    log.info(
-                        "XIRR share - intérêts: %.4f points (lifetime net interest %.2f EUR).",
-                        interest_xirr_contribution * 100, lifetime_interest_total,
-                    )
+            # XIRR Intérêts is NOT recomputed here - it's already computed
+            # unconditionally further above (works for both current and
+            # backfilled months), reused as-is.
             else:
                 interest_xirr_contribution = 0.0
 

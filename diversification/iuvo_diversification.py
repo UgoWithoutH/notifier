@@ -93,6 +93,22 @@ independently-measured figure (same category of computation as Bonus, not
 a derived leftover), so the two can be compared/sanity-checked against
 each other on the sheet/dashboard side.
 
+NOTE 2026-09-07 (investigated, NOT implemented - genuine data-source
+limitation, mirrors afranga_diversification.py's own backfill feature for
+a past REPORT_DATE month but does NOT port here): `total_invested` here is
+`balance_data["total"] - balance_data["available_funds"]`, itself built
+from the LIVE `investors[0].accountBalance` JS literal on the
+`overview_page` (no date param exists for it) - there is no way to know
+what this figure actually WAS on some past date without a genuine
+per-transaction dated ledger (the date-filtered `account_statement_grouped_page`
+call above only returns TYPE-GROUPED totals for a queried range, no
+running/closing-balance field). Reconstructing it for a past month would
+therefore have to guess, silently producing a WRONG historical outstanding
+figure (and therefore a wrong XIRR) with no warning - so XIRR/Cash
+drag/the pie-chart shares stay current-month-only (unchanged, still gated
+behind `is_current_month()`), same conclusion as Bienprêter's/
+Lendermarket's own equivalent notes.
+
 Required env vars:
     IUVO_EMAIL, IUVO_PASSWORD            -> Iuvo account credentials
 Optional:

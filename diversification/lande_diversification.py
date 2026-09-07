@@ -144,6 +144,18 @@ per-issuer breakdown rows) - written via fill_geographic_repartition_amounts()
 with just the account's total balance, same single-row pattern already
 used for Go & Grow's aggregate row.
 
+Added 2026-09-07: the whole XIRR block (Cash drag, XIRR, XIRR Intérêts,
+XIRR Bonus, XIRR Cash drag, XIRR Taxes/Frais) can now ALSO be computed for a
+BACKFILLED (past) month, not just the live current one - mirroring
+afranga_diversification.py's/mintos_diversification.py's own backfill
+ports, but simpler here since `total` is already the real period-end value
+from the tax-report PDF and `all_entries` is already filtered to `end_date`,
+which respects REPORT_DATE. The historical wallet balance is reconstructed
+by replaying the ledger's signed transaction amounts, so `total_invested` and
+both Cash drag metrics are available for backfills too. For the live current
+month, the independently fetched "Fonds disponibles" snapshot remains
+authoritative and is cross-checked against that replay.
+
 run() accepts an optional pre-built `requests.Session` (see
 lande_get_session.py) for a one-shot "log in by hand, then let this take
 over" flow - the env vars below are only required when calling run() with
@@ -407,6 +419,15 @@ def compute_average_idle_cash(entries: list, start_date, end_date) -> float:
     return total_balance / day_count
 
 
+def wallet_balance_as_of(entries: list, end_date) -> float:
+    """Reconstruct the wallet balance immediately after ``end_date``."""
+    return sum(
+        entry["amount"]
+        for entry in entries
+        if entry.get("date") is not None and entry["date"] <= end_date
+    )
+
+
 def fetch_available_funds(session: requests.Session) -> float:
     """Fetch the uninvested cash balance ("non investi") from the investor
     overview page's "Fonds disponibles" figure (verified live 2026-08-10):
@@ -488,121 +509,110 @@ def run(session: requests.Session | None = None) -> None:
 
     # "Répartition géographique" has a single "Lande" aggregate row (no
     # per-borrower sub-rows below it, unlike Mintos/Swaper) - same value as
-    # the Crowdlending section's total.
+    # the Crowdlending section's total. "non investi" ("Fonds disponibles")
+    # is a LIVE-only snapshot (no date param) - both stay current-month-only.
+    available_funds = None
     if current_month:
         fill_geographic_repartition_amounts([{"name": PLATFORM_LABEL, "amount": total}])
 
-        # "non investi" row (added 2026-08-10): "Fonds disponibles" on the
-        # investor overview page (/fr/investor) - a LIVE-only snapshot (no
-        # date param, like Afranga's walletUninvestedLiveWire), hence only
-        # written for the real current month.
-        available_funds = None
         try:
             available_funds = fetch_available_funds(session)
             fill_geographic_repartition_uninvested_amount(PLATFORM_LABEL, available_funds)
         except Exception:
             log.exception("Failed to fetch/update Lande's 'non investi' row.")
 
-        # Since-inception XIRR (money-weighted return) + this month's Cash
-        # drag + the XIRR Bonus/Cash drag/Taxes-Frais/Intérêts pie-chart
-        # shares - LIVE-only snapshot metrics (need TODAY's real total
-        # account value as the final cashflow), see module docstring for
-        # the scraped transaction ledger this is built from.
-        today_date = report_date
-        all_entries = None
-        try:
-            log.info("Fetching the since-inception transaction ledger (%s - %s)...", SINCE_INCEPTION_START_DATE, end_date)
-            all_entries = fetch_transactions(session, SINCE_INCEPTION_START_DATE, end_date)
-        except Exception:
-            log.exception("Failed to fetch the transaction ledger - XIRR/Cash drag will not be updated.")
+    # Since-inception XIRR (money-weighted return) + this month's/that
+    # backfilled month's Cash drag + the XIRR Bonus/Cash drag/Taxes-Frais/
+    # Intérêts pie-chart shares - see module docstring for the scraped
+    # transaction ledger this is built from. Added 2026-09-07: this now ALSO
+    # runs for a backfilled (past) month, not just the live current one -
+    # `total` (from the tax-report PDF) and `all_entries` (already filtered
+    # to `end_date`, which respects REPORT_DATE) are BOTH already real
+    # historical figures for any requested period, unlike Afranga/Mintos
+    # which need a dedicated reconstruction - only Cash drag/XIRR Cash drag
+    # stay current-month-only below, since they need the LIVE-only
+    # `available_funds` ("Fonds disponibles" has no date param).
+    today_date = report_date
+    all_entries = None
+    try:
+        log.info("Fetching the since-inception transaction ledger (%s - %s)...", SINCE_INCEPTION_START_DATE, end_date)
+        all_entries = fetch_transactions(session, SINCE_INCEPTION_START_DATE, end_date)
+    except Exception:
+        log.exception("Failed to fetch the transaction ledger - XIRR/Cash drag will not be updated.")
 
-        total_invested = (total - available_funds) if available_funds is not None else None
-
-        xirr_value = None
-        signed_cashflows = None
-        bonus_xirr_contribution = None
-        since_inception_date = None
-        lifetime_bonus = 0.0
-        if all_entries:
-            signed_cashflows = []
-            deposit_dates = []
-            for entry in all_entries:
-                label = entry["label"]
-                # `amount` is already signed for its cash-balance impact
-                # (deposit positive, withdrawal negative) - negate for
-                # XIRR's own convention (money going INTO the platform is
-                # negative, money coming back OUT is positive).
-                if _is_deposit(label):
-                    signed_cashflows.append((entry["date"], -entry["amount"]))
-                    deposit_dates.append(entry["date"])
-                elif _is_withdrawal(label):
-                    signed_cashflows.append((entry["date"], -entry["amount"]))
-                elif _is_bonus(label):
-                    lifetime_bonus += entry["amount"]
-
-            since_inception_date = min(deposit_dates) if deposit_dates else None
-            signed_cashflows.append((today_date, total))
-
-            xirr_value = compute_xirr(signed_cashflows)
-            if xirr_value is None:
-                log.warning("Could not compute XIRR from %d cashflow(s) - XIRR row will not be updated.", len(signed_cashflows) - 1)
-            else:
-                log.info(
-                    "Computed since-inception XIRR: %.2f%% (%d deposit/withdrawal cashflow(s), current total value %.2f EUR).",
-                    xirr_value * 100, len(signed_cashflows) - 1, total,
-                )
-                if lifetime_bonus:
-                    cashflows_without_bonus = signed_cashflows[:-1] + [(today_date, total - lifetime_bonus)]
-                    xirr_without_bonus = compute_xirr(cashflows_without_bonus)
-                    if xirr_without_bonus is not None:
-                        bonus_xirr_contribution = xirr_value - xirr_without_bonus
-                        log.info("Bonus's own share of XIRR: %.2f points.", bonus_xirr_contribution * 100)
-                else:
-                    bonus_xirr_contribution = 0.0
-
-        cash_drag_value = None
-        cash_drag_xirr_contribution = None
-        taxes_xirr_contribution = None
-        # XIRR Intérêts (added 2026-08-19, mirrors loanch/mintos/bienpreter/
-        # afranga/iuvo/lendermarket's own XIRR Intérêts blocks): Lande has
-        # no gross/withholding-tax split (net == gross here, see module
-        # docstring), so "lifetime net interest" is just lifetime_interest,
-        # already summed just below for the Cash drag lifetime yield rate -
-        # reused, not recomputed.
-        interest_xirr_contribution = None
-        if all_entries is not None and total_invested is not None and total_invested > 0:
-            month_start = today_date.replace(day=1)
-            avg_idle_cash_this_month = compute_average_idle_cash(all_entries, month_start, today_date)
-            cash_weight = avg_idle_cash_this_month / (avg_idle_cash_this_month + total_invested)
-            monthly_yield_rate = gross_interest_received / total_invested
-            cash_drag_value = cash_weight * monthly_yield_rate
-            log.info(
-                "Computed Cash drag: %.2f%% (avg idle cash %.2f EUR, cash weight %.2f%%, monthly yield %.2f%%).",
-                cash_drag_value * 100, avg_idle_cash_this_month, cash_weight * 100, monthly_yield_rate * 100,
+    wallet_balance_as_of_end = None
+    if all_entries is not None:
+        wallet_balance_as_of_end = wallet_balance_as_of(all_entries, end_date)
+        if available_funds is not None and abs(wallet_balance_as_of_end - available_funds) > 0.05:
+            log.warning(
+                "Reconstructed Lande wallet balance %.2f EUR differs from live available funds %.2f EUR.",
+                wallet_balance_as_of_end,
+                available_funds,
             )
 
-            if xirr_value is not None and signed_cashflows is not None and since_inception_date is not None:
-                avg_idle_cash_lifetime = compute_average_idle_cash(all_entries, since_inception_date, today_date)
-                cash_weight_lifetime = avg_idle_cash_lifetime / (avg_idle_cash_lifetime + total_invested)
-                lifetime_interest = sum(e["amount"] for e in all_entries if _is_interest(e["label"]))
-                lifetime_yield_rate = lifetime_interest / total_invested
-                cash_drag_lifetime_total = cash_weight_lifetime * lifetime_yield_rate
-                missed_earnings = cash_drag_lifetime_total * (avg_idle_cash_lifetime + total_invested)
-                cashflows_with_cash_invested = signed_cashflows[:-1] + [(today_date, total + missed_earnings)]
-                xirr_with_cash_invested = compute_xirr(cashflows_with_cash_invested)
-                if xirr_with_cash_invested is not None:
-                    cash_drag_xirr_contribution = xirr_value - xirr_with_cash_invested
-                    log.info(
-                        "XIRR share - cash drag: %.4f points (since-inception, avg idle cash %.2f EUR, missed earnings ~%.2f EUR).",
-                        cash_drag_xirr_contribution * 100, avg_idle_cash_lifetime, missed_earnings,
-                    )
+    total_invested = (
+        total - (available_funds if available_funds is not None else wallet_balance_as_of_end)
+        if available_funds is not None or wallet_balance_as_of_end is not None
+        else None
+    )
 
-                # No withholding-tax-style transaction has ever been
-                # observed on this account (see module docstring) - any
-                # future/unrecognized label (none of the 7 known ones) is
-                # conservatively bucketed here as Taxes/Frais, same
-                # defensive catch-all as Loanch's unclassified
-                # transaction_type bucket.
+    xirr_value = None
+    signed_cashflows = None
+    bonus_xirr_contribution = None
+    since_inception_date = None
+    lifetime_bonus = 0.0
+    lifetime_interest = None
+    taxes_xirr_contribution = None
+    interest_xirr_contribution = None
+    if all_entries:
+        signed_cashflows = []
+        deposit_dates = []
+        for entry in all_entries:
+            label = entry["label"]
+            # `amount` is already signed for its cash-balance impact
+            # (deposit positive, withdrawal negative) - negate for
+            # XIRR's own convention (money going INTO the platform is
+            # negative, money coming back OUT is positive).
+            if _is_deposit(label):
+                signed_cashflows.append((entry["date"], -entry["amount"]))
+                deposit_dates.append(entry["date"])
+            elif _is_withdrawal(label):
+                signed_cashflows.append((entry["date"], -entry["amount"]))
+            elif _is_bonus(label):
+                lifetime_bonus += entry["amount"]
+
+        since_inception_date = min(deposit_dates) if deposit_dates else None
+        signed_cashflows.append((today_date, total))
+
+        xirr_value = compute_xirr(signed_cashflows)
+        if xirr_value is None:
+            log.warning("Could not compute XIRR from %d cashflow(s) - XIRR row will not be updated.", len(signed_cashflows) - 1)
+        else:
+            log.info(
+                "Computed since-inception XIRR as of %s: %.2f%% (%d deposit/withdrawal cashflow(s), total value %.2f EUR).",
+                today_date, xirr_value * 100, len(signed_cashflows) - 1, total,
+            )
+            if lifetime_bonus:
+                cashflows_without_bonus = signed_cashflows[:-1] + [(today_date, total - lifetime_bonus)]
+                xirr_without_bonus = compute_xirr(cashflows_without_bonus)
+                if xirr_without_bonus is not None:
+                    bonus_xirr_contribution = xirr_value - xirr_without_bonus
+                    log.info("Bonus's own share of XIRR: %.2f points.", bonus_xirr_contribution * 100)
+            else:
+                bonus_xirr_contribution = 0.0
+
+            # XIRR Taxes/Frais + XIRR Intérêts only need `total`/`all_entries`
+            # (not the live-only `total_invested`) - computed here
+            # (moved 2026-09-07 out of the Cash drag guard below) so they're
+            # still available for a backfilled month with no live
+            # `available_funds`. No withholding-tax-style transaction has
+            # ever been observed on this account (see module docstring) -
+            # any future/unrecognized label (none of the 7 known ones) is
+            # conservatively bucketed here as Taxes/Frais, same defensive
+            # catch-all as Loanch's unclassified transaction_type bucket.
+            if since_inception_date is not None:
+                lifetime_interest = sum(e["amount"] for e in all_entries if _is_interest(e["label"]))
+
                 def _is_classified(label: str) -> bool:
                     return _is_interest(label) or _is_deposit(label) or _is_withdrawal(label) or _is_bonus(label) or _is_known_internal_movement(label)
 
@@ -616,11 +626,6 @@ def run(session: requests.Session | None = None) -> None:
                 else:
                     taxes_xirr_contribution = 0.0
 
-                # XIRR Intérêts (added 2026-08-19): same counterfactual
-                # pattern as XIRR Bonus/XIRR Taxes-Frais above -
-                # lifetime_interest (real "Intérêt"-labelled entries since
-                # inception, already summed above for Cash drag's lifetime
-                # yield rate) is reused here rather than recomputed.
                 if lifetime_interest:
                     cashflows_without_interest = signed_cashflows[:-1] + [(today_date, total - lifetime_interest)]
                     xirr_without_interest = compute_xirr(cashflows_without_interest)
@@ -633,36 +638,66 @@ def run(session: requests.Session | None = None) -> None:
                 else:
                     interest_xirr_contribution = 0.0
 
-        # "Cash drag"/"XIRR" and the XIRR Bonus/Cash drag/Taxes-Frais/
-        # Intérêts pie-chart shares sit further below Lande's block (rows
-        # already added by the user, verified live at rows 242-246 under
-        # "Lande"), past "Bonus"/"cashback"/"Rendements %". Only included
-        # when actually computed.
-        # UPDATED 2026-08-19: "XIRR Intérêts" sits right after "XIRR
-        # Taxes/Frais" (mirrors Loanch's/Mintos's/Bienprêter's/Afranga's/
-        # Iuvo's/Lendermarket's own block layout) - this pushes the block
-        # one row taller than it was before, so max_rows is bumped 12 -> 13
-        # to keep the search bounded before the next platform block.
-        # IMPORTANT: a "XIRR Intérêts" row must exist in the Lande block on
-        # the sheet itself (right after "XIRR Taxes/Frais") for this new
-        # value to actually land somewhere - this script fills an existing
-        # row by label, it doesn't insert new labelled rows into this
-        # block.
-        bonus_breakdown = {}
-        if xirr_value is not None:
-            bonus_breakdown["XIRR"] = xirr_value
-        if cash_drag_value is not None:
-            bonus_breakdown["Cash drag"] = cash_drag_value
-        if bonus_xirr_contribution is not None:
-            bonus_breakdown["XIRR Bonus"] = bonus_xirr_contribution
-        if cash_drag_xirr_contribution is not None:
-            bonus_breakdown["XIRR Cash drag"] = cash_drag_xirr_contribution
-        if taxes_xirr_contribution is not None:
-            bonus_breakdown["XIRR Taxes/Frais"] = taxes_xirr_contribution
-        if interest_xirr_contribution is not None:
-            bonus_breakdown["XIRR Intérêts"] = interest_xirr_contribution
-        if bonus_breakdown:
-            fill_current_month_bonus_breakdown(platform=PLATFORM_LABEL, breakdown=bonus_breakdown, max_rows=13)
+    # Cash drag and XIRR Cash drag use the live wallet snapshot for the
+    # current month and the ledger-reconstructed wallet for a backfill.
+    cash_drag_value = None
+    cash_drag_xirr_contribution = None
+    if all_entries is not None and total_invested is not None and total_invested > 0:
+        month_start = today_date.replace(day=1)
+        avg_idle_cash_this_month = compute_average_idle_cash(all_entries, month_start, today_date)
+        cash_weight = avg_idle_cash_this_month / (avg_idle_cash_this_month + total_invested)
+        monthly_yield_rate = gross_interest_received / total_invested
+        cash_drag_value = cash_weight * monthly_yield_rate
+        log.info(
+            "Computed Cash drag: %.2f%% (avg idle cash %.2f EUR, cash weight %.2f%%, monthly yield %.2f%%).",
+            cash_drag_value * 100, avg_idle_cash_this_month, cash_weight * 100, monthly_yield_rate * 100,
+        )
+
+        if xirr_value is not None and signed_cashflows is not None and since_inception_date is not None and lifetime_interest is not None:
+            avg_idle_cash_lifetime = compute_average_idle_cash(all_entries, since_inception_date, today_date)
+            cash_weight_lifetime = avg_idle_cash_lifetime / (avg_idle_cash_lifetime + total_invested)
+            lifetime_yield_rate = lifetime_interest / total_invested
+            cash_drag_lifetime_total = cash_weight_lifetime * lifetime_yield_rate
+            missed_earnings = cash_drag_lifetime_total * (avg_idle_cash_lifetime + total_invested)
+            cashflows_with_cash_invested = signed_cashflows[:-1] + [(today_date, total + missed_earnings)]
+            xirr_with_cash_invested = compute_xirr(cashflows_with_cash_invested)
+            if xirr_with_cash_invested is not None:
+                cash_drag_xirr_contribution = xirr_value - xirr_with_cash_invested
+                log.info(
+                    "XIRR share - cash drag: %.4f points (since-inception, avg idle cash %.2f EUR, missed earnings ~%.2f EUR).",
+                    cash_drag_xirr_contribution * 100, avg_idle_cash_lifetime, missed_earnings,
+                )
+
+    # "Cash drag"/"XIRR" and the XIRR Bonus/Cash drag/Taxes-Frais/
+    # Intérêts pie-chart shares sit further below Lande's block (rows
+    # already added by the user, verified live at rows 242-246 under
+    # "Lande"), past "Bonus"/"cashback"/"Rendements %". Only included
+    # when actually computed.
+    # UPDATED 2026-08-19: "XIRR Intérêts" sits right after "XIRR
+    # Taxes/Frais" (mirrors Loanch's/Mintos's/Bienprêter's/Afranga's/
+    # Iuvo's/Lendermarket's own block layout) - this pushes the block
+    # one row taller than it was before, so max_rows is bumped 12 -> 13
+    # to keep the search bounded before the next platform block.
+    # IMPORTANT: a "XIRR Intérêts" row must exist in the Lande block on
+    # the sheet itself (right after "XIRR Taxes/Frais") for this new
+    # value to actually land somewhere - this script fills an existing
+    # row by label, it doesn't insert new labelled rows into this
+    # block.
+    bonus_breakdown = {}
+    if xirr_value is not None:
+        bonus_breakdown["XIRR"] = xirr_value
+    if cash_drag_value is not None:
+        bonus_breakdown["Cash drag"] = cash_drag_value
+    if bonus_xirr_contribution is not None:
+        bonus_breakdown["XIRR Bonus"] = bonus_xirr_contribution
+    if cash_drag_xirr_contribution is not None:
+        bonus_breakdown["XIRR Cash drag"] = cash_drag_xirr_contribution
+    if taxes_xirr_contribution is not None:
+        bonus_breakdown["XIRR Taxes/Frais"] = taxes_xirr_contribution
+    if interest_xirr_contribution is not None:
+        bonus_breakdown["XIRR Intérêts"] = interest_xirr_contribution
+    if bonus_breakdown:
+        fill_current_month_bonus_breakdown(platform=PLATFORM_LABEL, breakdown=bonus_breakdown, max_rows=13)
 
 
 if __name__ == "__main__":

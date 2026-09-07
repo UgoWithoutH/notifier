@@ -202,6 +202,28 @@ category of computation as Bonus/Cash drag/Taxes, not a derived leftover),
 so the two can be compared/sanity-checked against each other on the
 sheet/dashboard side.
 
+Added 2026-09-07: the whole XIRR pie-chart block (Cash drag, XIRR, XIRR
+Intérêts, XIRR Bonus, XIRR Cash drag, XIRR Taxes/Frais) can now ALSO be
+computed for a BACKFILLED (past) month, not just the live current one -
+mirroring afranga_diversification.py's own backfill port. New
+`reconstruct_outstanding()`/`_outstanding_delta_for_entry()` replay the
+ledger's own `turnover`/`details` fields to reconstruct the loans+bonds
+outstanding balance as of an arbitrary past `end_date` (deposits/
+withdrawals are external, neutral; a negative-turnover row is money
+invested, a positive-turnover row is either interest/tax/bonus income
+(neutral) or a principal/capital return, decided by the label text - see
+`_outstanding_delta_for_entry()`'s own docstring for the full reasoning
+and its "not fully verified live" caveat), `_wallet_balance_as_of()` reads
+the wallet balance directly off the last ledger row at/before that date
+(same trick `compute_average_idle_cash()` already uses), and
+`compute_xirr_block_as_of()` ties it all together (mirrors
+afranga_diversification.compute_xirr_block_as_of() closely). The
+account-statement ledger fetch (`get_cached_transactions()`) now runs
+unconditionally (was gated behind `if current_month:`) so a backfill run
+can reconstruct up to that past date too. "en cours prêts"/"en cours
+obligations"/"total" stay current-month-only as before (genuinely no
+historical-outstanding endpoint exists, unrelated to this XIRR change).
+
 run() accepts an optional pre-built `requests.Session` (see
 mintos_get_session.py) for a one-shot "log in by hand, then let this take
 over" flow - the env vars below are only required when calling run() with
@@ -664,6 +686,211 @@ def compute_average_idle_cash(entries: list, start_date: str, end_date: str) -> 
     return total_balance / day_count
 
 
+def _entry_date(entry: dict):
+    raw = entry.get("date")
+    if not raw:
+        return None
+    try:
+        return datetime.strptime(raw, "%d.%m.%Y").date()
+    except ValueError:
+        return None
+
+
+def _entry_amount(entry: dict) -> float:
+    try:
+        return float(entry.get("turnover") or 0.0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _outstanding_delta_for_entry(label: str, turnover: float) -> float:
+    """Signed change to the OUTSTANDING invested balance (the same loans+
+    bonds sum fetch_portfolio_split() represents for the account's CURRENT
+    state) that one ledger row represents - needed to reconstruct that
+    balance for a past end_date (see reconstruct_outstanding() below).
+
+    Deposits/withdrawals are external cashflows (handled separately as
+    XIRR cashflows) and never touch the invested balance - always 0. Since
+    `turnover` is already signed for its WALLET-balance impact (see module
+    docstring), a NEGATIVE turnover on any other row means money left the
+    wallet to fund an investment ("Investissement" or an unclassified
+    variant) - outstanding increases by the same amount. A POSITIVE
+    turnover on any other row is either real interest/tax/bonus income
+    (wallet-only, doesn't touch principal) or a principal/capital return
+    (buyback, agreement termination, bond capital decrease) that DOES
+    reduce the outstanding balance - the sign alone can't distinguish the
+    two, so the label's own text decides. An unrecognized positive-turnover
+    label is conservatively treated as a principal return (not silently
+    ignored) since mis-classifying a real principal event as neutral would
+    understate how much capital had already come back out of the portfolio
+    by a past date - not fully verified live, revisit if a future run's
+    reconstructed closing balance looks off.
+    """
+    if _is_deposit(label) or _is_withdrawal(label):
+        return 0.0
+    if turnover < 0:
+        return abs(turnover)
+    if turnover > 0:
+        if _is_bonus(label) or "intér" in label.lower() or "inter" in label.lower() or "withholding" in label.lower() or "prélèvement" in label.lower() or "prelevement" in label.lower():
+            return 0.0
+        return -abs(turnover)
+    return 0.0
+
+
+def reconstruct_outstanding(entries: list, end_date: date) -> float:
+    """Reconstruct the OUTSTANDING invested balance (loans+bonds) as of an
+    arbitrary past `end_date`, by replaying every ledger row dated on or
+    before that date and applying _outstanding_delta_for_entry() to each -
+    mirrors afranga_diversification.reconstruct_outstanding(). Starts from
+    0 (before the account's first-ever transaction, outstanding is
+    necessarily 0)."""
+    outstanding = 0.0
+    for entry in entries:
+        entry_date = _entry_date(entry)
+        if entry_date is None or entry_date > end_date:
+            continue
+        label = _extract_action_label(entry.get("details") or "")
+        outstanding += _outstanding_delta_for_entry(label, _entry_amount(entry))
+    return outstanding
+
+
+def _wallet_balance_as_of(entries: list, end_date: date) -> float:
+    """The wallet/uninvested-cash balance as of `end_date`, taken directly
+    from the last ledger row (in chronological/cached order) dated on or
+    before it - each row's own `balance` field is already the real
+    uninvested-cash balance right after that transaction (see module
+    docstring), so no delta-accumulation is needed."""
+    balance = 0.0
+    for entry in entries:
+        entry_date = _entry_date(entry)
+        if entry_date is None or entry_date > end_date:
+            continue
+        raw_balance = entry.get("balance")
+        if raw_balance is None:
+            continue
+        try:
+            balance = float(raw_balance)
+        except (TypeError, ValueError):
+            continue
+    return balance
+
+
+def _build_deposit_withdrawal_cashflows_as_of(entries: list, end_date: date) -> tuple:
+    """Real Dépôts/Retrait cashflows (signed, XIRR convention) dated <=
+    end_date, the earliest deposit date found (or None), and the lifetime
+    bonus total over the same filtered range - shared building block for
+    compute_xirr_block_as_of() (backfilled months)."""
+    signed_cashflows = []
+    deposit_dates = []
+    lifetime_bonus = 0.0
+    for entry in entries:
+        entry_date = _entry_date(entry)
+        if entry_date is None or entry_date > end_date:
+            continue
+        label = _extract_action_label(entry.get("details") or "")
+        amount = _entry_amount(entry)
+        if _is_deposit(label):
+            signed_cashflows.append((entry_date, -amount))
+            deposit_dates.append(entry_date)
+        elif _is_withdrawal(label):
+            signed_cashflows.append((entry_date, -amount))
+        elif _is_bonus(label):
+            lifetime_bonus += amount
+    since_inception_date = min(deposit_dates) if deposit_dates else None
+    return signed_cashflows, since_inception_date, lifetime_bonus
+
+
+def compute_xirr_block_as_of(session: requests.Session, all_entries: list, end_date: date) -> dict:
+    """Compute the FULL XIRR pie-chart block (XIRR, Cash drag, XIRR Bonus,
+    XIRR Cash drag, XIRR Taxes/Frais, XIRR Intérêts) for a BACKFILLED
+    (non-current) month, as of that month's own `end_date` - the
+    historical equivalent of run()'s live-today block, mirroring
+    afranga_diversification.compute_xirr_block_as_of(). "Cash drag" stays a
+    MONTHLY figure (this backfilled month alone); everything else is
+    since-inception through end_date. Returns a dict with any subset of
+    {"XIRR", "Cash drag", "XIRR Bonus", "XIRR Cash drag", "XIRR
+    Taxes/Frais", "XIRR Intérêts"} that could actually be computed (soft-
+    fail - a missing key means the existing Sheet cell is left untouched).
+    """
+    result: dict = {}
+
+    outstanding_as_of = reconstruct_outstanding(all_entries, end_date)
+    wallet_balance_as_of = _wallet_balance_as_of(all_entries, end_date)
+    total_value_as_of = outstanding_as_of + wallet_balance_as_of
+
+    base_cashflows, since_inception_date, lifetime_bonus_as_of = _build_deposit_withdrawal_cashflows_as_of(all_entries, end_date)
+    if not base_cashflows:
+        return result
+
+    xirr_value = compute_xirr(base_cashflows + [(end_date, total_value_as_of)])
+    if xirr_value is None:
+        log.warning("Could not compute XIRR as of %s (backfilled month) from the reconstructed cashflows.", end_date)
+        return result
+    result["XIRR"] = xirr_value
+    log.info(
+        "Computed XIRR as of %s (backfilled month): %.2f%% (reconstructed outstanding=%.2f EUR, wallet balance=%.2f EUR).",
+        end_date, xirr_value * 100, outstanding_as_of, wallet_balance_as_of,
+    )
+
+    if lifetime_bonus_as_of:
+        xirr_without_bonus = compute_xirr(base_cashflows + [(end_date, total_value_as_of - lifetime_bonus_as_of)])
+        if xirr_without_bonus is not None:
+            result["XIRR Bonus"] = xirr_value - xirr_without_bonus
+    else:
+        result["XIRR Bonus"] = 0.0
+
+    if outstanding_as_of <= 0 or since_inception_date is None:
+        return result
+
+    month_start_date = end_date.replace(day=1)
+    avg_idle_cash_month = compute_average_idle_cash(all_entries, month_start_date.strftime("%Y-%m-%d"), end_date.strftime("%Y-%m-%d"))
+    try:
+        month_statement_totals = fetch_statement_totals(session, month_start_date, end_date)
+    except Exception:
+        log.exception("Failed to fetch this backfilled month's statement totals - Cash drag as of %s will not be updated.", end_date)
+        month_statement_totals = None
+
+    if month_statement_totals is not None:
+        cash_weight = avg_idle_cash_month / (avg_idle_cash_month + outstanding_as_of)
+        monthly_yield_rate = month_statement_totals["gross_interest_received"] / outstanding_as_of
+        result["Cash drag"] = cash_weight * monthly_yield_rate
+        log.info("Computed Cash drag as of %s (backfilled month): %.2f%%.", end_date, result["Cash drag"] * 100)
+
+    try:
+        lifetime_statement_totals = fetch_statement_totals(session, since_inception_date, end_date)
+    except Exception:
+        log.exception("Failed to fetch since-inception statement totals as of %s - XIRR Cash drag/Taxes/Intérêts will not be updated.", end_date)
+        return result
+
+    avg_idle_cash_lifetime = compute_average_idle_cash(all_entries, since_inception_date.strftime("%Y-%m-%d"), end_date.strftime("%Y-%m-%d"))
+    cash_weight_lifetime = avg_idle_cash_lifetime / (avg_idle_cash_lifetime + outstanding_as_of)
+    lifetime_yield_rate = lifetime_statement_totals["gross_interest_received"] / outstanding_as_of
+    cash_drag_lifetime_total = cash_weight_lifetime * lifetime_yield_rate
+    missed_earnings = cash_drag_lifetime_total * (avg_idle_cash_lifetime + outstanding_as_of)
+    xirr_with_cash_invested = compute_xirr(base_cashflows + [(end_date, total_value_as_of + missed_earnings)])
+    if xirr_with_cash_invested is not None:
+        result["XIRR Cash drag"] = xirr_value - xirr_with_cash_invested
+        log.info("XIRR share - cash drag as of %s: %.4f points.", end_date, result["XIRR Cash drag"] * 100)
+
+    lifetime_withholding_tax = lifetime_statement_totals["withholding_tax"]
+    if lifetime_withholding_tax:
+        xirr_with_tax_added_back = compute_xirr(base_cashflows + [(end_date, total_value_as_of + lifetime_withholding_tax)])
+        if xirr_with_tax_added_back is not None:
+            result["XIRR Taxes/Frais"] = xirr_value - xirr_with_tax_added_back
+    else:
+        result["XIRR Taxes/Frais"] = 0.0
+
+    lifetime_net_interest = lifetime_statement_totals["gross_interest_received"] - lifetime_withholding_tax
+    if lifetime_net_interest:
+        xirr_without_interest = compute_xirr(base_cashflows + [(end_date, total_value_as_of - lifetime_net_interest)])
+        if xirr_without_interest is not None:
+            result["XIRR Intérêts"] = xirr_value - xirr_without_interest
+    else:
+        result["XIRR Intérêts"] = 0.0
+
+    return result
+
+
 def run(session: requests.Session | None = None) -> None:
     """Runs the full fetch + Google Sheet write.
 
@@ -748,28 +975,12 @@ def run(session: requests.Session | None = None) -> None:
     # from.
     today_date = get_report_date()
     all_entries = None
-    if current_month:
-        try:
-            log.info("Fetching the since-inception account-statement ledger (cached where possible)...")
-            all_entries = get_cached_transactions(session)
-        except Exception:
-            log.exception("Failed to fetch the account-statement ledger - XIRR/Cash drag will not be updated.")
-            all_entries = None
-
-    def _entry_date(entry: dict):
-        raw = entry.get("date")
-        if not raw:
-            return None
-        try:
-            return datetime.strptime(raw, "%d.%m.%Y").date()
-        except ValueError:
-            return None
-
-    def _entry_amount(entry: dict) -> float:
-        try:
-            return float(entry.get("turnover") or 0.0)
-        except (TypeError, ValueError):
-            return 0.0
+    try:
+        log.info("Fetching the since-inception account-statement ledger (cached where possible)...")
+        all_entries = get_cached_transactions(session)
+    except Exception:
+        log.exception("Failed to fetch the account-statement ledger - XIRR/Cash drag will not be updated.")
+        all_entries = None
 
     xirr_value = None
     signed_cashflows = None
@@ -893,6 +1104,20 @@ def run(session: requests.Session | None = None) -> None:
                         )
                 else:
                     interest_xirr_contribution = 0.0
+    elif not current_month and all_entries is not None:
+        try:
+            xirr_block = compute_xirr_block_as_of(session, all_entries, today_date)
+        except Exception:
+            log.exception("Failed to compute the XIRR block as of %s.", today_date)
+            xirr_block = {}
+        xirr_value = xirr_block.get("XIRR")
+        cash_drag_value = xirr_block.get("Cash drag")
+        bonus_xirr_contribution = xirr_block.get("XIRR Bonus")
+        cash_drag_xirr_contribution = xirr_block.get("XIRR Cash drag")
+        taxes_xirr_contribution = xirr_block.get("XIRR Taxes/Frais")
+        interest_xirr_contribution = xirr_block.get("XIRR Intérêts")
+        if xirr_value is None:
+            log.warning("Could not compute XIRR as of %s from the reconstructed cashflows.", today_date)
 
     labeled_amounts = {
         "intérêts brut prêts": statement_totals["gross_interest_received_loans"],

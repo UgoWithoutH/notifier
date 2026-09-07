@@ -136,6 +136,30 @@ genuine, independently-measured figure (same category of computation as
 Bonus/Taxes, not a derived leftover), so the two can be compared/sanity-
 checked against each other on the sheet/dashboard side.
 
+NOTE 2026-09-07 (investigated, NOT implemented - genuine data-source
+limitation, mirrors afranga_diversification.py's own backfill feature for
+a past REPORT_DATE month but does NOT port here): unlike Afranga (whose
+Details rows have an explicit "Investments in loans"/"Principal ..."
+label per row, letting `reconstruct_outstanding()` replay the invested-
+principal balance for any past date), Bienpreter's "capital à recevoir"
+CANNOT be reliably reconstructed from /u/operations rows for an arbitrary
+past date: "Remboursement mensuel" rows only itemize the INTEREST portion
+(`.transaction__interests`) - any bundled CAPITAL repayment (when a loan
+matures within the queried window) is silently folded into that same
+row's `.transaction__amount` with no separate principal figure anywhere
+(see this module's own "In Fine loans" docstring paragraph above). Since
+the same ambiguity that forced net_interest_received to be built from
+`.transaction__interests` instead of `.transaction__amount` also makes it
+impossible to isolate a matured loan's principal component, any attempt
+to reconstruct "capital à recevoir" this way could silently produce a
+WRONG historical outstanding figure (and therefore a wrong XIRR) with no
+warning - worse than just leaving XIRR/Cash drag/the pie-chart shares
+current-month-only (unchanged, still gated behind `is_current_month()`).
+This mirrors the existing 2026-08-06 finding that Bienpreter's "total"
+itself can't be backfilled for the same underlying reason. Revisit only
+if Bienpreter's site ever starts itemizing a matured loan's principal
+separately from its interest in the operations table.
+
 Required env vars:
     BIENPRETER_EMAIL, BIENPRETER_PASSWORD -> Bienpreter account credentials
 Optional:
