@@ -96,6 +96,21 @@ category of computation as Bonus/Taxes, not a derived leftover), so the
 two can be compared/sanity-checked against each other on the sheet/
 dashboard side.
 
+NOTE 2026-09-07 (investigated, NOT implemented - genuine data-source
+limitation, mirrors afranga_diversification.py's own backfill feature for
+a past REPORT_DATE month but does NOT port here): `total_invested` here is
+`sum(l["remaining_principal"] for l in lenders)`, itself built from a LIVE
+fetch of the account's currently-active loans (no date param exists for
+that endpoint) - there is no way to know what the remaining principal on
+each active loan actually WAS on some past date without a genuine
+per-transaction dated ledger (which, per the whole paragraph above,
+Lendermarket simply doesn't expose). Reconstructing `total_invested` for a
+past month would therefore have to guess, silently producing a WRONG
+historical outstanding figure (and therefore a wrong XIRR) with no
+warning - so XIRR/Cash drag/the pie-chart shares stay current-month-only
+(unchanged, still gated behind `is_current_month()`), same conclusion as
+Bienprêter's own equivalent note.
+
 Required env vars:
     LENDERMARKET_EMAIL, LENDERMARKET_PASSWORD  -> Lendermarket credentials
 Optional:

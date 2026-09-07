@@ -84,7 +84,7 @@ enough to just run fresh every time, no benefit to caching it.
 import os
 import sys
 import logging
-from datetime import datetime
+from datetime import date, datetime
 from html.parser import HTMLParser
 from zoneinfo import ZoneInfo
 
@@ -95,6 +95,7 @@ load_dotenv()
 
 from shared.google_sheet import fill_current_month_amounts, fill_current_month_bonus_breakdown, fill_geographic_repartition_amounts
 from shared.report_date import get_report_now, is_current_month
+from shared.xirr import compute_xirr
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger("goandgrow_diversification")
@@ -193,13 +194,28 @@ def fetch_total_balance(goals: list) -> float:
     return round(total, 2)
 
 
-def fetch_current_month_statement_totals(session: requests.Session) -> dict:
+def fetch_all_statement_entries(session: requests.Session) -> list:
+    """Fetch the FULL statement ledger (no date-range param exists on this
+    endpoint - see module docstring) once, so both the current-month
+    totals AND the since-inception XIRR block below can share the same
+    single fetch instead of re-requesting it twice."""
+    log.info("Requesting the full statements API...")
+    resp = session.get(STATEMENTS_API_URL, timeout=30, headers={"Accept": "application/json"})
+    resp.raise_for_status()
+    entries = resp.json() or []
+    log.info("Fetched %d statement entr(y/ies).", len(entries))
+    return entries
+
+
+def fetch_current_month_statement_totals(session: requests.Session, entries: list | None = None) -> dict:
     """Fetch this calendar month's interest ("Return"-type entries) and
     bonus/cashback/contest totals from the statements API (see module
     docstring), filtering entries by date in Python since this endpoint
     doesn't take a date-range query param (unlike most other platforms'
     equivalents) - it returns the full history, so REPORT_DATE-driven
-    "this month" filtering happens locally here.
+    "this month" filtering happens locally here. `entries` can be passed in
+    (already fetched via fetch_all_statement_entries()) to avoid a second
+    HTTP call - fetched fresh if omitted.
 
     Also returns "closing_balance": each entry's own running `Balance`
     field (see module docstring) as of the LATEST entry dated on or before
@@ -213,12 +229,10 @@ def fetch_current_month_statement_totals(session: requests.Session) -> dict:
     now = get_report_now(REPORT_TIMEZONE)
     start_date = now.replace(day=1).date()
     end_date = now.date()
-    log.info("Requesting statements API, filtering locally for %s to %s...", start_date, end_date)
+    log.info("Filtering statement entries locally for %s to %s...", start_date, end_date)
 
-    resp = session.get(STATEMENTS_API_URL, timeout=30, headers={"Accept": "application/json"})
-    resp.raise_for_status()
-    entries = resp.json() or []
-    log.info("Fetched %d statement entr(y/ies).", len(entries))
+    if entries is None:
+        entries = fetch_all_statement_entries(session)
 
     interest_received = 0.0
     bonus_cashback_contest = 0.0
@@ -288,6 +302,78 @@ def fetch_current_month_statement_totals(session: requests.Session) -> dict:
     }
 
 
+def build_xirr_cashflows(entries: list, end_date: date | None = None) -> dict:
+    """Build the since-inception XIRR cashflow list + lifetime bonus/fee/
+    interest totals from the REAL per-transaction, per-DATED statements
+    ledger (see module docstring) - unlike Iuvo/Lendermarket/Monefit, Go &
+    Grow's statements API already gives a genuine dated ledger with a real
+    running `Balance` per entry, so this can use REAL cashflow dates (no
+    monthly midpoint approximation needed), same tier of accuracy as
+    Afranga/Swaper's own XIRR blocks.
+
+    "Deposit"-type entries become NEGATIVE cashflows (money the investor
+    put in); any entry whose Type contains "withdraw" becomes a POSITIVE
+    cashflow (money returned) MINUS the flat WITHDRAWAL_FEE_EUR fee (the
+    fee is silently deducted by Go & Grow, never itemized - see module
+    docstring - so it must be subtracted here to keep the reconstructed
+    cashflow consistent with what the investor actually received).
+    "Return" entries are interest, not an external cashflow (summed into
+    `lifetime_interest` instead). Everything else is bonus/cashback/contest
+    income (internal, not an external cashflow either).
+
+    `end_date` (added 2026-09-07, for a BACKFILLED past REPORT_DATE month):
+    when given, entries dated AFTER it are excluded entirely - needed
+    since `entries` is always the account's FULL history (this API has no
+    date-range param), so a backfill run's real "today" would otherwise
+    leak future-dated entries into a past month's lifetime totals.
+
+    Returns `{"cashflows": [(date, amount), ...], "lifetime_bonus":
+    float, "lifetime_fees": float, "lifetime_interest": float,
+    "inception_date": date | None}`.
+    """
+    cashflows = []
+    lifetime_bonus = 0.0
+    lifetime_interest = 0.0
+    withdrawal_count = 0
+    inception_date = None
+
+    for entry in entries:
+        raw_date = entry.get("Date")
+        try:
+            entry_date = datetime.fromisoformat(raw_date).date()
+        except (TypeError, ValueError):
+            continue
+        if end_date is not None and entry_date > end_date:
+            continue
+        if inception_date is None or entry_date < inception_date:
+            inception_date = entry_date
+
+        entry_type = (entry.get("Type") or "").strip()
+        entry_type_lower = entry_type.lower()
+        try:
+            amount = float(entry.get("Amount") or 0.0)
+        except (TypeError, ValueError):
+            amount = 0.0
+
+        if entry_type == "Deposit":
+            cashflows.append((entry_date, -amount))
+        elif "withdraw" in entry_type_lower:
+            withdrawal_count += 1
+            cashflows.append((entry_date, abs(amount) - WITHDRAWAL_FEE_EUR))
+        elif entry_type == "Return":
+            lifetime_interest += amount
+        else:
+            lifetime_bonus += amount
+
+    return {
+        "cashflows": cashflows,
+        "lifetime_bonus": round(lifetime_bonus, 2),
+        "lifetime_fees": round(withdrawal_count * WITHDRAWAL_FEE_EUR, 2),
+        "lifetime_interest": round(lifetime_interest, 2),
+        "inception_date": inception_date,
+    }
+
+
 def run() -> None:
     if not GOANDGROW_EMAIL or not GOANDGROW_PASSWORD:
         log.error("GOANDGROW_EMAIL and GOANDGROW_PASSWORD environment variables are required.")
@@ -315,9 +401,11 @@ def run() -> None:
         sys.exit(1)
 
     try:
-        statement_totals = fetch_current_month_statement_totals(session)
+        entries = fetch_all_statement_entries(session)
+        statement_totals = fetch_current_month_statement_totals(session, entries=entries)
     except Exception:
         log.exception("Failed to fetch this month's statement totals - defaulting to 0.0.")
+        entries = []
         statement_totals = {"interest_received": 0.0, "bonus_cashback_contest": 0.0, "fees": 0.0, "closing_balance": None}
 
     log.info("Go & Grow balance: %.2f EUR", balance)
@@ -327,6 +415,7 @@ def run() -> None:
     )
 
     current_month = is_current_month()
+    today_date = get_report_now(REPORT_TIMEZONE).date()
     closing_balance = statement_totals.get("closing_balance")
     # For the real current month, always use the live goal balance
     # (fetch_total_balance()). For a backfilled past month (a month-range
@@ -357,17 +446,121 @@ def run() -> None:
         skip_total=skip_total,
     )
 
+    # Since-inception XIRR (money-weighted return) + the XIRR Bonus/Cash
+    # drag/Taxes-Frais/Intérêts pie-chart shares - unlike Iuvo/Lendermarket/
+    # Monefit, Go & Grow's statements API already gives a REAL per-
+    # transaction dated ledger (see build_xirr_cashflows()'s docstring), so
+    # real dates are used directly, no monthly midpoint approximation
+    # needed. "Cash drag"/"XIRR Cash drag" are ALWAYS hardcoded 0.0 (a
+    # real, verified figure, not a placeholder, regardless of current vs.
+    # backfilled month): this account has a single goal whose ENTIRE
+    # balance earns Go & Grow's daily return from day one - there is no
+    # separate uninvested/idle-cash wallet in this data model (unlike
+    # Iuvo's real available_funds vs receivables_p2p split), so there is
+    # nothing for a cash-drag calculation to measure.
+    #
+    # Added 2026-09-07: this block can now ALSO be computed for a
+    # BACKFILLED (past) REPORT_DATE month, not just the real current month
+    # - unlike most other platforms, this doesn't need a separate
+    # reconstruct_outstanding()-style helper at all, since `entries`
+    # already is the account's FULL history (no date-range param exists on
+    # this API) and each entry carries its own real running `Balance` -
+    # the terminal value for a backfilled month is simply `closing_balance`
+    # (already computed above by fetch_current_month_statement_totals() as
+    # the latest entry's Balance at/before `today_date`, which for a
+    # month-range backfill run IS that month's own end date via
+    # REPORT_DATE). `build_xirr_cashflows(entries, end_date=today_date)`
+    # excludes any entry dated AFTER `today_date` so a backfill run's real
+    # "today" doesn't leak future cashflows/bonus/interest into a past
+    # month's totals.
+    xirr_value = None
+    bonus_xirr_contribution = None
+    taxes_xirr_contribution = None
+    interest_xirr_contribution = None
+    terminal_value = balance if current_month else closing_balance
+    if entries and terminal_value is not None:
+        xirr_data = build_xirr_cashflows(entries, end_date=today_date)
+        signed_cashflows = list(xirr_data["cashflows"])
+        signed_cashflows.append((today_date, terminal_value))
+
+        xirr_value = compute_xirr(signed_cashflows)
+        if xirr_value is None:
+            log.warning("Could not compute XIRR from %d real cashflow(s) - XIRR row will not be updated.", len(signed_cashflows) - 1)
+        else:
+            log.info(
+                "Computed since-inception XIRR as of %s: %.2f%% (%d real cashflow(s), total value %.2f EUR).",
+                today_date, xirr_value * 100, len(signed_cashflows) - 1, terminal_value,
+            )
+
+            lifetime_bonus_total = xirr_data["lifetime_bonus"]
+            if lifetime_bonus_total:
+                cashflows_without_bonus = signed_cashflows[:-1] + [(today_date, terminal_value - lifetime_bonus_total)]
+                xirr_without_bonus = compute_xirr(cashflows_without_bonus)
+                if xirr_without_bonus is not None:
+                    bonus_xirr_contribution = xirr_value - xirr_without_bonus
+                    log.info("Bonus's own share of XIRR: %.2f points.", bonus_xirr_contribution * 100)
+            else:
+                bonus_xirr_contribution = 0.0
+
+            lifetime_fees_total = xirr_data["lifetime_fees"]
+            if lifetime_fees_total:
+                cashflows_with_fees_cancelled = signed_cashflows[:-1] + [(today_date, terminal_value + lifetime_fees_total)]
+                xirr_with_fees_cancelled = compute_xirr(cashflows_with_fees_cancelled)
+                if xirr_with_fees_cancelled is not None:
+                    taxes_xirr_contribution = xirr_value - xirr_with_fees_cancelled
+                    log.info("XIRR share - taxes/frais: %.4f points (lifetime fees %.2f EUR).", taxes_xirr_contribution * 100, lifetime_fees_total)
+            else:
+                taxes_xirr_contribution = 0.0
+
+            # XIRR Intérêts (added 2026-09-07, mirrors afranga_diversification.py's/
+            # bienpreter_diversification.py's own XIRR Intérêts block):
+            # counterfactual XIRR share attributable to real interest
+            # received since inception ("Return"-type entries, no
+            # withholding tax on this platform, so lifetime_interest already
+            # IS the net figure).
+            lifetime_net_interest = xirr_data["lifetime_interest"]
+            if lifetime_net_interest:
+                cashflows_without_interest = signed_cashflows[:-1] + [(today_date, terminal_value - lifetime_net_interest)]
+                xirr_without_interest = compute_xirr(cashflows_without_interest)
+                if xirr_without_interest is not None:
+                    interest_xirr_contribution = xirr_value - xirr_without_interest
+                    log.info("XIRR share - intérêts: %.4f points (lifetime net interest %.2f EUR).", interest_xirr_contribution * 100, lifetime_net_interest)
+            else:
+                interest_xirr_contribution = 0.0
+
     # No bonus/cashback/contest statement entry Type has been observed yet
     # on this account (see module docstring) - everything currently
     # defaults into "prime", same catch-all convention used by
     # monefit_diversification.py until a real one shows up and its exact
     # Type label can be mapped to the right sub-row. "frais" is a real,
     # confirmed fee bucket (see module docstring) - written on the
-    # existing "frais" sub-row under the Go & Grow block.
+    # existing "frais" sub-row under the Go & Grow block. "XIRR"/"Cash
+    # drag" and the XIRR Bonus/Cash drag/Taxes-Frais/Intérêts pie-chart
+    # shares are only included when actually computed. "XIRR Intérêts"
+    # (added 2026-09-07) sits right after "XIRR Taxes/Frais" - this pushes
+    # the block one row taller than it was verified at 2026-08-14, so
+    # `max_rows` is bumped 15 -> 16 to keep the search bounded before the
+    # next platform block. IMPORTANT: a "XIRR Intérêts" row must exist in
+    # the Go & Grow block on the sheet itself (right after "XIRR
+    # Taxes/Frais") for this new value to actually land somewhere - this
+    # script fills an existing row by label, it doesn't insert new
+    # labelled rows into this block.
+    bonus_breakdown = {"prime": statement_totals["bonus_cashback_contest"], "frais": statement_totals["fees"]}
+    if xirr_value is not None:
+        bonus_breakdown["XIRR"] = xirr_value
+        bonus_breakdown["Cash drag"] = 0.0
+        bonus_breakdown["XIRR Cash drag"] = 0.0
+    if bonus_xirr_contribution is not None:
+        bonus_breakdown["XIRR Bonus"] = bonus_xirr_contribution
+    if taxes_xirr_contribution is not None:
+        bonus_breakdown["XIRR Taxes/Frais"] = taxes_xirr_contribution
+    if interest_xirr_contribution is not None:
+        bonus_breakdown["XIRR Intérêts"] = interest_xirr_contribution
     fill_current_month_bonus_breakdown(
         platform=PLATFORM_LABEL,
-        breakdown={"prime": statement_totals["bonus_cashback_contest"], "frais": statement_totals["fees"]},
+        breakdown=bonus_breakdown,
         section="Crowdlending savings",
+        max_rows=16,
     )
 
     if current_month:
