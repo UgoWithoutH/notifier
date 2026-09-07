@@ -136,29 +136,44 @@ genuine, independently-measured figure (same category of computation as
 Bonus/Taxes, not a derived leftover), so the two can be compared/sanity-
 checked against each other on the sheet/dashboard side.
 
-NOTE 2026-09-07 (investigated, NOT implemented - genuine data-source
-limitation, mirrors afranga_diversification.py's own backfill feature for
-a past REPORT_DATE month but does NOT port here): unlike Afranga (whose
-Details rows have an explicit "Investments in loans"/"Principal ..."
-label per row, letting `reconstruct_outstanding()` replay the invested-
-principal balance for any past date), Bienpreter's "capital à recevoir"
-CANNOT be reliably reconstructed from /u/operations rows for an arbitrary
-past date: "Remboursement mensuel" rows only itemize the INTEREST portion
-(`.transaction__interests`) - any bundled CAPITAL repayment (when a loan
-matures within the queried window) is silently folded into that same
-row's `.transaction__amount` with no separate principal figure anywhere
-(see this module's own "In Fine loans" docstring paragraph above). Since
-the same ambiguity that forced net_interest_received to be built from
-`.transaction__interests` instead of `.transaction__amount` also makes it
-impossible to isolate a matured loan's principal component, any attempt
-to reconstruct "capital à recevoir" this way could silently produce a
-WRONG historical outstanding figure (and therefore a wrong XIRR) with no
-warning - worse than just leaving XIRR/Cash drag/the pie-chart shares
-current-month-only (unchanged, still gated behind `is_current_month()`).
-This mirrors the existing 2026-08-06 finding that Bienpreter's "total"
-itself can't be backfilled for the same underlying reason. Revisit only
-if Bienpreter's site ever starts itemizing a matured loan's principal
-separately from its interest in the operations table.
+UPDATE 2026-09-07 (implemented via backward reconstruction, resolving the
+limitation noted below): forward-reconstructing "capital à recevoir" for
+an arbitrary past date is still impossible (see the unchanged paragraph
+below for why), but total_account_value at a past `today_date` can
+instead be derived BACKWARD from TODAY's known live total (solde
+disponible + capital à recevoir, always fetched live regardless of
+REPORT_DATE): every transaction dated after `today_date` is either a pure
+cash<->invested-capital reallocation (Investissement, Remboursement
+mensuel's bundled capital portion, Vente de prêt, Rétractation de
+l'intention de prêt - net zero effect on the SUM of the two components)
+or a real external cashflow/earnings event (Dépôt de fonds, Retrait de
+fonds, Intérêts, Bonus, Prélèvements fiscaux) whose effect on that sum IS
+known precisely - so subtracting only the latter's net effect (see
+`_net_value_change()`) from today's live total gives today_date's real
+total_account_value, with no need to ever itemize a matured loan's
+principal at all. "Capital à recevoir" at today_date then falls out as a
+remainder: total_account_value minus the real replayed "Solde indicatif"
+cash balance as of that date (`_balance_as_of()`, same snapshot-replay
+technique as compute_average_idle_cash()). This is what now lets XIRR/
+Cash drag/the pie-chart shares be computed for a backfilled month too
+(previously current-month-only, gated behind `is_current_month()`) - see
+run()'s `real_today`/`today_date` split below. "total" itself (the
+Crowdlending section's raw solde disponible + capital à recevoir figures)
+still isn't written for a backfilled month (still skip_total, unchanged) -
+only the derived XIRR/Cash drag block benefits from this reconstruction.
+
+ORIGINAL 2026-09-07 FINDING (still true, explains why forward
+reconstruction specifically doesn't work): unlike Afranga (whose Details
+rows have an explicit "Investments in loans"/"Principal ..." label per
+row, letting `reconstruct_outstanding()` replay the invested-principal
+balance for any past date), Bienpreter's "capital à recevoir" CANNOT be
+reliably reconstructed FORWARD from zero using /u/operations rows for an
+arbitrary past date: "Remboursement mensuel" rows only itemize the
+INTEREST portion (`.transaction__interests`) - any bundled CAPITAL
+repayment (when a loan matures within the queried window) is silently
+folded into that same row's `.transaction__amount` with no separate
+principal figure anywhere (see this module's own "In Fine loans"
+docstring paragraph above).
 
 Required env vars:
     BIENPRETER_EMAIL, BIENPRETER_PASSWORD -> Bienpreter account credentials
@@ -705,6 +720,59 @@ def compute_average_idle_cash(rows: list, start_date: str, end_date: str) -> flo
     return total_balance / day_count if day_count else 0.0
 
 
+def _balance_as_of(rows: list, as_of_date: date) -> float:
+    """Real 'Solde indicatif' available-cash balance as of `as_of_date`
+    (the most recent recorded balance on or before that date, 0.0 if
+    before the account's very first transaction) - same snapshot-replay
+    technique as compute_average_idle_cash(), used to reconstruct a
+    backfilled month's "solde disponible" (see module docstring's
+    2026-09-07 backward-reconstruction addition)."""
+    as_of_str = as_of_date.strftime("%Y-%m-%d")
+    dated_balances = sorted(
+        ((r["date"], r["balance"]) for r in rows if r.get("date") and r.get("balance") is not None),
+        key=lambda t: t[0],
+    )
+    balance = 0.0
+    for day_str, bal in dated_balances:
+        if day_str > as_of_str:
+            break
+        balance = bal
+    return balance
+
+
+def _net_value_change(rows: list, start_date: date, end_date: date) -> float:
+    """Net change in TOTAL account value (solde disponible + capital à
+    recevoir) caused by every transaction dated in (start_date, end_date]
+    that is NOT a pure cash<->invested-capital reallocation (Investissement,
+    Remboursement mensuel's bundled capital portion, Vente de prêt,
+    Rétractation de l'intention de prêt all net to zero on that sum) -
+    i.e. real external cashflows (Dépôt de fonds/Retrait de fonds) and
+    earnings (Intérêts/Bonus/Prélèvements fiscaux). Used to reconstruct a
+    past total_account_value from today's live total by subtracting off
+    everything that happened AFTER `start_date` (see module docstring's
+    2026-09-07 backward-reconstruction addition)."""
+    start_str = start_date.strftime("%Y-%m-%d")
+    end_str = end_date.strftime("%Y-%m-%d")
+    delta = 0.0
+    for row in rows:
+        row_date = row.get("date")
+        if not row_date or not (start_str < row_date <= end_str):
+            continue
+        label = row.get("label") or ""
+        amount = abs(_parse_amount(row.get("amountText")) or 0.0)
+        if label == "Dépôt de fonds":
+            delta += amount
+        elif label == "Retrait de fonds":
+            delta -= amount
+        elif label == "Bonus":
+            delta += amount
+        elif label == "Prélèvements fiscaux":
+            delta -= amount
+        for interest_text in row.get("interestTexts") or []:
+            delta += _parse_amount(interest_text) or 0.0
+    return delta
+
+
 def fetch_current_month_interest_totals(session: requests.Session) -> dict:
     """Fetch this calendar month's interest received, split into net/gross/
     withholding tax (plus this month's real "Bonus" total, see below), from
@@ -798,10 +866,11 @@ def run() -> None:
         interest_totals["withholding_tax"], interest_totals["bonus_total"],
     )
 
-    # XIRR (like "total" elsewhere in this repo) is a LIVE-only snapshot
-    # metric (needs TODAY's real total account value as its final
-    # cashflow) - it can't be meaningfully backfilled for a past REPORT_DATE
-    # month, so it's only ever computed/written for the real current month.
+    # "total"/"balances" fetched above are always a LIVE snapshot (as of
+    # real_today, no date param exists on the dashboard) - XIRR/Cash drag
+    # can still be computed "as of" a backfilled today_date though, by
+    # reconstructing that date's total account value BACKWARD from today's
+    # live total (see module docstring's 2026-09-07 addition).
     current_month = is_current_month()
 
     # Since-inception XIRR (money-weighted return) + this month's/lifetime
@@ -812,7 +881,8 @@ def run() -> None:
     # differences - a real per-transaction "Solde indicatif" balance is
     # already on every /u/operations row, so no delta-reconstruction is
     # needed here).
-    today_date = get_report_now(REPORT_TIMEZONE).date()
+    today_date = get_report_now(REPORT_TIMEZONE).date()  # the date this block is computed "as of" (REPORT_DATE if set, else real today)
+    real_today = date.today()  # always the actual current date - operations must be fetched through here so a backfilled today_date can subtract every intervening cashflow/earnings event from today's live total
     xirr_value = None
     bonus_xirr_contribution = None
     cash_drag_value = None
@@ -821,20 +891,43 @@ def run() -> None:
     interest_xirr_contribution = None
 
     all_operations = None
-    if current_month:
-        try:
-            log.info("Fetching the since-inception operations history (cached where possible) for XIRR/Cash drag...")
-            all_operations = get_cached_operations(session, today_date)
-        except Exception:
-            log.exception("Failed to fetch the operations history - XIRR/Cash drag will not be updated.")
-            all_operations = None
+    try:
+        log.info("Fetching the since-inception operations history (cached where possible) for XIRR/Cash drag...")
+        all_operations = get_cached_operations(session, real_today)
+    except Exception:
+        log.exception("Failed to fetch the operations history - XIRR/Cash drag will not be updated.")
+        all_operations = None
 
     total_invested = balances["capital_to_receive"]
-    if current_month and all_operations:
-        total_account_value = total  # solde disponible + capital à recevoir, same "as if withdrawn today" value used elsewhere in this repo
+    if all_operations:
+        today_date_str = today_date.strftime("%Y-%m-%d")
+        # Rows after today_date belong to a backfilled month's future (real
+        # now, not today_date) - excluded from every "as of today_date"
+        # figure below via operations_as_of; `all_operations` (unfiltered)
+        # is still needed for the backward reconstruction just below, which
+        # specifically looks PAST today_date.
+        operations_as_of = [r for r in all_operations if r.get("date") and r["date"] <= today_date_str]
+
+        if current_month:
+            total_account_value = total  # solde disponible + capital à recevoir, same "as if withdrawn today" value used elsewhere in this repo
+        else:
+            # Backfilled month: reconstruct today_date's total account
+            # value by subtracting today's live total every real external
+            # cashflow/interest/bonus/tax event dated after today_date, then
+            # derive capital à recevoir as a remainder (total minus the real
+            # replayed "Solde indicatif" cash balance) - see module docstring.
+            value_change_since = _net_value_change(all_operations, today_date, real_today)
+            total_account_value = total - value_change_since
+            available_balance_as_of = _balance_as_of(all_operations, today_date)
+            total_invested = total_account_value - available_balance_as_of
+            log.info(
+                "Backfilled month (%s): reconstructed total_account_value=%.2f EUR (live total %.2f EUR - "
+                "%.2f EUR net change since then), available_balance_as_of=%.2f EUR, total_invested=%.2f EUR.",
+                today_date, total_account_value, total, value_change_since, available_balance_as_of, total_invested,
+            )
 
         signed_cashflows = []
-        for row in all_operations:
+        for row in operations_as_of:
             if not row.get("date"):
                 continue
             row_date = datetime.strptime(row["date"], "%Y-%m-%d").date()
@@ -862,13 +955,13 @@ def run() -> None:
             # drag's lifetime yield rate (further down, reused instead of
             # recomputed).
             lifetime_gross_interest = sum(
-                _parse_amount(t) or 0.0 for r in all_operations for t in (r.get("interestTexts") or [])
+                _parse_amount(t) or 0.0 for r in operations_as_of for t in (r.get("interestTexts") or [])
             )
 
             lifetime_bonus_total = sum(
-                abs(_parse_amount(r.get("amountText")) or 0.0) for r in all_operations if r["label"] == "Bonus"
+                abs(_parse_amount(r.get("amountText")) or 0.0) for r in operations_as_of if r["label"] == "Bonus"
             )
-            bonus_rows = [r for r in all_operations if r["label"] == "Bonus"]
+            bonus_rows = [r for r in operations_as_of if r["label"] == "Bonus"]
             log.info(
                 "Bonus: %d transaction(s) trouvée(s), total lifetime = %.2f EUR (dates: %s).",
                 len(bonus_rows), lifetime_bonus_total,
@@ -895,7 +988,7 @@ def run() -> None:
                 bonus_xirr_contribution = 0.0
 
             lifetime_withholding_tax = sum(
-                abs(_parse_amount(r.get("amountText")) or 0.0) for r in all_operations if r["label"] == "Prélèvements fiscaux"
+                abs(_parse_amount(r.get("amountText")) or 0.0) for r in operations_as_of if r["label"] == "Prélèvements fiscaux"
             )
             if lifetime_withholding_tax:
                 cashflows_with_taxes_cancelled = signed_cashflows[:-1] + [(today_date, total_account_value + lifetime_withholding_tax)]
@@ -938,7 +1031,7 @@ def run() -> None:
             if total_invested > 0:
                 month_start_str = today_date.replace(day=1).strftime("%Y-%m-%d")
                 today_str = today_date.strftime("%Y-%m-%d")
-                avg_idle_cash = compute_average_idle_cash(all_operations, month_start_str, today_str)
+                avg_idle_cash = compute_average_idle_cash(operations_as_of, month_start_str, today_str)
                 cash_weight = avg_idle_cash / (avg_idle_cash + total_invested)
                 monthly_yield_rate = interest_totals["gross_interest_received"] / total_invested
                 cash_drag_value = cash_weight * monthly_yield_rate
@@ -947,14 +1040,14 @@ def run() -> None:
                     cash_drag_value * 100, avg_idle_cash, cash_weight * 100, monthly_yield_rate * 100,
                 )
 
-                deposit_dates = [r["date"] for r in all_operations if r.get("date") and r["label"] == "Dépôt de fonds"]
+                deposit_dates = [r["date"] for r in operations_as_of if r.get("date") and r["label"] == "Dépôt de fonds"]
                 if deposit_dates:
                     since_inception_date = datetime.strptime(min(deposit_dates), "%Y-%m-%d").date()
                     years_elapsed = max((today_date - since_inception_date).days / 365.25, 1 / 365.25)
                     # lifetime_gross_interest already computed above (used
                     # by XIRR Intérêts too) - reused here, not recomputed.
                     avg_idle_cash_lifetime = compute_average_idle_cash(
-                        all_operations, since_inception_date.strftime("%Y-%m-%d"), today_str
+                        operations_as_of, since_inception_date.strftime("%Y-%m-%d"), today_str
                     )
                     cash_weight_lifetime = avg_idle_cash_lifetime / (avg_idle_cash_lifetime + total_invested)
                     lifetime_yield_rate = lifetime_gross_interest / total_invested
