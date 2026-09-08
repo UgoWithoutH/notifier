@@ -90,6 +90,73 @@ row first and explicitly said not to worry about it and to just call the
 Sheet function anyway - don't "fix" this by skipping the Sheet call again
 without being asked.
 
+Added 2026-09-07: Cash drag/XIRR/XIRR Bonus/XIRR Cash drag/XIRR Taxes/Frais/
+XIRR Interets, mirroring the same block already built for Afranga/Swaper/
+Lendermarket/PeerBerry/Loanch/Mintos/Lande - per explicit user request,
+same corrections as afranga_diversification.py's 2026-09-07 backfill-month
+fix (see that module's docstring), applied here from scratch. Unlike
+Afranga (separate Details/Summary endpoints) or Loanch (a transaction-type
+enum ledger), Bricks exposes a SINGLE unified per-transaction wallet
+ledger, found via a real browser network capture (Playwright, logged in
+with BRICKS_EMAIL/PASSWORD) while opening the "Mon solde" ("wallet") page:
+
+    GET https://api.bricks.co/wallet-transactions?cursor=<offset>&take=50
+    -> {"data": [{"id", "kind", "createdAt": "<ISO8601>", "status":
+    confirmed/canceled/declined, "value": <cents, SIGNED for its real
+    wallet-cash impact>, "giftBalanceChange": <cents>, "propertyId"/
+    "propertyName": <only for property-linked kinds>, ...}], "cursor":
+    <next page's cursor>, "size": 0}. `take` silently caps at 50
+    server-side (2000 tested, still returned 50) - pagination is by
+    `cursor` (a simple forward offset) only, newest-first, no date-range
+    filter (same limitation as Loanch's transaction API) - the incremental
+    cache below stops as soon as an already-cached id is seen.
+
+    Every `kind` observed by paginating the ENTIRE account history (332
+    transactions, 2025-04-16 to today) and reconciling against the live
+    home-metrics API (see fetch_balances() above) - reconstructing BOTH
+    the invested principal ("Investissements en cours") AND the wallet
+    cash balance ("Solde total") from ONLY the confirmed rows' `value`
+    field matched the live API EXACTLY (3060.34 EUR / 441.96 EUR),
+    confirming the classification below is complete and correct:
+      - "primary_purchase_with_refund" (confirmed only - status
+        "canceled" means the purchase was refunded and net-zero, no
+        separate refund transaction ever appears in the ledger) -
+        INVESTMENT: value negative (wallet -> project), outstanding
+        increases by -value.
+      - "obligation_principal_repayment_partial"/"_final" - REPAYMENT:
+        value positive (project -> wallet), outstanding decreases by
+        -value (same formula as investment, just the opposite sign of
+        value).
+      - "topup_wire"/"topup_card" (confirmed only - "declined" card
+        top-ups never reached the wallet) - EXTERNAL deposit cashflow
+        for XIRR (value positive).
+      - "withdrawal" - EXTERNAL withdrawal cashflow for XIRR (value
+        negative).
+      - "recurring_revenue" - gross interest received (gross, i.e.
+        BEFORE tax - matches the existing revenue endpoint's
+        obligationCoupons.untaxedTotal).
+      - "withholding_tax" - tax withheld on interest (value negative,
+        stored here as a positive amount, same sign convention as
+        Afranga's own withholding_tax).
+      - "boosted_balance_gain"/"refer_referee" - bonus/referral income
+        (matches the existing revenue endpoint's boostedBalanceGain/
+        referrals totals exactly).
+      - Every kind above only ever affects the WALLET cash balance via
+        its own `value` (no separate direction lookup needed, unlike
+        Afranga's CSS-class-based direction-in/out) -
+        _wallet_balance_as_of()/compute_average_idle_cash() below simply
+        sum `value` for every CONFIRMED row regardless of kind.
+
+    Because the ledger is fetched back to account inception (like
+    Loanch), reconstruct_outstanding()/_wallet_balance_as_of() start
+    accumulating from a true 0, and - UNLIKE every other platform in this
+    repo - the reconstructed total (outstanding + wallet balance) can
+    ALSO stand in for a BACKFILLED month's "total" (see run() below):
+    home-metrics is a live-only endpoint with no historical equivalent,
+    but since reconstructing from the ledger matches it exactly for
+    today, it's used as a genuine historical total instead of Bricks'
+    previous skip_total=True lock for any non-current month.
+
 Required env vars:
     BRICKS_EMAIL, BRICKS_PASSWORD       -> Bricks account credentials
 Optional:
@@ -104,6 +171,7 @@ import os
 import sys
 import time
 import logging
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -135,12 +203,39 @@ except ModuleNotFoundError:
     )
     from shared.report_date import get_report_now, is_current_month
 
+from shared.state import load_state, save_state
+from shared.xirr import compute_xirr
+
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger("bricks_diversification")
 
 SIGNIN_URL = "https://api.bricks.co/api/auth/sign-in/email"
 HOME_METRICS_URL = "https://api.bricks.co/investor/portfolio/wealth/home-metrics"
 REVENUE_API_URL = "https://api.bricks.co/investor/portfolio/revenue"
+WALLET_TRANSACTIONS_URL = "https://api.bricks.co/wallet-transactions"
+# Server-side cap, confirmed live (requesting take=2000 still only returned 50).
+WALLET_TRANSACTIONS_PAGE_SIZE = 50
+MAX_WALLET_TRANSACTIONS_PAGES = 200
+# Incremental cache of every wallet-transactions row ever fetched (since
+# account inception) - same idea as loanch_diversification.XIRR_CASHFLOWS_STATE_FILE.
+XIRR_CASHFLOWS_STATE_FILE = Path(__file__).parent / "bricks_xirr_cashflows_state.json"
+XIRR_CASHFLOWS_STATE_DEFAULT = {"all_entries": []}
+
+# wallet-transactions "kind" classification - see module docstring for how
+# each was verified (live reconciliation against home-metrics' own
+# portfolioCurrentValue/balanceAvailable+giftBalance).
+_DEPOSIT_KINDS = {"topup_wire", "topup_card"}
+_WITHDRAWAL_KIND = "withdrawal"
+_OUTSTANDING_KINDS = {
+    "primary_purchase_with_refund", "obligation_principal_repayment_partial", "obligation_principal_repayment_final",
+}
+_INTEREST_KIND = "recurring_revenue"
+_TAX_KIND = "withholding_tax"
+_BONUS_KINDS = {"boosted_balance_gain", "refer_referee"}
+# Sentinel "since the dawn of time" start date for lifetime/since-inception
+# range sums below - the ledger itself never has anything before account
+# inception, so this is just a convenient lower bound.
+_LEDGER_EPOCH = date(2000, 1, 1)
 # Bricks' revenue endpoint is aggregated by MONTH (not day like every other
 # platform's equivalent) - using the current month for both startDate/endDate
 # gives month-to-date totals. Pinned explicitly rather than relying on the
@@ -311,6 +406,300 @@ def fetch_current_month_revenue_totals(session: requests.Session) -> dict:
     }
 
 
+def fetch_wallet_transactions_page(session: requests.Session, cursor: int) -> dict:
+    """Fetch one page of the account's own wallet-transactions ledger API
+    (see module docstring for the verified request/response shape)."""
+    resp = session.get(
+        WALLET_TRANSACTIONS_URL,
+        params={"cursor": cursor, "take": WALLET_TRANSACTIONS_PAGE_SIZE},
+        timeout=15,
+    )
+    if resp.status_code != 200:
+        raise RuntimeError(f"Bricks wallet-transactions endpoint returned status {resp.status_code} (cursor={cursor})")
+    return resp.json() or {}
+
+
+def get_cached_wallet_transactions(session: requests.Session) -> list:
+    """Return every wallet-transactions row since account inception,
+    fetching only the newest page(s) not already cached locally (in
+    XIRR_CASHFLOWS_STATE_FILE) - same "stop at an already-cached id"
+    incremental-cache idea as loanch_diversification.get_cached_transactions()
+    (this endpoint has no date-range filter either, only a forward `cursor`
+    offset, newest first)."""
+    state = load_state(XIRR_CASHFLOWS_STATE_FILE, XIRR_CASHFLOWS_STATE_DEFAULT)
+    cached_entries = state.get("all_entries") or []
+    cached_ids = {entry.get("id") for entry in cached_entries}
+
+    log.info("Found %d cached wallet-transaction(s) - fetching newest page(s) until an already-cached one is seen...", len(cached_entries))
+    new_entries = []
+    cursor = 0
+    reached_cached_entry = False
+    for page_number in range(1, MAX_WALLET_TRANSACTIONS_PAGES + 1):
+        body = fetch_wallet_transactions_page(session, cursor)
+        page_entries = body.get("data") or []
+        log.info("Page %d (cursor=%d): %d entrie(s) found.", page_number, cursor, len(page_entries))
+        for entry in page_entries:
+            if entry.get("id") in cached_ids:
+                reached_cached_entry = True
+                break
+            new_entries.append(entry)
+        if reached_cached_entry or not page_entries:
+            break
+        next_cursor = body.get("cursor")
+        if next_cursor is None or next_cursor == cursor:
+            break
+        cursor = next_cursor
+    else:
+        log.warning("Hit MAX_WALLET_TRANSACTIONS_PAGES (%d) without reaching a cached entry or the end of the ledger - it may be incomplete.", MAX_WALLET_TRANSACTIONS_PAGES)
+
+    seen = set()
+    merged = []
+    for entry in new_entries + cached_entries:
+        key = entry.get("id")
+        if key in seen:
+            continue
+        seen.add(key)
+        merged.append(entry)
+
+    save_state(XIRR_CASHFLOWS_STATE_FILE, {"all_entries": merged})
+    log.info("Wallet-transactions cache now holds %d entrie(s) (was %d before this run, %d new).", len(merged), len(cached_entries), len(new_entries))
+    return merged
+
+
+def _entry_date(entry: dict):
+    raw = entry.get("createdAt")
+    if not raw:
+        return None
+    try:
+        return datetime.strptime(raw[:10], "%Y-%m-%d").date()
+    except ValueError:
+        return None
+
+
+def _entry_value(entry: dict) -> float:
+    try:
+        return float(entry.get("value") or 0) / 100
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _is_confirmed(entry: dict) -> bool:
+    return entry.get("status") == "confirmed"
+
+
+def reconstruct_outstanding(all_entries: list, end_date) -> float:
+    """Reconstruct the INVESTED principal ("Investissements en cours") as
+    of an arbitrary past `end_date`, by replaying every confirmed
+    purchase/repayment row dated on or before that date - see module
+    docstring for why `-value` is the right delta for BOTH investment
+    (value negative, outstanding increases) and repayment (value positive,
+    outstanding decreases) kinds."""
+    outstanding = 0.0
+    for entry in all_entries:
+        entry_date = _entry_date(entry)
+        if entry_date is None or entry_date > end_date or not _is_confirmed(entry):
+            continue
+        if entry.get("kind") in _OUTSTANDING_KINDS:
+            outstanding += -_entry_value(entry)
+    return outstanding
+
+
+def _wallet_balance_as_of(all_entries: list, end_date) -> float:
+    """Reconstructed wallet cash balance ("Solde total") as of `end_date` -
+    every CONFIRMED row's own `value` already represents its real
+    wallet-cash impact regardless of kind (see module docstring), so this
+    is just their sum, starting from a true 0 at account inception (the
+    ledger is fetched back that far - see get_cached_wallet_transactions())."""
+    balance = 0.0
+    for entry in all_entries:
+        entry_date = _entry_date(entry)
+        if entry_date is None or entry_date > end_date or not _is_confirmed(entry):
+            continue
+        balance += _entry_value(entry)
+    return balance
+
+
+def compute_average_idle_cash(all_entries: list, start_date: str, end_date: str) -> float:
+    """Reconstruct the wallet's uninvested-cash balance for every day up to
+    end_date from the raw ledger rows and return the day-weighted average
+    over [start_date, end_date] - same technique as
+    loanch_diversification.compute_average_idle_cash()."""
+    try:
+        start = datetime.strptime(start_date, "%Y-%m-%d").date()
+        end = datetime.strptime(end_date, "%Y-%m-%d").date()
+    except ValueError:
+        return 0.0
+
+    daily_deltas: dict = {}
+    for entry in all_entries:
+        entry_date = _entry_date(entry)
+        if entry_date is None or entry_date > end or not _is_confirmed(entry):
+            continue
+        daily_deltas[entry_date] = daily_deltas.get(entry_date, 0.0) + _entry_value(entry)
+
+    if not daily_deltas:
+        return 0.0
+
+    running_balance = 0.0
+    total_balance = 0.0
+    day_count = 0
+    current = min(daily_deltas)
+    while current <= end:
+        running_balance += daily_deltas.get(current, 0.0)
+        if current >= start:
+            total_balance += running_balance
+            day_count += 1
+        current += timedelta(days=1)
+
+    if day_count == 0:
+        return running_balance
+    return total_balance / day_count
+
+
+def _sum_in_range(all_entries: list, kinds: set, start_date, end_date) -> float:
+    """Sum of every confirmed entry's own `value` whose `kind` is in
+    `kinds`, dated within [start_date, end_date] (inclusive)."""
+    total = 0.0
+    for entry in all_entries:
+        entry_date = _entry_date(entry)
+        if entry_date is None or entry_date < start_date or entry_date > end_date or not _is_confirmed(entry):
+            continue
+        if entry.get("kind") in kinds:
+            total += _entry_value(entry)
+    return total
+
+
+def _lifetime_sum_as_of(all_entries: list, kinds: set, end_date) -> float:
+    """Sum of every confirmed entry's own `value` whose `kind` is in
+    `kinds`, dated on or before `end_date` (since account inception)."""
+    return _sum_in_range(all_entries, kinds, _LEDGER_EPOCH, end_date)
+
+
+def _build_since_inception_cashflows_as_of(all_entries: list, end_date) -> list:
+    """Real deposit ("topup_wire"/"topup_card")/withdrawal cashflows,
+    signed and dated, filtered to date<=end_date - `value` is already
+    signed for its wallet-cash impact (deposit positive, withdrawal
+    negative), so negating it uniformly gives the right XIRR convention
+    for both (deposit -> negative cashflow, withdrawal -> positive one)."""
+    signed_cashflows = []
+    for entry in all_entries:
+        entry_date = _entry_date(entry)
+        if entry_date is None or entry_date > end_date or not _is_confirmed(entry):
+            continue
+        kind = entry.get("kind")
+        if kind in _DEPOSIT_KINDS or kind == _WITHDRAWAL_KIND:
+            signed_cashflows.append((entry_date, -_entry_value(entry)))
+    return signed_cashflows
+
+
+def compute_xirr_block_as_of(all_entries: list, end_date) -> dict:
+    """Compute the FULL XIRR pie-chart block (XIRR, Cash drag, XIRR Bonus,
+    XIRR Cash drag, XIRR Taxes/Frais, XIRR Intérêts) as of an arbitrary
+    `end_date` - works identically for the current month or a BACKFILLED
+    (past) one, since Bricks' single wallet-transactions ledger can
+    reconstruct the terminal account value (outstanding + wallet balance)
+    for ANY past date, unlike every other platform in this repo that needs
+    a live-only endpoint for "today" - see module docstring. Mirrors
+    afranga_diversification.compute_xirr_block_as_of() /
+    loanch_diversification.compute_xirr_block_as_of()'s methodology
+    exactly: Cash drag is a MONTHLY figure (this month alone), everything
+    else is a since-inception counterfactual XIRR share through end_date.
+
+    Returns a dict with any subset of {"XIRR", "Cash drag", "XIRR Bonus",
+    "XIRR Cash drag", "XIRR Taxes/Frais", "XIRR Intérêts"} that could
+    actually be computed - a missing key means "couldn't be computed", same
+    soft-fail convention as everywhere else in this module.
+    """
+    result: dict = {}
+
+    outstanding_as_of = reconstruct_outstanding(all_entries, end_date)
+    wallet_balance_as_of = _wallet_balance_as_of(all_entries, end_date)
+    total_value_as_of = outstanding_as_of + wallet_balance_as_of
+
+    base_cashflows = _build_since_inception_cashflows_as_of(all_entries, end_date)
+    xirr_value = compute_xirr(base_cashflows + [(end_date, total_value_as_of)])
+    if xirr_value is None:
+        log.warning("Could not compute XIRR as of %s from the reconstructed cashflows.", end_date)
+        return result
+    result["XIRR"] = xirr_value
+    log.info("Computed XIRR as of %s: %.2f%% (total value=%.2f EUR).", end_date, xirr_value * 100, total_value_as_of)
+
+    if outstanding_as_of <= 0:
+        # Nothing invested at end_date - Cash drag/the pie shares below all
+        # divide by the invested amount.
+        return result
+
+    month_start_str = end_date.replace(day=1).strftime("%Y-%m-%d")
+    end_date_str = end_date.strftime("%Y-%m-%d")
+    avg_idle_cash = compute_average_idle_cash(all_entries, month_start_str, end_date_str)
+    monthly_interest = _sum_in_range(all_entries, {_INTEREST_KIND}, end_date.replace(day=1), end_date)
+    cash_weight = avg_idle_cash / (avg_idle_cash + outstanding_as_of)
+    monthly_yield_rate = monthly_interest / outstanding_as_of
+    result["Cash drag"] = cash_weight * monthly_yield_rate
+    log.info(
+        "Computed Cash drag as of %s: %.2f%% (avg idle cash %.2f EUR, cash weight %.2f%%, monthly yield %.2f%%).",
+        end_date, result["Cash drag"] * 100, avg_idle_cash, cash_weight * 100, monthly_yield_rate * 100,
+    )
+
+    deposit_dates = [
+        d for d in (_entry_date(e) for e in all_entries if e.get("kind") in _DEPOSIT_KINDS and _is_confirmed(e))
+        if d is not None and d <= end_date
+    ]
+    if not deposit_dates:
+        return result
+    since_inception_date = min(deposit_dates)
+    since_inception_str = since_inception_date.strftime("%Y-%m-%d")
+
+    lifetime_bonus = _lifetime_sum_as_of(all_entries, _BONUS_KINDS, end_date)
+    if lifetime_bonus:
+        xirr_without_bonus = compute_xirr(base_cashflows + [(end_date, total_value_as_of - lifetime_bonus)])
+        if xirr_without_bonus is not None:
+            result["XIRR Bonus"] = xirr_value - xirr_without_bonus
+            log.info("XIRR share - bonus as of %s: %.2f points.", end_date, result["XIRR Bonus"] * 100)
+    else:
+        result["XIRR Bonus"] = 0.0
+
+    avg_idle_cash_lifetime = compute_average_idle_cash(all_entries, since_inception_str, end_date_str)
+    cash_weight_lifetime = avg_idle_cash_lifetime / (avg_idle_cash_lifetime + outstanding_as_of)
+    lifetime_gross_interest = _lifetime_sum_as_of(all_entries, {_INTEREST_KIND}, end_date)
+    lifetime_yield_rate = lifetime_gross_interest / outstanding_as_of
+    cash_drag_lifetime_total = cash_weight_lifetime * lifetime_yield_rate
+    missed_earnings = cash_drag_lifetime_total * (avg_idle_cash_lifetime + outstanding_as_of)
+    xirr_with_cash_invested = compute_xirr(base_cashflows + [(end_date, total_value_as_of + missed_earnings)])
+    if xirr_with_cash_invested is not None:
+        result["XIRR Cash drag"] = xirr_value - xirr_with_cash_invested
+        log.info(
+            "XIRR share - cash drag as of %s: %.4f points (since-inception, missed earnings ~%.2f EUR).",
+            end_date, result["XIRR Cash drag"] * 100, missed_earnings,
+        )
+
+    # withholding_tax's own `value` is already negative (see module
+    # docstring) - flip it here to a positive "amount withheld" figure,
+    # same sign convention as Afranga's withholding_tax.
+    lifetime_withholding_tax = -_lifetime_sum_as_of(all_entries, {_TAX_KIND}, end_date)
+    if lifetime_withholding_tax:
+        xirr_with_taxes_cancelled = compute_xirr(base_cashflows + [(end_date, total_value_as_of + lifetime_withholding_tax)])
+        if xirr_with_taxes_cancelled is not None:
+            result["XIRR Taxes/Frais"] = xirr_value - xirr_with_taxes_cancelled
+            log.info("XIRR share - taxes/frais as of %s: %.4f points (lifetime withholding tax %.2f EUR).", end_date, result["XIRR Taxes/Frais"] * 100, lifetime_withholding_tax)
+    else:
+        result["XIRR Taxes/Frais"] = 0.0
+
+    lifetime_net_interest = lifetime_gross_interest - lifetime_withholding_tax
+    if lifetime_net_interest:
+        xirr_without_interest = compute_xirr(base_cashflows + [(end_date, total_value_as_of - lifetime_net_interest)])
+        if xirr_without_interest is not None:
+            result["XIRR Intérêts"] = xirr_value - xirr_without_interest
+            log.info(
+                "XIRR share - intérêts as of %s: %.4f points (lifetime net interest %.2f EUR = %.2f gross - %.2f taxes).",
+                end_date, result["XIRR Intérêts"] * 100, lifetime_net_interest, lifetime_gross_interest, lifetime_withholding_tax,
+            )
+    else:
+        result["XIRR Intérêts"] = 0.0
+
+    return result
+
+
 def run() -> None:
     if not BRICKS_EMAIL or not BRICKS_PASSWORD:
         log.error("BRICKS_EMAIL and BRICKS_PASSWORD environment variables are required.")
@@ -352,6 +741,49 @@ def run() -> None:
         balances["solde_principal"], balances["solde_cadeau"], total,
     )
 
+    # Since-inception XIRR (money-weighted return) + this month's Cash drag
+    # + the XIRR Bonus/Cash drag/Taxes-Frais/Intérêts pie-chart shares - see
+    # module docstring for the wallet-transactions ledger this is built
+    # from. Fetched/cached unconditionally (not just for current_month) -
+    # this endpoint has no date-range params to invert (paginates by
+    # `cursor` only, newest first, stopping at an already-cached id), so a
+    # backfilled month's run can safely extend/persist this cache too, same
+    # reasoning as loanch_diversification.py.
+    all_entries = None
+    try:
+        log.info("Fetching the since-inception wallet-transactions ledger (cached where possible)...")
+        all_entries = get_cached_wallet_transactions(session)
+    except Exception:
+        log.exception("Failed to fetch the wallet-transactions ledger - XIRR/Cash drag will not be updated.")
+        all_entries = None
+
+    current_month = is_current_month()
+    today_date = get_report_now(REPORT_TIMEZONE).date()
+
+    xirr_block = {}
+    if all_entries is not None:
+        try:
+            xirr_block = compute_xirr_block_as_of(all_entries, today_date)
+        except Exception:
+            log.exception("Failed to compute the XIRR block as of %s.", today_date)
+            xirr_block = {}
+
+    # Unlike every other platform in this repo, Bricks' single ledger can
+    # ALSO reconstruct a genuine historical total (outstanding + wallet
+    # balance) for a backfilled month, reconciled exactly against the live
+    # home-metrics balances above (see module docstring) - so a backfilled
+    # month is no longer forced to skip "total" the way it used to.
+    skip_total = False
+    if not current_month:
+        if all_entries is not None:
+            reconstructed_total = round(
+                reconstruct_outstanding(all_entries, today_date) + _wallet_balance_as_of(all_entries, today_date), 2
+            )
+            log.info("Backfilled month (%s): using reconstructed total %.2f EUR instead of skipping it.", today_date, reconstructed_total)
+            total = reconstructed_total
+        else:
+            skip_total = True
+
     amounts = {
         "total": total,
         "gross_interest_received": revenue_totals["gross_interest_received"],
@@ -376,17 +808,17 @@ def run() -> None:
     # gross_interest_received write below will land on "Bourse"'s row
     # instead. Don't revert this to a log-only skeleton without being
     # asked again.
-    current_month = is_current_month()
 
-    # "total" comes from home-metrics, a LIVE-only endpoint with no date
-    # param; the revenue endpoint (which does take a month) has no balance
-    # field either (2026-08-06 investigation) - skip total for a backfilled
-    # month.
+    # "total" used to be unconditionally skipped for a backfilled month
+    # (home-metrics is LIVE-only, no historical equivalent) - now it's
+    # reconstructed from the ledger instead (see above) and only skipped
+    # if that ledger fetch itself failed, matching every other platform's
+    # soft-fail convention instead of an unconditional lock.
     fill_current_month_amounts(
         platform="Bricks",
         amounts=amounts,
         section="Crowdfunding immobilier",
-        skip_total=not current_month,
+        skip_total=skip_total,
     )
 
     # Bricks' block uses its own distinct sub-row labels ("parrainages" /
@@ -396,14 +828,22 @@ def run() -> None:
     # "prélèvements" gets the real withholding tax on the obligationCoupons
     # interest, same convention as Afranga/Bienprêter/Mintos's equivalent row
     # - previously missing here, silently leaving that row blank for Bricks.
+    # "Cash drag"/"XIRR"/"XIRR Intérêts"/"XIRR Bonus"/"XIRR Cash drag"/
+    # "XIRR Taxes/Frais" rows already exist in the live Sheet (rows already
+    # pre-added below Bricks' own row) - appended past the default
+    # max_rows=6 bound, only included when actually computed (soft-fail,
+    # same convention as everywhere else).
+    breakdown = {
+        "parrainages": revenue_totals["referrals"],
+        "soldes boost\u00e9s": revenue_totals["boosted_balance_gain"],
+        "pr\u00e9l\u00e8vements": revenue_totals["withholding_tax"],
+    }
+    breakdown.update(xirr_block)
     fill_current_month_bonus_breakdown(
         platform="Bricks",
-        breakdown={
-            "parrainages": revenue_totals["referrals"],
-            "soldes boost\u00e9s": revenue_totals["boosted_balance_gain"],
-            "pr\u00e9l\u00e8vements": revenue_totals["withholding_tax"],
-        },
+        breakdown=breakdown,
         section="Crowdfunding immobilier",
+        max_rows=14,
     )
 
     # "Répartition géographique" has a single "Bricks" aggregate row (no
