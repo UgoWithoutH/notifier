@@ -294,9 +294,11 @@ def fill_current_month_amounts(
     # offset now silently writes the interest figure into the wrong row.
     # Find it by label instead (falls back to the old fixed offset with a
     # warning if not found, e.g. an older Dashboard sheet without the new
-    # rows).
+    # rows). Bounded dynamically (stops at the next platform's own row,
+    # see _platform_block_max_rows()) rather than a hardcoded row count.
     interest_row = find_rows_by_texts_below(
-        grid, platform_row, section_col, ["intérêts brut"], max_rows=5
+        grid, platform_row, section_col, ["intérêts brut"],
+        max_rows=_platform_block_max_rows(grid, section_col, platform_row, platform),
     ).get("intérêts brut")
     if interest_row is None:
         logger.warning(
@@ -342,7 +344,7 @@ def fill_current_month_amounts(
 
 
 def fill_current_month_amounts_with_labels(
-    platform: str, total, labeled_amounts: dict, section: str = "Crowdlending", max_rows: int = 6,
+    platform: str, total, labeled_amounts: dict, section: str = "Crowdlending",
     skip_total: bool = False,
 ):
     """Like fill_current_month_amounts(), but for a platform whose block has
@@ -353,9 +355,10 @@ def fill_current_month_amounts_with_labels(
     writes each `labeled_amounts` entry (label -> amount) to its own
     dedicated sub-row found below the platform's row, using the same
     label-matching mechanism as fill_current_month_bonus_breakdown()/
-    find_rows_by_texts_below() (case-insensitive substring, bounded to
-    `max_rows` rows below the platform so it can never bleed into the next
-    platform's block).
+    find_rows_by_texts_below() (case-insensitive substring, bounded
+    dynamically via _platform_block_max_rows() so it stops at whichever
+    comes first: the label being found, or the next platform's own row -
+    no more hardcoded `max_rows` to keep in sync by hand).
 
     Added for Mintos (2026-07-29): its block was split from a single
     "intérêts brut" row into "en cours prêts" / "en cours obligations" /
@@ -397,7 +400,8 @@ def fill_current_month_amounts_with_labels(
 
     labels = list(labeled_amounts.keys())
     rows_by_label = find_rows_by_texts_below(
-        grid, platform_row, section_col, labels, max_rows=max_rows
+        grid, platform_row, section_col, labels,
+        max_rows=_platform_block_max_rows(grid, section_col, platform_row, platform),
     )
 
     missing = [label for label in labels if label not in rows_by_label]
@@ -422,7 +426,7 @@ def fill_current_month_amounts_with_labels(
     logger.info("Mise à jour terminée pour %s (par labels)", platform)
 
 
-def fill_current_month_bonus_breakdown(platform: str, breakdown: dict, section: str = "Crowdlending", max_rows: int = 6):
+def fill_current_month_bonus_breakdown(platform: str, breakdown: dict, section: str = "Crowdlending"):
     """Write this month's bonus/cashback/contest figures to their own
     dedicated sub-rows under a platform's block, instead of the merged
     "Bonus" row (which is a SUM formula over those sub-rows in the Sheet
@@ -437,14 +441,13 @@ def fill_current_month_bonus_breakdown(platform: str, breakdown: dict, section: 
     (the common case) only ever touches that one row, leaving the other
     sibling rows (and "Bonus" itself) untouched.
 
-    `max_rows` : how many rows below the platform's own row to search
-    (default 6, covers "intérêts brut" / "Bonus" / up to 3 category rows /
-    "Rendements %" in every verified block layout) so it can never cross
-    into the next platform's block below and misattribute a value (e.g.
-    writing into a different platform's "cashback" row just because this
-    platform doesn't have one). Pass a larger value for a block with more
-    sub-rows below the platform's own row (e.g. Swaper's "XIRR" row, which
-    sits further down than the usual 6-row bound).
+    No more hardcoded `max_rows`: the search below the platform's own row
+    is bounded dynamically via _platform_block_max_rows(), so it stops at
+    whichever comes first - the label being found, or the next platform's
+    own row (GEO_SECTION_BOUNDARY_LABELS) - instead of a per-platform
+    magic number that needed bumping by hand every time a row was
+    inserted (a recurring source of bugs, see the block layout comments
+    this replaced in each *_diversification.py caller).
     """
     logger.info("Début mise à jour de la répartition bonus/cashback/concours pour %s (section '%s')", platform, section)
 
@@ -476,7 +479,8 @@ def fill_current_month_bonus_breakdown(platform: str, breakdown: dict, section: 
 
     labels = list(breakdown.keys())
     rows_by_label = find_rows_by_texts_below(
-        grid, platform_row, section_col, labels, max_rows=max_rows
+        grid, platform_row, section_col, labels,
+        max_rows=_platform_block_max_rows(grid, section_col, platform_row, platform),
     )
 
     missing = [label for label in labels if label not in rows_by_label]
@@ -618,6 +622,19 @@ def _find_geo_block_end_row(grid, geo_row: int, geo_col: int, platform_row: int,
     return min(candidate_rows)
 
 
+def _platform_block_max_rows(grid, col: int, platform_row: int, platform: str) -> int:
+    """Dynamic replacement for a hardcoded `max_rows` value passed to
+    find_rows_by_texts_below(): reuses _find_geo_block_end_row()'s boundary
+    detection (stop at the next platform's own row, per
+    GEO_SECTION_BOUNDARY_LABELS, or 2 consecutive blank cells, or end of
+    sheet) so a label search below a platform's row in the "Crowdlending"
+    section can never bleed into the next platform's block, without a
+    per-platform magic number that needed bumping by hand every time a row
+    was inserted."""
+    end_row = _find_geo_block_end_row(grid, platform_row, col, platform_row, platform)
+    return end_row - platform_row - 1
+
+
 def _zero_fill_missing_geo_rows(grid, geo_row: int, geo_col: int, target_col: int, platform: str, written_names) -> list:
     """Pour le bloc de sociétés de prêt du `platform` donné sous
     'Répartition géographique', prépare une écriture de 0 pour chaque
@@ -693,7 +710,10 @@ def fill_geographic_repartition_uninvested_amount(platform: str, amount):
         logger.warning("Plateforme '%s' non trouvée sous 'Répartition géographique' - 'non investi' non écrit.", platform)
         return
 
-    uninvested_row = find_rows_by_texts_below(grid, platform_row, geo_col, ["non investi"], max_rows=3).get("non investi")
+    uninvested_row = find_rows_by_texts_below(
+        grid, platform_row, geo_col, ["non investi"],
+        max_rows=_platform_block_max_rows(grid, geo_col, platform_row, platform),
+    ).get("non investi")
     if not uninvested_row:
         logger.warning(
             "Ligne 'non investi' non trouvée sous '%s' - rien n'a été écrit.", platform
@@ -733,7 +753,10 @@ def get_geographic_repartition_uninvested_amounts(platforms: list) -> dict:
             logger.warning("Plateforme '%s' non trouvée sous 'Répartition géographique'.", platform)
             continue
 
-        uninvested_row = find_rows_by_texts_below(grid, platform_row, geo_col, ["non investi"], max_rows=3).get("non investi")
+        uninvested_row = find_rows_by_texts_below(
+            grid, platform_row, geo_col, ["non investi"],
+            max_rows=_platform_block_max_rows(grid, geo_col, platform_row, platform),
+        ).get("non investi")
         if not uninvested_row:
             logger.warning("Ligne 'non investi' non trouvée sous '%s'.", platform)
             continue

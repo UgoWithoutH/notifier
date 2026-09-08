@@ -1208,7 +1208,6 @@ def run() -> None:
     fill_current_month_bonus_breakdown(
         platform="Bienprêter",
         breakdown=bonus_breakdown,
-        max_rows=16,
     )
 
     # "Répartition géographique" per-borrower breakdown (added 2026-07-31,

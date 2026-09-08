@@ -771,7 +771,7 @@ def run() -> None:
     if non_invested_balance is not None:
         bonus_breakdown[NON_INVESTED_BALANCE_LABEL] = non_invested_balance
     if bonus_breakdown:
-        fill_current_month_bonus_breakdown(platform="Iuvo", breakdown=bonus_breakdown, max_rows=16)
+        fill_current_month_bonus_breakdown(platform="Iuvo", breakdown=bonus_breakdown)
 
     if current_month:
         fill_geographic_repartition_amounts(balance_data["originators"], platform="Iuvo")

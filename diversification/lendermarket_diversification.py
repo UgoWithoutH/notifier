@@ -676,18 +676,14 @@ def run() -> None:
     # cashback/concours - written to its own dedicated sub-row, never to
     # the "Bonus" row itself (a SUM formula over prime/cashback/concours).
     # "XIRR"/"Cash drag" and the XIRR Bonus/Cash drag/Taxes-Frais/Intérêts
-    # pie-chart shares are appended past the default max_rows=6 bound, same
-    # convention as afranga_diversification.py - only included when
-    # actually computed.
-    # UPDATED 2026-08-18: "XIRR Intérêts" sits right after "XIRR
-    # Taxes/Frais" (mirrors Bienprêter's/Afranga's/Iuvo's own block
-    # layout) - this pushes the block one row taller than it was before
-    # (platform_row+9 through +13 previously), so `max_rows` is bumped
-    # 14 -> 15 to keep the search bounded before the next platform block.
-    # IMPORTANT: a "XIRR Intérêts" row must exist in the Lendermarket block
-    # on the sheet itself (right after "XIRR Taxes/Frais") for this new
-    # value to actually land somewhere - this script fills an existing row
-    # by label, it doesn't insert new labelled rows into this block.
+    # pie-chart shares sit further below - only included when actually
+    # computed. The search below the platform's row is bounded dynamically
+    # (stops at the next platform's own row), no more hardcoded `max_rows`
+    # to bump whenever a row is inserted. IMPORTANT: a "XIRR Intérêts" row
+    # must exist in the Lendermarket block on the sheet itself (right after
+    # "XIRR Taxes/Frais") for this new value to actually land somewhere -
+    # this script fills an existing row by label, it doesn't insert new
+    # labelled rows into this block.
     bonus_breakdown = {"prime": statement_totals["bonuses"]}
     if xirr_value is not None:
         bonus_breakdown["XIRR"] = xirr_value
@@ -708,7 +704,6 @@ def run() -> None:
     fill_current_month_bonus_breakdown(
         platform="Lendermarket",
         breakdown=bonus_breakdown,
-        max_rows=15,
     )
 
     loan_originators = [

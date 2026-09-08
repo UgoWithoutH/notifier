@@ -644,7 +644,6 @@ def run() -> None:
         platform="Monefit",
         breakdown=bonus_breakdown,
         section="Crowdlending savings",
-        max_rows=15,
     )
 
     loan_originators = [{"name": LOAN_ORIGINATOR_LABEL, "amount": balance}]

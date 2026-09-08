@@ -1461,12 +1461,11 @@ def run() -> None:
     # over prime/cashback/concours). "prélèvements" gets the real
     # withholding tax on gross interest, same as Bienprêter's equivalent row.
     # "XIRR"/"Cash drag" and the XIRR Bonus/Cash drag/Taxes-Frais/Intérêts
-    # pie-chart shares are appended past the default max_rows=6 bound (same
-    # as swaper_diversification.py) - only included when actually computed.
-    # "XIRR Intérêts" (added 2026-08-18) sits right after "XIRR
-    # Taxes/Frais" - this pushes the block one row taller than before, so
-    # `max_rows` is bumped 18 -> 19 to keep the search bounded before the
-    # next platform block. IMPORTANT: a "XIRR Intérêts" row must exist in
+    # pie-chart shares sit further down the block - only included when
+    # actually computed. The search below the platform's row is bounded
+    # dynamically (stops at the next platform's own row), no more
+    # hardcoded `max_rows` to bump whenever a row is inserted. IMPORTANT: a
+    # "XIRR Intérêts" row must exist in
     # the Afranga block on the sheet itself (right after "XIRR
     # Taxes/Frais") for this new value to actually land somewhere - this
     # script fills an existing row by label, it doesn't insert new
@@ -1494,7 +1493,6 @@ def run() -> None:
     fill_current_month_bonus_breakdown(
         platform="Afranga",
         breakdown=bonus_breakdown,
-        max_rows=19,
     )
 
     loan_originators = [

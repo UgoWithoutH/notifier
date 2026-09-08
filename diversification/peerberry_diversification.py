@@ -987,11 +987,10 @@ def run() -> None:
     # over prime/cashback/concours). "XIRR"/"Cash drag" and the XIRR
     # Bonus/Cash drag/Taxes-Frais/Intérêts pie-chart shares (rows already
     # added by the user, mirroring Afranga/Swaper/Lendermarket's own
-    # blocks) are appended past the default max_rows=6 bound - only
-    # included when actually computed. "XIRR Intérêts" (added 2026-08-19)
-    # sits right after "XIRR Taxes/Frais" - this pushes the block one row
-    # taller than before, so `max_rows` is bumped 14 -> 15 to keep the
-    # search bounded before the next platform block. IMPORTANT: a "XIRR
+    # blocks) sit further below - only included when actually computed.
+    # The search below the platform's row is bounded dynamically (stops at
+    # the next platform's own row), no more hardcoded `max_rows` to bump
+    # whenever a row is inserted. IMPORTANT: a "XIRR
     # Intérêts" row must exist in the PeerBerry block on the sheet itself
     # (right after "XIRR Taxes/Frais") for this new value to actually land
     # somewhere - this script fills an existing row by label, it doesn't
@@ -1016,7 +1015,6 @@ def run() -> None:
     fill_current_month_bonus_breakdown(
         platform="PeerBerry",
         breakdown=bonus_breakdown,
-        max_rows=15,
     )
 
     loan_originators = [

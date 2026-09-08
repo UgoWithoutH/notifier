@@ -622,7 +622,6 @@ def run() -> None:
         platform=PLATFORM_LABEL,
         breakdown=bonus_breakdown,
         section="Crowdlending savings",
-        max_rows=16,
     )
 
     if current_month:

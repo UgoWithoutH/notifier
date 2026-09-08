@@ -877,9 +877,10 @@ def run() -> None:
     # - previously missing here, silently leaving that row blank for Bricks.
     # "Cash drag"/"XIRR"/"XIRR Intérêts"/"XIRR Bonus"/"XIRR Cash drag"/
     # "XIRR Taxes/Frais" rows already exist in the live Sheet (rows already
-    # pre-added below Bricks' own row) - appended past the default
-    # max_rows=6 bound, only included when actually computed (soft-fail,
-    # same convention as everywhere else).
+    # pre-added below Bricks' own row) - the search below the platform's
+    # row is bounded dynamically (stops at the next platform's own row), no
+    # hardcoded `max_rows` needed - only included when actually computed
+    # (soft-fail, same convention as everywhere else).
     breakdown = {
         "parrainages": revenue_totals["referrals"],
         "soldes boost\u00e9s": revenue_totals["boosted_balance_gain"],
@@ -894,7 +895,6 @@ def run() -> None:
         platform="Bricks",
         breakdown=breakdown,
         section="Crowdfunding immobilier",
-        max_rows=14,
     )
 
     # "Répartition géographique" has a single "Bricks" aggregate row (no
