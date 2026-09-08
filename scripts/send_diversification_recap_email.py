@@ -37,7 +37,7 @@ log = logging.getLogger("send_diversification_recap_email")
 
 WORKFLOW_PLATFORMS = [
     "Swaper", "Iuvo", "Afranga", "Bienprêter", "Lendermarket",
-    "Loanch", "Peerberry", "Bricks",
+    "Loanch", "Peerberry", "Bricks", "Nectaro",
 ]
 
 
