@@ -523,14 +523,25 @@ def fetch_active_loans_by_borrower(session: requests.Session):
     """Fetches every active loan (fetch_active_loans()) and its project's
     country (fetch_project_country(), cached per project_id since several
     contracts can point at the same project), then groups/sums by
-    borrower name. Returns (borrowers, issues):
-    - borrowers : {borrower_name: {"amount": float, "country": str|None}} -
-      feeds fill_bienpreter_borrower_geo_amounts() in shared/google_sheet.py.
+    (borrower name, country) - a borrower with active loans in SEVERAL
+    countries gets one entry per country instead of only the first one
+    found (FIXED 2026-09-08: the old "keep only the first country, warn
+    and drop the rest" behavior silently discarded real invested amounts
+    from the Répartition géographique total whenever a borrower - e.g.
+    real case "ROMRADIATOARE", Cluj-Napoca/Roumanie + Rotterdam/Pays Bas -
+    genuinely has loans in more than one country). Returns (borrowers, issues):
+    - borrowers : {borrower_name: {country_name: summed_amount}} - feeds
+      fill_bienpreter_borrower_geo_amounts() in shared/google_sheet.py,
+      which now splits each borrower's row across every matching country
+      column instead of a single amount/country pair. A country that
+      couldn't be resolved (fetch_project_country() returned None) is kept
+      under the "" key so its amount isn't silently dropped from the
+      dict, even though fill_bienpreter_borrower_geo_amounts() still can't
+      write it to any column (reported via `issues` instead).
     - issues : list of short strings, one per country that couldn't be
-      found/fetched or per borrower with loans in more than one country -
-      feeds shared.notifier.send_bienpreter_geo_issues_email() (per
-      explicit user request: any missing country or error here should be
-      emailed, not just logged).
+      found/fetched - feeds shared.notifier.send_bienpreter_geo_issues_email()
+      (per explicit user request: any missing country or error here should
+      be emailed, not just logged).
     """
     loans, issues = fetch_active_loans(session)
 
@@ -555,18 +566,9 @@ def fetch_active_loans_by_borrower(session: requests.Session):
                 )
                 project_country_cache[project_id] = None
 
-        country = project_country_cache[project_id]
-        entry = borrowers.setdefault(name, {"amount": 0.0, "country": None})
-        entry["amount"] += loan["amount"]
-        if country and not entry["country"]:
-            entry["country"] = country
-        elif country and entry["country"] and entry["country"] != country:
-            message = (
-                f"Emprunteur '{name}' a des prêts dans plusieurs pays "
-                f"({entry['country']} vs {country}) - seul le premier trouvé est conservé."
-            )
-            log.warning(message)
-            issues.append(message)
+        country = project_country_cache[project_id] or ""
+        entry = borrowers.setdefault(name, {})
+        entry[country] = entry.get(country, 0.0) + loan["amount"]
 
     log.info("Active loans grouped by borrower: %d borrower(s) found.", len(borrowers))
     return borrowers, issues
