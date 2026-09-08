@@ -189,6 +189,7 @@ from shared.google_sheet import (
     fill_geographic_repartition_uninvested_amount,
 )
 from shared.report_date import get_report_date, is_current_month
+from shared.weighted_average import compute_time_weighted_average
 from shared.xirr import compute_xirr
 
 load_dotenv()
@@ -428,6 +429,50 @@ def wallet_balance_as_of(entries: list, end_date) -> float:
     )
 
 
+def _outstanding_delta_for_entry(entry: dict) -> float:
+    """Signed change to the INVESTED principal ("outstanding") one
+    transaction row represents - reuses the same "Principal"/
+    "Investissement" label classification as
+    _is_known_internal_movement() above (the only 2 known label kinds
+    that move money between the wallet and an active loan investment).
+    `amount` is already signed for its cash-balance impact (see
+    fetch_transactions()'s docstring) - "Investissement" debits the
+    wallet to fund a loan (amount negative) and "Principal" (repaid
+    principal) credits it back (amount positive), so in both cases the
+    outstanding-principal effect is the exact MIRROR of the cash effect,
+    same convention as loanch_diversification._outstanding_delta_for_entry().
+    Every other label (Dépôt/Retrait/Intérêt/Bonus) only ever touches the
+    wallet, never outstanding -> 0."""
+    if _is_known_internal_movement(entry.get("label") or ""):
+        return -entry["amount"]
+    return 0.0
+
+
+def compute_average_balances(entries: list, start_date, end_date) -> tuple:
+    """Day-weighted average INVESTED ("outstanding") and NON-INVESTED
+    (wallet cash) balances over [start_date, end_date] (`date` objects) -
+    for the "solde moyen pondéré investi"/"solde moyen pondéré non
+    investi" Sheet rows (added 2026-09-08). Reuses the SAME per-entry
+    classifiers as compute_average_idle_cash()/_outstanding_delta_for_entry()
+    above, just fed into the generic shared day-weighted-average helper
+    (opening_balance=0.0 at account inception) instead of a running-total
+    reconstruction - `entries` is expected to cover the account's FULL
+    history (see SINCE_INCEPTION_START_DATE), so the running balance
+    carried into `start_date` from summed prior deltas is accurate."""
+    invested_events = []
+    non_invested_events = []
+    for entry in entries:
+        entry_date = entry.get("date")
+        if entry_date is None:
+            continue
+        invested_events.append((entry_date, _outstanding_delta_for_entry(entry)))
+        non_invested_events.append((entry_date, entry["amount"]))
+
+    avg_invested = compute_time_weighted_average(invested_events, start_date, end_date)
+    avg_non_invested = compute_time_weighted_average(non_invested_events, start_date, end_date)
+    return avg_invested, avg_non_invested
+
+
 def fetch_available_funds(session: requests.Session) -> float:
     """Fetch the uninvested cash balance ("non investi") from the investor
     overview page's "Fonds disponibles" figure (verified live 2026-08-10):
@@ -549,6 +594,24 @@ def run(session: requests.Session | None = None) -> None:
                 wallet_balance_as_of_end,
                 available_funds,
             )
+
+    # Day-weighted average invested/non-invested balances (new Sheet rows
+    # "solde moyen pondéré investi"/"non investi", added 2026-09-08) -
+    # computed whenever all_entries is available, independent of
+    # current_month, so this also works for a REPORT_DATE-backfilled past
+    # month. Uses the REAL number of days in the period, never a
+    # hardcoded 30.
+    avg_invested_balance = None
+    avg_non_invested_balance = None
+    if all_entries is not None:
+        month_start_date = today_date.replace(day=1)
+        avg_invested_balance, avg_non_invested_balance = compute_average_balances(
+            all_entries, month_start_date, today_date
+        )
+        log.info(
+            "Solde moyen pondéré - investi: %.2f EUR, non investi: %.2f EUR (%s to %s).",
+            avg_invested_balance, avg_non_invested_balance, month_start_date, today_date,
+        )
 
     total_invested = (
         total - (available_funds if available_funds is not None else wallet_balance_as_of_end)
@@ -696,6 +759,10 @@ def run(session: requests.Session | None = None) -> None:
         bonus_breakdown["XIRR Taxes/Frais"] = taxes_xirr_contribution
     if interest_xirr_contribution is not None:
         bonus_breakdown["XIRR Intérêts"] = interest_xirr_contribution
+    if avg_invested_balance is not None:
+        bonus_breakdown["solde moyen pondéré investi"] = avg_invested_balance
+    if avg_non_invested_balance is not None:
+        bonus_breakdown["solde moyen pondéré non investi"] = avg_non_invested_balance
     if bonus_breakdown:
         fill_current_month_bonus_breakdown(platform=PLATFORM_LABEL, breakdown=bonus_breakdown, max_rows=13)
 

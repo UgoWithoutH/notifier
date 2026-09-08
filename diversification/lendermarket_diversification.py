@@ -639,6 +639,26 @@ def run() -> None:
             else:
                 interest_xirr_contribution = 0.0
 
+    # Day-weighted average invested/non-invested balances (new Sheet rows
+    # "solde moyen pondéré investi"/"non investi", added 2026-09-08).
+    # Lendermarket has no per-transaction dated ledger at all (see module
+    # docstring) - "non investi" reuses the SAME coarse (opening+closing)/2
+    # monthly approximation as Cash drag above (`statement_totals`, the
+    # best available precision for this platform, already respects
+    # REPORT_DATE for a backfilled month). "investi" falls back to the
+    # SAME total_invested point-in-time figure (reconstructed above for a
+    # backfilled month, or live for the current month) already used as a
+    # constant for this month's Cash drag math.
+    avg_invested_balance = None
+    avg_non_invested_balance = None
+    if total_invested > 0:
+        avg_invested_balance = total_invested
+        avg_non_invested_balance = (statement_totals["opening_balance"] + statement_totals["closing_balance"]) / 2
+        log.info(
+            "Solde moyen pondéré - investi: %.2f EUR (constant, point-in-time), non investi: %.2f EUR (approximation mensuelle).",
+            avg_invested_balance, avg_non_invested_balance,
+        )
+
     # "total" comes from a live balance call/summed active investments plus
     # the available (uninvested) balance, and
     # getInvestorAccountStatementSummary (the date-ranged statement API) has
@@ -680,6 +700,10 @@ def run() -> None:
         bonus_breakdown["XIRR Taxes/Frais"] = taxes_xirr_contribution
     if interest_xirr_contribution is not None:
         bonus_breakdown["XIRR Intérêts"] = interest_xirr_contribution
+    if avg_invested_balance is not None:
+        bonus_breakdown["solde moyen pondéré investi"] = avg_invested_balance
+    if avg_non_invested_balance is not None:
+        bonus_breakdown["solde moyen pondéré non investi"] = avg_non_invested_balance
     fill_current_month_bonus_breakdown(
         platform="Lendermarket",
         breakdown=bonus_breakdown,

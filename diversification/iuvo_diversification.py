@@ -704,6 +704,29 @@ def run() -> None:
                     cash_drag_xirr_contribution * 100, avg_idle_cash_lifetime, missed_earnings,
                 )
 
+    # Day-weighted average invested/non-invested balances (new Sheet rows
+    # "solde moyen pondéré investi"/"non investi", added 2026-09-08). Iuvo
+    # has no per-transaction dated ledger at all (see module docstring) -
+    # "non investi" reuses the SAME coarse (opening+closing)/2 monthly
+    # approximation as compute_average_idle_cash() above (the best
+    # available precision for this platform), for the reporting month's
+    # own cached summary. "investi" falls back to the SAME total_invested
+    # point-in-time figure (reconstructed above for a backfilled month, or
+    # live for the current month) already used as a constant for this
+    # month's Cash drag math.
+    avg_invested_balance = None
+    avg_non_invested_balance = None
+    if monthly_summaries_as_of and today_month_key in monthly_summaries_as_of:
+        current_month_summary_for_avg = monthly_summaries_as_of[today_month_key]
+        avg_invested_balance = total_invested
+        avg_non_invested_balance = (
+            current_month_summary_for_avg.get("opening_balance", 0.0) + current_month_summary_for_avg.get("closing_balance", 0.0)
+        ) / 2
+        log.info(
+            "Solde moyen pondéré - investi: %.2f EUR (constant, point-in-time), non investi: %.2f EUR (approximation mensuelle).",
+            avg_invested_balance, avg_non_invested_balance,
+        )
+
     # "total" comes from the overview_page's embedded `investors` JS
     # literal, a LIVE-only snapshot; the date-filtered account-statement
     # endpoint has no balance field either (2026-08-06 investigation) -
@@ -734,6 +757,10 @@ def run() -> None:
         bonus_breakdown["XIRR Taxes/Frais"] = taxes_xirr_contribution
     if interest_xirr_contribution is not None:
         bonus_breakdown["XIRR Intérêts"] = interest_xirr_contribution
+    if avg_invested_balance is not None:
+        bonus_breakdown["solde moyen pondéré investi"] = avg_invested_balance
+    if avg_non_invested_balance is not None:
+        bonus_breakdown["solde moyen pondéré non investi"] = avg_non_invested_balance
     if bonus_breakdown:
         fill_current_month_bonus_breakdown(platform="Iuvo", breakdown=bonus_breakdown, max_rows=16)
 

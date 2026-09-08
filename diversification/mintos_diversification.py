@@ -256,6 +256,7 @@ from shared.google_sheet import (
 )
 from shared.report_date import get_report_date, is_current_month
 from shared.state import load_state, save_state
+from shared.weighted_average import compute_time_weighted_average
 from shared.xirr import compute_xirr
 
 load_dotenv()
@@ -775,6 +776,52 @@ def _wallet_balance_as_of(entries: list, end_date: date) -> float:
     return balance
 
 
+def compute_average_balances(entries: list, start_date, end_date) -> tuple:
+    """Day-weighted average INVESTED ("outstanding") and NON-INVESTED
+    (wallet cash) balances over [start_date, end_date] (`date` objects) -
+    for the "solde moyen pondéré investi"/"solde moyen pondéré non
+    investi" Sheet rows (added 2026-09-08). The invested side reuses the
+    SAME per-entry classifier as reconstruct_outstanding() above
+    (_outstanding_delta_for_entry), fed into the generic shared day-
+    weighted-average helper. The cash side is different: Mintos ledger
+    rows carry a real running `balance` snapshot (forward-fill, see
+    compute_average_idle_cash()'s docstring) rather than a per-row signed
+    delta - converted here into an equivalent delta sequence (delta =
+    balance_after - balance_before per entry, processed in ascending date
+    order) so the SAME generic averaging helper can be reused for both
+    sides uniformly. `entries` is expected to cover the account's full
+    history (see get_cached_transactions()), so the running balance
+    carried into `start_date` is accurate."""
+    dated_entries = []
+    for entry in entries:
+        entry_date = _entry_date(entry)
+        if entry_date is None:
+            continue
+        dated_entries.append((entry_date, entry))
+    dated_entries.sort(key=lambda t: t[0])
+
+    invested_events = []
+    non_invested_events = []
+    running_cash_balance = 0.0
+    for entry_date, entry in dated_entries:
+        label = _extract_action_label(entry.get("details") or "")
+        invested_events.append((entry_date, _outstanding_delta_for_entry(label, _entry_amount(entry))))
+
+        raw_balance = entry.get("balance")
+        if raw_balance is not None:
+            try:
+                balance = float(raw_balance)
+            except (TypeError, ValueError):
+                balance = None
+            if balance is not None:
+                non_invested_events.append((entry_date, balance - running_cash_balance))
+                running_cash_balance = balance
+
+    avg_invested = compute_time_weighted_average(invested_events, start_date, end_date)
+    avg_non_invested = compute_time_weighted_average(non_invested_events, start_date, end_date)
+    return avg_invested, avg_non_invested
+
+
 def _build_deposit_withdrawal_cashflows_as_of(entries: list, end_date: date) -> tuple:
     """Real Dépôts/Retrait cashflows (signed, XIRR convention) dated <=
     end_date, the earliest deposit date found (or None), and the lifetime
@@ -1143,6 +1190,24 @@ def run(session: requests.Session | None = None) -> None:
         skip_total=not current_month,
     )
 
+    # Day-weighted average invested/non-invested balances (new Sheet rows
+    # "solde moyen pondéré investi"/"non investi", added 2026-09-08) -
+    # computed whenever all_entries is available, independent of
+    # current_month, so this also works for a REPORT_DATE-backfilled past
+    # month. Uses the REAL number of days in the period, never a
+    # hardcoded 30.
+    avg_invested_balance = None
+    avg_non_invested_balance = None
+    if all_entries is not None:
+        month_start_date = today_date.replace(day=1)
+        avg_invested_balance, avg_non_invested_balance = compute_average_balances(
+            all_entries, month_start_date, today_date
+        )
+        log.info(
+            "Solde moyen pondéré - investi: %.2f EUR, non investi: %.2f EUR (%s to %s).",
+            avg_invested_balance, avg_non_invested_balance, month_start_date, today_date,
+        )
+
     # "Cash drag"/"XIRR" and the XIRR Bonus/Cash drag/Taxes-Frais/Intérêts
     # pie-chart shares sit further below Mintos' block (rows already added
     # by the user, mirroring Afranga/Swaper/Lendermarket/PeerBerry/Loanch's
@@ -1171,6 +1236,10 @@ def run(session: requests.Session | None = None) -> None:
         bonus_breakdown["XIRR Taxes/Frais"] = taxes_xirr_contribution
     if interest_xirr_contribution is not None:
         bonus_breakdown["XIRR Intérêts"] = interest_xirr_contribution
+    if avg_invested_balance is not None:
+        bonus_breakdown["solde moyen pondéré investi"] = avg_invested_balance
+    if avg_non_invested_balance is not None:
+        bonus_breakdown["solde moyen pondéré non investi"] = avg_non_invested_balance
     if bonus_breakdown:
         fill_current_month_bonus_breakdown(platform=PLATFORM_LABEL, breakdown=bonus_breakdown, max_rows=19)
 
