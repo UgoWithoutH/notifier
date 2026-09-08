@@ -69,6 +69,11 @@ on:
         type: boolean
         required: false
         default: true
+      run_debitum:
+        description: "Exécuter Debitum"
+        type: boolean
+        required: false
+        default: true
 
 permissions:
   contents: read
@@ -635,8 +640,59 @@ jobs:
           path: diversification/nectaro_xirr_cashflows_state.json
           key: nectaro-diversification-state-${{ github.run_id }}
 
-  recap_email:
+  debitum:
     needs: nectaro
+    if: ${{ always() && inputs.run_debitum }}
+    runs-on: ubuntu-22.04
+    concurrency:
+      group: debitum-diversification
+      cancel-in-progress: false
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Python dependencies
+        run: pip install -r requirements.txt
+
+      # No Playwright/Chromium install needed - Debitum logs in via a
+      # pure-HTTP replay of its OAuth password-grant + TOTP flow instead
+      # (see diversification/debitum_diversification.py's module
+      # docstring) - just `requests`/`pyotp`, already in
+      # requirements.txt. No session/cookie persistence needed for LOGIN
+      # (that flow is lightweight enough to run fresh every time) - the
+      # XIRR cashflow cache below is unrelated to login, it just avoids
+      # re-fetching the account's entire transaction history every run.
+      - name: Restore persisted state (XIRR cashflow cache)
+        uses: actions/cache/restore@v4
+        with:
+          path: diversification/debitum_xirr_cashflows_state.json
+          key: debitum-diversification-state-${{ github.run_id }}
+          restore-keys: |
+            debitum-diversification-state-
+
+      - name: Run Debitum diversification report
+        env:
+          DEBITUM_EMAIL: ${{ secrets.DEBITUM_EMAIL }}
+          DEBITUM_PASSWORD: ${{ secrets.DEBITUM_PASSWORD }}
+          DEBITUM_TOTP_SECRET: ${{ secrets.DEBITUM_TOTP_SECRET }}
+          GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
+          GOOGLE_CREDENTIALS: ${{ secrets.GOOGLE_CREDENTIALS }}
+        run: bash scripts/run_diversification_for_month_range.sh diversification.debitum_diversification "${{ github.event.inputs.start_month }}" "${{ github.event.inputs.end_month }}"
+
+      - name: Save persisted state (XIRR cashflow cache) for the next run
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: diversification/debitum_xirr_cashflows_state.json
+          key: debitum-diversification-state-${{ github.run_id }}
+
+  recap_email:
+    needs: debitum
     if: always()
     runs-on: ubuntu-22.04
     steps:

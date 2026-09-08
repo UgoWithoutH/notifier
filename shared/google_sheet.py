@@ -577,7 +577,7 @@ def find_rows_by_texts_below(grid, start_row, start_col, texts: list, max_rows: 
 # via _zero_fill_missing_geo_rows().
 GEO_SECTION_BOUNDARY_LABELS = [
     "Afranga", "Bienprêter", "Iuvo", "Lendermarket", "Loanch", "Mintos", "Peerberry",
-    "Swaper", "Monefit", "Go & Grow", "Lande", "Bricks", "Nectaro",
+    "Swaper", "Monefit", "Go & Grow", "Lande", "Bricks", "Nectaro", "Debitum",
     "Crowdlending savings", "Crowdlending agricole", "Crowdfunding immobilier", "Bourse",
 ]
 
@@ -683,12 +683,14 @@ def fill_geographic_repartition_uninvested_amount(platform: str, amount):
 
     geo_pos = find_cell_by_value(grid, "Répartition géographique")
     if not geo_pos:
-        raise RuntimeError("La section 'Répartition géographique' n'a pas été trouvée.")
+        logger.warning("Section 'Répartition géographique' non trouvée - 'non investi' non écrit pour %s.", platform)
+        return
     geo_row, geo_col = geo_pos
 
     platform_row = find_first_cell_containing_below(grid, geo_row, geo_col, platform)
     if not platform_row:
-        raise RuntimeError(f"La plateforme '{platform}' n'a pas été trouvée sous 'Répartition géographique'.")
+        logger.warning("Plateforme '%s' non trouvée sous 'Répartition géographique' - 'non investi' non écrit.", platform)
+        return
 
     uninvested_row = find_rows_by_texts_below(grid, platform_row, geo_col, ["non investi"], max_rows=3).get("non investi")
     if not uninvested_row:
