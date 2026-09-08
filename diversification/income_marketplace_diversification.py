@@ -348,6 +348,18 @@ def get_cached_statement_transactions(page, token: str, end_date: date) -> list:
         else XIRR_HISTORY_START_DATE
     )
 
+    if fetch_start > end_date:
+        # Cache already covers past end_date (e.g. a live run advanced it,
+        # then a backfill run asked for an earlier REPORT_DATE) - the API
+        # rejects a start>end range with a non-JSON "End date must be..."
+        # error body, which crashes page.evaluate's JSON parse, so skip
+        # the fetch entirely and just filter the existing cache instead.
+        log.info(
+            "Cache already covers up to %s (requested end date %s) - skipping fetch, using cached data only.",
+            fetch_start, end_date,
+        )
+        return list(cached.values())
+
     log.info("Fetching statement transactions from %s to %s (incremental cache)...", fetch_start, end_date)
     new_rows = fetch_all_statement_transactions(page, token, fetch_start, end_date)
     for row in new_rows:

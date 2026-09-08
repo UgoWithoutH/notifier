@@ -669,6 +669,16 @@ def get_cached_operations(session: requests.Session, end_date: date) -> list:
         if state.get("last_fetched_date") else XIRR_HISTORY_START_DATE
     )
 
+    if start_date > end_date:
+        # Cache already covers past end_date (e.g. a live run advanced it,
+        # then a backfill run asked for an earlier REPORT_DATE) - skip the
+        # fetch instead of sending an inverted start>end range to the API.
+        log.info(
+            "Cache already covers up to %s (requested end date %s) - skipping fetch, using cached data only.",
+            start_date, end_date,
+        )
+        return cached_rows
+
     log.info(
         "Found %d cached operation row(s) (last fetched up to %s) - fetching only %s to %s...",
         len(cached_rows), state.get("last_fetched_date"), start_date, end_date,
