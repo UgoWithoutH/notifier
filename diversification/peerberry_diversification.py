@@ -171,7 +171,7 @@ from shared.google_sheet import (
 )
 from shared.report_date import get_report_now, is_current_month
 from shared.state import load_state, save_state
-from shared.weighted_average import compute_time_weighted_average
+from shared.weighted_average import INVESTED_BALANCE_LABEL, NON_INVESTED_BALANCE_LABEL, compute_time_weighted_average
 from shared.xirr import compute_xirr
 from monitors.peerberry_monitor import login, PEERBERRY_EMAIL, PEERBERRY_PASSWORD, _HEADERS, fetch_available_money
 
@@ -1010,9 +1010,9 @@ def run() -> None:
     if interest_xirr_contribution is not None:
         bonus_breakdown["XIRR Intérêts"] = interest_xirr_contribution
     if avg_invested_balance is not None:
-        bonus_breakdown["solde moyen pondéré investi"] = avg_invested_balance
+        bonus_breakdown[INVESTED_BALANCE_LABEL] = avg_invested_balance
     if avg_non_invested_balance is not None:
-        bonus_breakdown["solde moyen pondéré non investi"] = avg_non_invested_balance
+        bonus_breakdown[NON_INVESTED_BALANCE_LABEL] = avg_non_invested_balance
     fill_current_month_bonus_breakdown(
         platform="PeerBerry",
         breakdown=bonus_breakdown,

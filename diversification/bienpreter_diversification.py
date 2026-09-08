@@ -204,6 +204,7 @@ from shared.google_sheet import (
 from shared.report_date import get_report_now, is_current_month
 from shared.notifier import send_bienpreter_geo_issues_email
 from shared.state import load_state, save_state
+from shared.weighted_average import INVESTED_BALANCE_LABEL, NON_INVESTED_BALANCE_LABEL, compute_time_weighted_average
 from shared.xirr import compute_xirr
 
 load_dotenv()
@@ -740,17 +741,39 @@ def _balance_as_of(rows: list, as_of_date: date) -> float:
     return balance
 
 
+def _total_account_value_delta_for_row(row: dict) -> float:
+    """Signed change in TOTAL account value (solde disponible + capital à
+    recevoir) caused by a single /u/operations row - real external
+    cashflows (Dépôt de fonds/Retrait de fonds) and earnings (Intérêts/
+    Bonus/Prélèvements fiscaux) change the total; every other row type
+    (Investissement, Remboursement mensuel, Vente de prêt, Rétractation de
+    l'intention de prêt) is a pure cash<->invested-capital reallocation,
+    net zero on the total - see _net_value_change()'s docstring, which
+    reuses this per-row classification summed over a date range."""
+    label = row.get("label") or ""
+    amount = abs(_parse_amount(row.get("amountText")) or 0.0)
+    delta = 0.0
+    if label == "Dépôt de fonds":
+        delta += amount
+    elif label == "Retrait de fonds":
+        delta -= amount
+    elif label == "Bonus":
+        delta += amount
+    elif label == "Prélèvements fiscaux":
+        delta -= amount
+    for interest_text in row.get("interestTexts") or []:
+        delta += _parse_amount(interest_text) or 0.0
+    return delta
+
+
 def _net_value_change(rows: list, start_date: date, end_date: date) -> float:
     """Net change in TOTAL account value (solde disponible + capital à
-    recevoir) caused by every transaction dated in (start_date, end_date]
-    that is NOT a pure cash<->invested-capital reallocation (Investissement,
-    Remboursement mensuel's bundled capital portion, Vente de prêt,
-    Rétractation de l'intention de prêt all net to zero on that sum) -
-    i.e. real external cashflows (Dépôt de fonds/Retrait de fonds) and
-    earnings (Intérêts/Bonus/Prélèvements fiscaux). Used to reconstruct a
-    past total_account_value from today's live total by subtracting off
-    everything that happened AFTER `start_date` (see module docstring's
-    2026-09-07 backward-reconstruction addition)."""
+    recevoir) caused by every transaction dated in (start_date, end_date] -
+    see _total_account_value_delta_for_row() for the per-row
+    classification. Used to reconstruct a past total_account_value from
+    today's live total by subtracting off everything that happened AFTER
+    `start_date` (see module docstring's 2026-09-07 backward-
+    reconstruction addition)."""
     start_str = start_date.strftime("%Y-%m-%d")
     end_str = end_date.strftime("%Y-%m-%d")
     delta = 0.0
@@ -758,19 +781,37 @@ def _net_value_change(rows: list, start_date: date, end_date: date) -> float:
         row_date = row.get("date")
         if not row_date or not (start_str < row_date <= end_str):
             continue
-        label = row.get("label") or ""
-        amount = abs(_parse_amount(row.get("amountText")) or 0.0)
-        if label == "Dépôt de fonds":
-            delta += amount
-        elif label == "Retrait de fonds":
-            delta -= amount
-        elif label == "Bonus":
-            delta += amount
-        elif label == "Prélèvements fiscaux":
-            delta -= amount
-        for interest_text in row.get("interestTexts") or []:
-            delta += _parse_amount(interest_text) or 0.0
+        delta += _total_account_value_delta_for_row(row)
     return delta
+
+
+def compute_average_balances(rows: list, start_date: date, end_date: date) -> tuple:
+    """Day-weighted average INVESTED ("capital à recevoir")/NON-INVESTED
+    ("solde disponible") balances over [start_date, end_date] - REAL,
+    day-by-day, not the point-in-time approximation this used before
+    2026-09-08. "non investi" replays the real "Solde indicatif" snapshots
+    (compute_average_idle_cash(), unchanged). "investi" is derived as
+    avg_total_account_value - avg_non_invested: TOTAL account value can be
+    built FORWARD from 0.0 at account inception using
+    compute_time_weighted_average() fed by
+    _total_account_value_delta_for_row()'s per-row classification (only
+    real external cashflows/earnings move it; Investissement/
+    Remboursement/Vente de prêt/Rétractation are pure cash<->invested
+    reallocations, net zero on the total - so no invested-side
+    reconstruction is actually needed at all). Since total(d) =
+    invested(d) + non_invested(d) holds for every single day, averaging
+    that identity over the period gives avg_invested = avg_total -
+    avg_non_invested exactly, with no loss of precision.
+    `rows` should cover the account's FULL history (see
+    get_cached_operations())."""
+    total_value_events = [
+        (datetime.strptime(row["date"], "%Y-%m-%d").date(), _total_account_value_delta_for_row(row))
+        for row in rows if row.get("date")
+    ]
+    avg_total_account_value = compute_time_weighted_average(total_value_events, start_date, end_date)
+    avg_non_invested = compute_average_idle_cash(rows, start_date.strftime("%Y-%m-%d"), end_date.strftime("%Y-%m-%d"))
+    avg_invested = avg_total_account_value - avg_non_invested
+    return avg_invested, avg_non_invested
 
 
 def fetch_current_month_interest_totals(session: requests.Session) -> dict:
@@ -1065,28 +1106,20 @@ def run() -> None:
                         )
 
     # Day-weighted average invested/non-invested balances (new Sheet rows
-    # "solde moyen pondéré investi"/"non investi", added 2026-09-08).
-    # UNLIKE every other platform, Bienprêter has no per-transaction
-    # outstanding/invested-side ledger at all (no way to tell a "new
-    # investment" row apart from a repayment in the operations history) -
-    # so "investi" falls back to the SAME total_invested point-in-time
-    # figure (reconstructed above for a backfilled month, or live for the
-    # current month) already used as a constant for this month's Cash drag
-    # math, rather than a true day-weighted average (best available
-    # approximation, not fabricated). "non investi" DOES get a genuine
-    # day-weighted average, reusing compute_average_idle_cash() (real
-    # "Solde indicatif" balance replay) unconditionally, not just when
-    # total_invested > 0.
+    # "solde moyen pondéré investi"/"non investi", added 2026-09-08,
+    # rewritten to a real day-by-day calculation 2026-09-08 - see
+    # compute_average_balances()'s docstring for why "investi" no longer
+    # needs a per-transaction outstanding ledger at all).
     avg_invested_balance = None
     avg_non_invested_balance = None
     if all_operations:
-        month_start_str = today_date.replace(day=1).strftime("%Y-%m-%d")
-        today_str = today_date.strftime("%Y-%m-%d")
-        avg_invested_balance = total_invested
-        avg_non_invested_balance = compute_average_idle_cash(operations_as_of, month_start_str, today_str)
+        month_start_date = today_date.replace(day=1)
+        avg_invested_balance, avg_non_invested_balance = compute_average_balances(
+            operations_as_of, month_start_date, today_date
+        )
         log.info(
-            "Solde moyen pondéré - investi: %.2f EUR (constant, point-in-time), non investi: %.2f EUR (%s to %s).",
-            avg_invested_balance, avg_non_invested_balance, month_start_str, today_str,
+            "Solde moyen pondéré - investi: %.2f EUR, non investi: %.2f EUR (%s to %s).",
+            avg_invested_balance, avg_non_invested_balance, month_start_date, today_date,
         )
 
     # "total" = solde disponible + capital à recevoir, both scraped from
@@ -1133,9 +1166,9 @@ def run() -> None:
     if interest_xirr_contribution is not None:
         bonus_breakdown["XIRR Intérêts"] = interest_xirr_contribution
     if avg_invested_balance is not None:
-        bonus_breakdown["solde moyen pondéré investi"] = avg_invested_balance
+        bonus_breakdown[INVESTED_BALANCE_LABEL] = avg_invested_balance
     if avg_non_invested_balance is not None:
-        bonus_breakdown["solde moyen pondéré non investi"] = avg_non_invested_balance
+        bonus_breakdown[NON_INVESTED_BALANCE_LABEL] = avg_non_invested_balance
     fill_current_month_bonus_breakdown(
         platform="Bienprêter",
         breakdown=bonus_breakdown,

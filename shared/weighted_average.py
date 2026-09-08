@@ -11,6 +11,14 @@ calculation, reused as-is for both the invested and non-invested balance.
 
 from datetime import date, timedelta
 
+# Shared Sheet row labels for the two rows written by every
+# *_diversification.py - keep these in sync with the actual Sheet cell
+# text (matched case-insensitively as a substring, see
+# shared/google_sheet.py's find_rows_by_texts_below) so a typo in one
+# platform file can't silently stop matching just for that platform.
+INVESTED_BALANCE_LABEL = "solde moyen pondéré investi"
+NON_INVESTED_BALANCE_LABEL = "solde moyen pondéré non investi"
+
 
 def compute_time_weighted_average(
     events: list[tuple[date, float]], start_date: date, end_date: date, opening_balance: float = 0.0,

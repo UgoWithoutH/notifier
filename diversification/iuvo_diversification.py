@@ -169,6 +169,14 @@ except ModuleNotFoundError:
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger("iuvo_diversification")
 
+# Iuvo-only Sheet row labels (no per-transaction dated ledger exists here -
+# see module docstring - so these are real point-in-time balances from the
+# account statement, not a day-weighted average like every other platform;
+# the Sheet cells themselves were renamed to these exact labels, unlike the
+# shared "solde moyen pondéré investi"/"non investi" used elsewhere).
+INVESTED_BALANCE_LABEL = "solde investi"
+NON_INVESTED_BALANCE_LABEL = "solde non investi"
+
 LOGIN_PAGE_URL = "https://iuvo-group.com/en/login/"
 API_BASE = "https://tbp2p.iuvo-group.com"
 # Pin the timezone explicitly (rather than relying on the executing
@@ -566,6 +574,7 @@ def run() -> None:
     # everything NOT sitting idle in the uninvested wallet (receivables in
     # P2P + iuvoSAVE), i.e. total minus available_funds.
     total_invested = balance_data["total"] - balance_data["available_funds"]
+    non_invested_balance = None
     xirr_value = None
     signed_cashflows = None
     total_account_value = None
@@ -603,6 +612,7 @@ def run() -> None:
     if monthly_summaries_as_of:
         if current_month:
             total_account_value = balance_data["total"]
+            non_invested_balance = balance_data["available_funds"]
         else:
             # Backfilled month: reconstruct today_date's total account
             # value by subtracting today's live total every real net
@@ -618,6 +628,7 @@ def run() -> None:
             total_account_value = balance_data["total"] - value_change_since
             closing_balance_as_of = monthly_summaries_as_of[today_month_key]["closing_balance"]
             total_invested = total_account_value - closing_balance_as_of
+            non_invested_balance = closing_balance_as_of
             log.info(
                 "Backfilled month (%s): reconstructed total_account_value=%.2f EUR (live total %.2f EUR - "
                 "%.2f EUR net change since then), closing_balance_as_of=%.2f EUR, total_invested=%.2f EUR.",
@@ -704,27 +715,25 @@ def run() -> None:
                     cash_drag_xirr_contribution * 100, avg_idle_cash_lifetime, missed_earnings,
                 )
 
-    # Day-weighted average invested/non-invested balances (new Sheet rows
-    # "solde moyen pondéré investi"/"non investi", added 2026-09-08). Iuvo
-    # has no per-transaction dated ledger at all (see module docstring) -
-    # "non investi" reuses the SAME coarse (opening+closing)/2 monthly
-    # approximation as compute_average_idle_cash() above (the best
-    # available precision for this platform), for the reporting month's
-    # own cached summary. "investi" falls back to the SAME total_invested
-    # point-in-time figure (reconstructed above for a backfilled month, or
-    # live for the current month) already used as a constant for this
-    # month's Cash drag math.
-    avg_invested_balance = None
-    avg_non_invested_balance = None
+    # Real point-in-time invested/non-invested balances (Sheet rows
+    # "solde investi"/"solde non investi", rewritten 2026-09-08 - dropped
+    # the day-weighted-average attempt entirely: Iuvo has no per-
+    # transaction dated ledger at all (see module docstring), so a real
+    # day-by-day average isn't achievable without querying the statement
+    # endpoint once per day. "non investi" is the account's real current
+    # available-funds balance (live for the current month, or the
+    # reconstructed closing_balance_as_of for a backfilled month) - this
+    # already reflects every withdrawal exactly (e.g. depositing then
+    # withdrawing the same 2 EUR nets to 0, not still showing 2 EUR),
+    # since it's Iuvo's own real running wallet balance, not a derived
+    # figure. "investi" is total_invested (same reconstructed/live figure
+    # already used for this month's Cash drag math).
+    invested_balance = None
     if monthly_summaries_as_of and today_month_key in monthly_summaries_as_of:
-        current_month_summary_for_avg = monthly_summaries_as_of[today_month_key]
-        avg_invested_balance = total_invested
-        avg_non_invested_balance = (
-            current_month_summary_for_avg.get("opening_balance", 0.0) + current_month_summary_for_avg.get("closing_balance", 0.0)
-        ) / 2
+        invested_balance = total_invested
         log.info(
-            "Solde moyen pondéré - investi: %.2f EUR (constant, point-in-time), non investi: %.2f EUR (approximation mensuelle).",
-            avg_invested_balance, avg_non_invested_balance,
+            "Solde investi: %.2f EUR, solde non investi: %.2f EUR (point-in-time, %s).",
+            invested_balance, non_invested_balance, today_date,
         )
 
     # "total" comes from the overview_page's embedded `investors` JS
@@ -757,10 +766,10 @@ def run() -> None:
         bonus_breakdown["XIRR Taxes/Frais"] = taxes_xirr_contribution
     if interest_xirr_contribution is not None:
         bonus_breakdown["XIRR Intérêts"] = interest_xirr_contribution
-    if avg_invested_balance is not None:
-        bonus_breakdown["solde moyen pondéré investi"] = avg_invested_balance
-    if avg_non_invested_balance is not None:
-        bonus_breakdown["solde moyen pondéré non investi"] = avg_non_invested_balance
+    if invested_balance is not None:
+        bonus_breakdown[INVESTED_BALANCE_LABEL] = invested_balance
+    if non_invested_balance is not None:
+        bonus_breakdown[NON_INVESTED_BALANCE_LABEL] = non_invested_balance
     if bonus_breakdown:
         fill_current_month_bonus_breakdown(platform="Iuvo", breakdown=bonus_breakdown, max_rows=16)
 
