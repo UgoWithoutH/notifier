@@ -577,7 +577,7 @@ def find_rows_by_texts_below(grid, start_row, start_col, texts: list, max_rows: 
 # via _zero_fill_missing_geo_rows().
 GEO_SECTION_BOUNDARY_LABELS = [
     "Afranga", "Bienprêter", "Iuvo", "Lendermarket", "Loanch", "Mintos", "Peerberry",
-    "Swaper", "Monefit", "Go & Grow", "Lande", "Bricks",
+    "Swaper", "Monefit", "Go & Grow", "Lande", "Bricks", "Nectaro",
     "Crowdlending savings", "Crowdlending agricole", "Crowdfunding immobilier", "Bourse",
 ]
 
@@ -747,6 +747,67 @@ def get_geographic_repartition_uninvested_amounts(platforms: list) -> dict:
     return amounts
 
 
+def _insert_missing_geo_rows(worksheet, grid, geo_row, geo_col, target_col, platform: str, missing_loan_originators: list) -> int:
+    """Pour le bloc de sociétés de prêt du `platform` donné sous
+    'Répartition géographique', INSÈRE une nouvelle ligne (nom + montant, à
+    la toute fin du bloc de cette plateforme, juste avant la ligne de la
+    plateforme suivante) pour chaque loan originator de
+    `missing_loan_originators` (des dicts {"name", "amount"}) qui n'a pas de
+    ligne existante dans le bloc - ajoutée 2026-09-08, même principe que
+    l'insertion de nouvel emprunteur de fill_bienpreter_borrower_geo_amounts()
+    mais pour le cas générique (une seule colonne total, pas de matrice
+    pays x emprunteur). Le nom de la ligne insérée est explicitement
+    formaté (aligné à droite, police taille 9, non gras) pour matcher le
+    style des lignes voisines, une ligne insérée via insert_rows() hérite
+    sinon par défaut du style de la ligne de plateforme suivante (gras,
+    aligné à gauche).
+
+    Retourne le nombre de lignes réellement insérées (0 si
+    `missing_loan_originators` est vide ou si la ligne de `platform` elle-même
+    est introuvable).
+    """
+    if not missing_loan_originators:
+        return 0
+
+    platform_row = find_first_cell_containing_below(grid, geo_row, geo_col, platform)
+    if not platform_row:
+        logger.warning(
+            "Insertion de ligne(s) manquante(s) ignorée : la plateforme '%s' n'a pas été trouvée sous 'Répartition géographique'.",
+            platform,
+        )
+        return 0
+
+    end_row = _find_geo_block_end_row(grid, geo_row, geo_col, platform_row, platform)
+
+    name_format = {
+        "horizontalAlignment": "RIGHT",
+        "textFormat": {"fontSize": 9, "bold": False},
+    }
+    name_cells_to_restyle = []
+
+    insert_row = end_row
+    for lo in missing_loan_originators:
+        name = lo["name"]
+        amount = lo.get("amount", 0)
+        row_length = max(geo_col, target_col)
+        row_values = [""] * row_length
+        row_values[geo_col - 1] = name
+        row_values[target_col - 1] = amount
+
+        logger.info(
+            "Insertion d'une nouvelle ligne '%s' (plateforme '%s') à la ligne %s, montant=%s",
+            name, platform, insert_row, amount,
+        )
+        _call_with_retry(worksheet.insert_rows, [row_values], insert_row, value_input_option="USER_ENTERED")
+        name_cells_to_restyle.append(rowcol_to_a1(insert_row, geo_col))
+        insert_row += 1
+
+    if name_cells_to_restyle:
+        _call_with_retry(worksheet.format, name_cells_to_restyle, name_format)
+
+    return len(missing_loan_originators)
+
+
 def fill_geographic_repartition_amounts(loan_originators: list, platform: str | None = None):
     """
     loan_originators : liste de dicts, ex.
@@ -763,7 +824,11 @@ def fill_geographic_repartition_amounts(loan_originators: list, platform: str | 
     `loan_originators` (= plus aucun investissement actuel dessus) reçoit
     un 0 explicite, au lieu de garder sa dernière valeur écrite (qui
     pourrait dater d'un mois précédent où il y avait encore un
-    investissement).
+    investissement). Réciproquement (ajouté 2026-09-08), toute société de
+    prêt de `loan_originators` qui n'a AUCUNE ligne existante dans ce bloc
+    (nouveau loan originator jamais vu) est INSÉRÉE en nouvelle ligne, tout
+    à la fin du bloc de cette plateforme (juste avant la ligne de la
+    plateforme suivante) - voir _insert_missing_geo_rows().
     """
     logger.info(
         "Début mise à jour Répartition géographique (%s loan originators)",
@@ -830,17 +895,26 @@ def fill_geographic_repartition_amounts(loan_originators: list, platform: str | 
         zero_fill_count = len(zero_updates)
         updates.extend(zero_updates)
 
-    if not updates:
+    if updates:
+        _call_with_retry(worksheet.batch_update, updates, value_input_option="USER_ENTERED")
+
+    inserted_count = 0
+    if platform and missing:
+        missing_loan_originators = [lo for lo in loan_originators if lo["name"] in missing]
+        inserted_count = _insert_missing_geo_rows(
+            worksheet, grid, geo_row, geo_col, target_col, platform, missing_loan_originators
+        )
+
+    if not updates and not inserted_count:
         logger.warning("Aucun loan originator trouvé, rien à écrire.")
         return
 
-    _call_with_retry(worksheet.batch_update, updates, value_input_option="USER_ENTERED")
-
     logger.info(
-        "Mise à jour Répartition géographique terminée (%d trouvé(s), %d manquant(s), %d mis à 0).",
+        "Mise à jour Répartition géographique terminée (%d trouvé(s), %d manquant(s), %d mis à 0, %d ajouté(s) en nouvelle ligne).",
         len(updates) - zero_fill_count,
         len(missing),
         zero_fill_count,
+        inserted_count,
     )
 
 
