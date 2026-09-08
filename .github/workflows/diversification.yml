@@ -307,6 +307,12 @@ jobs:
           BIENPRETER_PASSWORD: ${{ secrets.BIENPRETER_PASSWORD }}
           GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
           GOOGLE_CREDENTIALS: ${{ secrets.GOOGLE_CREDENTIALS }}
+          SMTP_HOST: ${{ secrets.SMTP_HOST }}
+          SMTP_PORT: ${{ secrets.SMTP_PORT }}
+          SMTP_USER: ${{ secrets.SMTP_USER }}
+          SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
+          EMAIL_FROM: ${{ secrets.EMAIL_FROM }}
+          EMAIL_TO: ${{ secrets.EMAIL_TO }}
         run: bash scripts/run_diversification_for_month_range.sh diversification.bienpreter_diversification "${{ github.event.inputs.start_month }}" "${{ github.event.inputs.end_month }}"
 
       - name: Save persisted state (XIRR cashflow cache) for the next run

@@ -455,7 +455,7 @@ def fetch_active_loans(session: requests.Session):
 
 def _country_from_location(location: str):
     """Parses the project page's 'Localisation' text into just the
-    country name. Two formats observed on real projects: foreign ones are
+    country name. Formats observed on real projects: foreign ones are
     'City - Country' (e.g. 'Madrid - Espagne', 'Bucarest - Roumanie',
     even 'Montpellier - France'), domestic (French) ones instead start
     with a postal code and have NO country at all - either just
@@ -463,14 +463,38 @@ def _country_from_location(location: str):
     before a city name, e.g. '83330 - Le Castellet' (NOT a 'city -
     country' pair despite the dash). So: if it starts with a postal code,
     it's always France regardless of any dash; otherwise take the text
-    after the last ' - ' if present, else the whole string as a fallback.
+    after the last ' - ' if present.
+
+    BUG FIXED 2026-09-08: a THIRD domestic format also exists - some French
+    project pages render ONLY the bare city name, with NEITHER a postal
+    code NOR a dash at all (confirmed live: 'Saint-Philbert-de-Grand-Lieu',
+    'Rivière-Salée' - both real French communes, project ids 5472/5473,
+    borrower 'BEMA'). The OLD code returned this bare string as-is (treated
+    as if it were itself a "country" name), which never matches any real
+    country column header - the amount was then silently dropped from the
+    Répartition géographique write ("pays introuvable" issue), causing a
+    real, reproduced 250 EUR gap between the live 'capital à recevoir'
+    total (5320 EUR) and the sum of the Bienprêter geo block's borrower
+    rows (5070 EUR). Every FOREIGN project observed so far always includes
+    an explicit ' - <Country>' suffix, so a bare city name with no dash and
+    no leading digits is assumed to be French domestic too, not a country
+    name on its own - logged as a warning (not silently guessed) since this
+    is a real assumption, not a proven rule, in case a future foreign
+    project ever omits its country suffix too.
     """
     location = location.strip()
     if re.match(r"^\d{4,5}\b", location):
         return "France"
     if " - " in location:
         return location.rsplit(" - ", 1)[-1].strip()
-    return location or None
+    if location:
+        log.warning(
+            "Localisation %r n'a ni code postal ni ' - Pays' - traitée comme la France par défaut "
+            "(vérifier si un jour un projet étranger utilise ce format).",
+            location,
+        )
+        return "France"
+    return None
 
 
 def fetch_project_country(session: requests.Session, project_id: str):
