@@ -571,6 +571,16 @@ def get_cached_account_cashflows(page, end_date: str) -> tuple:
         log.info("Cached 'all_entries' is empty despite existing cashflows - backfilling the full history once.")
         start_date = XIRR_HISTORY_START_DATE
 
+    if start_date > end_date:
+        # Cache already covers past end_date (e.g. a live run advanced it,
+        # then a backfill run asked for an earlier REPORT_DATE) - skip the
+        # fetch instead of sending an inverted start>end range to the API.
+        log.info(
+            "Cache already covers up to %s (requested end date %s) - skipping fetch, using cached data only.",
+            start_date, end_date,
+        )
+        return cached_cashflows, cached_all_entries
+
     log.info(
         "Found %d cached XIRR cashflow(s) (last fetched up to %s) - fetching only new entries from %s to %s...",
         len(cached_cashflows), state["last_fetched_date"], start_date, end_date,

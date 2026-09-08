@@ -356,6 +356,16 @@ def get_cached_statement_transactions(session: requests.Session, headers: dict, 
         else XIRR_HISTORY_START_DATE
     )
 
+    if fetch_start > end_date:
+        # Cache already covers past end_date (e.g. a live run advanced it,
+        # then a backfill run asked for an earlier REPORT_DATE) - skip the
+        # fetch instead of sending an inverted start>end range to the API.
+        log.info(
+            "Cache already covers up to %s (requested end date %s) - skipping fetch, using cached data only.",
+            fetch_start, end_date,
+        )
+        return list(cached.values())
+
     log.info("Fetching statement transactions from %s to %s (incremental cache)...", fetch_start, end_date)
     new_rows = fetch_all_statement_transactions(session, headers, fetch_start, end_date)
     for row in new_rows:
