@@ -189,7 +189,7 @@ from shared.google_sheet import (
     fill_geographic_repartition_uninvested_amount,
 )
 from shared.report_date import get_report_date, is_current_month
-from shared.weighted_average import compute_time_weighted_average
+from shared.weighted_average import INVESTED_BALANCE_LABEL, NON_INVESTED_BALANCE_LABEL, compute_time_weighted_average
 from shared.xirr import compute_xirr
 
 load_dotenv()
@@ -760,9 +760,9 @@ def run(session: requests.Session | None = None) -> None:
     if interest_xirr_contribution is not None:
         bonus_breakdown["XIRR Intérêts"] = interest_xirr_contribution
     if avg_invested_balance is not None:
-        bonus_breakdown["solde moyen pondéré investi"] = avg_invested_balance
+        bonus_breakdown[INVESTED_BALANCE_LABEL] = avg_invested_balance
     if avg_non_invested_balance is not None:
-        bonus_breakdown["solde moyen pondéré non investi"] = avg_non_invested_balance
+        bonus_breakdown[NON_INVESTED_BALANCE_LABEL] = avg_non_invested_balance
     if bonus_breakdown:
         fill_current_month_bonus_breakdown(platform=PLATFORM_LABEL, breakdown=bonus_breakdown, max_rows=13)
 
