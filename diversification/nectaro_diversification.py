@@ -434,7 +434,7 @@ def run() -> None:
     today_date = get_report_date()
 
     amounts = {
-        "total": overview["invested_funds"],
+        "total": overview["invested_funds"] + overview["cash_balance"],
         "gross_interest_received": 0.0,
         "net_interest_received": 0.0,
         "withholding_tax": 0.0,

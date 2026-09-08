@@ -578,6 +578,7 @@ def find_rows_by_texts_below(grid, start_row, start_col, texts: list, max_rows: 
 GEO_SECTION_BOUNDARY_LABELS = [
     "Afranga", "Bienprêter", "Iuvo", "Lendermarket", "Loanch", "Mintos", "Peerberry",
     "Swaper", "Monefit", "Go & Grow", "Lande", "Bricks", "Nectaro", "Debitum",
+    "Income Marketplace",
     "Crowdlending savings", "Crowdlending agricole", "Crowdfunding immobilier", "Bourse",
 ]
 
