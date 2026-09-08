@@ -932,9 +932,14 @@ def _normalize_borrower_name(name: str) -> str:
 
 def fill_bienpreter_borrower_geo_amounts(borrowers: dict):
     """
-    borrowers : {nom_emprunteur: {"amount": float, "country": str|None}} -
-    les prêts Bienprêter actuellement en cours (statut "en remboursement"),
-    regroupés/sommés par emprunteur (ex. "EXCAVAN").
+    borrowers : {nom_emprunteur: {nom_pays: montant}} - les prêts Bienprêter
+    actuellement en cours (statut "en remboursement"), regroupés/sommés par
+    (emprunteur, pays) (ex. "EXCAVAN": {"Espagne": 300.0}). Un emprunteur
+    ayant des prêts dans PLUSIEURS pays a simplement plusieurs clés - son
+    montant est alors réparti sur les colonnes pays correspondantes de sa
+    ligne, une par pays (FIXÉ 2026-09-08 : l'ancien comportement ne gardait
+    que le premier pays trouvé et jetait silencieusement le reste,
+    faussant le total réel - cas réel "ROMRADIATOARE", Roumanie + Pays Bas).
 
     Contrairement à fill_geographic_repartition_amounts() (un seul montant
     juste à droite du nom), le bloc "Bienprêter" de "Répartition
@@ -943,17 +948,22 @@ def fill_bienpreter_borrower_geo_amounts(borrowers: dict):
     partir de geo_col+2 - la colonne juste à droite du nom, geo_col+1, est
     une colonne "total" séparée, sans en-tête pays). Pour chaque emprunteur :
     - Si une ligne du bloc porte déjà ce nom (recherche insensible à la
-      casse), le montant est écrit dans la colonne du pays correspondant
-      SUR CETTE ligne (ne touche aucune autre colonne pays de la ligne).
+      casse), le montant de CHAQUE pays est écrit dans la colonne
+      correspondante sur cette ligne ; toute colonne pays déjà remplie sur
+      cette ligne mais absente du relevé actuel (le prêt dans ce pays n'est
+      plus en cours) est remise à 0, per explicit user request - le montant
+      ne doit pas rester affiché s'il n'existe plus réellement.
     - Sinon, une nouvelle ligne est INSÉRÉE juste avant la ligne de la
       plateforme suivante (donc juste après le dernier emprunteur du bloc
-      Bienprêter), avec le nom + le montant dans la bonne colonne pays -
-      son nom est explicitement formaté (aligné à droite, police taille 9,
-      non gras) pour matcher le style des autres lignes emprunteur, car une
-      ligne insérée hérite par défaut du style de la ligne d'en-tête de
-      plateforme suivante (gras, aligné à gauche), pas de ses voisines.
-    - Toute ligne du bloc dont le nom n'apparaît PLUS dans `borrowers` (prêt
-      soldé/plus aucun prêt en cours pour cet emprunteur) est SUPPRIMÉE.
+      Bienprêter), avec le nom + le(s) montant(s) dans la/les bonne(s)
+      colonne(s) pays - son nom est explicitement formaté (aligné à droite,
+      police taille 9, non gras) pour matcher le style des autres lignes
+      emprunteur, car une ligne insérée hérite par défaut du style de la
+      ligne d'en-tête de plateforme suivante (gras, aligné à gauche), pas
+      de ses voisines.
+    - Toute ligne du bloc dont le nom n'apparaît PLUS dans `borrowers` (plus
+      aucun prêt en cours pour cet emprunteur, dans AUCUN pays) est
+      SUPPRIMÉE.
 
     Par ailleurs, la colonne "total" (geo_col+1, juste à droite du nom) de
     TOUTES les lignes du bloc restantes (pas seulement celles mises à jour
@@ -1067,28 +1077,44 @@ def fill_bienpreter_borrower_geo_amounts(borrowers: dict):
     pending_new_borrowers = []
     name_cells_to_restyle = []
 
-    for name, data in borrowers.items():
-        amount = data.get("amount", 0)
-        country = (data.get("country") or "").strip()
-        country_col = country_columns.get(country.lower()) if country else None
-        if country and country_col is None:
-            message = f"Pays '{country}' (emprunteur '{name}') introuvable comme en-tête de colonne - montant non écrit."
-            logger.warning(message)
-            issues.append(message)
-        elif not country:
-            message = f"Emprunteur '{name}' : pays inconnu - montant non écrit (ligne quand même créée/mise à jour)."
-            logger.warning(message)
-            issues.append(message)
+    for name, country_amounts in borrowers.items():
+        # {country_col: summed_amount} for every country actually resolvable
+        # to a real column - a borrower with loans in several countries ends
+        # up with several entries here instead of just one.
+        resolved_country_cols = {}
+        for country, amount in country_amounts.items():
+            country = (country or "").strip()
+            country_col = country_columns.get(country.lower()) if country else None
+            if country and country_col is None:
+                message = f"Pays '{country}' (emprunteur '{name}') introuvable comme en-tête de colonne - montant non écrit."
+                logger.warning(message)
+                issues.append(message)
+            elif not country:
+                message = f"Emprunteur '{name}' : pays inconnu pour {amount:.2f} EUR - montant non écrit (ligne quand même créée/mise à jour)."
+                logger.warning(message)
+                issues.append(message)
+            if country_col is not None:
+                resolved_country_cols[country_col] = resolved_country_cols.get(country_col, 0.0) + amount
 
         row_idx = existing_rows.get(_normalize_borrower_name(name))
         if row_idx is not None:
             name_cells_to_restyle.append(rowcol_to_a1(row_idx, geo_col))
-            if country_col is not None:
+            # Also clear any country column this row already has a value in
+            # but that isn't part of this run's resolved countries anymore
+            # (that country's loan is no longer active) - otherwise a stale
+            # amount would keep being counted in the row's SOMME total.
+            row = grid[row_idx - 1]
+            currently_filled_cols = {
+                col_idx for col_idx in country_columns.values()
+                if col_idx - 1 < len(row) and row[col_idx - 1].strip()
+            }
+            for country_col in currently_filled_cols | set(resolved_country_cols):
+                amount = resolved_country_cols.get(country_col, 0)
                 address = rowcol_to_a1(row_idx, country_col)
                 updates.append({"range": address, "values": [[amount]]})
-                logger.info("Préparation écriture : %s (ligne %s) / %s = %s (%s)", name, row_idx, country, amount, address)
+                logger.info("Préparation écriture : %s (ligne %s) / colonne %s = %s (%s)", name, row_idx, country_col, amount, address)
         else:
-            pending_new_borrowers.append((name, country_col, amount))
+            pending_new_borrowers.append((name, resolved_country_cols))
 
     if updates:
         _call_with_retry(worksheet.batch_update, updates, value_input_option="USER_ENTERED")
@@ -1107,17 +1133,17 @@ def fill_bienpreter_borrower_geo_amounts(borrowers: dict):
     }
 
     insert_row = end_row
-    for name, country_col, amount in pending_new_borrowers:
-        row_length = max(geo_col, target_col, country_col or 0)
+    for name, resolved_country_cols in pending_new_borrowers:
+        row_length = max([geo_col, target_col] + list(resolved_country_cols))
         row_values = [""] * row_length
         row_values[geo_col - 1] = name
         row_values[target_col - 1] = f"=SOMME({first_country_letter}{insert_row}:{insert_row})"
-        if country_col is not None:
+        for country_col, amount in resolved_country_cols.items():
             row_values[country_col - 1] = amount
 
         logger.info(
-            "Insertion d'une nouvelle ligne emprunteur '%s' à la ligne %s (pays=%s, montant=%s)",
-            name, insert_row, country_col, amount,
+            "Insertion d'une nouvelle ligne emprunteur '%s' à la ligne %s (colonnes pays=%s)",
+            name, insert_row, resolved_country_cols,
         )
         _call_with_retry(worksheet.insert_rows, [row_values], insert_row, value_input_option="USER_ENTERED")
         name_cells_to_restyle.append(rowcol_to_a1(insert_row, geo_col))
