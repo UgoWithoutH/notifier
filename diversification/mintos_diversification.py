@@ -224,6 +224,22 @@ can reconstruct up to that past date too. "en cours prêts"/"en cours
 obligations"/"total" stay current-month-only as before (genuinely no
 historical-outstanding endpoint exists, unrelated to this XIRR change).
 
+FIXED 2026-09-08 (same day, twice): a version shipped earlier the same day
+excluded bonds entirely from this whole XIRR block (terminal valuation +
+gross interest/withholding tax), keeping the FULL deposit/withdrawal
+cashflows unchanged - since deposits fund both loans AND bonds, this
+silently understated the account's terminal value by the whole bonds
+position while still counting the cash that bought it, making XIRR
+persistently/artificially negative for any month on an account holding
+bonds (confirmed against a real account: reported XIRR -11.7% vs. the
+correct +9.8% once bonds were added back). Reverted the same day: bonds
+are included again everywhere in this block (reconstruct_outstanding(),
+compute_average_balances(), run(), compute_xirr_block_as_of()) - the
+bond-classification heuristic (`"obligat" in details`) that motivated the
+original exclusion was itself already verified accurate against the real
+ledger, so there was no remaining reason to exclude bonds' real value.
+
+
 run() accepts an optional pre-built `requests.Session` (see
 mintos_get_session.py) for a one-shot "log in by hand, then let this take
 over" flow - the env vars below are only required when calling run() with
@@ -739,12 +755,20 @@ def _outstanding_delta_for_entry(label: str, turnover: float) -> float:
 
 
 def reconstruct_outstanding(entries: list, end_date: date) -> float:
-    """Reconstruct the OUTSTANDING invested balance (loans+bonds) as of an
-    arbitrary past `end_date`, by replaying every ledger row dated on or
-    before that date and applying _outstanding_delta_for_entry() to each -
-    mirrors afranga_diversification.reconstruct_outstanding(). Starts from
-    0 (before the account's first-ever transaction, outstanding is
-    necessarily 0)."""
+    """Reconstruct the OUTSTANDING invested balance (loans + bonds) as of
+    an arbitrary past `end_date`, by replaying every ledger row dated on
+    or before that date and applying _outstanding_delta_for_entry() to
+    each - mirrors afranga_diversification.reconstruct_outstanding().
+    Starts from 0 (before the account's first-ever transaction, outstanding
+    is necessarily 0).
+
+    NOTE: a 2026-09-08 version of this function excluded bonds entirely
+    from the XIRR block (deposits/withdrawals still counted in full) -
+    this silently understated the account's terminal value by the whole
+    bonds position while still counting the cash that funded it, making
+    XIRR persistently/artificially negative for any account holding bonds.
+    Reverted 2026-09-08 (same day, found via a real account's cached
+    ledger): bonds are included again."""
     outstanding = 0.0
     for entry in entries:
         entry_date = _entry_date(entry)
@@ -1138,7 +1162,7 @@ def run(session: requests.Session | None = None) -> None:
                 # net interest reuses lifetime_statement_totals (already
                 # fetched just above for Cash drag/XIRR Taxes-Frais),
                 # rather than being recomputed from the ledger.
-                lifetime_net_interest = lifetime_statement_totals["gross_interest_received"] - lifetime_statement_totals["withholding_tax"]
+                lifetime_net_interest = lifetime_statement_totals["gross_interest_received"] - lifetime_withholding_tax
                 if lifetime_net_interest:
                     cashflows_without_interest = signed_cashflows[:-1] + [(today_date, total_with_cash - lifetime_net_interest)]
                     xirr_without_interest = compute_xirr(cashflows_without_interest)
@@ -1180,13 +1204,13 @@ def run(session: requests.Session | None = None) -> None:
     # the platform - fill_current_month_amounts() assumes THAT single-row
     # shape and would silently write into the wrong row ("en cours prêts")
     # here, so this uses the label-matching variant instead.
-    # "prélèvements" (verified live 2026-08-05) sits 10 rows below the
-    # "Mintos" row - past the default max_rows=6 bound - hence max_rows=10.
+    # "prélèvements" (verified live 2026-08-05) sits several rows below the
+    # "Mintos" row - the search is bounded dynamically (stops at the next
+    # platform's own row), no hardcoded `max_rows` needed.
     fill_current_month_amounts_with_labels(
         platform=PLATFORM_LABEL,
         total=total_with_cash,
         labeled_amounts=labeled_amounts,
-        max_rows=10,
         skip_total=not current_month,
     )
 
@@ -1241,7 +1265,7 @@ def run(session: requests.Session | None = None) -> None:
     if avg_non_invested_balance is not None:
         bonus_breakdown[NON_INVESTED_BALANCE_LABEL] = avg_non_invested_balance
     if bonus_breakdown:
-        fill_current_month_bonus_breakdown(platform=PLATFORM_LABEL, breakdown=bonus_breakdown, max_rows=19)
+        fill_current_month_bonus_breakdown(platform=PLATFORM_LABEL, breakdown=bonus_breakdown)
 
     # "Répartition géographique": the "Mintos" row itself is a computed
     # cell in the Sheet (sums its own sub-rows) - only write the per-issuer

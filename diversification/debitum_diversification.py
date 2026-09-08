@@ -636,7 +636,6 @@ def run() -> None:
     fill_current_month_bonus_breakdown(
         platform="Debitum",
         breakdown=bonus_breakdown,
-        max_rows=19,
     )
 
     if current_month:

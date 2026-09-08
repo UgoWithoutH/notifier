@@ -587,7 +587,7 @@ def run(session: requests.Session | None = None) -> None:
 
     wallet_balance_as_of_end = None
     if all_entries is not None:
-        wallet_balance_as_of_end = wallet_balance_as_of(all_entries, end_date)
+        wallet_balance_as_of_end = wallet_balance_as_of(all_entries, today_date)
         if available_funds is not None and abs(wallet_balance_as_of_end - available_funds) > 0.05:
             log.warning(
                 "Reconstructed Lande wallet balance %.2f EUR differs from live available funds %.2f EUR.",
@@ -764,7 +764,7 @@ def run(session: requests.Session | None = None) -> None:
     if avg_non_invested_balance is not None:
         bonus_breakdown[NON_INVESTED_BALANCE_LABEL] = avg_non_invested_balance
     if bonus_breakdown:
-        fill_current_month_bonus_breakdown(platform=PLATFORM_LABEL, breakdown=bonus_breakdown, max_rows=13)
+        fill_current_month_bonus_breakdown(platform=PLATFORM_LABEL, breakdown=bonus_breakdown)
 
 
 if __name__ == "__main__":

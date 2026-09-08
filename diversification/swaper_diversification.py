@@ -1297,15 +1297,12 @@ def run(headless: bool = True) -> None:
     # cashback or contest - written to its own dedicated sub-row, never to
     # the "Bonus" row itself (a SUM formula over prime/cashback/concours).
     # "Cash drag"/"XIRR" are written alongside it, further down the same
-    # block (past fill_current_month_bonus_breakdown()'s default max_rows=6
-    # bound - hence the explicit max_rows=19 here, with a safety margin
-    # since the user has already inserted rows in this block a few times) -
-    # only included when actually computed, so a failed/skipped computation
-    # leaves the existing cell untouched rather than overwriting it with a
-    # wrong/zero value. "XIRR Intérêts" (added 2026-08-19) sits right after
-    # "XIRR Taxes/Frais" - this pushes the block one row taller than
-    # before, so `max_rows` is bumped 18 -> 19 to keep the search bounded
-    # before the next platform block. IMPORTANT: a "XIRR Intérêts" row must
+    # block - the search below the platform's row is bounded dynamically
+    # (stops at the next platform's own row), no more hardcoded `max_rows`
+    # to bump whenever a row is inserted - only included when actually
+    # computed, so a failed/skipped computation leaves the existing cell
+    # untouched rather than overwriting it with a wrong/zero value.
+    # IMPORTANT: a "XIRR Intérêts" row must
     # exist in the Swaper block on the sheet itself (right after "XIRR
     # Taxes/Frais") for this new value to actually land somewhere - this
     # script fills an existing row by label, it doesn't insert new
@@ -1334,7 +1331,6 @@ def run(headless: bool = True) -> None:
     fill_current_month_bonus_breakdown(
         platform="Swaper",
         breakdown=bonus_breakdown,
-        max_rows=19,
     )
 
     loan_originators = [
