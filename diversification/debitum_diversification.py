@@ -156,7 +156,7 @@ from shared.google_sheet import (
 )
 from shared.report_date import get_report_date, is_current_month
 from shared.state import load_state, save_state
-from shared.weighted_average import NON_INVESTED_BALANCE_LABEL, compute_time_weighted_average
+from shared.weighted_average import INVESTED_BALANCE_LABEL, NON_INVESTED_BALANCE_LABEL, compute_time_weighted_average
 from shared.xirr import compute_xirr
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
@@ -399,6 +399,24 @@ def _cash_delta_for_transaction(transaction: dict) -> float:
     return transaction.get("amount", 0.0)
 
 
+# Signed delta to the INVESTED (outstanding) balance - only "INVESTMENT"
+# is known to move money INTO investedEur (its own `amount` is negative,
+# mirroring SUBSCRIPTION's real debit for the same loan purchase, see the
+# module docstring's accounting-quirk paragraph) - so the invested balance
+# INCREASES by -amount. No principal-repayment transaction type has been
+# observed yet on this (young) account to decrease it - every other type
+# is treated as neutral here, same "don't guess" convention as elsewhere
+# in this repo. If a real principal-repayment type is ever observed, add
+# it here (decrease = -amount) instead of leaving this at 0.0.
+_INVESTED_INCREASE_TRANSACTION_TYPES = {"INVESTMENT"}
+
+
+def _invested_delta_for_transaction(transaction: dict) -> float:
+    if transaction.get("transactionType") in _INVESTED_INCREASE_TRANSACTION_TYPES:
+        return -transaction.get("amount", 0.0)
+    return 0.0
+
+
 def run() -> None:
     if not DEBITUM_EMAIL or not DEBITUM_PASSWORD:
         log.error("DEBITUM_EMAIL and DEBITUM_PASSWORD environment variables are required.")
@@ -430,7 +448,7 @@ def run() -> None:
     month_start_date = today_date.replace(day=1)
 
     amounts = {
-        "total": balances["invested_funds"],
+        "total": balances["invested_funds"] + balances["cash_balance"],
         "gross_interest_received": 0.0,
         "net_interest_received": 0.0,
         "withholding_tax": 0.0,
@@ -461,6 +479,7 @@ def run() -> None:
     cash_drag_xirr_contribution = None
     taxes_xirr_contribution = None
     interest_xirr_contribution = None
+    avg_invested_balance = None
     avg_non_invested_balance = None
 
     all_transactions = None
@@ -471,6 +490,7 @@ def run() -> None:
 
     if all_transactions is not None:
         cash_events = []
+        invested_events = []
         for t in all_transactions:
             try:
                 t_date = _parse_transaction_date(t["createdOn"])
@@ -478,9 +498,14 @@ def run() -> None:
                 log.warning("Skipping a transaction with an unparseable date: %r", t)
                 continue
             cash_events.append((t_date, _cash_delta_for_transaction(t)))
+            invested_events.append((t_date, _invested_delta_for_transaction(t)))
 
+        avg_invested_balance = compute_time_weighted_average(invested_events, month_start_date, today_date)
         avg_non_invested_balance = compute_time_weighted_average(cash_events, month_start_date, today_date)
-        log.info("Solde moyen pondéré non investi: %.2f EUR (%s to %s).", avg_non_invested_balance, month_start_date, today_date)
+        log.info(
+            "Solde moyen pondéré - investi: %.2f EUR, non investi: %.2f EUR (%s to %s).",
+            avg_invested_balance, avg_non_invested_balance, month_start_date, today_date,
+        )
 
         if current_month:
             deposit_dates = [
@@ -593,6 +618,8 @@ def run() -> None:
         bonus_breakdown["XIRR Taxes/Frais"] = taxes_xirr_contribution
     if interest_xirr_contribution is not None:
         bonus_breakdown["XIRR Intérêts"] = interest_xirr_contribution
+    if avg_invested_balance is not None:
+        bonus_breakdown[INVESTED_BALANCE_LABEL] = avg_invested_balance
     if avg_non_invested_balance is not None:
         bonus_breakdown[NON_INVESTED_BALANCE_LABEL] = avg_non_invested_balance
 

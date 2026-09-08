@@ -74,6 +74,11 @@ on:
         type: boolean
         required: false
         default: true
+      run_income_marketplace:
+        description: "Exécuter Income Marketplace"
+        type: boolean
+        required: false
+        default: true
 
 permissions:
   contents: read
@@ -691,8 +696,80 @@ jobs:
           path: diversification/debitum_xirr_cashflows_state.json
           key: debitum-diversification-state-${{ github.run_id }}
 
-  recap_email:
+  income_marketplace:
     needs: debitum
+    if: ${{ always() && inputs.run_income_marketplace }}
+    runs-on: ubuntu-22.04
+    concurrency:
+      group: income-marketplace-diversification
+      cancel-in-progress: false
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Python dependencies
+        run: pip install -r requirements.txt
+
+      - name: Remove broken third-party apt repos (Azure CLI / Microsoft)
+        run: |
+          sudo find /etc/apt/sources.list.d -maxdepth 1 -type f \( -name "*microsoft*" -o -name "*azure*" \) -print -delete || true
+          sudo sed -i '/packages.microsoft.com/d;/azure-cli/d' /etc/apt/sources.list || true
+          sudo apt-get update
+
+      - name: Cache Playwright browsers
+        uses: actions/cache@v4
+        id: playwright-cache
+        with:
+          path: ~/.cache/ms-playwright
+          key: ${{ runner.os }}-playwright-v2-${{ hashFiles('requirements.txt') }}
+
+      - name: Install Playwright Chromium (cache miss only)
+        if: steps.playwright-cache.outputs.cache-hit != 'true'
+        run: playwright install --with-deps chromium
+
+      - name: Install Playwright OS dependencies (cache hit)
+        if: steps.playwright-cache.outputs.cache-hit == 'true'
+        run: |
+          playwright install chromium
+          playwright install-deps chromium
+
+      # No session/storage_state persistence for LOGIN itself (Income
+      # Marketplace's Auth0 login stays Playwright-based every run - see
+      # diversification/income_marketplace_diversification.py's module
+      # docstring for why a pure-HTTP login couldn't be confirmed safe) -
+      # only the XIRR cashflow cache below is persisted, to avoid
+      # re-fetching the account's entire statement history every run.
+      - name: Restore persisted state (XIRR cashflow cache)
+        uses: actions/cache/restore@v4
+        with:
+          path: diversification/income_marketplace_xirr_cashflows_state.json
+          key: income-marketplace-diversification-state-${{ github.run_id }}
+          restore-keys: |
+            income-marketplace-diversification-state-
+
+      - name: Run Income Marketplace diversification report
+        env:
+          INCOME_MARKETPLACE_EMAIL: ${{ secrets.INCOME_MARKETPLACE_EMAIL }}
+          INCOME_MARKETPLACE_PASSWORD: ${{ secrets.INCOME_MARKETPLACE_PASSWORD }}
+          INCOME_MARKETPLACE_TOTP_SECRET: ${{ secrets.INCOME_MARKETPLACE_TOTP_SECRET }}
+          GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
+          GOOGLE_CREDENTIALS: ${{ secrets.GOOGLE_CREDENTIALS }}
+        run: bash scripts/run_diversification_for_month_range.sh diversification.income_marketplace_diversification "${{ github.event.inputs.start_month }}" "${{ github.event.inputs.end_month }}"
+
+      - name: Save persisted state (XIRR cashflow cache) for the next run
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: diversification/income_marketplace_xirr_cashflows_state.json
+          key: income-marketplace-diversification-state-${{ github.run_id }}
+
+  recap_email:
+    needs: income_marketplace
     if: always()
     runs-on: ubuntu-22.04
     steps:
