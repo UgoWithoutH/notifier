@@ -720,19 +720,29 @@ def reconstruct_outstanding(all_entries: list, end_date) -> float:
     return outstanding
 
 
-def compute_average_balances(all_entries: list, start_date, end_date) -> tuple:
+def compute_average_balances(all_entries: list, start_date, end_date, non_invested_opening_balance: float = None) -> tuple:
     """Day-weighted average INVESTED ("outstanding") and NON-INVESTED
     (wallet cash) balances over [start_date, end_date] (`date` objects) -
     for the "solde moyen pondéré investi"/"solde moyen pondéré non
     investi" Sheet rows (added 2026-09-08). Reuses the SAME per-entry
     classifiers as reconstruct_outstanding()/compute_average_idle_cash()
     above (_outstanding_delta_for_entry/_cash_delta_for_entry), just fed
-    into the generic shared day-weighted-average helper (opening_balance=
-    0.0 at account inception) instead of a point-in-time replay or the
-    naive opening/closing 2-point average - `all_entries` is expected to
-    cover the account's FULL history (see get_cached_account_cashflows()),
-    so the running balance carried into `start_date` from summed prior
-    deltas is accurate."""
+    into the generic shared day-weighted-average helper.
+
+    `non_invested_opening_balance`: when given, anchors the cash side to
+    this REAL known balance at `start_date` (the account-entries API's
+    own `openingBalance` for this exact range, see fetch_statement_totals())
+    instead of replaying every cash delta from account inception
+    (opening_balance=0.0) - the same anchoring compute_average_idle_cash()
+    already uses for Cash drag. Without this, any unmapped/misclassified
+    transactionType anywhere in years of history accumulates into a
+    persistent drift of a few cents (e.g. a small negative "non investi"
+    average even though the real wallet balance never went negative) -
+    only entries dated on/after `start_date` are then replayed on top of
+    the anchor, to avoid double-counting. The invested side has no
+    equivalent live anchor available, so it still replays the full
+    history from 0.0 - `all_entries` is expected to cover the account's
+    FULL history (see get_cached_account_cashflows()) for that side."""
     invested_events = []
     non_invested_events = []
     for entry in all_entries:
@@ -747,10 +757,14 @@ def compute_average_balances(all_entries: list, start_date, end_date) -> tuple:
         except (TypeError, ValueError):
             continue
         invested_events.append((entry_date, _outstanding_delta_for_entry(transaction_type, amount)))
-        non_invested_events.append((entry_date, _cash_delta_for_entry(transaction_type, amount)))
+        if non_invested_opening_balance is None or entry_date >= start_date:
+            non_invested_events.append((entry_date, _cash_delta_for_entry(transaction_type, amount)))
 
     avg_invested = compute_time_weighted_average(invested_events, start_date, end_date)
-    avg_non_invested = compute_time_weighted_average(non_invested_events, start_date, end_date)
+    avg_non_invested = compute_time_weighted_average(
+        non_invested_events, start_date, end_date,
+        opening_balance=non_invested_opening_balance if non_invested_opening_balance is not None else 0.0,
+    )
     return avg_invested, avg_non_invested
 
 
@@ -851,6 +865,10 @@ def compute_xirr_block_as_of(page, all_entries: list, xirr_cashflow_entries: lis
 
     month_start_date = end_date.replace(day=1)
     month_statement_totals = fetch_statement_totals(page, month_start_date.strftime("%Y-%m-%d"), end_date_str)
+    # Exposed (private, not written to the Sheet) so run() can anchor
+    # compute_average_balances()'s non-invested average the same way, for
+    # a backfilled month, without an extra account-entries API call.
+    result["_month_opening_balance"] = month_statement_totals["opening_balance"]
     avg_idle_cash = compute_average_idle_cash(
         all_entries, month_statement_totals["opening_balance"], month_statement_totals["closing_balance"],
         month_start_date.strftime("%Y-%m-%d"), end_date_str,
@@ -1234,8 +1252,20 @@ def run(headless: bool = True) -> None:
     if all_account_entries is not None:
         report_end_date = get_report_now(REPORT_TIMEZONE).date()
         report_start_date = report_end_date.replace(day=1)
+        # Real opening balance for report_start_date (from the account-
+        # entries API itself) - anchors the non-invested average, avoiding
+        # any since-inception drift accumulated from a full-history replay
+        # (see compute_average_balances()'s own docstring). Already
+        # fetched as part of this month's statement totals for a live
+        # run, or exposed by compute_xirr_block_as_of() for a backfilled
+        # one - no extra API call needed either way.
+        non_invested_opening_balance = None
+        if current_month and statement_totals is not None:
+            non_invested_opening_balance = statement_totals["opening_balance"]
+        elif not current_month and xirr_backfill_block is not None:
+            non_invested_opening_balance = xirr_backfill_block.get("_month_opening_balance")
         avg_invested_balance, avg_non_invested_balance = compute_average_balances(
-            all_account_entries, report_start_date, report_end_date
+            all_account_entries, report_start_date, report_end_date, non_invested_opening_balance
         )
         log.info(
             "Solde moyen pondéré - investi: %.2f EUR, non investi: %.2f EUR (%s to %s).",
