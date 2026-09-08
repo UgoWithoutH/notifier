@@ -42,12 +42,17 @@ pure HTTP on 2026-07-18):
   active investments would be truncated (logged as a warning if the exact
   cap is hit - fine for now, revisit if/when the portfolio grows that big).
 - Each `<tr>` has the loan originator as an `<img alt="X logo">` (never as
-  plain text) in the 5th `<td>`, and the outstanding amount as
-  "€ 1 234.56"-formatted text in the 11th `<td>` ("Outstanding Investment"
+  plain text) in the 6th `<td>`, and the outstanding amount as
+  "€ 1 234.56"-formatted text in the 12th `<td>` ("Outstanding Investment"
   column - the remaining/still-invested capital, as opposed to "Invested
   Amount" which is the original amount before any repayments). The last row
   is always a "Total:" summary row, not a real investment (its first `<td>`
-  has no Loan ID link), and is skipped.
+  has no Loan ID link), and is skipped. NOTE: a leading `<td>` (a "Sell on
+  Secondary market" checkbox, added by Afranga at some point after this was
+  first verified) shifts every column index by +1 versus earlier versions
+  of this comment - re-verify live (e.g. via a throwaway probe script) if
+  investments start silently disappearing again (0 parsed rows despite a
+  non-zero "Invested Funds" on the overview page is the telltale symptom).
 - Parsed via regex only (no HTML parser dependency), same approach as
   bienpreter_diversification.py: split the fragment into `<tr>...</tr>`
   blocks, then each block into `<td>...</td>` cells.
@@ -330,13 +335,15 @@ def fetch_investments(session: requests.Session) -> list:
     investments = []
     for row_html in raw_rows:
         cells = re.findall(r"<td[^>]*>(.*?)</td>", row_html, re.DOTALL)
-        if len(cells) < 11:
+        if len(cells) < 12:
             continue
-        loan_id_m = re.search(r">\s*(\d+)\s*<", cells[1])
-        originator_m = re.search(r'alt="([^"]+)"', cells[4])
+        # Indices are +1 vs. an older verification of this page - Afranga
+        # added a leading checkbox `<td>` ("Sell on Secondary market") since.
+        loan_id_m = re.search(r">\s*(\d+)\s*<", cells[2])
+        originator_m = re.search(r'alt="([^"]+)"', cells[5])
         if not loan_id_m or not originator_m:
             continue  # the trailing "Total:" row has no loan ID / originator
-        outstanding_m = re.search(r"€\s*([\d\s.,]+)", cells[10])
+        outstanding_m = re.search(r"€\s*([\d\s.,]+)", cells[11])
         investments.append(
             {
                 "originator": originator_m.group(1),
