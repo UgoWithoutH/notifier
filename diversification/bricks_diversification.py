@@ -204,6 +204,7 @@ except ModuleNotFoundError:
     from shared.report_date import get_report_now, is_current_month
 
 from shared.state import load_state, save_state
+from shared.weighted_average import compute_time_weighted_average
 from shared.xirr import compute_xirr
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
@@ -556,6 +557,34 @@ def compute_average_idle_cash(all_entries: list, start_date: str, end_date: str)
     return total_balance / day_count
 
 
+def compute_average_balances(all_entries: list, start_date, end_date) -> tuple:
+    """Day-weighted average INVESTED ("outstanding") and NON-INVESTED
+    (wallet cash) balances over [start_date, end_date] (`date` objects) -
+    for the "solde moyen pondéré investi"/"solde moyen pondéré non
+    investi" Sheet rows (added 2026-09-08). Reuses the SAME per-entry
+    classifiers as reconstruct_outstanding()/compute_average_idle_cash()
+    above (_OUTSTANDING_KINDS/_entry_value), just fed into the generic
+    shared day-weighted-average helper (opening_balance=0.0 at account
+    inception) instead of a point-in-time replay - `all_entries` is
+    expected to cover the account's full history (see
+    get_cached_wallet_transactions()), so the running balance carried into
+    `start_date` from summed prior deltas is accurate."""
+    invested_events = []
+    non_invested_events = []
+    for entry in all_entries:
+        entry_date = _entry_date(entry)
+        if entry_date is None or not _is_confirmed(entry):
+            continue
+        value = _entry_value(entry)
+        non_invested_events.append((entry_date, value))
+        if entry.get("kind") in _OUTSTANDING_KINDS:
+            invested_events.append((entry_date, -value))
+
+    avg_invested = compute_time_weighted_average(invested_events, start_date, end_date)
+    avg_non_invested = compute_time_weighted_average(non_invested_events, start_date, end_date)
+    return avg_invested, avg_non_invested
+
+
 def _sum_in_range(all_entries: list, kinds: set, start_date, end_date) -> float:
     """Sum of every confirmed entry's own `value` whose `kind` is in
     `kinds`, dated within [start_date, end_date] (inclusive)."""
@@ -821,6 +850,24 @@ def run() -> None:
         skip_total=skip_total,
     )
 
+    # Day-weighted average invested/non-invested balances (new Sheet rows
+    # "solde moyen pondéré investi"/"non investi", added 2026-09-08) -
+    # computed whenever all_entries is available, independent of
+    # current_month, so this also works for a REPORT_DATE-backfilled past
+    # month. Uses the REAL number of days in the period, never a
+    # hardcoded 30.
+    avg_invested_balance = None
+    avg_non_invested_balance = None
+    if all_entries is not None:
+        month_start_date = today_date.replace(day=1)
+        avg_invested_balance, avg_non_invested_balance = compute_average_balances(
+            all_entries, month_start_date, today_date
+        )
+        log.info(
+            "Solde moyen pondéré - investi: %.2f EUR, non investi: %.2f EUR (%s to %s).",
+            avg_invested_balance, avg_non_invested_balance, month_start_date, today_date,
+        )
+
     # Bricks' block uses its own distinct sub-row labels ("parrainages" /
     # "soldes boostés"), not the generic prime/cashback/concours trio used
     # elsewhere - map referrals/boostedBalanceGain to them directly, never
@@ -839,6 +886,10 @@ def run() -> None:
         "pr\u00e9l\u00e8vements": revenue_totals["withholding_tax"],
     }
     breakdown.update(xirr_block)
+    if avg_invested_balance is not None:
+        breakdown["solde moyen pondéré investi"] = avg_invested_balance
+    if avg_non_invested_balance is not None:
+        breakdown["solde moyen pondéré non investi"] = avg_non_invested_balance
     fill_current_month_bonus_breakdown(
         platform="Bricks",
         breakdown=breakdown,

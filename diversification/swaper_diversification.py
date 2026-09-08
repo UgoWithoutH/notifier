@@ -101,6 +101,7 @@ from shared.google_sheet import (
 )
 from shared.report_date import get_report_now, is_current_month
 from shared.state import load_state, save_state
+from shared.weighted_average import compute_time_weighted_average
 from shared.xirr import compute_xirr
 
 load_dotenv()
@@ -719,6 +720,40 @@ def reconstruct_outstanding(all_entries: list, end_date) -> float:
     return outstanding
 
 
+def compute_average_balances(all_entries: list, start_date, end_date) -> tuple:
+    """Day-weighted average INVESTED ("outstanding") and NON-INVESTED
+    (wallet cash) balances over [start_date, end_date] (`date` objects) -
+    for the "solde moyen pondéré investi"/"solde moyen pondéré non
+    investi" Sheet rows (added 2026-09-08). Reuses the SAME per-entry
+    classifiers as reconstruct_outstanding()/compute_average_idle_cash()
+    above (_outstanding_delta_for_entry/_cash_delta_for_entry), just fed
+    into the generic shared day-weighted-average helper (opening_balance=
+    0.0 at account inception) instead of a point-in-time replay or the
+    naive opening/closing 2-point average - `all_entries` is expected to
+    cover the account's FULL history (see get_cached_account_cashflows()),
+    so the running balance carried into `start_date` from summed prior
+    deltas is accurate."""
+    invested_events = []
+    non_invested_events = []
+    for entry in all_entries:
+        raw_date = entry.get("bookingDate")
+        raw_amount = entry.get("amount")
+        transaction_type = entry.get("transactionType")
+        if not raw_date or raw_amount is None or not transaction_type:
+            continue
+        try:
+            entry_date = datetime.strptime(raw_date, "%Y-%m-%d").date()
+            amount = float(raw_amount)
+        except (TypeError, ValueError):
+            continue
+        invested_events.append((entry_date, _outstanding_delta_for_entry(transaction_type, amount)))
+        non_invested_events.append((entry_date, _cash_delta_for_entry(transaction_type, amount)))
+
+    avg_invested = compute_time_weighted_average(invested_events, start_date, end_date)
+    avg_non_invested = compute_time_weighted_average(non_invested_events, start_date, end_date)
+    return avg_invested, avg_non_invested
+
+
 def _build_since_inception_cashflows_as_of(xirr_cashflow_entries: list, end_date) -> list:
     """Real FUNDING/WITHDRAW* cashflows, signed and dated, filtered to
     date<=end_date - shared by every XIRR-as-of computation below (no
@@ -1186,6 +1221,27 @@ def run(headless: bool = True) -> None:
                     else:
                         interest_xirr_contribution = 0.0
 
+    # Day-weighted average invested/non-invested balances (new Sheet rows
+    # "solde moyen pondéré investi"/"non investi", added 2026-09-08) -
+    # computed whenever all_account_entries is available, independent of
+    # current_month, so this also works for a REPORT_DATE-backfilled past
+    # month. Uses the REAL number of days in the period, never a
+    # hardcoded 30. Uses its own local date variables (not `today_date`,
+    # which is reused above as either a string or a date depending on
+    # branch) to avoid any ambiguity.
+    avg_invested_balance = None
+    avg_non_invested_balance = None
+    if all_account_entries is not None:
+        report_end_date = get_report_now(REPORT_TIMEZONE).date()
+        report_start_date = report_end_date.replace(day=1)
+        avg_invested_balance, avg_non_invested_balance = compute_average_balances(
+            all_account_entries, report_start_date, report_end_date
+        )
+        log.info(
+            "Solde moyen pondéré - investi: %.2f EUR, non investi: %.2f EUR (%s to %s).",
+            avg_invested_balance, avg_non_invested_balance, report_start_date, report_end_date,
+        )
+
     # "total" comes from the "Currently Allocated" DOM widget plus the
     # uninvested balance (see above), a LIVE-only snapshot with no date
     # param, and account-entries (the date-ranged interest API) has no
@@ -1231,6 +1287,10 @@ def run(headless: bool = True) -> None:
         bonus_breakdown["XIRR Taxes/Frais"] = taxes_xirr_contribution
     if interest_xirr_contribution is not None:
         bonus_breakdown["XIRR Intérêts"] = interest_xirr_contribution
+    if avg_invested_balance is not None:
+        bonus_breakdown["solde moyen pondéré investi"] = avg_invested_balance
+    if avg_non_invested_balance is not None:
+        bonus_breakdown["solde moyen pondéré non investi"] = avg_non_invested_balance
     fill_current_month_bonus_breakdown(
         platform="Swaper",
         breakdown=bonus_breakdown,

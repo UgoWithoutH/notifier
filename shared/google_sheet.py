@@ -287,8 +287,27 @@ def fill_current_month_amounts(
     total_amount = amounts.get("total", 0)
     gross_interest_received = amounts.get("gross_interest_received", 0)
 
+    # "intérêts brut" used to always sit right below the platform's own
+    # row (platform_row + 1) - BUG FIXÉ 2026-09-08: since 2 new rows
+    # ("solde moyen pondéré investi"/"non investi") were inserted between
+    # the platform's row and "intérêts brut" on the live Sheet, that fixed
+    # offset now silently writes the interest figure into the wrong row.
+    # Find it by label instead (falls back to the old fixed offset with a
+    # warning if not found, e.g. an older Dashboard sheet without the new
+    # rows).
+    interest_row = find_rows_by_texts_below(
+        grid, platform_row, section_col, ["intérêts brut"], max_rows=5
+    ).get("intérêts brut")
+    if interest_row is None:
+        logger.warning(
+            "Ligne 'intérêts brut' non trouvée sous '%s' par recherche de libellé - "
+            "utilisation de l'ancien comportement (ligne juste sous la plateforme).",
+            platform,
+        )
+        interest_row = platform_row + 1
+
     if skip_total:
-        address = rowcol_to_a1(platform_row + 1, current_month_col)
+        address = rowcol_to_a1(interest_row, current_month_col)
         logger.info(
             "skip_total=True (mois non courant) : écriture uniquement des intérêts = %s (%s), total ignoré",
             gross_interest_received, address,
@@ -302,24 +321,24 @@ def fill_current_month_amounts(
         logger.info("Mise à jour terminée pour %s (%s écrit, total ignoré)", platform, address)
         return
 
-    # 1 seul appel API pour écrire les 2 valeurs (lignes adjacentes, même colonne)
-    start_a1 = rowcol_to_a1(platform_row, current_month_col)
-    end_a1 = rowcol_to_a1(platform_row + 1, current_month_col)
-    range_name = f"{start_a1}:{end_a1}"
+    total_a1 = rowcol_to_a1(platform_row, current_month_col)
+    interest_a1 = rowcol_to_a1(interest_row, current_month_col)
 
     logger.info(
         "Préparation écriture : %s / total = %s (%s), intérêts = %s (%s)",
-        platform, total_amount, start_a1, gross_interest_received, end_a1,
+        platform, total_amount, total_a1, gross_interest_received, interest_a1,
     )
 
     _call_with_retry(
-        worksheet.update,
-        range_name,
-        [[total_amount], [gross_interest_received]],
+        worksheet.batch_update,
+        [
+            {"range": total_a1, "values": [[total_amount]]},
+            {"range": interest_a1, "values": [[gross_interest_received]]},
+        ],
         value_input_option="USER_ENTERED"
     )
 
-    logger.info("Mise à jour terminée pour %s (%s écrit)", platform, range_name)
+    logger.info("Mise à jour terminée pour %s (total %s, intérêts %s)", platform, total_a1, interest_a1)
 
 
 def fill_current_month_amounts_with_labels(

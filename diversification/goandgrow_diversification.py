@@ -95,6 +95,7 @@ load_dotenv()
 
 from shared.google_sheet import fill_current_month_amounts, fill_current_month_bonus_breakdown, fill_geographic_repartition_amounts
 from shared.report_date import get_report_now, is_current_month
+from shared.weighted_average import compute_time_weighted_average
 from shared.xirr import compute_xirr
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
@@ -374,6 +375,48 @@ def build_xirr_cashflows(entries: list, end_date: date | None = None) -> dict:
     }
 
 
+def compute_average_balance(entries: list, start_date: date, end_date: date) -> float:
+    """Day-weighted average of the account's single-goal `Balance` over
+    [start_date, end_date] (new Sheet row "solde moyen pondéré investi",
+    added 2026-09-08) - the ENTIRE balance counts as "invested" here (see
+    module docstring: Go & Grow has no separate uninvested/idle-cash
+    wallet, unlike Iuvo/Lendermarket), so "non investi" is always 0.0,
+    hardcoded, same convention already used for Cash drag above.
+
+    Unlike Iuvo/Lendermarket/Monefit's coarse monthly-midpoint
+    approximation, Go & Grow's statements API already gives a REAL running
+    `Balance` per dated entry (see build_xirr_cashflows()'s docstring) - so
+    this converts that forward-fill balance into `(date, delta)` events
+    (same technique as mintos_diversification.py's cash-side conversion)
+    and feeds them into the shared, generic
+    compute_time_weighted_average() - a true day-weighted average, not an
+    approximation."""
+    sortable_entries = []
+    for entry in entries:
+        raw_date = entry.get("Date")
+        try:
+            entry_date = datetime.fromisoformat(raw_date).date()
+        except (TypeError, ValueError):
+            continue
+        try:
+            balance = round(float(entry["Balance"]), 2) if entry.get("Balance") is not None else None
+        except (TypeError, ValueError):
+            balance = None
+        if balance is None:
+            continue
+        sortable_entries.append((entry_date, balance))
+    sortable_entries.sort(key=lambda pair: pair[0])
+
+    events = []
+    running_balance = 0.0
+    for entry_date, balance in sortable_entries:
+        delta = balance - running_balance
+        events.append((entry_date, delta))
+        running_balance = balance
+
+    return compute_time_weighted_average(events, start_date, end_date, opening_balance=0.0)
+
+
 def run() -> None:
     if not GOANDGROW_EMAIL or not GOANDGROW_PASSWORD:
         log.error("GOANDGROW_EMAIL and GOANDGROW_PASSWORD environment variables are required.")
@@ -425,6 +468,21 @@ def run() -> None:
     # found/parsed for that date.
     total = balance if current_month else (closing_balance if closing_balance is not None else balance)
     skip_total = not current_month and closing_balance is None
+
+    # Day-weighted average invested/non-invested balances (new Sheet rows
+    # "solde moyen pondéré investi"/"non investi", added 2026-09-08) - see
+    # compute_average_balance()'s docstring: "non investi" is always 0.0,
+    # this account has no separate uninvested cash wallet.
+    avg_invested_balance = None
+    avg_non_invested_balance = None
+    if entries:
+        month_start_date = today_date.replace(day=1)
+        avg_invested_balance = compute_average_balance(entries, month_start_date, today_date)
+        avg_non_invested_balance = 0.0
+        log.info(
+            "Solde moyen pondéré - investi: %.2f EUR (%s to %s), non investi: 0.00 EUR (pas de solde non investi séparé).",
+            avg_invested_balance, month_start_date, today_date,
+        )
 
     # Go & Grow's statements API has no gross/net/withholding-tax
     # breakdown - "interest_received" (summed "Return"-type entries) is
@@ -556,6 +614,10 @@ def run() -> None:
         bonus_breakdown["XIRR Taxes/Frais"] = taxes_xirr_contribution
     if interest_xirr_contribution is not None:
         bonus_breakdown["XIRR Intérêts"] = interest_xirr_contribution
+    if avg_invested_balance is not None:
+        bonus_breakdown["solde moyen pondéré investi"] = avg_invested_balance
+    if avg_non_invested_balance is not None:
+        bonus_breakdown["solde moyen pondéré non investi"] = avg_non_invested_balance
     fill_current_month_bonus_breakdown(
         platform=PLATFORM_LABEL,
         breakdown=bonus_breakdown,

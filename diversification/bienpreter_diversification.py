@@ -1064,6 +1064,31 @@ def run() -> None:
                             cash_drag_xirr_contribution * 100, years_elapsed, missed_earnings,
                         )
 
+    # Day-weighted average invested/non-invested balances (new Sheet rows
+    # "solde moyen pondéré investi"/"non investi", added 2026-09-08).
+    # UNLIKE every other platform, Bienprêter has no per-transaction
+    # outstanding/invested-side ledger at all (no way to tell a "new
+    # investment" row apart from a repayment in the operations history) -
+    # so "investi" falls back to the SAME total_invested point-in-time
+    # figure (reconstructed above for a backfilled month, or live for the
+    # current month) already used as a constant for this month's Cash drag
+    # math, rather than a true day-weighted average (best available
+    # approximation, not fabricated). "non investi" DOES get a genuine
+    # day-weighted average, reusing compute_average_idle_cash() (real
+    # "Solde indicatif" balance replay) unconditionally, not just when
+    # total_invested > 0.
+    avg_invested_balance = None
+    avg_non_invested_balance = None
+    if all_operations:
+        month_start_str = today_date.replace(day=1).strftime("%Y-%m-%d")
+        today_str = today_date.strftime("%Y-%m-%d")
+        avg_invested_balance = total_invested
+        avg_non_invested_balance = compute_average_idle_cash(operations_as_of, month_start_str, today_str)
+        log.info(
+            "Solde moyen pondéré - investi: %.2f EUR (constant, point-in-time), non investi: %.2f EUR (%s to %s).",
+            avg_invested_balance, avg_non_invested_balance, month_start_str, today_str,
+        )
+
     # "total" = solde disponible + capital à recevoir, both scraped from
     # LIVE-only dashboard widgets with no date param and no historical/
     # closing-balance equivalent found anywhere on the site (2026-08-06
@@ -1107,6 +1132,10 @@ def run() -> None:
         bonus_breakdown["XIRR Taxes/Frais"] = taxes_xirr_contribution
     if interest_xirr_contribution is not None:
         bonus_breakdown["XIRR Intérêts"] = interest_xirr_contribution
+    if avg_invested_balance is not None:
+        bonus_breakdown["solde moyen pondéré investi"] = avg_invested_balance
+    if avg_non_invested_balance is not None:
+        bonus_breakdown["solde moyen pondéré non investi"] = avg_non_invested_balance
     fill_current_month_bonus_breakdown(
         platform="Bienprêter",
         breakdown=bonus_breakdown,

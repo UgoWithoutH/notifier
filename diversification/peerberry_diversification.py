@@ -171,6 +171,7 @@ from shared.google_sheet import (
 )
 from shared.report_date import get_report_now, is_current_month
 from shared.state import load_state, save_state
+from shared.weighted_average import compute_time_weighted_average
 from shared.xirr import compute_xirr
 from monitors.peerberry_monitor import login, PEERBERRY_EMAIL, PEERBERRY_PASSWORD, _HEADERS, fetch_available_money
 
@@ -531,6 +532,34 @@ def reconstruct_outstanding(all_entries: list, end_date: date) -> float:
             continue
         outstanding += _outstanding_delta_for_entry(entry)
     return outstanding
+
+
+def compute_average_balances(all_entries: list, start_date: date, end_date: date) -> tuple:
+    """Day-weighted average INVESTED ("outstanding") and NON-INVESTED
+    (wallet cash) balances over [start_date, end_date] (`date` objects) -
+    for the "solde moyen pondéré investi"/"solde moyen pondéré non
+    investi" Sheet rows (added 2026-09-08). Reuses the SAME per-entry
+    classifiers as reconstruct_outstanding()/compute_average_idle_cash()
+    above (_outstanding_delta_for_entry/_entry_amount), just fed into the
+    generic shared day-weighted-average helper (opening_balance=0.0 at
+    account inception) instead of a point-in-time replay or the real
+    statement API's own opening_balance - mathematically equivalent since
+    `all_entries` already covers the account's FULL history back to
+    XIRR_HISTORY_START_DATE (see get_cached_transactions()), so the
+    running balance carried into `start_date` from summed prior deltas is
+    accurate without needing a separate API-fetched anchor."""
+    invested_events = []
+    non_invested_events = []
+    for entry in all_entries:
+        entry_date = _entry_date(entry)
+        if entry_date is None:
+            continue
+        invested_events.append((entry_date, _outstanding_delta_for_entry(entry)))
+        non_invested_events.append((entry_date, _entry_amount(entry)))
+
+    avg_invested = compute_time_weighted_average(invested_events, start_date, end_date)
+    avg_non_invested = compute_time_weighted_average(non_invested_events, start_date, end_date)
+    return avg_invested, avg_non_invested
 
 
 def _build_since_inception_cashflows_as_of(all_entries: list, end_date: date) -> list:
@@ -934,6 +963,24 @@ def run() -> None:
         skip_total=not current_month,
     )
 
+    # Day-weighted average invested/non-invested balances (new Sheet rows
+    # "solde moyen pondéré investi"/"non investi", added 2026-09-08) -
+    # computed whenever all_entries is available, independent of
+    # current_month, so this also works for a REPORT_DATE-backfilled past
+    # month. Uses the REAL number of days in the period, never a
+    # hardcoded 30.
+    avg_invested_balance = None
+    avg_non_invested_balance = None
+    if all_entries is not None:
+        month_start_date = today_date.replace(day=1)
+        avg_invested_balance, avg_non_invested_balance = compute_average_balances(
+            all_entries, month_start_date, today_date
+        )
+        log.info(
+            "Solde moyen pondéré - investi: %.2f EUR, non investi: %.2f EUR (%s to %s).",
+            avg_invested_balance, avg_non_invested_balance, month_start_date, today_date,
+        )
+
     # PeerBerry's REFERRAL_FEE is treated as a "prime" (referral reward),
     # same convention as Swaper's referral bonus - written to its own
     # dedicated sub-row, never to the "Bonus" row itself (a SUM formula
@@ -962,6 +1009,10 @@ def run() -> None:
         bonus_breakdown["XIRR Taxes/Frais"] = taxes_xirr_contribution
     if interest_xirr_contribution is not None:
         bonus_breakdown["XIRR Intérêts"] = interest_xirr_contribution
+    if avg_invested_balance is not None:
+        bonus_breakdown["solde moyen pondéré investi"] = avg_invested_balance
+    if avg_non_invested_balance is not None:
+        bonus_breakdown["solde moyen pondéré non investi"] = avg_non_invested_balance
     fill_current_month_bonus_breakdown(
         platform="PeerBerry",
         breakdown=bonus_breakdown,

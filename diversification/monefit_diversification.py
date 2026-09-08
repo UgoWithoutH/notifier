@@ -603,6 +603,25 @@ def run() -> None:
     # "XIRR Taxes/Frais") for this new value to actually land somewhere -
     # this script fills an existing row by label, it doesn't insert new
     # labelled rows into this block.
+    # Day-weighted average invested/non-invested balances (new Sheet rows
+    # "solde moyen pondéré investi"/"non investi", added 2026-09-08).
+    # Monefit's SmartSaver product actually DOES split into an "invested"
+    # part (money placed in a loan/vault, `vaults["invested"]`) and an
+    # uninvested "main account" cash part (`vaults["main_account"]`) -
+    # already used above for Cash drag - but, like Cash drag, both are
+    # LIVE-only snapshots with no historical/date-ranged equivalent (see
+    # the comment above Cash drag's own block) - current-month-only,
+    # reused as constants rather than a true day-weighted average.
+    avg_invested_balance = None
+    avg_non_invested_balance = None
+    if current_month:
+        avg_invested_balance = total_invested
+        avg_non_invested_balance = avg_idle_cash
+        log.info(
+            "Solde moyen pondéré - investi: %.2f EUR, non investi: %.2f EUR (both constant, live snapshot).",
+            avg_invested_balance, avg_non_invested_balance,
+        )
+
     bonus_breakdown = {"prime": statement_totals["rewards_bonuses"]}
     if xirr_value is not None:
         bonus_breakdown["XIRR"] = xirr_value
@@ -616,6 +635,10 @@ def run() -> None:
         bonus_breakdown["XIRR Taxes/Frais"] = taxes_xirr_contribution
     if interest_xirr_contribution is not None:
         bonus_breakdown["XIRR Intérêts"] = interest_xirr_contribution
+    if avg_invested_balance is not None:
+        bonus_breakdown["solde moyen pondéré investi"] = avg_invested_balance
+    if avg_non_invested_balance is not None:
+        bonus_breakdown["solde moyen pondéré non investi"] = avg_non_invested_balance
     fill_current_month_bonus_breakdown(
         platform="Monefit",
         breakdown=bonus_breakdown,
