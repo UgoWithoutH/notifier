@@ -15,67 +15,67 @@ on:
       # inputs, only relying on defaults) keeps running every platform -
       # decocher one here only affects a manual run.
       run_swaper:
-        description: "Exécuter Swaper"
+        description: "Swaper"
         type: boolean
         required: false
         default: true
       run_iuvo:
-        description: "Exécuter Iuvo"
+        description: "Iuvo"
         type: boolean
         required: false
         default: true
       run_afranga:
-        description: "Exécuter Afranga"
+        description: "Afranga"
         type: boolean
         required: false
         default: true
       run_bienpreter:
-        description: "Exécuter Bienprêter"
+        description: "Bienprêter"
         type: boolean
         required: false
         default: true
       run_lendermarket:
-        description: "Exécuter Lendermarket"
+        description: "Lendermarket"
         type: boolean
         required: false
         default: true
       run_loanch:
-        description: "Exécuter Loanch"
+        description: "Loanch"
         type: boolean
         required: false
         default: true
       run_monefit:
-        description: "Exécuter Monefit"
+        description: "Monefit"
         type: boolean
         required: false
         default: true
       run_peerberry:
-        description: "Exécuter PeerBerry"
+        description: "PeerBerry"
         type: boolean
         required: false
         default: true
       run_goandgrow:
-        description: "Exécuter Go & Grow"
+        description: "Go & Grow"
         type: boolean
         required: false
         default: true
       run_bricks:
-        description: "Exécuter Bricks"
+        description: "Bricks"
         type: boolean
         required: false
         default: true
       run_nectaro:
-        description: "Exécuter Nectaro"
+        description: "Nectaro"
         type: boolean
         required: false
         default: true
       run_debitum:
-        description: "Exécuter Debitum"
+        description: "Debitum"
         type: boolean
         required: false
         default: true
       run_income_marketplace:
-        description: "Exécuter Income Marketplace"
+        description: "Income Marketplace"
         type: boolean
         required: false
         default: true
