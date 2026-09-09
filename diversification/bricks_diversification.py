@@ -223,7 +223,7 @@ except ModuleNotFoundError:
 from shared.state import load_state, save_state
 from shared.weighted_average import INVESTED_BALANCE_LABEL, NON_INVESTED_BALANCE_LABEL, compute_time_weighted_average
 from shared.xirr import compute_xirr
-from shared.xirr_shapley import compute_shapley_xirr_shares
+from shared.xirr_waterfall import compute_waterfall_xirr_shares
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger("bricks_diversification")
@@ -711,39 +711,36 @@ def compute_xirr_block_as_of(all_entries: list, end_date) -> dict:
     # docstring) - flip it here to a positive "amount withheld" figure,
     # same sign convention as Afranga's withholding_tax.
     lifetime_withholding_tax = -_lifetime_sum_as_of(all_entries, {_TAX_KIND}, end_date)
-    lifetime_net_interest = lifetime_gross_interest - lifetime_withholding_tax
 
-    # Shapley decomposition (added 2026-09-09, see shared/xirr_shapley.py's
-    # module docstring for why): each factor's neutralizing delta below is
-    # EXACTLY the same value the old isolated-contribution code used to
-    # add/subtract from total_value_as_of one at a time - only the way the
-    # factors are COMBINED changed (all 2**4=16 subsets evaluated jointly,
-    # not one factor cancelled in isolation), so the resulting shares are
-    # guaranteed to sum back to XIRR real - XIRR with every factor
-    # neutralized (efficiency property, checked at runtime by
-    # compute_shapley_xirr_shares' own warning log). Bricks has no
-    # platform-fee concept distinct from withholding tax (no separate
-    # "frais" wallet-transaction kind was ever found - see module
-    # docstring's `_TAX_KIND` classification) - "XIRR Frais" is hardcoded
-    # to 0.0 rather than duplicating/inventing a value, and is NOT part of
-    # the Shapley game.
-    factor_deltas = {
-        "XIRR Bonus": -lifetime_bonus,
-        "XIRR Cash drag": missed_earnings,
-        "XIRR Taxes": lifetime_withholding_tax,
-        "XIRR Intérêts": -lifetime_net_interest,
-    }
-    shapley_shares = compute_shapley_xirr_shares(
-        base_cashflows, end_date, total_value_as_of, factor_deltas,
+    # Waterfall decomposition (switched from Shapley 2026-09-09, see
+    # shared/xirr_waterfall.py's module docstring for why): walks a true
+    # 0%-return baseline up to total_value_as_of in the fixed order
+    # Intérêts -> Cash drag -> Bonus -> Frais -> Taxes, using GROSS
+    # interest (not net) at the Intérêts step and subtracting
+    # missed_earnings right after - each euro counted exactly once, so
+    # the shares sum EXACTLY to XIRR real (checked at runtime via a
+    # warning log). Bricks has no platform-fee concept distinct from
+    # withholding tax (no separate "frais" wallet-transaction kind was
+    # ever found - see module docstring's `_TAX_KIND` classification) -
+    # "XIRR Frais" is hardcoded to 0.0 rather than duplicating/inventing
+    # a value, and is skipped from the steps below.
+    steps = [
+        ("XIRR Intérêts", lifetime_gross_interest + missed_earnings),
+        ("XIRR Cash drag", -missed_earnings),
+        ("XIRR Bonus", lifetime_bonus),
+        ("XIRR Taxes", -lifetime_withholding_tax),
+    ]
+    waterfall_shares = compute_waterfall_xirr_shares(
+        base_cashflows, end_date, total_value_as_of, steps,
         log=log, log_context=f"Bricks as of {end_date}",
     )
-    for name, value in shapley_shares.items():
+    for name, value in waterfall_shares.items():
         if value is not None:
             result[name] = value
     result["XIRR Frais"] = 0.0
     log.info(
-        "XIRR Shapley shares as of %s (since-inception, missed earnings ~%.2f EUR): %r",
-        end_date, missed_earnings, {k: round(v * 100, 4) for k, v in shapley_shares.items() if v is not None},
+        "XIRR Waterfall shares as of %s (since-inception, missed earnings ~%.2f EUR): %r",
+        end_date, missed_earnings, {k: round(v * 100, 4) for k, v in waterfall_shares.items() if v is not None},
     )
 
     return result

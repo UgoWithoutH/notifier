@@ -116,7 +116,7 @@ from shared.google_sheet import fill_current_month_amounts, fill_current_month_b
 from shared.report_date import get_report_now, is_current_month
 from shared.weighted_average import INVESTED_BALANCE_LABEL, NON_INVESTED_BALANCE_LABEL, compute_time_weighted_average
 from shared.xirr import compute_xirr
-from shared.xirr_shapley import compute_shapley_xirr_shares
+from shared.xirr_waterfall import compute_waterfall_xirr_shares
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger("goandgrow_diversification")
@@ -575,41 +575,34 @@ def run() -> None:
             # XIRR Intérêts: counterfactual XIRR share attributable to real
             # interest received since inception ("Return"-type entries, no
             # withholding tax on this platform, so lifetime_interest
-            # already IS the net figure).
-            lifetime_net_interest = xirr_data["lifetime_interest"]
+            # already IS the gross/net figure - no Cash drag data source
+            # exists here either, see module docstring, so no missed-
+            # earnings step is needed).
+            lifetime_gross_interest = xirr_data["lifetime_interest"]
 
-            # Shapley decomposition (added 2026-09-09, see
-            # shared/xirr_shapley.py's module docstring for why): each
-            # factor's neutralizing delta below is EXACTLY the same value
-            # the old isolated-contribution code used to add/subtract from
-            # terminal_value one at a time - only the way the factors are
-            # COMBINED changed (all 2**3=8 subsets evaluated jointly, not
-            # one factor cancelled in isolation), so the resulting shares
-            # are guaranteed to sum back to XIRR real - XIRR with every
-            # factor neutralized (efficiency property, checked at runtime
-            # via a warning log). Go & Grow has NO withholding tax at all
-            # (statements API has no tax breakdown, see module docstring) -
-            # "XIRR Taxes" is hardcoded to 0.0 rather than
-            # duplicating/inventing a value, and is NOT part of the
-            # Shapley game. Cash drag/XIRR Cash drag stay hardcoded 0.0
-            # too (no separate uninvested/idle-cash wallet exists here,
-            # see module docstring) - also excluded from the game (a
-            # constant-zero factor can't change any other share's value).
-            factor_deltas = {
-                "XIRR Bonus": -lifetime_bonus_total,
-                "XIRR Frais": lifetime_fees_total,
-                "XIRR Intérêts": -lifetime_net_interest,
-            }
-            shapley_shares = compute_shapley_xirr_shares(
-                signed_cashflows[:-1], today_date, terminal_value, factor_deltas,
+            # Waterfall decomposition (switched from Shapley 2026-09-09,
+            # see shared/xirr_waterfall.py's module docstring for why):
+            # walks a true 0%-return baseline up to terminal_value in the
+            # fixed order Intérêts -> Bonus -> Frais (no Cash drag/Taxes
+            # steps - Go & Grow has neither an idle-cash wallet nor
+            # withholding tax, see module docstring) - each euro counted
+            # exactly once, so the shares sum EXACTLY to XIRR real
+            # (checked at runtime via a warning log).
+            steps = [
+                ("XIRR Intérêts", lifetime_gross_interest),
+                ("XIRR Bonus", lifetime_bonus_total),
+                ("XIRR Frais", -lifetime_fees_total),
+            ]
+            waterfall_shares = compute_waterfall_xirr_shares(
+                signed_cashflows[:-1], today_date, terminal_value, steps,
                 log=log, log_context="Go & Grow",
             )
-            bonus_xirr_contribution = shapley_shares.get("XIRR Bonus")
-            frais_xirr_contribution = shapley_shares.get("XIRR Frais")
-            interest_xirr_contribution = shapley_shares.get("XIRR Intérêts")
+            bonus_xirr_contribution = waterfall_shares.get("XIRR Bonus")
+            frais_xirr_contribution = waterfall_shares.get("XIRR Frais")
+            interest_xirr_contribution = waterfall_shares.get("XIRR Intérêts")
             log.info(
-                "XIRR Shapley shares (since-inception): %r",
-                {k: round(v * 100, 4) for k, v in shapley_shares.items() if v is not None},
+                "XIRR Waterfall shares (since-inception): %r",
+                {k: round(v * 100, 4) for k, v in waterfall_shares.items() if v is not None},
             )
 
     # No bonus/cashback/contest statement entry Type has been observed yet

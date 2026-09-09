@@ -126,7 +126,7 @@ from shared.report_date import get_report_now, is_current_month
 from shared.state import load_state, save_state
 from shared.weighted_average import INVESTED_BALANCE_LABEL, NON_INVESTED_BALANCE_LABEL
 from shared.xirr import compute_xirr
-from shared.xirr_shapley import compute_shapley_xirr_shares
+from shared.xirr_waterfall import compute_waterfall_xirr_shares
 
 load_dotenv()
 
@@ -536,35 +536,35 @@ def run() -> None:
 
                 lifetime_bonus_total = sum(s["rewards_bonuses"] for s in relevant_summaries.values())
                 # bonus_xirr_contribution/frais_xirr_contribution/
-                # interest_xirr_contribution computed together via
-                # Shapley (added 2026-09-09, see
-                # shared/xirr_shapley.py's module docstring) - WITHOUT
+                # interest_xirr_contribution computed together via a
+                # waterfall (switched from Shapley 2026-09-09, see
+                # shared/xirr_waterfall.py's module docstring) - WITHOUT
                 # Cash drag here (missed_earnings isn't known yet, needs
                 # the live-only vaults snapshot below); overridden by a
-                # full 4-factor joint Shapley call further below whenever
-                # Cash drag CAN be computed (current month only).
+                # full 4-step waterfall further below whenever Cash drag
+                # CAN be computed (current month only).
                 lifetime_fees_total = sum(s["fees"] for s in relevant_summaries.values())
-                lifetime_interest_total_as_of = sum(s["daily_returns"] for s in relevant_summaries.values())
+                lifetime_gross_interest_total_as_of = sum(s["daily_returns"] for s in relevant_summaries.values())
 
                 # Monefit has genuine, real platform fees ("fees" field,
                 # see module docstring) but NO withholding-tax data at all
                 # - mapped to "XIRR Frais" here, NOT "XIRR Taxes" (which
-                # is hardcoded 0.0 instead, not part of the game).
-                factor_deltas = {
-                    "XIRR Bonus": -lifetime_bonus_total,
-                    "XIRR Frais": lifetime_fees_total,
-                    "XIRR Intérêts": -lifetime_interest_total_as_of,
-                }
-                shapley_shares = compute_shapley_xirr_shares(
-                    signed_cashflows[:-1], end_date, total_account_value, factor_deltas,
+                # is hardcoded 0.0 instead, skipped from the steps).
+                steps = [
+                    ("XIRR Intérêts", lifetime_gross_interest_total_as_of),
+                    ("XIRR Bonus", lifetime_bonus_total),
+                    ("XIRR Frais", -lifetime_fees_total),
+                ]
+                waterfall_shares = compute_waterfall_xirr_shares(
+                    signed_cashflows[:-1], end_date, total_account_value, steps,
                     log=log, log_context="Monefit (no cash drag)",
                 )
-                bonus_xirr_contribution = shapley_shares.get("XIRR Bonus")
-                frais_xirr_contribution = shapley_shares.get("XIRR Frais")
-                interest_xirr_contribution = shapley_shares.get("XIRR Intérêts")
+                bonus_xirr_contribution = waterfall_shares.get("XIRR Bonus")
+                frais_xirr_contribution = waterfall_shares.get("XIRR Frais")
+                interest_xirr_contribution = waterfall_shares.get("XIRR Intérêts")
                 log.info(
-                    "XIRR Shapley shares (since-inception, no cash drag, lifetime fees %.2f EUR): %r",
-                    lifetime_fees_total, {k: round(v * 100, 4) for k, v in shapley_shares.items() if v is not None},
+                    "XIRR Waterfall shares (since-inception, no cash drag, lifetime fees %.2f EUR): %r",
+                    lifetime_fees_total, {k: round(v * 100, 4) for k, v in waterfall_shares.items() if v is not None},
                 )
 
 
@@ -579,36 +579,36 @@ def run() -> None:
 
         if xirr_value is not None and signed_cashflows is not None and monthly_summaries:
             cash_weight_lifetime = cash_weight  # no real historical idle-cash time series - reuse the live snapshot (see comment above).
-            lifetime_interest_total = sum(s["daily_returns"] for s in monthly_summaries.values())
-            lifetime_yield_rate = lifetime_interest_total / total_invested
+            lifetime_gross_interest_total = sum(s["daily_returns"] for s in monthly_summaries.values())
+            lifetime_yield_rate = lifetime_gross_interest_total / total_invested
             cash_drag_lifetime_total = cash_weight_lifetime * lifetime_yield_rate
             missed_earnings = cash_drag_lifetime_total * (avg_idle_cash + total_invested)
             lifetime_bonus_total = sum(s["rewards_bonuses"] for s in monthly_summaries.values())
             lifetime_fees_total = sum(s["fees"] for s in monthly_summaries.values())
 
-            # Shapley decomposition (added 2026-09-09, see
-            # shared/xirr_shapley.py's module docstring for why) - full
-            # 4-factor joint game, overriding the 3-factor (no cash drag)
+            # Waterfall decomposition (switched from Shapley 2026-09-09,
+            # see shared/xirr_waterfall.py's module docstring for why) -
+            # full 4-step walk, overriding the 3-step (no cash drag)
             # partial result computed further above. "XIRR Taxes" stays
             # hardcoded 0.0 (Monefit has no withholding-tax data at all,
-            # see module docstring) - not part of the game.
-            factor_deltas = {
-                "XIRR Bonus": -lifetime_bonus_total,
-                "XIRR Cash drag": missed_earnings,
-                "XIRR Frais": lifetime_fees_total,
-                "XIRR Intérêts": -lifetime_interest_total,
-            }
-            shapley_shares = compute_shapley_xirr_shares(
-                signed_cashflows[:-1], end_date, total_account_value, factor_deltas,
+            # see module docstring) - skipped from the steps.
+            steps = [
+                ("XIRR Intérêts", lifetime_gross_interest_total + missed_earnings),
+                ("XIRR Cash drag", -missed_earnings),
+                ("XIRR Bonus", lifetime_bonus_total),
+                ("XIRR Frais", -lifetime_fees_total),
+            ]
+            waterfall_shares = compute_waterfall_xirr_shares(
+                signed_cashflows[:-1], end_date, total_account_value, steps,
                 log=log, log_context="Monefit",
             )
-            bonus_xirr_contribution = shapley_shares.get("XIRR Bonus")
-            cash_drag_xirr_contribution = shapley_shares.get("XIRR Cash drag")
-            frais_xirr_contribution = shapley_shares.get("XIRR Frais")
-            interest_xirr_contribution = shapley_shares.get("XIRR Intérêts")
+            bonus_xirr_contribution = waterfall_shares.get("XIRR Bonus")
+            cash_drag_xirr_contribution = waterfall_shares.get("XIRR Cash drag")
+            frais_xirr_contribution = waterfall_shares.get("XIRR Frais")
+            interest_xirr_contribution = waterfall_shares.get("XIRR Intérêts")
             log.info(
-                "XIRR Shapley shares (since-inception, avg idle cash %.2f EUR, missed earnings ~%.2f EUR): %r",
-                avg_idle_cash, missed_earnings, {k: round(v * 100, 4) for k, v in shapley_shares.items() if v is not None},
+                "XIRR Waterfall shares (since-inception, avg idle cash %.2f EUR, missed earnings ~%.2f EUR): %r",
+                avg_idle_cash, missed_earnings, {k: round(v * 100, 4) for k, v in waterfall_shares.items() if v is not None},
             )
 
     # Monefit's "bonus" field ("Rewards & bonuses") maps to "prime" (a

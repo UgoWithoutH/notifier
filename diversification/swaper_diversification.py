@@ -115,7 +115,7 @@ from shared.report_date import get_report_now, is_current_month
 from shared.state import load_state, save_state
 from shared.weighted_average import INVESTED_BALANCE_LABEL, NON_INVESTED_BALANCE_LABEL, compute_time_weighted_average
 from shared.xirr import compute_xirr
-from shared.xirr_shapley import compute_shapley_xirr_shares
+from shared.xirr_waterfall import compute_waterfall_xirr_shares
 
 load_dotenv()
 
@@ -925,31 +925,27 @@ def compute_xirr_block_as_of(page, all_entries: list, xirr_cashflow_entries: lis
     lifetime_yield_rate = lifetime_statement_totals_as_of["earned_interest"] / outstanding_as_of
     cash_drag_lifetime_total = cash_weight_lifetime * lifetime_yield_rate
     missed_earnings = cash_drag_lifetime_total * (avg_idle_cash_lifetime + outstanding_as_of)
-    lifetime_net_interest = lifetime_statement_totals_as_of["earned_interest"]
+    lifetime_gross_interest = lifetime_statement_totals_as_of["earned_interest"]
 
-    # Shapley decomposition (added 2026-09-09, see
-    # shared/xirr_shapley.py's module docstring for why) - only 2 factors
+    # Waterfall decomposition (switched from Shapley 2026-09-09, see
+    # shared/xirr_waterfall.py's module docstring for why) - only 2 steps
     # here (no Bonus, deliberately excluded for backfilled months - see
     # this function's own docstring; no Taxes/Frais, hardcoded 0.0 above -
-    # Swaper has neither withholding tax nor a distinct fee concept), but
-    # still run through the same generic Shapley machinery for
-    # consistency/additivity with every other platform - XIRR is
-    # non-linear, so even a 2-factor joint game can differ from cancelling
-    # each factor in isolation.
-    factor_deltas = {
-        "XIRR Cash drag": missed_earnings,
-        "XIRR Intérêts": -lifetime_net_interest,
-    }
-    shapley_shares = compute_shapley_xirr_shares(
-        base_cashflows, end_date, total_value_as_of, factor_deltas,
+    # Swaper has neither withholding tax nor a distinct fee concept).
+    steps = [
+        ("XIRR Intérêts", lifetime_gross_interest + missed_earnings),
+        ("XIRR Cash drag", -missed_earnings),
+    ]
+    waterfall_shares = compute_waterfall_xirr_shares(
+        base_cashflows, end_date, total_value_as_of, steps,
         log=log, log_context=f"Swaper as of {end_date}",
     )
-    for name, value in shapley_shares.items():
+    for name, value in waterfall_shares.items():
         if value is not None:
             result[name] = value
     log.info(
-        "XIRR Shapley shares as of %s (since-inception, missed earnings ~%.2f EUR): %r",
-        end_date, missed_earnings, {k: round(v * 100, 4) for k, v in shapley_shares.items() if v is not None},
+        "XIRR Waterfall shares as of %s (since-inception, missed earnings ~%.2f EUR): %r",
+        end_date, missed_earnings, {k: round(v * 100, 4) for k, v in waterfall_shares.items() if v is not None},
     )
 
     return result
@@ -1240,37 +1236,31 @@ def run(headless: bool = True) -> None:
                 # methodology as xirr_value itself.
                 if xirr_value is not None:
                     missed_earnings = cash_drag_lifetime_total * (avg_idle_cash_lifetime + breakdown["total_invested"])
-                    lifetime_net_interest = lifetime_statement_totals["earned_interest"]
+                    lifetime_gross_interest = lifetime_statement_totals["earned_interest"]
 
-                    # Shapley decomposition (added 2026-09-09, see
-                    # shared/xirr_shapley.py's module docstring for why) -
-                    # each factor's neutralizing delta below is EXACTLY
-                    # the same value the old isolated-contribution code
-                    # used to add/subtract from total_account_value one at
-                    # a time - only the way the factors are COMBINED
-                    # changed (all 2**3=8 subsets evaluated jointly, not
-                    # one factor cancelled in isolation), so the resulting
-                    # shares are guaranteed to sum back to XIRR real -
-                    # XIRR with every factor neutralized (efficiency
-                    # property, checked at runtime via a warning log).
-                    # "XIRR Taxes"/"XIRR Frais" stay hardcoded 0.0 (Swaper
-                    # has neither withholding tax nor a distinct fee
-                    # concept) - not part of the game.
-                    factor_deltas = {
-                        "XIRR Bonus": -referral_bonus_earned,
-                        "XIRR Cash drag": missed_earnings,
-                        "XIRR Intérêts": -lifetime_net_interest,
-                    }
-                    shapley_shares = compute_shapley_xirr_shares(
-                        signed_cashflows[:-1], today_date, total_account_value, factor_deltas,
+                    # Waterfall decomposition (switched from Shapley
+                    # 2026-09-09, see shared/xirr_waterfall.py's module
+                    # docstring for why) - walks a true 0%-return baseline
+                    # up to total_account_value in the fixed order
+                    # Intérêts -> Cash drag -> Bonus. "XIRR Taxes"/"XIRR
+                    # Frais" stay hardcoded 0.0 (Swaper has neither
+                    # withholding tax nor a distinct fee concept) - not
+                    # part of the steps.
+                    steps = [
+                        ("XIRR Intérêts", lifetime_gross_interest + missed_earnings),
+                        ("XIRR Cash drag", -missed_earnings),
+                        ("XIRR Bonus", referral_bonus_earned),
+                    ]
+                    waterfall_shares = compute_waterfall_xirr_shares(
+                        signed_cashflows[:-1], today_date, total_account_value, steps,
                         log=log, log_context="Swaper",
                     )
-                    bonus_xirr_contribution = shapley_shares.get("XIRR Bonus")
-                    cash_drag_xirr_contribution = shapley_shares.get("XIRR Cash drag")
-                    interest_xirr_contribution = shapley_shares.get("XIRR Intérêts")
+                    bonus_xirr_contribution = waterfall_shares.get("XIRR Bonus")
+                    cash_drag_xirr_contribution = waterfall_shares.get("XIRR Cash drag")
+                    interest_xirr_contribution = waterfall_shares.get("XIRR Intérêts")
                     log.info(
-                        "XIRR Shapley shares (since-inception, %.2f years, missed earnings ~%.2f EUR): %r",
-                        years_elapsed, missed_earnings, {k: round(v * 100, 4) for k, v in shapley_shares.items() if v is not None},
+                        "XIRR Waterfall shares (since-inception, %.2f years, missed earnings ~%.2f EUR): %r",
+                        years_elapsed, missed_earnings, {k: round(v * 100, 4) for k, v in waterfall_shares.items() if v is not None},
                     )
 
     # Day-weighted average invested/non-invested balances (new Sheet rows
