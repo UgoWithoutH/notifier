@@ -22,10 +22,10 @@ concurrency:
 jobs:
   swaper:
     runs-on: ubuntu-22.04
-    # GitHub-hosted runners hard-cap a single job at 6h (360min) regardless
-    # of this value or SWAPER_LOOP_MAX_HOURS - kept explicit so the real
-    # ceiling is visible here, not just implied by GitHub's own default.
+
+    # GitHub-hosted runners hard-cap a single job at 6h (360min)
     timeout-minutes: 360
+
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -38,19 +38,42 @@ jobs:
       - name: Install Python dependencies
         run: pip install -r requirements.txt
 
-      - name: Remove broken third-party apt repos (Azure CLI / Microsoft)
+      - name: Prepare APT for Playwright
         run: |
-          echo "Before cleanup:" 
+          echo "Before cleanup:"
           sudo ls -la /etc/apt/sources.list.d || true
-          sudo grep -RinE "packages\.microsoft\.com|azure-cli" /etc/apt/sources.list /etc/apt/sources.list.d || true
+          sudo grep -RinE \
+            "packages\.microsoft\.com|azure-cli|dl\.google\.com|chrome-stable" \
+            /etc/apt/sources.list /etc/apt/sources.list.d || true
 
-          # GitHub runner images can ship these repos as either .list or .sources.
-          sudo find /etc/apt/sources.list.d -maxdepth 1 -type f \( -name "*microsoft*" -o -name "*azure*" \) -print -delete || true
-          sudo sed -i '/packages.microsoft.com/d;/azure-cli/d' /etc/apt/sources.list || true
+          # GitHub runner images can ship these repositories as either
+          # .list or .sources files.
 
-          echo "After cleanup:" 
+          # Remove Microsoft / Azure repositories.
+          sudo find /etc/apt/sources.list.d -maxdepth 1 -type f \
+            \( -name "*microsoft*" -o -name "*azure*" \) \
+            -print -delete || true
+
+          sudo sed -i \
+            '/packages.microsoft.com/d;/azure-cli/d' \
+            /etc/apt/sources.list || true
+
+          # Remove Google Chrome repository.
+          # Playwright downloads and manages its own Chromium,
+          # so this repository is not required.
+          sudo find /etc/apt/sources.list.d -maxdepth 1 -type f \
+            \( -name "*google*" -o -name "*chrome*" \) \
+            -print -delete || true
+
+          sudo sed -i \
+            '/dl\.google\.com\/linux\/chrome-stable/d' \
+            /etc/apt/sources.list || true
+
+          echo "After cleanup:"
           sudo ls -la /etc/apt/sources.list.d || true
-          sudo grep -RinE "packages\.microsoft\.com|azure-cli" /etc/apt/sources.list /etc/apt/sources.list.d || true
+          sudo grep -RinE \
+            "packages\.microsoft\.com|azure-cli|dl\.google\.com|chrome-stable" \
+            /etc/apt/sources.list /etc/apt/sources.list.d || true
 
           sudo apt-get update
 
@@ -73,9 +96,8 @@ jobs:
         if: steps.playwright-cache.outputs.cache-hit == 'true'
         # Also re-run `playwright install` (not just install-deps): a cache
         # populated before Playwright started shipping the separate
-        # chrome-headless-shell binary would otherwise never get it, since
-        # the cache key (hash of requirements.txt) doesn't change - this is
-        # a no-op download-wise if the binary is already present.
+        # chrome-headless-shell binary would otherwise never get it.
+        # This is a no-op download-wise if the binary is already present.
         run: |
           playwright install chromium
           playwright install-deps chromium

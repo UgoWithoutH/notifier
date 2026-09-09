@@ -13,6 +13,7 @@ concurrency:
 jobs:
   lendermarket:
     runs-on: ubuntu-22.04
+
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -24,12 +25,6 @@ jobs:
 
       - name: Install Python dependencies
         run: pip install -r requirements.txt
-
-      - name: Remove broken third-party apt repos (Azure CLI / Microsoft)
-        run: |
-          sudo find /etc/apt/sources.list.d -maxdepth 1 -type f \( -name "*microsoft*" -o -name "*azure*" \) -print -delete || true
-          sudo sed -i '/packages.microsoft.com/d;/azure-cli/d' /etc/apt/sources.list || true
-          sudo apt-get update
 
       - name: Restore persisted state (already-notified loan IDs + cron schedule)
         uses: actions/cache/restore@v4
