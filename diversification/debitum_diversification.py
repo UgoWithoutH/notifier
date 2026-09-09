@@ -491,6 +491,7 @@ def run() -> None:
     interest_xirr_contribution = None
     avg_invested_balance = None
     avg_non_invested_balance = None
+    earliest_transaction_date = None
 
     all_transactions = None
     try:
@@ -509,6 +510,8 @@ def run() -> None:
                 continue
             cash_events.append((t_date, _cash_delta_for_transaction(t)))
             invested_events.append((t_date, _invested_delta_for_transaction(t)))
+            if earliest_transaction_date is None or t_date < earliest_transaction_date:
+                earliest_transaction_date = t_date
 
         avg_invested_balance = compute_time_weighted_average(invested_events, month_start_date, today_date)
         avg_non_invested_balance = compute_time_weighted_average(cash_events, month_start_date, today_date)
@@ -604,6 +607,23 @@ def run() -> None:
                         if xirr_with_cash_invested is not None:
                             cash_drag_xirr_contribution = xirr_value - xirr_with_cash_invested
                             log.info("XIRR share - cash drag: %.4f points.", cash_drag_xirr_contribution * 100)
+
+    # For a backfilled (non-current) month, only write to the Sheet if the
+    # account actually existed by then (had at least one real transaction
+    # on or before today_date) - otherwise every month before the account
+    # was opened would get 0.00 EUR written into every cell instead of
+    # staying blank, which looks like real (if empty) data was recorded
+    # for a period the account didn't exist yet.
+    account_existed_this_period = current_month or (
+        all_transactions is None or (earliest_transaction_date is not None and today_date >= earliest_transaction_date)
+    )
+    if not account_existed_this_period:
+        log.info(
+            "Debitum account had no transactions as of %s (first known transaction %s) - "
+            "skipping all Sheet writes for this backfilled month.",
+            today_date, earliest_transaction_date,
+        )
+        return
 
     fill_current_month_amounts(
         platform="Debitum",
