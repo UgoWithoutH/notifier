@@ -63,7 +63,7 @@ BASE_INTERVAL_MINUTES = {"2m": 2, "30m": 30}
 # produce >=6 firings/hour, also revisit `_infer_mode_from_minutes()`'s
 # count-based threshold below.
 JITTER_RANGE_MINUTES_2M = (0, 3)
-JITTER_RANGE_MINUTES_30M = (0, 20)
+JITTER_RANGE_MINUTES_30M = (0, 10)
 
 
 def _build_jittered_minutes(mode: str) -> list:
