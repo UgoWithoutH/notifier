@@ -227,7 +227,6 @@ throughout.
 
 import json
 import os
-import random
 import sys
 import time
 import logging
@@ -1551,12 +1550,6 @@ def run(headless: bool = True) -> None:
 
 
 if __name__ == "__main__":
-    # Random startup delay (up to 1 minute) so scheduled runs don't always
-    # fire at exactly the same second, making the traffic look less bot-like.
-    delay = random.uniform(0, 60)
-    log.info("Startup jitter: sleeping for %.1f seconds before starting.", delay)
-    time.sleep(delay)
-
     # Set headless=False locally (e.g. via `python swaper_monitor.py --show`) to
     # watch the browser and debug the login flow if selectors need adjusting.
     run(headless="--show" not in sys.argv)
