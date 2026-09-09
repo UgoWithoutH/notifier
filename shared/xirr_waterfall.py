@@ -15,14 +15,19 @@ this walks UP from a literal 0% baseline (get back exactly the net capital
 deposited, no more no less) by ADDING each step's real delta in a FIXED
 order, so that:
     share(step_k) = XIRR(cumulative through step_k) - XIRR(cumulative through step_{k-1})
-telescopes to `sum(shares) == XIRR_real - 0% == XIRR_real` PROVIDED the
-steps' deltas reconstruct `base_value` exactly by the last step (checked at
-runtime below). E.g. for the "intérêts -> cash drag -> bonus -> frais ->
-taxes" order: use GROSS interest (not net) at the "Intérêts" step, then
-SUBTRACT the missed-earnings amount at "Cash drag" (real cost of idle cash
-pulling the ideal gross interest back down to what was actually earned),
-then add bonus, subtract fees, subtract withholding tax last - each euro is
-counted exactly once.
+telescopes to `sum(shares) == XIRR_real - 0% == XIRR_real` ALWAYS - the
+LAST step is always evaluated against the real `base_value` (not the
+steps' own accumulated total), so any reconciliation gap between the
+steps' deltas and base_value (logged as a warning, see value_tolerance
+below) is silently absorbed into that last step's own share instead of
+leaking into a "sum(shares) != XIRR real" mismatch. E.g. for the
+"intérêts -> cash drag -> bonus -> frais -> taxes" order: use GROSS
+interest (not net) at the "Intérêts" step, then SUBTRACT the missed-
+earnings amount at "Cash drag" (real cost of idle cash pulling the ideal
+gross interest back down to what was actually earned), then add bonus,
+subtract fees, subtract withholding tax last - each euro is counted
+exactly once, and any leftover reconciliation slop lands in the last
+step ("Taxes" here).
 """
 
 from datetime import date
@@ -49,10 +54,14 @@ def compute_waterfall_xirr_shares(
     Each step's delta is added on top of the running cumulative value -
     unlike shared/xirr_shapley.py's `factor_deltas`, these are NOT
     "neutralize from the real value" adjustments; they're real amounts
-    that build UP from 0 to `base_value`. The last step's cumulative value
-    should equal `base_value` (a mismatch beyond `value_tolerance` logs a
-    warning - it means the steps don't fully/uniquely explain the gain,
-    same double-counting bug this replaces).
+    that build UP from 0 to `base_value`. The steps' own accumulated total
+    SHOULD equal `base_value` by the last step (a mismatch beyond
+    `value_tolerance` logs a warning - it means the steps don't fully/
+    uniquely explain the gain) - but regardless of that gap, the LAST
+    step is always evaluated against the real `base_value` directly, so
+    the returned shares always sum EXACTLY to the real XIRR (the gap, if
+    any, is folded into the last step's own share rather than causing a
+    silent inconsistency).
 
     Returns {step_name: waterfall_share_or_None}, same soft-fail convention
     as compute_shapley_xirr_shares (None only if some step's XIRR couldn't
@@ -64,9 +73,19 @@ def compute_waterfall_xirr_shares(
 
     shares: dict[str, float | None] = {}
     ok = True
-    for name, delta in steps:
+    last_index = len(steps) - 1
+    for i, (name, delta) in enumerate(steps):
         cumulative += delta
-        xirr_next = compute_xirr(base_cashflows + [(end_date, cumulative)])
+        # The LAST step always targets the real `base_value` (not the
+        # accumulated `cumulative`) - this guarantees the shares telescope
+        # EXACTLY to the real XIRR regardless of any reconciliation gap
+        # between the steps' own deltas and base_value (see the
+        # value_gap warning below, still computed from the uncorrected
+        # `cumulative` for diagnostics) - any such gap is silently folded
+        # into this last step's own share instead of leaking into a wrong
+        # "sum(shares) != XIRR real" result.
+        step_value = base_value if i == last_index else cumulative
+        xirr_next = compute_xirr(base_cashflows + [(end_date, step_value)])
         if xirr_prev is None or xirr_next is None:
             shares[name] = None
             ok = False
