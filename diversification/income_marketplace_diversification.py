@@ -92,6 +92,21 @@ design almost exactly, including using the SAME shared
 `is_current_month()` (LIVE-only, needs today's real total account value) -
 NOT yet extended to support a REPORT_DATE-backfilled past month.
 
+Added 2026-09-09: switched the XIRR Bonus/Cash drag/Intérêts shares from
+isolated counterfactuals (cancel ONE factor, XIRR_real - XIRR_without that
+factor) to a proper Shapley-value decomposition (see
+shared/xirr_shapley.py's module docstring) - the old method left an
+unexplained gap between XIRR and the sum of its "explaining" shares
+because XIRR is non-linear in its cashflows (interaction effects between
+factors were silently dropped). Shapley shares are additive by
+construction: XIRR Bonus + XIRR Cash drag + XIRR Intérêts now sums back to
+XIRR real - XIRR with every factor neutralized (checked at runtime, warns
+if off by more than 0.0001). Also split the old single "XIRR Taxes/Frais"
+share into "XIRR Taxes" and "XIRR Frais" - Income Marketplace has NEITHER
+a withholding-tax category NOR a distinct platform-fee category anywhere
+in its account-statement API, so BOTH are hardcoded to 0.0, not computed
+via Shapley (neither is part of the game).
+
 Required environment variables:
     INCOME_MARKETPLACE_EMAIL, INCOME_MARKETPLACE_PASSWORD -> login
                                        credentials.
@@ -129,6 +144,7 @@ from shared.report_date import get_report_date, is_current_month
 from shared.state import load_state, save_state
 from shared.weighted_average import INVESTED_BALANCE_LABEL, NON_INVESTED_BALANCE_LABEL, compute_time_weighted_average
 from shared.xirr import compute_xirr
+from shared.xirr_shapley import compute_shapley_xirr_shares
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger("income_marketplace_diversification")
@@ -453,6 +469,7 @@ def run() -> None:
             bonus_xirr_contribution = None
             cash_drag_xirr_contribution = None
             taxes_xirr_contribution = 0.0  # no withholding-tax category exists at all, see docstring
+            frais_xirr_contribution = 0.0  # no distinct fee category exists either, same reasoning
             interest_xirr_contribution = None
             avg_invested_balance = None
             avg_non_invested_balance = None
@@ -518,22 +535,6 @@ def run() -> None:
                         lifetime_gross_interest = sum(t["amount"] for t in all_transactions if t["account_type"] == INTEREST_TYPE)
                         lifetime_net_interest = lifetime_gross_interest  # no withholding tax, see docstring
 
-                        if lifetime_bonus_total:
-                            cashflows_without_bonus = signed_cashflows[:-1] + [(today_date, total_account_value - lifetime_bonus_total)]
-                            xirr_without_bonus = compute_xirr(cashflows_without_bonus)
-                            if xirr_without_bonus is not None:
-                                bonus_xirr_contribution = xirr_value - xirr_without_bonus
-                        else:
-                            bonus_xirr_contribution = 0.0
-
-                        if lifetime_net_interest:
-                            cashflows_without_interest = signed_cashflows[:-1] + [(today_date, total_account_value - lifetime_net_interest)]
-                            xirr_without_interest = compute_xirr(cashflows_without_interest)
-                            if xirr_without_interest is not None:
-                                interest_xirr_contribution = xirr_value - xirr_without_interest
-                        else:
-                            interest_xirr_contribution = 0.0
-
                         if total_invested > 0:
                             avg_idle_cash_month = compute_time_weighted_average(cash_events, month_start_date, today_date)
                             cash_weight = avg_idle_cash_month / (avg_idle_cash_month + total_invested)
@@ -551,11 +552,29 @@ def run() -> None:
                                 lifetime_yield_rate = lifetime_gross_interest / total_invested
                                 cash_drag_lifetime_total = cash_weight_lifetime * lifetime_yield_rate
                                 missed_earnings = cash_drag_lifetime_total * (avg_idle_cash_lifetime + total_invested)
-                                cashflows_with_cash_invested = signed_cashflows[:-1] + [(today_date, total_account_value + missed_earnings)]
-                                xirr_with_cash_invested = compute_xirr(cashflows_with_cash_invested)
-                                if xirr_with_cash_invested is not None:
-                                    cash_drag_xirr_contribution = xirr_value - xirr_with_cash_invested
-                                    log.info("XIRR share - cash drag: %.4f points.", cash_drag_xirr_contribution * 100)
+
+                                # Shapley decomposition (added 2026-09-09,
+                                # see shared/xirr_shapley.py's module
+                                # docstring for why) - Taxes/Frais are
+                                # excluded from the game (both hardcoded
+                                # 0.0, no distinct data source exists for
+                                # either on this platform, see docstring).
+                                factor_deltas = {
+                                    "XIRR Bonus": -lifetime_bonus_total,
+                                    "XIRR Cash drag": missed_earnings,
+                                    "XIRR Intérêts": -lifetime_net_interest,
+                                }
+                                shapley_shares = compute_shapley_xirr_shares(
+                                    signed_cashflows[:-1], today_date, total_account_value, factor_deltas,
+                                    log=log, log_context="Income Marketplace",
+                                )
+                                bonus_xirr_contribution = shapley_shares.get("XIRR Bonus")
+                                cash_drag_xirr_contribution = shapley_shares.get("XIRR Cash drag")
+                                interest_xirr_contribution = shapley_shares.get("XIRR Intérêts")
+                                log.info(
+                                    "XIRR Shapley shares (since-inception, missed earnings ~%.2f EUR): %r",
+                                    missed_earnings, {k: round(v * 100, 4) for k, v in shapley_shares.items() if v is not None},
+                                )
 
             browser.close()
     except Exception:
@@ -582,7 +601,9 @@ def run() -> None:
     if cash_drag_xirr_contribution is not None:
         bonus_breakdown["XIRR Cash drag"] = cash_drag_xirr_contribution
     if taxes_xirr_contribution is not None:
-        bonus_breakdown["XIRR Taxes/Frais"] = taxes_xirr_contribution
+        bonus_breakdown["XIRR Taxes"] = taxes_xirr_contribution
+    if frais_xirr_contribution is not None:
+        bonus_breakdown["XIRR Frais"] = frais_xirr_contribution
     if interest_xirr_contribution is not None:
         bonus_breakdown["XIRR Intérêts"] = interest_xirr_contribution
     if avg_invested_balance is not None:

@@ -93,6 +93,21 @@ independently-measured figure (same category of computation as Bonus, not
 a derived leftover), so the two can be compared/sanity-checked against
 each other on the sheet/dashboard side.
 
+Added 2026-09-09: switched the XIRR Bonus/Cash drag/Intérêts shares from
+isolated counterfactuals (cancel ONE factor, XIRR_real - XIRR_without that
+factor) to a proper Shapley-value decomposition (see
+shared/xirr_shapley.py's module docstring) - the old method left an
+unexplained gap between XIRR and the sum of its "explaining" shares
+because XIRR is non-linear in its cashflows (interaction effects between
+factors were silently dropped). Shapley shares are additive by
+construction: XIRR Bonus + XIRR Cash drag + XIRR Intérêts now sums back to
+XIRR real - XIRR with every factor neutralized (checked at runtime, warns
+if off by more than 0.0001). Also split the old single "XIRR Taxes/Frais"
+share into "XIRR Taxes" and "XIRR Frais" - Iuvo has NEITHER a withholding-
+tax transaction type NOR a distinct platform-fee transaction type at all,
+so BOTH are hardcoded to 0.0, not computed via Shapley (neither is part of
+the game).
+
 UPDATE 2026-09-07 (implemented after all - backward reconstruction,
 supersedes the "NOT IMPLEMENTED" finding below): forward-reconstructing
 `total_invested` (the live `balance_data["total"] - available_funds`
@@ -155,6 +170,7 @@ try:
     from shared.report_date import get_report_now, is_current_month
     from shared.state import load_state, save_state
     from shared.xirr import compute_xirr
+    from shared.xirr_shapley import compute_shapley_xirr_shares
 except ModuleNotFoundError:
     # Support direct execution (python diversification/iuvo_diversification.py)
     # where the project root may not be on sys.path.
@@ -165,6 +181,7 @@ except ModuleNotFoundError:
     from shared.report_date import get_report_now, is_current_month
     from shared.state import load_state, save_state
     from shared.xirr import compute_xirr
+    from shared.xirr_shapley import compute_shapley_xirr_shares
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger("iuvo_diversification")
@@ -582,6 +599,7 @@ def run() -> None:
     cash_drag_value = None
     cash_drag_xirr_contribution = None
     taxes_xirr_contribution = 0.0  # Iuvo has no separate withholding-tax transaction type (see module docstring) - genuinely 0, not a placeholder.
+    frais_xirr_contribution = 0.0  # Iuvo has no distinct platform-fee transaction type either - genuinely 0, not a placeholder.
     # XIRR Intérêts (added 2026-08-18, mirrors bienpreter_diversification.py's/
     # afranga_diversification.py's own XIRR Intérêts blocks): counterfactual
     # XIRR share attributable to real net interest received since inception.
@@ -662,31 +680,12 @@ def run() -> None:
             )
 
             lifetime_bonus_total = sum(s["bonus_cashback_contest"] for s in monthly_summaries_as_of.values())
-            if lifetime_bonus_total:
-                cashflows_without_bonus = signed_cashflows[:-1] + [(today_date, total_account_value - lifetime_bonus_total)]
-                xirr_without_bonus = compute_xirr(cashflows_without_bonus)
-                if xirr_without_bonus is not None:
-                    bonus_xirr_contribution = xirr_value - xirr_without_bonus
-                    log.info("Bonus's own share of XIRR: %.2f points.", bonus_xirr_contribution * 100)
-            else:
-                bonus_xirr_contribution = 0.0
-
-            # XIRR Intérêts (added 2026-08-18): same counterfactual pattern
-            # as XIRR Bonus just above - lifetime net interest = lifetime
-            # gross interest here (no withholding tax on Iuvo at all), summed
-            # across every cached monthly summary.
+            # XIRR Intérêts: lifetime net interest = lifetime gross
+            # interest here (no withholding tax on Iuvo at all), summed
+            # across every cached monthly summary. Actual Shapley call
+            # (added 2026-09-09) happens jointly with Cash drag further
+            # below, once missed_earnings is available.
             lifetime_net_interest = sum(s["gross_interest_received"] for s in monthly_summaries_as_of.values())
-            if lifetime_net_interest:
-                cashflows_without_interest = signed_cashflows[:-1] + [(today_date, total_account_value - lifetime_net_interest)]
-                xirr_without_interest = compute_xirr(cashflows_without_interest)
-                if xirr_without_interest is not None:
-                    interest_xirr_contribution = xirr_value - xirr_without_interest
-                    log.info(
-                        "XIRR share - intérêts: %.4f points (lifetime net interest %.2f EUR, no withholding tax on Iuvo).",
-                        interest_xirr_contribution * 100, lifetime_net_interest,
-                    )
-            else:
-                interest_xirr_contribution = 0.0
 
     if total_invested > 0 and monthly_summaries_as_of:
         current_month_summary = monthly_summaries_as_of.get(today_month_key) or {}
@@ -706,14 +705,28 @@ def run() -> None:
             lifetime_yield_rate = lifetime_interest_total / total_invested
             cash_drag_lifetime_total = cash_weight_lifetime * lifetime_yield_rate
             missed_earnings = cash_drag_lifetime_total * (avg_idle_cash_lifetime + total_invested)
-            cashflows_with_cash_invested = signed_cashflows[:-1] + [(today_date, total_account_value + missed_earnings)]
-            xirr_with_cash_invested = compute_xirr(cashflows_with_cash_invested)
-            if xirr_with_cash_invested is not None:
-                cash_drag_xirr_contribution = xirr_value - xirr_with_cash_invested
-                log.info(
-                    "XIRR share - cash drag: %.4f points (since-inception, avg idle cash %.2f EUR, missed earnings ~%.2f EUR).",
-                    cash_drag_xirr_contribution * 100, avg_idle_cash_lifetime, missed_earnings,
-                )
+
+            # Shapley decomposition (added 2026-09-09, see
+            # shared/xirr_shapley.py's module docstring for why) - Taxes/
+            # Frais excluded from the game (both hardcoded 0.0, Iuvo has
+            # no withholding-tax nor distinct fee transaction type at all,
+            # see module docstring).
+            factor_deltas = {
+                "XIRR Bonus": -lifetime_bonus_total,
+                "XIRR Cash drag": missed_earnings,
+                "XIRR Intérêts": -lifetime_net_interest,
+            }
+            shapley_shares = compute_shapley_xirr_shares(
+                signed_cashflows[:-1], today_date, total_account_value, factor_deltas,
+                log=log, log_context="Iuvo",
+            )
+            bonus_xirr_contribution = shapley_shares.get("XIRR Bonus")
+            cash_drag_xirr_contribution = shapley_shares.get("XIRR Cash drag")
+            interest_xirr_contribution = shapley_shares.get("XIRR Intérêts")
+            log.info(
+                "XIRR Shapley shares (since-inception, avg idle cash %.2f EUR, missed earnings ~%.2f EUR): %r",
+                avg_idle_cash_lifetime, missed_earnings, {k: round(v * 100, 4) for k, v in shapley_shares.items() if v is not None},
+            )
 
     # Real point-in-time invested/non-invested balances (Sheet rows
     # "solde investi"/"solde non investi", rewritten 2026-09-08 - dropped
@@ -763,7 +776,9 @@ def run() -> None:
     if cash_drag_xirr_contribution is not None:
         bonus_breakdown["XIRR Cash drag"] = cash_drag_xirr_contribution
     if xirr_value is not None:
-        bonus_breakdown["XIRR Taxes/Frais"] = taxes_xirr_contribution
+        bonus_breakdown["XIRR Taxes"] = taxes_xirr_contribution
+    if frais_xirr_contribution is not None:
+        bonus_breakdown["XIRR Frais"] = frais_xirr_contribution
     if interest_xirr_contribution is not None:
         bonus_breakdown["XIRR Intérêts"] = interest_xirr_contribution
     if invested_balance is not None:

@@ -88,11 +88,14 @@ requested later.
     stable, per-row unique integer, unlike Afranga's reused transaction_id
     that needed a composite dedup key).
   - Terminal cashflow: today's real `investedFunds + cashAccountBalance`.
-  - Cash drag / XIRR Cash drag / XIRR Bonus / XIRR Taxes/Frais / XIRR
-    Intérêts: same counterfactual-XIRR technique as Afranga (add the
-    lifetime bonus/taxes/interest total back to today's total value,
-    recompute XIRR, contribution = xirr_real - xirr_counterfactual), Cash
-    drag's own avg-idle-cash input computed via the existing generic
+  - Cash drag / XIRR Cash drag / XIRR Bonus / XIRR Taxes / XIRR Frais /
+    XIRR Intérêts: XIRR Bonus/Cash drag/Taxes/Intérêts use a Shapley-value
+    decomposition (see shared/xirr_shapley.py, added 2026-09-09) instead
+    of isolated counterfactuals, so the shares sum back to the real XIRR
+    gap exactly. Nectaro's "TAXATION" transaction type is a genuine
+    withholding tax, kept under "XIRR Taxes"; no distinct fee concept
+    exists on this platform, so "XIRR Frais" is hardcoded 0.0. Cash drag's
+    own avg-idle-cash input computed via the existing generic
     `shared.weighted_average.compute_time_weighted_average()` (a plain
     day-weighted average of a running balance) instead of a bespoke
     per-platform reconstruction function - Nectaro's clean IN/OUT
@@ -137,6 +140,7 @@ from shared.report_date import get_report_date, is_current_month
 from shared.state import load_state, save_state
 from shared.weighted_average import INVESTED_BALANCE_LABEL, NON_INVESTED_BALANCE_LABEL, compute_time_weighted_average
 from shared.xirr import compute_xirr
+from shared.xirr_shapley import compute_shapley_xirr_shares
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger("nectaro_diversification")
@@ -476,6 +480,7 @@ def run() -> None:
     bonus_xirr_contribution = None
     cash_drag_xirr_contribution = None
     taxes_xirr_contribution = None
+    frais_xirr_contribution = 0.0  # Nectaro has no distinct fee data source, see module docstring - genuinely 0, not a placeholder.
     interest_xirr_contribution = None
     avg_invested_balance = None
     avg_non_invested_balance = None
@@ -539,29 +544,29 @@ def run() -> None:
                 lifetime_gross_interest = sum(t["amount"] for t in all_transactions if t.get("type") == "INTEREST")
                 lifetime_net_interest = lifetime_gross_interest - lifetime_withholding_tax
 
-                if lifetime_bonus_total:
-                    cashflows_without_bonus = signed_cashflows[:-1] + [(today_date, total_account_value - lifetime_bonus_total)]
-                    xirr_without_bonus = compute_xirr(cashflows_without_bonus)
-                    if xirr_without_bonus is not None:
-                        bonus_xirr_contribution = xirr_value - xirr_without_bonus
-                else:
-                    bonus_xirr_contribution = 0.0
-
-                if lifetime_withholding_tax:
-                    cashflows_with_taxes_cancelled = signed_cashflows[:-1] + [(today_date, total_account_value + lifetime_withholding_tax)]
-                    xirr_with_taxes_cancelled = compute_xirr(cashflows_with_taxes_cancelled)
-                    if xirr_with_taxes_cancelled is not None:
-                        taxes_xirr_contribution = xirr_value - xirr_with_taxes_cancelled
-                else:
-                    taxes_xirr_contribution = 0.0
-
-                if lifetime_net_interest:
-                    cashflows_without_interest = signed_cashflows[:-1] + [(today_date, total_account_value - lifetime_net_interest)]
-                    xirr_without_interest = compute_xirr(cashflows_without_interest)
-                    if xirr_without_interest is not None:
-                        interest_xirr_contribution = xirr_value - xirr_without_interest
-                else:
-                    interest_xirr_contribution = 0.0
+                # Shapley decomposition (added 2026-09-09, see
+                # shared/xirr_shapley.py's module docstring) - Nectaro has
+                # a genuine "TAXATION" transaction type, a real
+                # withholding tax kept under "XIRR Taxes"; no distinct fee
+                # concept exists, so "XIRR Frais" is hardcoded 0.0
+                # (fixed further below, not part of the game). This
+                # 3-factor call (no Cash drag) is a fallback used when
+                # `total_invested`/`missed_earnings` aren't computable
+                # (e.g. no invested funds) - overridden by the full
+                # 4-factor joint call below whenever Cash drag CAN be
+                # computed.
+                factor_deltas = {
+                    "XIRR Bonus": -lifetime_bonus_total,
+                    "XIRR Taxes": lifetime_withholding_tax,
+                    "XIRR Intérêts": -lifetime_net_interest,
+                }
+                shapley_shares = compute_shapley_xirr_shares(
+                    signed_cashflows[:-1], today_date, total_account_value, factor_deltas,
+                    log=log, log_context="Nectaro (no cash drag)",
+                )
+                bonus_xirr_contribution = shapley_shares.get("XIRR Bonus")
+                taxes_xirr_contribution = shapley_shares.get("XIRR Taxes")
+                interest_xirr_contribution = shapley_shares.get("XIRR Intérêts")
 
                 if total_invested > 0:
                     avg_idle_cash_month = compute_time_weighted_average(cash_events, month_start_date, today_date)
@@ -580,11 +585,25 @@ def run() -> None:
                         lifetime_yield_rate = lifetime_gross_interest / total_invested
                         cash_drag_lifetime_total = cash_weight_lifetime * lifetime_yield_rate
                         missed_earnings = cash_drag_lifetime_total * (avg_idle_cash_lifetime + total_invested)
-                        cashflows_with_cash_invested = signed_cashflows[:-1] + [(today_date, total_account_value + missed_earnings)]
-                        xirr_with_cash_invested = compute_xirr(cashflows_with_cash_invested)
-                        if xirr_with_cash_invested is not None:
-                            cash_drag_xirr_contribution = xirr_value - xirr_with_cash_invested
-                            log.info("XIRR share - cash drag: %.4f points.", cash_drag_xirr_contribution * 100)
+
+                        factor_deltas = {
+                            "XIRR Bonus": -lifetime_bonus_total,
+                            "XIRR Cash drag": missed_earnings,
+                            "XIRR Taxes": lifetime_withholding_tax,
+                            "XIRR Intérêts": -lifetime_net_interest,
+                        }
+                        shapley_shares = compute_shapley_xirr_shares(
+                            signed_cashflows[:-1], today_date, total_account_value, factor_deltas,
+                            log=log, log_context="Nectaro",
+                        )
+                        bonus_xirr_contribution = shapley_shares.get("XIRR Bonus")
+                        cash_drag_xirr_contribution = shapley_shares.get("XIRR Cash drag")
+                        taxes_xirr_contribution = shapley_shares.get("XIRR Taxes")
+                        interest_xirr_contribution = shapley_shares.get("XIRR Intérêts")
+                        log.info(
+                            "XIRR Shapley shares (since-inception, missed earnings ~%.2f EUR): %r",
+                            missed_earnings, {k: round(v * 100, 4) for k, v in shapley_shares.items() if v is not None},
+                        )
 
     fill_current_month_amounts(
         platform="Nectaro",
@@ -606,7 +625,9 @@ def run() -> None:
     if cash_drag_xirr_contribution is not None:
         bonus_breakdown["XIRR Cash drag"] = cash_drag_xirr_contribution
     if taxes_xirr_contribution is not None:
-        bonus_breakdown["XIRR Taxes/Frais"] = taxes_xirr_contribution
+        bonus_breakdown["XIRR Taxes"] = taxes_xirr_contribution
+    if frais_xirr_contribution is not None:
+        bonus_breakdown["XIRR Frais"] = frais_xirr_contribution
     if interest_xirr_contribution is not None:
         bonus_breakdown["XIRR Intérêts"] = interest_xirr_contribution
     if avg_invested_balance is not None:

@@ -157,6 +157,23 @@ with BRICKS_EMAIL/PASSWORD) while opening the "Mon solde" ("wallet") page:
     today, it's used as a genuine historical total instead of Bricks'
     previous skip_total=True lock for any non-current month.
 
+Added 2026-09-09: switched the XIRR Bonus/Cash drag/Taxes/Intérêts shares
+from isolated counterfactuals (cancel ONE factor, XIRR_real - XIRR_without
+that factor) to a proper Shapley-value decomposition (see
+shared/xirr_shapley.py's module docstring) - the old method left an
+unexplained gap between XIRR and the sum of its "explaining" shares
+because XIRR is non-linear in its cashflows (interaction effects between
+factors were silently dropped). Shapley shares are additive by
+construction: XIRR Bonus + XIRR Cash drag + XIRR Taxes + XIRR Frais + XIRR
+Intérêts now sums back to XIRR real - XIRR with every factor neutralized
+(checked at runtime, warns if off by more than 0.0001). Also split the old
+single "XIRR Taxes/Frais" share into "XIRR Taxes" (withholding tax) and
+"XIRR Frais" - Bricks has no platform-fee concept distinct from
+withholding tax (no separate fee `kind` was ever found in the wallet
+ledger), so "XIRR Frais" is hardcoded to 0.0, not computed via Shapley.
+Note "XIRR Cash drag" here is the LIFETIME (since-inception) share,
+distinct from the plain monthly "Cash drag" row above, which is unchanged.
+
 Required env vars:
     BRICKS_EMAIL, BRICKS_PASSWORD       -> Bricks account credentials
 Optional:
@@ -206,6 +223,7 @@ except ModuleNotFoundError:
 from shared.state import load_state, save_state
 from shared.weighted_average import INVESTED_BALANCE_LABEL, NON_INVESTED_BALANCE_LABEL, compute_time_weighted_average
 from shared.xirr import compute_xirr
+from shared.xirr_shapley import compute_shapley_xirr_shares
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger("bricks_diversification")
@@ -623,7 +641,7 @@ def _build_since_inception_cashflows_as_of(all_entries: list, end_date) -> list:
 
 def compute_xirr_block_as_of(all_entries: list, end_date) -> dict:
     """Compute the FULL XIRR pie-chart block (XIRR, Cash drag, XIRR Bonus,
-    XIRR Cash drag, XIRR Taxes/Frais, XIRR Intérêts) as of an arbitrary
+    XIRR Cash drag, XIRR Taxes, XIRR Frais, XIRR Intérêts) as of an arbitrary
     `end_date` - works identically for the current month or a BACKFILLED
     (past) one, since Bricks' single wallet-transactions ledger can
     reconstruct the terminal account value (outstanding + wallet balance)
@@ -632,12 +650,13 @@ def compute_xirr_block_as_of(all_entries: list, end_date) -> dict:
     afranga_diversification.compute_xirr_block_as_of() /
     loanch_diversification.compute_xirr_block_as_of()'s methodology
     exactly: Cash drag is a MONTHLY figure (this month alone), everything
-    else is a since-inception counterfactual XIRR share through end_date.
+    else is a Shapley decomposition (see shared/xirr_shapley.py) of the
+    since-inception XIRR gap through end_date.
 
     Returns a dict with any subset of {"XIRR", "Cash drag", "XIRR Bonus",
-    "XIRR Cash drag", "XIRR Taxes/Frais", "XIRR Intérêts"} that could
-    actually be computed - a missing key means "couldn't be computed", same
-    soft-fail convention as everywhere else in this module.
+    "XIRR Cash drag", "XIRR Taxes", "XIRR Frais", "XIRR Intérêts"} that
+    could actually be computed - a missing key means "couldn't be
+    computed", same soft-fail convention as everywhere else in this module.
     """
     result: dict = {}
 
@@ -680,13 +699,6 @@ def compute_xirr_block_as_of(all_entries: list, end_date) -> dict:
     since_inception_str = since_inception_date.strftime("%Y-%m-%d")
 
     lifetime_bonus = _lifetime_sum_as_of(all_entries, _BONUS_KINDS, end_date)
-    if lifetime_bonus:
-        xirr_without_bonus = compute_xirr(base_cashflows + [(end_date, total_value_as_of - lifetime_bonus)])
-        if xirr_without_bonus is not None:
-            result["XIRR Bonus"] = xirr_value - xirr_without_bonus
-            log.info("XIRR share - bonus as of %s: %.2f points.", end_date, result["XIRR Bonus"] * 100)
-    else:
-        result["XIRR Bonus"] = 0.0
 
     avg_idle_cash_lifetime = compute_average_idle_cash(all_entries, since_inception_str, end_date_str)
     cash_weight_lifetime = avg_idle_cash_lifetime / (avg_idle_cash_lifetime + outstanding_as_of)
@@ -694,37 +706,45 @@ def compute_xirr_block_as_of(all_entries: list, end_date) -> dict:
     lifetime_yield_rate = lifetime_gross_interest / outstanding_as_of
     cash_drag_lifetime_total = cash_weight_lifetime * lifetime_yield_rate
     missed_earnings = cash_drag_lifetime_total * (avg_idle_cash_lifetime + outstanding_as_of)
-    xirr_with_cash_invested = compute_xirr(base_cashflows + [(end_date, total_value_as_of + missed_earnings)])
-    if xirr_with_cash_invested is not None:
-        result["XIRR Cash drag"] = xirr_value - xirr_with_cash_invested
-        log.info(
-            "XIRR share - cash drag as of %s: %.4f points (since-inception, missed earnings ~%.2f EUR).",
-            end_date, result["XIRR Cash drag"] * 100, missed_earnings,
-        )
 
     # withholding_tax's own `value` is already negative (see module
     # docstring) - flip it here to a positive "amount withheld" figure,
     # same sign convention as Afranga's withholding_tax.
     lifetime_withholding_tax = -_lifetime_sum_as_of(all_entries, {_TAX_KIND}, end_date)
-    if lifetime_withholding_tax:
-        xirr_with_taxes_cancelled = compute_xirr(base_cashflows + [(end_date, total_value_as_of + lifetime_withholding_tax)])
-        if xirr_with_taxes_cancelled is not None:
-            result["XIRR Taxes/Frais"] = xirr_value - xirr_with_taxes_cancelled
-            log.info("XIRR share - taxes/frais as of %s: %.4f points (lifetime withholding tax %.2f EUR).", end_date, result["XIRR Taxes/Frais"] * 100, lifetime_withholding_tax)
-    else:
-        result["XIRR Taxes/Frais"] = 0.0
-
     lifetime_net_interest = lifetime_gross_interest - lifetime_withholding_tax
-    if lifetime_net_interest:
-        xirr_without_interest = compute_xirr(base_cashflows + [(end_date, total_value_as_of - lifetime_net_interest)])
-        if xirr_without_interest is not None:
-            result["XIRR Intérêts"] = xirr_value - xirr_without_interest
-            log.info(
-                "XIRR share - intérêts as of %s: %.4f points (lifetime net interest %.2f EUR = %.2f gross - %.2f taxes).",
-                end_date, result["XIRR Intérêts"] * 100, lifetime_net_interest, lifetime_gross_interest, lifetime_withholding_tax,
-            )
-    else:
-        result["XIRR Intérêts"] = 0.0
+
+    # Shapley decomposition (added 2026-09-09, see shared/xirr_shapley.py's
+    # module docstring for why): each factor's neutralizing delta below is
+    # EXACTLY the same value the old isolated-contribution code used to
+    # add/subtract from total_value_as_of one at a time - only the way the
+    # factors are COMBINED changed (all 2**4=16 subsets evaluated jointly,
+    # not one factor cancelled in isolation), so the resulting shares are
+    # guaranteed to sum back to XIRR real - XIRR with every factor
+    # neutralized (efficiency property, checked at runtime by
+    # compute_shapley_xirr_shares' own warning log). Bricks has no
+    # platform-fee concept distinct from withholding tax (no separate
+    # "frais" wallet-transaction kind was ever found - see module
+    # docstring's `_TAX_KIND` classification) - "XIRR Frais" is hardcoded
+    # to 0.0 rather than duplicating/inventing a value, and is NOT part of
+    # the Shapley game.
+    factor_deltas = {
+        "XIRR Bonus": -lifetime_bonus,
+        "XIRR Cash drag": missed_earnings,
+        "XIRR Taxes": lifetime_withholding_tax,
+        "XIRR Intérêts": -lifetime_net_interest,
+    }
+    shapley_shares = compute_shapley_xirr_shares(
+        base_cashflows, end_date, total_value_as_of, factor_deltas,
+        log=log, log_context=f"Bricks as of {end_date}",
+    )
+    for name, value in shapley_shares.items():
+        if value is not None:
+            result[name] = value
+    result["XIRR Frais"] = 0.0
+    log.info(
+        "XIRR Shapley shares as of %s (since-inception, missed earnings ~%.2f EUR): %r",
+        end_date, missed_earnings, {k: round(v * 100, 4) for k, v in shapley_shares.items() if v is not None},
+    )
 
     return result
 
@@ -876,11 +896,17 @@ def run() -> None:
     # interest, same convention as Afranga/Bienprêter/Mintos's equivalent row
     # - previously missing here, silently leaving that row blank for Bricks.
     # "Cash drag"/"XIRR"/"XIRR Intérêts"/"XIRR Bonus"/"XIRR Cash drag"/
-    # "XIRR Taxes/Frais" rows already exist in the live Sheet (rows already
-    # pre-added below Bricks' own row) - the search below the platform's
-    # row is bounded dynamically (stops at the next platform's own row), no
-    # hardcoded `max_rows` needed - only included when actually computed
-    # (soft-fail, same convention as everywhere else).
+    # "XIRR Taxes"/"XIRR Frais" rows (since 2026-09-09, replacing the old
+    # single "XIRR Taxes/Frais" row - "XIRR Taxes" still substring-matches
+    # an existing "XIRR Taxes/Frais" cell, see shared/google_sheet.py's
+    # find_rows_by_texts_below; "XIRR Frais" needs its own new row to be
+    # written anywhere - Bricks has no platform-fee concept distinct from
+    # withholding tax, so it's always hardcoded 0.0, no row needed) already
+    # exist in the live Sheet (rows already pre-added below Bricks' own
+    # row) - the search below the platform's row is bounded dynamically
+    # (stops at the next platform's own row), no hardcoded `max_rows`
+    # needed - only included when actually computed (soft-fail, same
+    # convention as everywhere else).
     breakdown = {
         "parrainages": revenue_totals["referrals"],
         "soldes boost\u00e9s": revenue_totals["boosted_balance_gain"],
