@@ -960,102 +960,108 @@ def run() -> None:
     session, investor_id, balance = login_and_fetch_balance()
     log.info("Account balance: %s", f"{balance:.2f} €" if balance is not None else "unavailable")
 
-    # Read selected lenders once - reused by both the real auto-invest step
-    # below and the one-time-ever invest-exploration capture further down.
-    try:
-        selected_lender_names = get_selected_lendermarket_lenders()
-    except Exception:
-        log.exception("Could not read selected Lendermarket lenders from the Google Sheet.")
-        selected_lender_names = []
-
-    # minInterestRate + per-country cap, read from the Sheet once at
-    # startup (added 2026-07-31, same convention/cell layout as
-    # PeerBerry's own MIN_INTEREST_RATE/country allocations) - both are
-    # soft-fail: a read error just falls back to the module default /
-    # disables country blocking for this run, rather than aborting.
-    min_interest_rate = MIN_INTEREST_RATE
-    try:
-        min_interest_rate = get_lendermarket_min_interest_rate()
-    except Exception:
-        log.exception("Could not read the Lendermarket minInterestRate from the Google Sheet, falling back to the default (%s).", MIN_INTEREST_RATE)
-
-    country_allocations = None
-    try:
-        country_allocations = get_lendermarket_country_allocations()
-    except Exception:
-        log.exception("Could not read the Lendermarket per-country allocations from the Google Sheet, country blocking is disabled this run.")
-
-    # Per-lender cap (added 2026-08-05, in ADDITION to the per-country cap
-    # above) - same soft-fail convention: a read error just disables this
-    # cap for the run rather than aborting it.
-    originator_caps = None
-    try:
-        originator_caps = get_lendermarket_originator_caps()
-    except Exception:
-        log.exception("Could not read the Lendermarket per-lender caps from the Google Sheet, per-lender cap blocking is disabled this run.")
-
-    if originator_caps:
-        configured_caps = {name: data.get("max_percentage") for name, data in originator_caps.items() if data.get("max_percentage") is not None}
-        if configured_caps:
-            log.info("Plafonds par lender configurés (%% du budget total) : %s", configured_caps)
-        else:
-            log.info("Aucun plafond par lender configuré - blocage par lender désactivé pour ce run.")
-
     # Real auto-invest (added 2026-07-24, per explicit user request) - runs
     # BEFORE the segment-availability monitor below (invest first, monitor/
     # notify after), so a matching loan gets a real investment attempt as
     # soon as possible each run instead of after the informational checks.
     # See invest_selected_lenders()'s docstring for the exact budget-
-    # splitting rules. The bot stops itself (skips entirely) as soon as the
-    # balance is < MIN_INVESTMENT_AMOUNT (10 EUR by default) - explicit
-    # user request 2026-07-24, nothing left to invest below that. The
-    # summary email is only sent if something actually happened this run
-    # (an investment was attempted, or an unexpected error occurred) - NOT
-    # on every run - so this frequent scheduled monitor doesn't spam an
-    # email every cycle.
+    # splitting rules. The bot stops itself as soon as the balance is <
+    # MIN_INVESTMENT_AMOUNT (10 EUR by default) - explicit user request
+    # 2026-07-24, nothing left to invest below that. FIXED 2026-09-09 (real
+    # GitHub Actions log showed a 0.01 EUR run still doing the Sheet reads
+    # for selected lenders/minInterestRate/country+lender caps below before
+    # this check): the low-balance stop now happens BEFORE any of those
+    # Google Sheet reads, not just before the actual invest call, so a
+    # low-balance run skips them entirely instead of reading the Sheet for
+    # nothing. The summary email is only sent if something actually
+    # happened this run (an investment was attempted, or an unexpected
+    # error occurred) - NOT on every run - so this frequent scheduled
+    # monitor doesn't spam an email every cycle.
     if session is None or balance is None:
         log.info("Skipping auto-invest: no authenticated session/balance available this run.")
     elif balance < MIN_INVESTMENT_AMOUNT:
         log.info("Auto-invest bot stopping: balance (%.2f EUR) is below the minimum investment amount (%.2f EUR), nothing to invest.", balance, MIN_INVESTMENT_AMOUNT)
-    elif not selected_lender_names:
-        log.info("Skipping auto-invest: no Lendermarket lender selected in the Google Sheet.")
     else:
-        invest_error = None
+        # Read selected lenders once - reused only by the real auto-invest
+        # step below.
         try:
-            invest_stats = invest_selected_lenders(
-                session, balance, selected_lender_names,
-                min_interest_rate=min_interest_rate,
-                country_allocations=country_allocations,
-                originator_caps=originator_caps,
-            )
-        except Exception as exc:
-            invest_error = str(exc)
-            invest_stats = {"balance_before": balance, "balance_after": balance, "invest_attempts": 0}
-            _log_invest_diagnostics("run_error", error=invest_error, traceback=traceback.format_exc())
-            log.exception("Unexpected error during the Lendermarket auto-invest step.")
+            selected_lender_names = get_selected_lendermarket_lenders()
+        except Exception:
+            log.exception("Could not read selected Lendermarket lenders from the Google Sheet.")
+            selected_lender_names = []
 
-        # The bot runs BEFORE the loan-availability recap below - re-fetch
-        # the real balance from the server now (instead of reusing the
-        # pre-invest value, or invest_selected_lenders()'s own computed
-        # balance_after estimate) so the recap/notification email further
-        # down reflects the account's state AFTER this run's investments,
-        # per explicit user request.
-        refreshed_balance = fetch_account_balance(session, investor_id)
-        if refreshed_balance is not None:
-            balance = refreshed_balance
+        if not selected_lender_names:
+            log.info("Skipping auto-invest: no Lendermarket lender selected in the Google Sheet.")
         else:
-            log.warning("Could not refresh the Lendermarket balance after auto-invest, falling back to the estimated post-invest balance for the recap.")
-            balance = invest_stats.get("balance_after", balance)
+            # minInterestRate + per-country cap, read from the Sheet once at
+            # startup (added 2026-07-31, same convention/cell layout as
+            # PeerBerry's own MIN_INTEREST_RATE/country allocations) - both are
+            # soft-fail: a read error just falls back to the module default /
+            # disables country blocking for this run, rather than aborting.
+            min_interest_rate = MIN_INTEREST_RATE
+            try:
+                min_interest_rate = get_lendermarket_min_interest_rate()
+            except Exception:
+                log.exception("Could not read the Lendermarket minInterestRate from the Google Sheet, falling back to the default (%s).", MIN_INTEREST_RATE)
 
-        if invest_stats.get("invest_attempts", 0) > 0 or invest_error:
-            log.info("Auto-invest run finished: %s", invest_stats)
-            send_lendermarket_invest_summary_email(
-                invest_stats,
-                error=invest_error,
-                diagnostics_text=_collect_run_invest_diagnostics(run_started_at),
-            )
-        else:
-            log.info("Auto-invest: no fundable loan found this run for the selected lenders.")
+            country_allocations = None
+            try:
+                country_allocations = get_lendermarket_country_allocations()
+            except Exception:
+                log.exception("Could not read the Lendermarket per-country allocations from the Google Sheet, country blocking is disabled this run.")
+
+            # Per-lender cap (added 2026-08-05, in ADDITION to the per-country cap
+            # above) - same soft-fail convention: a read error just disables this
+            # cap for the run rather than aborting it.
+            originator_caps = None
+            try:
+                originator_caps = get_lendermarket_originator_caps()
+            except Exception:
+                log.exception("Could not read the Lendermarket per-lender caps from the Google Sheet, per-lender cap blocking is disabled this run.")
+
+            if originator_caps:
+                configured_caps = {name: data.get("max_percentage") for name, data in originator_caps.items() if data.get("max_percentage") is not None}
+                if configured_caps:
+                    log.info("Plafonds par lender configurés (%% du budget total) : %s", configured_caps)
+                else:
+                    log.info("Aucun plafond par lender configuré - blocage par lender désactivé pour ce run.")
+
+            invest_error = None
+            try:
+                invest_stats = invest_selected_lenders(
+                    session, balance, selected_lender_names,
+                    min_interest_rate=min_interest_rate,
+                    country_allocations=country_allocations,
+                    originator_caps=originator_caps,
+                )
+            except Exception as exc:
+                invest_error = str(exc)
+                invest_stats = {"balance_before": balance, "balance_after": balance, "invest_attempts": 0}
+                _log_invest_diagnostics("run_error", error=invest_error, traceback=traceback.format_exc())
+                log.exception("Unexpected error during the Lendermarket auto-invest step.")
+
+            # The bot runs BEFORE the loan-availability recap below - re-fetch
+            # the real balance from the server now (instead of reusing the
+            # pre-invest value, or invest_selected_lenders()'s own computed
+            # balance_after estimate) so the recap/notification email further
+            # down reflects the account's state AFTER this run's investments,
+            # per explicit user request.
+            refreshed_balance = fetch_account_balance(session, investor_id)
+            if refreshed_balance is not None:
+                balance = refreshed_balance
+            else:
+                log.warning("Could not refresh the Lendermarket balance after auto-invest, falling back to the estimated post-invest balance for the recap.")
+                balance = invest_stats.get("balance_after", balance)
+
+            if invest_stats.get("invest_attempts", 0) > 0 or invest_error:
+                log.info("Auto-invest run finished: %s", invest_stats)
+                send_lendermarket_invest_summary_email(
+                    invest_stats,
+                    error=invest_error,
+                    diagnostics_text=_collect_run_invest_diagnostics(run_started_at),
+                )
+            else:
+                log.info("Auto-invest: no fundable loan found this run for the selected lenders.")
 
     # Same cron-job.org speed-up/slow-down as Swaper (see cron_schedule.py):
     # poll faster while there's money to invest. Skipped when the balance

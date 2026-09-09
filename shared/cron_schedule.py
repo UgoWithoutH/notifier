@@ -78,6 +78,24 @@ def _build_jittered_minutes(mode: str) -> list:
     return minutes
 
 
+def _fetch_current_schedule(cron_job_id: str) -> list | None:
+    """Best-effort GET of the job's CURRENT minutes list, purely so
+    `ensure_schedule()` can log old-vs-new - returns None (never raises) on
+    a missing API key/job id or any request/parsing failure."""
+    if not CRON_JOB_API_KEY or not cron_job_id:
+        return None
+
+    endpoint = f"https://api.cron-job.org/jobs/{cron_job_id}"
+    req = request.Request(endpoint, method="GET", headers={"Authorization": f"Bearer {CRON_JOB_API_KEY}"})
+    try:
+        with request.urlopen(req, timeout=20) as resp:
+            body = json.loads(resp.read().decode("utf-8"))
+            return body["jobDetails"]["schedule"]["minutes"]
+    except Exception:
+        log.warning("Could not fetch the current cron-job.org schedule (for logging only).", exc_info=True)
+        return None
+
+
 def _patch_schedule(cron_job_id: str, minutes: list) -> bool:
     if not CRON_JOB_API_KEY or not cron_job_id:
         log.info("CRON_JOB_API_KEY or cron job id missing, skipping cron-job.org update.")
@@ -125,15 +143,20 @@ def ensure_schedule(mode: str, cron_job_id: str, state_file: Path) -> None:
 
     state = load_state(state_file, DEFAULT_STATE)
 
+    old_minutes = _fetch_current_schedule(cron_job_id)
+    if old_minutes is None:
+        old_minutes = state.get("cron_schedule_minutes")
+    log.info("Cron timer BEFORE update: minutes=%s (last known mode=%s).", old_minutes, state.get("cron_schedule_mode"))
+
     new_minutes = _build_jittered_minutes(mode)
     log.info("Cron decision: updating to mode=%s (new minutes=%s).", mode, new_minutes)
     if _patch_schedule(cron_job_id, new_minutes):
         state["cron_schedule_mode"] = mode
         state["cron_schedule_minutes"] = new_minutes
         save_state(state_file, state)
-        log.info("Cron decision: UPDATE success (new_mode=%s).", mode)
+        log.info("Cron timer AFTER update: minutes=%s (mode=%s) - was minutes=%s.", new_minutes, mode, old_minutes)
     else:
-        log.warning("Cron decision: UPDATE failed (target_mode=%s).", mode)
+        log.warning("Cron decision: UPDATE failed (target_mode=%s, timer unchanged: minutes=%s).", mode, old_minutes)
 
 
 
