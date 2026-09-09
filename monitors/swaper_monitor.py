@@ -29,11 +29,15 @@ Optional:
                                                kept short since Swaper's manual
                                                loan inventory is extremely
                                                transient (grabbed within seconds)
-    SWAPER_CRON_JOB_ID                     -> cron-job.org job id, disabled
+    SWAPER_CRON_JOB_ID                     -> cron-job.org job id: disabled
                                                for the duration of the invest
                                                loop (see shared/cron_schedule.py's
                                                set_job_enabled()) and re-enabled
-                                               once the loop stops
+                                               once the loop stops; also used
+                                               (re-enabled 2026-09-09) to speed
+                                               up/slow down the external
+                                               trigger's own schedule based on
+                                               balance (see ensure_schedule())
 
 REAL auto-invest bot (added 2026-07-25, explicit user decision - real money,
 no more click-and-abort safety net): Swaper's manual loan inventory is
@@ -1500,10 +1504,14 @@ def run(headless: bool = True) -> None:
         log.info("FORCE_TEST_EMAIL is set - sending a forced test recap email.")
         send_swaper_email(balance, loans)
 
-    # if balance < 10:
-    #     ensure_schedule("30m", cron_job_id=SWAPER_CRON_JOB_ID, state_file=CRON_SCHEDULE_STATE_FILE)
-    # else:
-    #     ensure_schedule("2m", cron_job_id=SWAPER_CRON_JOB_ID, state_file=CRON_SCHEDULE_STATE_FILE)
+    # Cron-job.org schedule speed-up/slow-down (re-enabled 2026-09-09, see
+    # shared/cron_schedule.py's own docstring for the live-check-then-cache
+    # fallback + randomized-jitter details) - poll faster while there's
+    # money to invest.
+    if balance < 10:
+        ensure_schedule("30m", cron_job_id=SWAPER_CRON_JOB_ID, state_file=CRON_SCHEDULE_STATE_FILE)
+    else:
+        ensure_schedule("2m", cron_job_id=SWAPER_CRON_JOB_ID, state_file=CRON_SCHEDULE_STATE_FILE)
 
     # Same rule for both monitors (see notification_gate.py): only really
     # "available" when there's money to invest AND at least one loan listed.
