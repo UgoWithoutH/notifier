@@ -239,6 +239,21 @@ bond-classification heuristic (`"obligat" in details`) that motivated the
 original exclusion was itself already verified accurate against the real
 ledger, so there was no remaining reason to exclude bonds' real value.
 
+Added 2026-09-09: switched the XIRR Bonus/Cash drag/Taxes/Intérêts shares
+from isolated counterfactuals (cancel ONE factor, XIRR_real - XIRR_without
+that factor) to a proper Shapley-value decomposition (see
+shared/xirr_shapley.py's module docstring) - the old method left an
+unexplained gap between XIRR and the sum of its "explaining" shares
+because XIRR is non-linear in its cashflows (interaction effects between
+factors were silently dropped). Shapley shares are additive by
+construction: XIRR Bonus + XIRR Cash drag + XIRR Taxes + XIRR Frais + XIRR
+Intérêts now sums back to XIRR real - XIRR with every factor neutralized
+(checked at runtime, warns if off by more than 0.0001). Also split the old
+single "XIRR Taxes/Frais" share into "XIRR Taxes" (the real, genuine 5%
+withholding tax) and "XIRR Frais" - Mintos has no distinct platform-fee
+concept beyond that withholding tax, so "XIRR Frais" is hardcoded to 0.0,
+not computed via Shapley.
+
 
 run() accepts an optional pre-built `requests.Session` (see
 mintos_get_session.py) for a one-shot "log in by hand, then let this take
@@ -274,6 +289,7 @@ from shared.report_date import get_report_date, is_current_month
 from shared.state import load_state, save_state
 from shared.weighted_average import INVESTED_BALANCE_LABEL, NON_INVESTED_BALANCE_LABEL, compute_time_weighted_average
 from shared.xirr import compute_xirr
+from shared.xirr_shapley import compute_shapley_xirr_shares
 
 load_dotenv()
 
@@ -873,15 +889,17 @@ def _build_deposit_withdrawal_cashflows_as_of(entries: list, end_date: date) -> 
 
 def compute_xirr_block_as_of(session: requests.Session, all_entries: list, end_date: date) -> dict:
     """Compute the FULL XIRR pie-chart block (XIRR, Cash drag, XIRR Bonus,
-    XIRR Cash drag, XIRR Taxes/Frais, XIRR Intérêts) for a BACKFILLED
+    XIRR Cash drag, XIRR Taxes, XIRR Frais, XIRR Intérêts) for a BACKFILLED
     (non-current) month, as of that month's own `end_date` - the
     historical equivalent of run()'s live-today block, mirroring
     afranga_diversification.compute_xirr_block_as_of(). "Cash drag" stays a
-    MONTHLY figure (this backfilled month alone); everything else is
-    since-inception through end_date. Returns a dict with any subset of
-    {"XIRR", "Cash drag", "XIRR Bonus", "XIRR Cash drag", "XIRR
-    Taxes/Frais", "XIRR Intérêts"} that could actually be computed (soft-
-    fail - a missing key means the existing Sheet cell is left untouched).
+    MONTHLY figure (this backfilled month alone); everything else is a
+    Shapley decomposition (see shared/xirr_shapley.py) of the
+    since-inception XIRR gap through end_date. Returns a dict with any
+    subset of {"XIRR", "Cash drag", "XIRR Bonus", "XIRR Cash drag", "XIRR
+    Taxes", "XIRR Frais", "XIRR Intérêts"} that could actually be computed
+    (soft-fail - a missing key means the existing Sheet cell is left
+    untouched).
     """
     result: dict = {}
 
@@ -903,14 +921,13 @@ def compute_xirr_block_as_of(session: requests.Session, all_entries: list, end_d
         end_date, xirr_value * 100, outstanding_as_of, wallet_balance_as_of,
     )
 
-    if lifetime_bonus_as_of:
-        xirr_without_bonus = compute_xirr(base_cashflows + [(end_date, total_value_as_of - lifetime_bonus_as_of)])
-        if xirr_without_bonus is not None:
-            result["XIRR Bonus"] = xirr_value - xirr_without_bonus
-    else:
-        result["XIRR Bonus"] = 0.0
-
     if outstanding_as_of <= 0 or since_inception_date is None:
+        if lifetime_bonus_as_of:
+            xirr_without_bonus = compute_xirr(base_cashflows + [(end_date, total_value_as_of - lifetime_bonus_as_of)])
+            if xirr_without_bonus is not None:
+                result["XIRR Bonus"] = xirr_value - xirr_without_bonus
+        else:
+            result["XIRR Bonus"] = 0.0
         return result
 
     month_start_date = end_date.replace(day=1)
@@ -931,6 +948,12 @@ def compute_xirr_block_as_of(session: requests.Session, all_entries: list, end_d
         lifetime_statement_totals = fetch_statement_totals(session, since_inception_date, end_date)
     except Exception:
         log.exception("Failed to fetch since-inception statement totals as of %s - XIRR Cash drag/Taxes/Intérêts will not be updated.", end_date)
+        if lifetime_bonus_as_of:
+            xirr_without_bonus = compute_xirr(base_cashflows + [(end_date, total_value_as_of - lifetime_bonus_as_of)])
+            if xirr_without_bonus is not None:
+                result["XIRR Bonus"] = xirr_value - xirr_without_bonus
+        else:
+            result["XIRR Bonus"] = 0.0
         return result
 
     avg_idle_cash_lifetime = compute_average_idle_cash(all_entries, since_inception_date.strftime("%Y-%m-%d"), end_date.strftime("%Y-%m-%d"))
@@ -938,26 +961,40 @@ def compute_xirr_block_as_of(session: requests.Session, all_entries: list, end_d
     lifetime_yield_rate = lifetime_statement_totals["gross_interest_received"] / outstanding_as_of
     cash_drag_lifetime_total = cash_weight_lifetime * lifetime_yield_rate
     missed_earnings = cash_drag_lifetime_total * (avg_idle_cash_lifetime + outstanding_as_of)
-    xirr_with_cash_invested = compute_xirr(base_cashflows + [(end_date, total_value_as_of + missed_earnings)])
-    if xirr_with_cash_invested is not None:
-        result["XIRR Cash drag"] = xirr_value - xirr_with_cash_invested
-        log.info("XIRR share - cash drag as of %s: %.4f points.", end_date, result["XIRR Cash drag"] * 100)
 
     lifetime_withholding_tax = lifetime_statement_totals["withholding_tax"]
-    if lifetime_withholding_tax:
-        xirr_with_tax_added_back = compute_xirr(base_cashflows + [(end_date, total_value_as_of + lifetime_withholding_tax)])
-        if xirr_with_tax_added_back is not None:
-            result["XIRR Taxes/Frais"] = xirr_value - xirr_with_tax_added_back
-    else:
-        result["XIRR Taxes/Frais"] = 0.0
-
     lifetime_net_interest = lifetime_statement_totals["gross_interest_received"] - lifetime_withholding_tax
-    if lifetime_net_interest:
-        xirr_without_interest = compute_xirr(base_cashflows + [(end_date, total_value_as_of - lifetime_net_interest)])
-        if xirr_without_interest is not None:
-            result["XIRR Intérêts"] = xirr_value - xirr_without_interest
-    else:
-        result["XIRR Intérêts"] = 0.0
+
+    # Shapley decomposition (added 2026-09-09, see
+    # shared/xirr_shapley.py's module docstring for why) - each factor's
+    # neutralizing delta below is EXACTLY the same value the old
+    # isolated-contribution code used to add/subtract from
+    # total_value_as_of one at a time - only the way the factors are
+    # COMBINED changed (all 2**4=16 subsets evaluated jointly, not one
+    # factor cancelled in isolation), so the resulting shares are
+    # guaranteed to sum back to XIRR real - XIRR with every factor
+    # neutralized (efficiency property, checked at runtime via a warning
+    # log). Mintos has a genuine withholding-tax split (5% rate, see
+    # module docstring) but no distinct platform-fee concept - "XIRR
+    # Frais" is hardcoded to 0.0, not computed via Shapley.
+    factor_deltas = {
+        "XIRR Bonus": -lifetime_bonus_as_of,
+        "XIRR Cash drag": missed_earnings,
+        "XIRR Taxes": lifetime_withholding_tax,
+        "XIRR Intérêts": -lifetime_net_interest,
+    }
+    shapley_shares = compute_shapley_xirr_shares(
+        base_cashflows, end_date, total_value_as_of, factor_deltas,
+        log=log, log_context=f"Mintos as of {end_date}",
+    )
+    for name, value in shapley_shares.items():
+        if value is not None:
+            result[name] = value
+    result["XIRR Frais"] = 0.0
+    log.info(
+        "XIRR Shapley shares as of %s (since-inception, missed earnings ~%.2f EUR): %r",
+        end_date, missed_earnings, {k: round(v * 100, 4) for k, v in shapley_shares.items() if v is not None},
+    )
 
     return result
 
@@ -1088,18 +1125,14 @@ def run(session: requests.Session | None = None) -> None:
                 "Computed since-inception XIRR: %.2f%% (%d deposit/withdrawal cashflow(s), current total value %.2f EUR).",
                 xirr_value * 100, len(signed_cashflows) - 1, total_with_cash,
             )
-            if lifetime_bonus:
-                cashflows_without_bonus = signed_cashflows[:-1] + [(today_date, total_with_cash - lifetime_bonus)]
-                xirr_without_bonus = compute_xirr(cashflows_without_bonus)
-                if xirr_without_bonus is not None:
-                    bonus_xirr_contribution = xirr_value - xirr_without_bonus
-                    log.info("Bonus's own share of XIRR: %.2f points.", bonus_xirr_contribution * 100)
-            else:
-                bonus_xirr_contribution = 0.0
+            # bonus_xirr_contribution computed jointly with Cash drag/
+            # Taxes/Intérêts further below (Shapley game, added
+            # 2026-09-09) once missed_earnings is known.
 
     cash_drag_value = None
     cash_drag_xirr_contribution = None
     taxes_xirr_contribution = None
+    frais_xirr_contribution = None
     # XIRR Intérêts (added 2026-08-19, mirrors loanch_diversification.py's/
     # bienpreter_diversification.py's/afranga_diversification.py's/
     # iuvo_diversification.py's/lendermarket_diversification.py's own XIRR
@@ -1138,43 +1171,42 @@ def run(session: requests.Session | None = None) -> None:
                 lifetime_yield_rate = lifetime_statement_totals["gross_interest_received"] / total_outstanding
                 cash_drag_lifetime_total = cash_weight_lifetime * lifetime_yield_rate
                 missed_earnings = cash_drag_lifetime_total * (avg_idle_cash_lifetime + total_outstanding)
-                cashflows_with_cash_invested = signed_cashflows[:-1] + [(today_date, total_with_cash + missed_earnings)]
-                xirr_with_cash_invested = compute_xirr(cashflows_with_cash_invested)
-                if xirr_with_cash_invested is not None:
-                    cash_drag_xirr_contribution = xirr_value - xirr_with_cash_invested
-                    log.info(
-                        "XIRR share - cash drag: %.4f points (since-inception, avg idle cash %.2f EUR, missed earnings ~%.2f EUR).",
-                        cash_drag_xirr_contribution * 100, avg_idle_cash_lifetime, missed_earnings,
-                    )
-
                 lifetime_withholding_tax = lifetime_statement_totals["withholding_tax"]
-                if lifetime_withholding_tax:
-                    cashflows_with_tax_added_back = signed_cashflows[:-1] + [(today_date, total_with_cash + lifetime_withholding_tax)]
-                    xirr_with_tax_added_back = compute_xirr(cashflows_with_tax_added_back)
-                    if xirr_with_tax_added_back is not None:
-                        taxes_xirr_contribution = xirr_value - xirr_with_tax_added_back
-                        log.info("XIRR share - taxes/frais: %.4f points (lifetime withholding tax %.2f EUR).", taxes_xirr_contribution * 100, lifetime_withholding_tax)
-                else:
-                    taxes_xirr_contribution = 0.0
-
-                # XIRR Intérêts (added 2026-08-19): same counterfactual
-                # pattern as XIRR Bonus/XIRR Taxes-Frais above - lifetime
-                # net interest reuses lifetime_statement_totals (already
-                # fetched just above for Cash drag/XIRR Taxes-Frais),
-                # rather than being recomputed from the ledger.
                 lifetime_net_interest = lifetime_statement_totals["gross_interest_received"] - lifetime_withholding_tax
-                if lifetime_net_interest:
-                    cashflows_without_interest = signed_cashflows[:-1] + [(today_date, total_with_cash - lifetime_net_interest)]
-                    xirr_without_interest = compute_xirr(cashflows_without_interest)
-                    if xirr_without_interest is not None:
-                        interest_xirr_contribution = xirr_value - xirr_without_interest
-                        log.info(
-                            "XIRR share - intérêts: %.4f points (lifetime net interest %.2f EUR, gross %.2f EUR, withholding tax %.2f EUR).",
-                            interest_xirr_contribution * 100, lifetime_net_interest,
-                            lifetime_statement_totals["gross_interest_received"], lifetime_withholding_tax,
-                        )
-                else:
-                    interest_xirr_contribution = 0.0
+
+                # Shapley decomposition (added 2026-09-09, see
+                # shared/xirr_shapley.py's module docstring for why) -
+                # each factor's neutralizing delta below is EXACTLY the
+                # same value the old isolated-contribution code used to
+                # add/subtract from total_with_cash one at a time - only
+                # the way the factors are COMBINED changed (all 2**4=16
+                # subsets evaluated jointly, not one factor cancelled in
+                # isolation), so the resulting shares are guaranteed to
+                # sum back to XIRR real - XIRR with every factor
+                # neutralized (efficiency property, checked at runtime
+                # via a warning log). Mintos has a genuine withholding-tax
+                # split (5% rate, see module docstring) but no distinct
+                # platform-fee concept - "XIRR Frais" is hardcoded to
+                # 0.0, not computed via Shapley.
+                factor_deltas = {
+                    "XIRR Bonus": -lifetime_bonus,
+                    "XIRR Cash drag": missed_earnings,
+                    "XIRR Taxes": lifetime_withholding_tax,
+                    "XIRR Intérêts": -lifetime_net_interest,
+                }
+                shapley_shares = compute_shapley_xirr_shares(
+                    signed_cashflows[:-1], today_date, total_with_cash, factor_deltas,
+                    log=log, log_context="Mintos",
+                )
+                bonus_xirr_contribution = shapley_shares.get("XIRR Bonus")
+                cash_drag_xirr_contribution = shapley_shares.get("XIRR Cash drag")
+                taxes_xirr_contribution = shapley_shares.get("XIRR Taxes")
+                frais_xirr_contribution = 0.0
+                interest_xirr_contribution = shapley_shares.get("XIRR Intérêts")
+                log.info(
+                    "XIRR Shapley shares (since-inception, avg idle cash %.2f EUR, missed earnings ~%.2f EUR): %r",
+                    avg_idle_cash_lifetime, missed_earnings, {k: round(v * 100, 4) for k, v in shapley_shares.items() if v is not None},
+                )
     elif not current_month and all_entries is not None:
         try:
             xirr_block = compute_xirr_block_as_of(session, all_entries, today_date)
@@ -1185,7 +1217,8 @@ def run(session: requests.Session | None = None) -> None:
         cash_drag_value = xirr_block.get("Cash drag")
         bonus_xirr_contribution = xirr_block.get("XIRR Bonus")
         cash_drag_xirr_contribution = xirr_block.get("XIRR Cash drag")
-        taxes_xirr_contribution = xirr_block.get("XIRR Taxes/Frais")
+        taxes_xirr_contribution = xirr_block.get("XIRR Taxes")
+        frais_xirr_contribution = xirr_block.get("XIRR Frais")
         interest_xirr_contribution = xirr_block.get("XIRR Intérêts")
         if xirr_value is None:
             log.warning("Could not compute XIRR as of %s from the reconstructed cashflows.", today_date)
@@ -1257,7 +1290,9 @@ def run(session: requests.Session | None = None) -> None:
     if cash_drag_xirr_contribution is not None:
         bonus_breakdown["XIRR Cash drag"] = cash_drag_xirr_contribution
     if taxes_xirr_contribution is not None:
-        bonus_breakdown["XIRR Taxes/Frais"] = taxes_xirr_contribution
+        bonus_breakdown["XIRR Taxes"] = taxes_xirr_contribution
+    if frais_xirr_contribution is not None:
+        bonus_breakdown["XIRR Frais"] = frais_xirr_contribution
     if interest_xirr_contribution is not None:
         bonus_breakdown["XIRR Intérêts"] = interest_xirr_contribution
     if avg_invested_balance is not None:
