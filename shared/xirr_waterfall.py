@@ -15,19 +15,20 @@ this walks UP from a literal 0% baseline (get back exactly the net capital
 deposited, no more no less) by ADDING each step's real delta in a FIXED
 order, so that:
     share(step_k) = XIRR(cumulative through step_k) - XIRR(cumulative through step_{k-1})
-telescopes to `sum(shares) == XIRR_real - 0% == XIRR_real` ALWAYS - the
-LAST step is always evaluated against the real `base_value` (not the
-steps' own accumulated total), so any reconciliation gap between the
-steps' deltas and base_value (logged as a warning, see value_tolerance
-below) is silently absorbed into that last step's own share instead of
-leaking into a "sum(shares) != XIRR real" mismatch. E.g. for the
+telescopes to `sum(shares) == XIRR_real - 0% == XIRR_real` ALWAYS - any
+reconciliation gap between the steps' own deltas and the real `base_value`
+(logged as a warning, see value_tolerance below) is folded into the FIRST
+step's own delta before the walk starts, so it can never leak into
+"sum(shares) != XIRR real" NOR silently flip the sign of an unrelated,
+smaller category (e.g. "XIRR Taxes") the way absorbing it into the LAST
+step used to (a real bug found 2026-09-09). E.g. for the
 "intérêts -> cash drag -> bonus -> frais -> taxes" order: use GROSS
 interest (not net) at the "Intérêts" step, then SUBTRACT the missed-
 earnings amount at "Cash drag" (real cost of idle cash pulling the ideal
 gross interest back down to what was actually earned), then add bonus,
 subtract fees, subtract withholding tax last - each euro is counted
-exactly once, and any leftover reconciliation slop lands in the last
-step ("Taxes" here).
+exactly once, and any leftover reconciliation slop lands in the first
+step ("Intérêts" here, normally the largest/most sign-robust category).
 """
 
 from datetime import date
@@ -54,38 +55,41 @@ def compute_waterfall_xirr_shares(
     Each step's delta is added on top of the running cumulative value -
     unlike shared/xirr_shapley.py's `factor_deltas`, these are NOT
     "neutralize from the real value" adjustments; they're real amounts
-    that build UP from 0 to `base_value`. The steps' own accumulated total
-    SHOULD equal `base_value` by the last step (a mismatch beyond
-    `value_tolerance` logs a warning - it means the steps don't fully/
-    uniquely explain the gain) - but regardless of that gap, the LAST
-    step is always evaluated against the real `base_value` directly, so
-    the returned shares always sum EXACTLY to the real XIRR (the gap, if
-    any, is folded into the last step's own share rather than causing a
-    silent inconsistency).
+    that build UP from 0 to `base_value`. The steps' own deltas are
+    expected to reconstruct `base_value` almost exactly by design, but in
+    practice a small reconciliation gap (unreconciled EUR here or there,
+    see `value_tolerance`) is common - rather than letting that leak into
+    whichever step happens to be LAST in the caller's list (which used to
+    silently corrupt/flip the sign of a small, unrelated category like
+    "XIRR Taxes" - a real bug found 2026-09-09), any such gap is folded
+    into the FIRST step's own delta before the walk starts. Every caller
+    puts the (normally largest, sign-robust) interest step first, so a
+    small reconciliation gap there barely nudges its own share and never
+    contaminates an unrelated, smaller category's sign. This guarantees
+    the returned shares always sum EXACTLY to the real XIRR.
 
     Returns {step_name: waterfall_share_or_None}, same soft-fail convention
     as compute_shapley_xirr_shares (None only if some step's XIRR couldn't
     be solved).
     """
     zero_return_value = -sum(amount for _, amount in base_cashflows)
+
+    adjusted_steps = list(steps)
+    value_gap = 0.0
+    if adjusted_steps:
+        reconstructed = zero_return_value + sum(delta for _, delta in adjusted_steps)
+        value_gap = base_value - reconstructed
+        first_name, first_delta = adjusted_steps[0]
+        adjusted_steps[0] = (first_name, first_delta + value_gap)
+
     cumulative = zero_return_value
     xirr_prev = compute_xirr(base_cashflows + [(end_date, cumulative)])
 
     shares: dict[str, float | None] = {}
     ok = True
-    last_index = len(steps) - 1
-    for i, (name, delta) in enumerate(steps):
+    for name, delta in adjusted_steps:
         cumulative += delta
-        # The LAST step always targets the real `base_value` (not the
-        # accumulated `cumulative`) - this guarantees the shares telescope
-        # EXACTLY to the real XIRR regardless of any reconciliation gap
-        # between the steps' own deltas and base_value (see the
-        # value_gap warning below, still computed from the uncorrected
-        # `cumulative` for diagnostics) - any such gap is silently folded
-        # into this last step's own share instead of leaking into a wrong
-        # "sum(shares) != XIRR real" result.
-        step_value = base_value if i == last_index else cumulative
-        xirr_next = compute_xirr(base_cashflows + [(end_date, step_value)])
+        xirr_next = compute_xirr(base_cashflows + [(end_date, cumulative)])
         if xirr_prev is None or xirr_next is None:
             shares[name] = None
             ok = False
@@ -94,12 +98,12 @@ def compute_waterfall_xirr_shares(
         xirr_prev = xirr_next
 
     if log is not None:
-        value_gap = abs(cumulative - base_value)
-        if value_gap > value_tolerance:
+        if abs(value_gap) > value_tolerance:
             log.warning(
-                "Waterfall XIRR decomposition%s: steps reconstruct %.2f EUR but base_value is "
-                "%.2f EUR - gap %.2f EUR (some euro is double-counted or missing).",
-                f" ({log_context})" if log_context else "", cumulative, base_value, value_gap,
+                "Waterfall XIRR decomposition%s: steps reconstructed %.2f EUR but base_value is "
+                "%.2f EUR - gap %.2f EUR folded into the first step ('%s').",
+                f" ({log_context})" if log_context else "", base_value - value_gap, base_value, value_gap,
+                steps[0][0] if steps else "?",
             )
         real_xirr = compute_xirr(base_cashflows + [(end_date, base_value)])
         computed = [v for v in shares.values() if v is not None]
