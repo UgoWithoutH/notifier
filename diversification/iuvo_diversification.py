@@ -170,7 +170,7 @@ try:
     from shared.report_date import get_report_now, is_current_month
     from shared.state import load_state, save_state
     from shared.xirr import compute_xirr
-    from shared.xirr_shapley import compute_shapley_xirr_shares
+    from shared.xirr_waterfall import compute_waterfall_xirr_shares
 except ModuleNotFoundError:
     # Support direct execution (python diversification/iuvo_diversification.py)
     # where the project root may not be on sys.path.
@@ -181,7 +181,7 @@ except ModuleNotFoundError:
     from shared.report_date import get_report_now, is_current_month
     from shared.state import load_state, save_state
     from shared.xirr import compute_xirr
-    from shared.xirr_shapley import compute_shapley_xirr_shares
+    from shared.xirr_waterfall import compute_waterfall_xirr_shares
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger("iuvo_diversification")
@@ -682,10 +682,10 @@ def run() -> None:
             lifetime_bonus_total = sum(s["bonus_cashback_contest"] for s in monthly_summaries_as_of.values())
             # XIRR Intérêts: lifetime net interest = lifetime gross
             # interest here (no withholding tax on Iuvo at all), summed
-            # across every cached monthly summary. Actual Shapley call
-            # (added 2026-09-09) happens jointly with Cash drag further
-            # below, once missed_earnings is available.
-            lifetime_net_interest = sum(s["gross_interest_received"] for s in monthly_summaries_as_of.values())
+            # across every cached monthly summary. Actual waterfall call
+            # (switched from Shapley 2026-09-09) happens jointly with
+            # Cash drag further below, once missed_earnings is available.
+            lifetime_gross_interest = sum(s["gross_interest_received"] for s in monthly_summaries_as_of.values())
 
     if total_invested > 0 and monthly_summaries_as_of:
         current_month_summary = monthly_summaries_as_of.get(today_month_key) or {}
@@ -706,26 +706,27 @@ def run() -> None:
             cash_drag_lifetime_total = cash_weight_lifetime * lifetime_yield_rate
             missed_earnings = cash_drag_lifetime_total * (avg_idle_cash_lifetime + total_invested)
 
-            # Shapley decomposition (added 2026-09-09, see
-            # shared/xirr_shapley.py's module docstring for why) - Taxes/
-            # Frais excluded from the game (both hardcoded 0.0, Iuvo has
-            # no withholding-tax nor distinct fee transaction type at all,
-            # see module docstring).
-            factor_deltas = {
-                "XIRR Bonus": -lifetime_bonus_total,
-                "XIRR Cash drag": missed_earnings,
-                "XIRR Intérêts": -lifetime_net_interest,
-            }
-            shapley_shares = compute_shapley_xirr_shares(
-                signed_cashflows[:-1], today_date, total_account_value, factor_deltas,
+            # Waterfall decomposition (switched from Shapley 2026-09-09,
+            # see shared/xirr_waterfall.py's module docstring for why) -
+            # Taxes/Frais excluded from the steps (both hardcoded 0.0,
+            # Iuvo has no withholding-tax nor distinct fee transaction
+            # type at all, see module docstring). No withholding tax
+            # here, so lifetime_gross_interest already is the net figure.
+            steps = [
+                ("XIRR Intérêts", lifetime_gross_interest + missed_earnings),
+                ("XIRR Cash drag", -missed_earnings),
+                ("XIRR Bonus", lifetime_bonus_total),
+            ]
+            waterfall_shares = compute_waterfall_xirr_shares(
+                signed_cashflows[:-1], today_date, total_account_value, steps,
                 log=log, log_context="Iuvo",
             )
-            bonus_xirr_contribution = shapley_shares.get("XIRR Bonus")
-            cash_drag_xirr_contribution = shapley_shares.get("XIRR Cash drag")
-            interest_xirr_contribution = shapley_shares.get("XIRR Intérêts")
+            bonus_xirr_contribution = waterfall_shares.get("XIRR Bonus")
+            cash_drag_xirr_contribution = waterfall_shares.get("XIRR Cash drag")
+            interest_xirr_contribution = waterfall_shares.get("XIRR Intérêts")
             log.info(
-                "XIRR Shapley shares (since-inception, avg idle cash %.2f EUR, missed earnings ~%.2f EUR): %r",
-                avg_idle_cash_lifetime, missed_earnings, {k: round(v * 100, 4) for k, v in shapley_shares.items() if v is not None},
+                "XIRR Waterfall shares (since-inception, avg idle cash %.2f EUR, missed earnings ~%.2f EUR): %r",
+                avg_idle_cash_lifetime, missed_earnings, {k: round(v * 100, 4) for k, v in waterfall_shares.items() if v is not None},
             )
 
     # Real point-in-time invested/non-invested balances (Sheet rows

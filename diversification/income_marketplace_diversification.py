@@ -144,7 +144,7 @@ from shared.report_date import get_report_date, is_current_month
 from shared.state import load_state, save_state
 from shared.weighted_average import INVESTED_BALANCE_LABEL, NON_INVESTED_BALANCE_LABEL, compute_time_weighted_average
 from shared.xirr import compute_xirr
-from shared.xirr_shapley import compute_shapley_xirr_shares
+from shared.xirr_waterfall import compute_waterfall_xirr_shares
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger("income_marketplace_diversification")
@@ -533,7 +533,6 @@ def run() -> None:
 
                         lifetime_bonus_total = sum(t["amount"] for t in all_transactions if t["account_type"] == BONUS_TYPE)
                         lifetime_gross_interest = sum(t["amount"] for t in all_transactions if t["account_type"] == INTEREST_TYPE)
-                        lifetime_net_interest = lifetime_gross_interest  # no withholding tax, see docstring
 
                         if total_invested > 0:
                             avg_idle_cash_month = compute_time_weighted_average(cash_events, month_start_date, today_date)
@@ -553,27 +552,34 @@ def run() -> None:
                                 cash_drag_lifetime_total = cash_weight_lifetime * lifetime_yield_rate
                                 missed_earnings = cash_drag_lifetime_total * (avg_idle_cash_lifetime + total_invested)
 
-                                # Shapley decomposition (added 2026-09-09,
-                                # see shared/xirr_shapley.py's module
-                                # docstring for why) - Taxes/Frais are
-                                # excluded from the game (both hardcoded
-                                # 0.0, no distinct data source exists for
-                                # either on this platform, see docstring).
-                                factor_deltas = {
-                                    "XIRR Bonus": -lifetime_bonus_total,
-                                    "XIRR Cash drag": missed_earnings,
-                                    "XIRR Intérêts": -lifetime_net_interest,
-                                }
-                                shapley_shares = compute_shapley_xirr_shares(
-                                    signed_cashflows[:-1], today_date, total_account_value, factor_deltas,
+                                # Waterfall decomposition (switched from
+                                # Shapley 2026-09-09, see
+                                # shared/xirr_waterfall.py's module
+                                # docstring for why) - walks a true
+                                # 0%-return baseline up to
+                                # total_account_value in the fixed order
+                                # Intérêts -> Cash drag -> Bonus (Taxes/
+                                # Frais are excluded, both hardcoded 0.0,
+                                # no distinct data source exists for
+                                # either on this platform, see
+                                # docstring). No withholding tax here, so
+                                # lifetime_gross_interest already is the
+                                # net figure.
+                                steps = [
+                                    ("XIRR Intérêts", lifetime_gross_interest + missed_earnings),
+                                    ("XIRR Cash drag", -missed_earnings),
+                                    ("XIRR Bonus", lifetime_bonus_total),
+                                ]
+                                waterfall_shares = compute_waterfall_xirr_shares(
+                                    signed_cashflows[:-1], today_date, total_account_value, steps,
                                     log=log, log_context="Income Marketplace",
                                 )
-                                bonus_xirr_contribution = shapley_shares.get("XIRR Bonus")
-                                cash_drag_xirr_contribution = shapley_shares.get("XIRR Cash drag")
-                                interest_xirr_contribution = shapley_shares.get("XIRR Intérêts")
+                                bonus_xirr_contribution = waterfall_shares.get("XIRR Bonus")
+                                cash_drag_xirr_contribution = waterfall_shares.get("XIRR Cash drag")
+                                interest_xirr_contribution = waterfall_shares.get("XIRR Intérêts")
                                 log.info(
-                                    "XIRR Shapley shares (since-inception, missed earnings ~%.2f EUR): %r",
-                                    missed_earnings, {k: round(v * 100, 4) for k, v in shapley_shares.items() if v is not None},
+                                    "XIRR Waterfall shares (since-inception, missed earnings ~%.2f EUR): %r",
+                                    missed_earnings, {k: round(v * 100, 4) for k, v in waterfall_shares.items() if v is not None},
                                 )
 
             browser.close()
