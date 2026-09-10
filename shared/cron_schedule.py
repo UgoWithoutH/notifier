@@ -10,16 +10,17 @@ which schedule is currently applied - the job ID and the state file are
 passed in by each caller since they're per-monitor, only the API key and the
 patching mechanics are shared here.
 
-Re-added 2026-09-09 (was previously disabled/commented out for Swaper).
-`ensure_schedule()` unconditionally rebuilds a freshly-jittered minutes list
-and PATCHes it to cron-job.org on EVERY call (no "already in this mode,
-skip" check) - the actual minutes list for each mode is never a fixed,
-perfectly regular cadence ([0, 30] / every 2 minutes), a random jitter (in
-whole minutes) is added to the base 2min/30min interval on every rebuild,
-so the external trigger doesn't fire at an obviously robotic, perfectly-even
-cadence. See JITTER_RANGE_MINUTES_2M / JITTER_RANGE_MINUTES_30M below -
-deliberately hardcoded constants (not env vars) so they're trivial to tweak
-directly in code.
+Re-added 2026-09-09 (was previously disabled/commented out for Swaper),
+then REWORKED 2026-09-10 (cron-job.org's account is capped at 100 API
+requests/day, and the earlier design burned through that budget fast):
+`ensure_schedule()` now only PATCHes cron-job.org when `mode` actually
+differs from the last known mode in `state_file` - staying in the same mode
+across runs costs zero API calls. The cron-job.org schedule itself is now a
+plain, FIXED interval per mode (every 2min / every 30min, no jitter) - the
+anti-robotic-cadence randomness moved to `apply_startup_jitter()` instead,
+a short random sleep each monitor calls once at the very start of its own
+`run()`, sized from the SAME JITTER_RANGE_MINUTES_2M/30M ranges (now in
+minutes of SLEEP, not minutes added to the cron timer).
 
 Required env var (missing -> calls are logged and skipped, never raise):
     CRON_JOB_API_KEY
@@ -44,39 +45,48 @@ CRON_JOB_TIMEZONE = os.environ.get("CRON_JOB_TIMEZONE", "Europe/Paris")
 
 DEFAULT_STATE = {"cron_schedule_mode": None, "cron_schedule_minutes": None}
 
-# Base interval (in minutes) for each mode, before jitter is added -
-# solde >= 10 -> fast poll ("2m"), solde < 10 -> slow poll ("30m").
+# Base interval (in minutes) for each mode - solde >= 10 -> fast poll
+# ("2m"), solde < 10 -> slow poll ("30m"). The cron-job.org schedule itself
+# is now built at exactly this interval, no jitter (see apply_startup_jitter()
+# below for where the randomness moved to).
 BASE_INTERVAL_MINUTES = {"2m": 2, "30m": 30}
 
-# Random jitter (whole minutes, INCLUSIVE range) added on top of each mode's
-# own base interval every time a schedule is actually (re)built - two
-# SEPARATE ranges, one per mode, per explicit user request ("deux random
-# différent... chacun aurait leur fourchette"). E.g. (0, 3) for "2m" means
-# each step in the built minutes list is somewhere between 2 and 5 minutes
-# apart, never a perfectly even "every 2 minutes" heartbeat. Adjust these
-# two constants directly to change the randomness range - if
-# JITTER_RANGE_MINUTES_30M ever grows large enough that a "30m" schedule can
-# produce >=6 firings/hour, also revisit `_infer_mode_from_minutes()`'s
-# count-based threshold below.
+# Random sleep (whole minutes, INCLUSIVE range), applied ONCE at the start
+# of a monitor's own run() via apply_startup_jitter() - two SEPARATE ranges,
+# one per mode, per explicit user request ("deux random différent... chacun
+# aurait leur fourchette"). No longer added to the cron-job.org schedule
+# itself (that's now a plain fixed interval, to avoid rebuilding/re-PATCHing
+# it on every run just to re-randomize it). Adjust these two constants
+# directly to change the sleep range.
 JITTER_RANGE_MINUTES_2M = (0, 3)
 JITTER_RANGE_MINUTES_30M = (0, 10)
 
 
-def _build_jittered_minutes(mode: str) -> list:
-    """Builds an irregularly-spaced list of minutes-of-hour (0-59) for the
-    given mode: starts at 0, then repeatedly advances by (that mode's base
-    interval + a freshly-drawn random jitter from its own range) until past
-    59 - deliberately NOT a perfectly even cadence, see the module docstring
-    and JITTER_RANGE_MINUTES_* constants above."""
+def _build_fixed_minutes(mode: str) -> list:
+    """Builds a plain, regularly-spaced list of minutes-of-hour (0-59) for
+    the given mode, at exactly that mode's own base interval - no jitter
+    (see the module docstring for why the randomness moved elsewhere)."""
     base = BASE_INTERVAL_MINUTES[mode]
+    return list(range(0, 60, base))
+
+
+def apply_startup_jitter(state_file: Path) -> None:
+    """Sleeps once, for a random whole-minute duration drawn from the
+    jitter range of the LAST KNOWN cron schedule mode (read from
+    `state_file` - the same one passed to `ensure_schedule()`; falls back
+    to the "30m" range if no mode has ever been recorded yet). Meant to be
+    called once, right at the very start of a monitor's own `run()`
+    (before login/any real work) - this is where the anti-robotic-cadence
+    randomness now lives, since the cron-job.org schedule itself is a
+    plain fixed interval (see module docstring)."""
+    state = load_state(state_file, DEFAULT_STATE)
+    mode = state.get("cron_schedule_mode") or "30m"
     jitter_range = JITTER_RANGE_MINUTES_2M if mode == "2m" else JITTER_RANGE_MINUTES_30M
-    minutes = []
-    m = 0
-    while m < 60:
-        minutes.append(m)
-        step = base + random.randint(*jitter_range)
-        m += max(step, 1)
-    return minutes
+    delay_minutes = random.randint(*jitter_range)
+    if delay_minutes <= 0:
+        return
+    log.info("Startup jitter: sleeping %sm (mode=%s) before proceeding...", delay_minutes, mode)
+    time.sleep(delay_minutes * 60)
 
 
 # One short retry on a 429 (cron-job.org's own per-account rate limit,
@@ -132,21 +142,27 @@ def _patch_schedule(cron_job_id: str, minutes: list) -> bool:
 
 
 def ensure_schedule(mode: str, cron_job_id: str, state_file: Path) -> None:
-    """Unconditionally (re)builds a freshly-jittered minutes list for `mode`
-    ("30m" or "2m") and PATCHes it to cron-job.org every single call - no
-    "already in this mode, skip" check anymore (per explicit user request),
-    since skipping meant the schedule kept the SAME stale jittered minutes
-    list run after run instead of actually re-randomizing it each time."""
+    """PATCHes cron-job.org's schedule to a fixed `mode` ("30m" or "2m")
+    ONLY when it differs from the last known mode in `state_file` - staying
+    in the same mode across runs makes zero API calls, to stay well under
+    cron-job.org's 100-requests/day account cap (re-added 2026-09-10, after
+    the brief 2026-09-09 "always rebuild+PATCH" design blew through that
+    budget)."""
     if mode not in BASE_INTERVAL_MINUTES:
         raise ValueError(f"Unknown cron schedule mode: {mode!r}")
 
     state = load_state(state_file, DEFAULT_STATE)
+    current_mode = state.get("cron_schedule_mode")
+
+    if current_mode == mode:
+        log.info("Cron decision: already in mode=%s, skipping cron-job.org API call.", mode)
+        return
 
     old_minutes = state.get("cron_schedule_minutes")
-    log.info("Cron timer BEFORE update: minutes=%s (last known mode=%s).", old_minutes, state.get("cron_schedule_mode"))
+    log.info("Cron timer BEFORE update: minutes=%s (last known mode=%s).", old_minutes, current_mode)
 
-    new_minutes = _build_jittered_minutes(mode)
-    log.info("Cron decision: updating to mode=%s (new minutes=%s).", mode, new_minutes)
+    new_minutes = _build_fixed_minutes(mode)
+    log.info("Cron decision: mode changed %s -> %s, updating cron-job.org (new minutes=%s).", current_mode, mode, new_minutes)
     if _patch_schedule(cron_job_id, new_minutes):
         state["cron_schedule_mode"] = mode
         state["cron_schedule_minutes"] = new_minutes
