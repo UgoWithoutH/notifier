@@ -31,6 +31,7 @@ import json
 import logging
 import os
 import random
+import time
 from pathlib import Path
 from urllib import request, error
 
@@ -78,6 +79,12 @@ def _build_jittered_minutes(mode: str) -> list:
     return minutes
 
 
+# One short retry on a 429 (cron-job.org's own per-account rate limit,
+# hit occasionally since Swaper/Lendermarket can both call this API in a
+# short window) before giving up and leaving the schedule unchanged.
+RATE_LIMIT_RETRY_DELAY_SECONDS = 15
+
+
 def _patch_schedule(cron_job_id: str, minutes: list) -> bool:
     if not CRON_JOB_API_KEY or not cron_job_id:
         log.info("CRON_JOB_API_KEY or cron job id missing, skipping cron-job.org update.")
@@ -85,31 +92,41 @@ def _patch_schedule(cron_job_id: str, minutes: list) -> bool:
 
     endpoint = f"https://api.cron-job.org/jobs/{cron_job_id}"
     payload = {"job": {"schedule": {"timezone": CRON_JOB_TIMEZONE, "minutes": minutes}}}
-    req = request.Request(
-        endpoint,
-        method="PATCH",
-        data=json.dumps(payload).encode("utf-8"),
-        headers={
-            "Authorization": f"Bearer {CRON_JOB_API_KEY}",
-            "Content-Type": "application/json",
-        },
-    )
 
-    try:
-        with request.urlopen(req, timeout=20) as resp:
-            if 200 <= resp.status < 300:
-                return True
-            log.warning("cron-job.org update returned unexpected HTTP status %s.", resp.status)
-            return False
-    except error.HTTPError as exc:
-        details = ""
+    for attempt in range(1, 3):
+        req = request.Request(
+            endpoint,
+            method="PATCH",
+            data=json.dumps(payload).encode("utf-8"),
+            headers={
+                "Authorization": f"Bearer {CRON_JOB_API_KEY}",
+                "Content-Type": "application/json",
+            },
+        )
         try:
-            details = exc.read().decode("utf-8", errors="ignore")
+            with request.urlopen(req, timeout=20) as resp:
+                if 200 <= resp.status < 300:
+                    return True
+                log.warning("cron-job.org update returned unexpected HTTP status %s.", resp.status)
+                return False
+        except error.HTTPError as exc:
+            details = ""
+            try:
+                details = exc.read().decode("utf-8", errors="ignore")
+            except Exception:
+                pass
+            if exc.code == 429 and attempt == 1:
+                log.warning(
+                    "cron-job.org update rate-limited (HTTP 429), retrying once in %ss...",
+                    RATE_LIMIT_RETRY_DELAY_SECONDS,
+                )
+                time.sleep(RATE_LIMIT_RETRY_DELAY_SECONDS)
+                continue
+            log.warning("cron-job.org update failed (HTTP %s). Response: %s", exc.code, details[:400])
+            return False
         except Exception:
-            pass
-        log.warning("cron-job.org update failed (HTTP %s). Response: %s", exc.code, details[:400])
-    except Exception:
-        log.exception("cron-job.org update failed.")
+            log.exception("cron-job.org update failed.")
+            return False
 
     return False
 
