@@ -100,6 +100,36 @@ def get_google_credentials():
         json.loads(GOOGLE_CREDENTIALS),
         scopes=SCOPES,
     )
+    
+def get_worksheet_by_name(sheet_name: str):
+    """
+    Retourne la feuille Google Sheets dont le nom correspond exactement
+    à `sheet_name`.
+
+    Utilise SPREADSHEET_ID et les credentials configurés dans les variables
+    d'environnement.
+
+    Lève `gspread.exceptions.WorksheetNotFound` si aucune feuille ne porte
+    exactement ce nom.
+    """
+    logger.info("Recherche de la feuille Google Sheets : '%s'", sheet_name)
+
+    credentials = get_google_credentials()
+    client = gspread.authorize(credentials)
+
+    spreadsheet = _call_with_retry(
+        client.open_by_key,
+        SPREADSHEET_ID
+    )
+
+    worksheet = _call_with_retry(
+        spreadsheet.worksheet,
+        sheet_name
+    )
+
+    logger.info("Feuille sélectionnée : '%s'", worksheet.title)
+
+    return worksheet
 
 
 def get_latest_dashboard_worksheet(spreadsheet_id: str):
@@ -696,7 +726,7 @@ def fill_geographic_repartition_uninvested_amount(platform: str, amount):
     """
     logger.info("Début mise à jour 'non investi' pour %s (%s)", platform, amount)
 
-    worksheet = get_latest_dashboard_worksheet(SPREADSHEET_ID)
+    worksheet = get_worksheet_by_name("Répartition géographique")
     grid = _call_with_retry(worksheet.get_all_values)
 
     geo_pos = find_cell_by_value(grid, "Répartition géographique")
@@ -738,7 +768,7 @@ def get_geographic_repartition_uninvested_amounts(platforms: list) -> dict:
     (ligne non trouvée, ou cellule vide/non-parsable) sont simplement omises
     du dict.
     """
-    worksheet = get_latest_dashboard_worksheet(SPREADSHEET_ID)
+    worksheet = get_worksheet_by_name("Répartition géographique")
     grid = _call_with_retry(worksheet.get_all_values)
 
     geo_pos = find_cell_by_value(grid, "Répartition géographique")
@@ -861,7 +891,7 @@ def fill_geographic_repartition_amounts(loan_originators: list, platform: str | 
         len(loan_originators)
     )
 
-    worksheet = get_latest_dashboard_worksheet(SPREADSHEET_ID)
+    worksheet = get_worksheet_by_name("Répartition géographique")
 
     # 1 seul appel API pour charger toute la feuille
     grid = _call_with_retry(worksheet.get_all_values)
@@ -1013,7 +1043,7 @@ def fill_bienpreter_borrower_geo_amounts(borrowers: dict):
 
     issues = []
 
-    worksheet = get_latest_dashboard_worksheet(SPREADSHEET_ID)
+    worksheet = get_worksheet_by_name("Répartition géographique")
     grid = _call_with_retry(worksheet.get_all_values)
 
     geo_pos = find_cell_by_value(grid, "Répartition géographique")
@@ -1280,7 +1310,7 @@ def get_selected_peerberry_loan_originators() -> list:
     """
     logger.info("Recherche des loan originators PeerBerry sélectionnés (colonne -1 = 'x')")
 
-    worksheet = get_latest_dashboard_worksheet(SPREADSHEET_ID)
+    worksheet = get_worksheet_by_name("Répartition géographique")
 
     # 1 seul appel API pour charger toute la feuille
     grid = _call_with_retry(worksheet.get_all_values)
@@ -1341,7 +1371,7 @@ def get_peerberry_min_interest_rate() -> float:
     """
     logger.info("Lecture du minInterestRate PeerBerry depuis la cellule à gauche de 'Peerberry'")
 
-    worksheet = get_latest_dashboard_worksheet(SPREADSHEET_ID)
+    worksheet = get_worksheet_by_name("Répartition géographique")
 
     grid = _call_with_retry(worksheet.get_all_values)
 
@@ -1413,7 +1443,7 @@ def get_peerberry_country_allocations() -> dict:
     """
     logger.info("Lecture des allocations par pays PeerBerry depuis la feuille")
 
-    worksheet = get_latest_dashboard_worksheet(SPREADSHEET_ID)
+    worksheet = get_worksheet_by_name("Répartition géographique")
 
     grid = _call_with_retry(worksheet.get_all_values)
 
@@ -1524,7 +1554,7 @@ def get_selected_lendermarket_lenders() -> list:
     """
     logger.info("Recherche des lenders Lendermarket sélectionnés (colonne -1 = 'x')")
 
-    worksheet = get_latest_dashboard_worksheet(SPREADSHEET_ID)
+    worksheet = get_worksheet_by_name("Répartition géographique")
 
     # 1 seul appel API pour charger toute la feuille
     grid = _call_with_retry(worksheet.get_all_values)
@@ -1584,7 +1614,7 @@ def get_lendermarket_min_interest_rate() -> float:
     """
     logger.info("Lecture du minInterestRate Lendermarket depuis la cellule à gauche de 'Lendermarket'")
 
-    worksheet = get_latest_dashboard_worksheet(SPREADSHEET_ID)
+    worksheet = get_worksheet_by_name("Répartition géographique")
 
     grid = _call_with_retry(worksheet.get_all_values)
 
@@ -1648,7 +1678,7 @@ def get_lendermarket_country_allocations() -> dict:
     """
     logger.info("Lecture des allocations par pays Lendermarket depuis la feuille")
 
-    worksheet = get_latest_dashboard_worksheet(SPREADSHEET_ID)
+    worksheet = get_worksheet_by_name("Répartition géographique")
 
     grid = _call_with_retry(worksheet.get_all_values)
 
@@ -1765,7 +1795,7 @@ def get_selected_swaper_loan_originators() -> list:
     """
     logger.info("Recherche des loan originators Swaper sélectionnés (colonne -1 = 'x')")
 
-    worksheet = get_latest_dashboard_worksheet(SPREADSHEET_ID)
+    worksheet = get_worksheet_by_name("Répartition géographique")
 
     # 1 seul appel API pour charger toute la feuille
     grid = _call_with_retry(worksheet.get_all_values)
@@ -1828,7 +1858,7 @@ def get_swaper_min_interest_rate() -> float:
     """
     logger.info("Lecture du minInterestRate Swaper depuis la cellule à gauche de 'Swaper'")
 
-    worksheet = get_latest_dashboard_worksheet(SPREADSHEET_ID)
+    worksheet = get_worksheet_by_name("Répartition géographique")
 
     grid = _call_with_retry(worksheet.get_all_values)
 
@@ -1893,7 +1923,7 @@ def get_swaper_country_allocations() -> dict:
     """
     logger.info("Lecture des allocations par pays Swaper depuis la feuille")
 
-    worksheet = get_latest_dashboard_worksheet(SPREADSHEET_ID)
+    worksheet = get_worksheet_by_name("Répartition géographique")
 
     grid = _call_with_retry(worksheet.get_all_values)
 
@@ -2007,7 +2037,7 @@ def get_peerberry_originator_caps() -> dict:
     """
     logger.info("Lecture des plafonds par loan originator PeerBerry depuis la feuille")
 
-    worksheet = get_latest_dashboard_worksheet(SPREADSHEET_ID)
+    worksheet = get_worksheet_by_name("Répartition géographique")
 
     grid = _call_with_retry(worksheet.get_all_values)
 
@@ -2050,7 +2080,7 @@ def get_lendermarket_originator_caps() -> dict:
     """
     logger.info("Lecture des plafonds par lender Lendermarket depuis la feuille")
 
-    worksheet = get_latest_dashboard_worksheet(SPREADSHEET_ID)
+    worksheet = get_worksheet_by_name("Répartition géographique")
 
     grid = _call_with_retry(worksheet.get_all_values)
 
@@ -2093,7 +2123,7 @@ def get_swaper_originator_caps() -> dict:
     """
     logger.info("Lecture des plafonds par loan originator Swaper depuis la feuille")
 
-    worksheet = get_latest_dashboard_worksheet(SPREADSHEET_ID)
+    worksheet = get_worksheet_by_name("Répartition géographique")
 
     grid = _call_with_retry(worksheet.get_all_values)
 
