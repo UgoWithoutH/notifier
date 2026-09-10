@@ -17,52 +17,23 @@ Optional:
     SWAPER_TOTP_SECRET                     -> base32 secret used to set up
                                                Google Authenticator, needed
                                                if 2FA is enabled on the account
-    SWAPER_LOOP_MAX_HOURS (default 1)      -> safety cutoff (hours) for the
-                                               continuous invest loop below -
-                                               user-adjustable, stops the loop
-                                               without a success after this long
-                                               (kept low by default since GitHub
-                                               Actions hosted runners hard-cap a
-                                               job at 6h anyway - see below)
-    SWAPER_LOOP_POLL_INTERVAL_SECONDS (default 1) -> delay between passes
-                                               while the invest loop is active -
-                                               kept short since Swaper's manual
-                                               loan inventory is extremely
-                                               transient (grabbed within seconds)
-    SWAPER_CRON_JOB_ID                     -> cron-job.org job id: disabled
-                                               for the duration of the invest
-                                               loop (see shared/cron_schedule.py's
-                                               set_job_enabled()) and re-enabled
-                                               once the loop stops; also used
-                                               (re-enabled 2026-09-09) to speed
-                                               up/slow down the external
+    SWAPER_CRON_JOB_ID                     -> cron-job.org job id: used to
+                                               speed up/slow down the external
                                                trigger's own schedule based on
                                                balance (see ensure_schedule())
 
 REAL auto-invest bot (added 2026-07-25, explicit user decision - real money,
-no more click-and-abort safety net): Swaper's manual loan inventory is
-extremely transient (a single loan can appear and be grabbed by another
-investor within minutes). Once the balance is >= MIN_INVESTMENT_AMOUNT,
-run() no longer just does a single discovery+invest pass and waits for the
-next externally-triggered run - it loops CONTINUOUSLY inside the same
-Playwright session (added 2026-08-01, explicit user request: "dès que solde
->= 10 je voudrais que le bot tourne en boucle sans s'arrêter jusqu'à qu'il
-réussisse à investir"), re-checking availability and re-attempting every
-SWAPER_LOOP_POLL_INTERVAL_SECONDS, until either an investment is confirmed,
-the balance drops back below the minimum (nothing left to invest), or the
-SWAPER_LOOP_MAX_HOURS safety cutoff is reached without success. While the
-loop is active, the external cron-job.org trigger (SWAPER_CRON_JOB_ID) is
-disabled via `shared.cron_schedule.set_job_enabled()` - no point in a
-second, overlapping run firing mid-loop - and re-enabled once the loop
-stops (success or timeout), even on an unexpected error (done in a
-`finally`). NOTE: GitHub Actions hosted runners hard-cap a single job at 6
-hours regardless of SWAPER_LOOP_MAX_HOURS or the workflow's own
-timeout-minutes - the default was lowered from an initial 24h to 1h for this
-reason (a value above ~6h only matters on a self-hosted runner anyway). If
-an unexpected error occurs anywhere during login/discovery/investing, the
-loop/bot stops immediately (never keeps retrying blindly) and the run's
-summary email is STILL sent at the end no matter what (with the error
-included in its body) - see `run_error` in `run()`.
+no more click-and-abort safety net): does a SINGLE discovery+invest pass per
+run, same principle as lendermarket_monitor.py's invest_selected_lenders()
+(removed 2026-09-10, was previously a continuous in-run loop added
+2026-08-01 - explicit user request to drop it: "je ne veux pas de boucle qui
+check en boucle"). If nothing is available/investable this run, the run
+simply stops and the next externally-triggered run (cron-job.org) checks
+again - no waiting/retrying inside the same process. If an unexpected error
+occurs anywhere during login/discovery/investing, the bot stops immediately
+(never keeps retrying blindly) and the run's summary email is STILL sent at
+the end no matter what (with the error included in its body) - see
+`run_error` in `run()`.
 For each available loan (in listing
 order), it fills the row's amount input with min(money left, loan's own
 amount) and clicks its real "+" icon - a REAL click that really reaches
@@ -228,7 +199,6 @@ throughout.
 import json
 import os
 import sys
-import time
 import logging
 from datetime import datetime, timezone
 from pathlib import Path
@@ -239,7 +209,7 @@ from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeo
 
 from shared.notifier import send_swaper_email, send_swaper_investment_summary_email, send_swaper_api_structure_email
 from shared.state import load_state, save_state
-from shared.cron_schedule import ensure_schedule, set_job_enabled, apply_startup_jitter
+from shared.cron_schedule import ensure_schedule, apply_startup_jitter
 from shared.notification_gate import should_notify
 from shared.google_sheet import (
     get_selected_swaper_loan_originators,
@@ -272,20 +242,6 @@ SWAPER_CRON_JOB_ID = os.environ.get("SWAPER_CRON_JOB_ID")
 # this, don't even attempt a click (mirrors MIN_INVESTMENT_AMOUNT in
 # monitors/peerberry_invest_bot.py).
 MIN_INVESTMENT_AMOUNT = float(os.environ.get("MIN_INVESTMENT_AMOUNT", "10"))
-
-# Continuous invest loop (added 2026-08-01, explicit user request: "dès que
-# solde >= 10 je voudrais que le bot tourne en boucle sans s'arrêter jusqu'à
-# qu'il réussisse à investir"). SWAPER_LOOP_MAX_HOURS is the safety cutoff
-# (user-adjustable env var, as explicitly requested) - the loop gives up
-# after this many hours without a successful investment. Default lowered to
-# 1h (was 24h) since GitHub Actions hosted runners hard-cap a single job at
-# 6h regardless of this setting anyway - a higher value only matters on a
-# self-hosted runner.
-SWAPER_LOOP_MAX_HOURS = float(os.environ.get("SWAPER_LOOP_MAX_HOURS", "1"))
-# How long to wait between two discovery+invest passes while looping - kept
-# short (default 1s) since Swaper's manual loan inventory is extremely
-# transient (a loan can be grabbed by someone else within seconds).
-SWAPER_LOOP_POLL_INTERVAL_SECONDS = float(os.environ.get("SWAPER_LOOP_POLL_INTERVAL_SECONDS", "1"))
 
 # Fallback used only if get_swaper_min_interest_rate() (reads the cell just
 # left of "Swaper" in "Répartition géographique", see that function's
@@ -1153,223 +1109,187 @@ def run(headless: bool = True) -> None:
                 if not selected_originators:
                     log.info("No Swaper loan originator is flagged with 'x' in the Google Sheet - skipping auto-invest.")
                 else:
-                    # Continuous invest loop (added 2026-08-01, explicit user
-                    # request: "d\u00e8s que solde >= 10 je voudrais que le bot tourne
-                    # en boucle sans s'arr\u00eater jusqu'\u00e0 qu'il r\u00e9ussisse \u00e0
-                    # investir"). As long as the balance is >= the minimum,
-                    # repeat discovery+invest passes - instead of a single pass
-                    # per externally-triggered run - until either a real
-                    # investment gets confirmed, the balance drops back below
-                    # the minimum (nothing left to invest), or
-                    # SWAPER_LOOP_MAX_HOURS elapses without success (a
-                    # user-adjustable safety cutoff, see that env var's
-                    # docstring). The external cron-job.org trigger is disabled
-                    # for the loop's duration (no point in a second, overlapping
-                    # run firing mid-loop) and re-enabled once it stops, in a
-                    # `finally` so it's re-enabled even on an unexpected error.
-                    loop_active = balance_now >= MIN_INVESTMENT_AMOUNT
-                    loop_deadline = time.monotonic() + SWAPER_LOOP_MAX_HOURS * 3600
-                    cron_disabled = False
-                    if loop_active:
-                        log.info(
-                            "Balance %.2f EUR >= minimum - looping continuously (up to %.1fh) until an "
-                            "investment succeeds.", balance_now, SWAPER_LOOP_MAX_HOURS,
-                        )
-                        cron_disabled = set_job_enabled(SWAPER_CRON_JOB_ID, False)
-
+                    # Single discovery+invest pass per run (changed 2026-09-10,
+                    # explicit user request: "je ne veux pas de boucle qui check
+                    # en boucle... si rien n'est trouv\u00e9 on s'arr\u00eate et on
+                    # attend le prochain run" - same principle as
+                    # lendermarket_monitor.py's invest_selected_lenders()).
+                    # Previously (2026-08-01 through 2026-09-10) this looped
+                    # continuously inside the same Playwright session while the
+                    # balance stayed >= the minimum - that behavior was removed.
+                    # If nothing is available/investable this run, it just
+                    # stops here and the next externally-triggered run
+                    # (cron-job.org) checks again.
                     try:
-                        pass_number = 0
-                        while True:
-                            pass_number += 1
-                            # Availability is checked for every selected originator
-                            # REGARDLESS of balance (added 2026-07-26, explicit user
-                            # request: "j'ai pas besoin d'attendre d'avoir des sous sur
-                            # mon compte pour te donner tout ce dont tu auras besoin") -
-                            # this is what feeds the one-time API-structure diagnostics
-                            # email below even when there's nothing to actually invest
-                            # yet. Only the real investing step further below stays
-                            # gated behind the minimum balance. The minInterestRate is
-                            # applied client-side here too (see
-                            # _filter_loans_by_min_interest_rate()'s docstring).
-                            log.info(
-                                "%d loan originator(s) selected in the Google Sheet (%s) - checking current "
-                                "availability for each (min interest rate: %s%%, pass %d).",
-                                len(selected_originators), ", ".join(selected_originators), min_interest_rate, pass_number,
+                        # Availability is checked for every selected originator
+                        # REGARDLESS of balance (added 2026-07-26, explicit user
+                        # request: "j'ai pas besoin d'attendre d'avoir des sous sur
+                        # mon compte pour te donner tout ce dont tu auras besoin") -
+                        # this is what feeds the one-time API-structure diagnostics
+                        # email below even when there's nothing to actually invest
+                        # yet. Only the real investing step further below stays
+                        # gated behind the minimum balance. The minInterestRate is
+                        # applied client-side here too (see
+                        # _filter_loans_by_min_interest_rate()'s docstring).
+                        log.info(
+                            "%d loan originator(s) selected in the Google Sheet (%s) - checking current "
+                            "availability for each (min interest rate: %s%%).",
+                            len(selected_originators), ", ".join(selected_originators), min_interest_rate,
+                        )
+                        originator_loans = {}
+                        fast_grouped = None
+                        try:
+                            fast_grouped = _with_relogin_retry(
+                                lambda: fetch_loans_by_selected_originators(
+                                    page, captured_api_calls, selected_originators, min_interest_rate
+                                )
                             )
-                            originator_loans = {}
-                            fast_grouped = None
-                            try:
-                                fast_grouped = _with_relogin_retry(
-                                    lambda: fetch_loans_by_selected_originators(
-                                        page, captured_api_calls, selected_originators, min_interest_rate
+                        except Exception:
+                            log.exception("Combined multi-originator fetch failed - falling back to per-originator fetches.")
+
+                        if fast_grouped is not None:
+                            for name, loans_for_name in fast_grouped.items():
+                                if loans_for_name:
+                                    originator_loans[name] = loans_for_name
+                                    log.info("Originator %r currently has %d loan(s) available (fast combined fetch).", name, len(loans_for_name))
+                                else:
+                                    log.info("Originator %r currently has no loans available (fast combined fetch).", name)
+                        else:
+                            for name in selected_originators:
+                                try:
+                                    originator_payload = _with_relogin_retry(
+                                        lambda name=name: fetch_loans(page, captured_api_calls, groups=[name])
                                     )
+                                except Exception:
+                                    log.exception("Failed to fetch filtered loans for originator %r - skipping it.", name)
+                                    continue
+                                loans_for_name = _filter_loans_by_min_interest_rate(
+                                    extract_loans(originator_payload), min_interest_rate
                                 )
-                            except Exception:
-                                log.exception("Combined multi-originator fetch failed - falling back to per-originator fetches.")
+                                if loans_for_name:
+                                    originator_loans[name] = loans_for_name
+                                    log.info("Originator %r currently has %d loan(s) available.", name, len(loans_for_name))
+                                else:
+                                    log.info("Originator %r currently has no loans available.", name)
 
-                            if fast_grouped is not None:
-                                for name, loans_for_name in fast_grouped.items():
-                                    if loans_for_name:
-                                        originator_loans[name] = loans_for_name
-                                        log.info("Originator %r currently has %d loan(s) available (fast combined fetch).", name, len(loans_for_name))
-                                    else:
-                                        log.info("Originator %r currently has no loans available (fast combined fetch).", name)
-                            else:
-                                for name in selected_originators:
-                                    try:
-                                        originator_payload = _with_relogin_retry(
-                                            lambda name=name: fetch_loans(page, captured_api_calls, groups=[name])
-                                        )
-                                    except Exception:
-                                        log.exception("Failed to fetch filtered loans for originator %r - skipping it.", name)
-                                        continue
-                                    loans_for_name = _filter_loans_by_min_interest_rate(
-                                        extract_loans(originator_payload), min_interest_rate
+                        pass_attempts = []
+                        if balance_now < MIN_INVESTMENT_AMOUNT:
+                            log.info(
+                                "Balance %.2f EUR is below the minimum (%.2f EUR) - availability was still "
+                                "checked above for diagnostics, but skipping the actual auto-invest step.",
+                                balance_now, MIN_INVESTMENT_AMOUNT,
+                            )
+                        else:
+                            # Per-country cap (added 2026-07-31, mirrors
+                            # lendermarket_monitor.py's invest_selected_lenders()) -
+                            # any currently-available originator whose mapped
+                            # country is already at/above
+                            # `country_threshold_percentage`% of the total Swaper
+                            # budget (balance + every country's already-invested
+                            # amount) is excluded from this run's budget split
+                            # (same treatment as "0 loans available").
+                            total_budget = balance_now + sum(country_invested.values())
+                            for name in list(originator_loans.keys()):
+                                country = originator_countries.get(name)
+                                if _is_country_blocked(country, total_budget):
+                                    log.info(
+                                        "Originator %r (country %r) is blocked this run: already at/above the %s%% country cap.",
+                                        name, country, country_threshold_percentage,
                                     )
-                                    if loans_for_name:
-                                        originator_loans[name] = loans_for_name
-                                        log.info("Originator %r currently has %d loan(s) available.", name, len(loans_for_name))
-                                    else:
-                                        log.info("Originator %r currently has no loans available.", name)
-
-                            pass_attempts = []
-                            if balance_now < MIN_INVESTMENT_AMOUNT:
-                                log.info(
-                                    "Balance %.2f EUR is below the minimum (%.2f EUR) - availability was still "
-                                    "checked above for diagnostics, but skipping the actual auto-invest step.",
-                                    balance_now, MIN_INVESTMENT_AMOUNT,
-                                )
-                            else:
-                                # Per-country cap (added 2026-07-31, mirrors
-                                # lendermarket_monitor.py's invest_selected_lenders() -
-                                # re-checked on EVERY pass since balance_now/total_budget
-                                # can change as this loop invests) - any currently-
-                                # available originator whose mapped country is already
-                                # at/above `country_threshold_percentage`% of the total
-                                # Swaper budget (balance + every country's already-
-                                # invested amount) is excluded from this pass's budget
-                                # split (same treatment as "0 loans available").
-                                total_budget = balance_now + sum(country_invested.values())
-                                for name in list(originator_loans.keys()):
-                                    country = originator_countries.get(name)
-                                    if _is_country_blocked(country, total_budget):
-                                        log.info(
-                                            "Originator %r (country %r) is blocked this run: already at/above the %s%% country cap.",
-                                            name, country, country_threshold_percentage,
-                                        )
-                                        if name not in country_blocked_originators:
-                                            country_blocked_originators.append(name)
-                                        del originator_loans[name]
-                                        continue
-                                    if _is_originator_cap_blocked(name, total_budget):
-                                        log.info(
-                                            "Originator %r is blocked this run: already at/above its own %s%% cap.",
-                                            name, originator_max_percentages.get(name),
-                                        )
-                                        if name not in originator_cap_blocked:
-                                            originator_cap_blocked.append(name)
-                                        del originator_loans[name]
-
-                                budgets = _split_budget_across_available_originators(balance_now, originator_loans)
-                                for name, budget in budgets.items():
-                                    log.info("Investing up to %.2f EUR into originator %r's loan(s).", budget, name)
-
-                                    try:
-                                        # Re-fetch (not just re-apply the filter) right
-                                        # before investing - the discovery loop's loan
-                                        # list can already be stale by now since Swaper's
-                                        # manual inventory is extremely transient (a loan
-                                        # can be grabbed by someone else, or a new one can
-                                        # appear, within seconds). Using the fresh list
-                                        # here (instead of the discovery-time
-                                        # originator_loans[name]) avoids computing shares
-                                        # for/targeting a loan that no longer exists, and
-                                        # correctly picks up any loan that appeared since.
-                                        refreshed_payload = _with_relogin_retry(
-                                            lambda name=name: fetch_loans(page, captured_api_calls, groups=[name])
-                                        )
-                                    except Exception:
-                                        log.exception("Failed to re-fetch loans for originator %r before investing - skipping it.", name)
-                                        continue
-                                    current_loans = _filter_loans_by_min_interest_rate(
-                                        extract_loans(refreshed_payload), min_interest_rate
+                                    if name not in country_blocked_originators:
+                                        country_blocked_originators.append(name)
+                                    del originator_loans[name]
+                                    continue
+                                if _is_originator_cap_blocked(name, total_budget):
+                                    log.info(
+                                        "Originator %r is blocked this run: already at/above its own %s%% cap.",
+                                        name, originator_max_percentages.get(name),
                                     )
-                                    if not current_loans:
-                                        log.info("Originator %r no longer has any loan available right before investing - skipping.", name)
-                                        continue
-                                    shares = _compute_swaper_loan_shares(budget, current_loans)
-                                    try:
-                                        attempts = _with_relogin_retry(
-                                            lambda: _invest_available_loans(page, current_loans, shares, captured_api_calls)
-                                        )
-                                    except Exception:
-                                        log.exception("Failed to invest into originator %r's loan(s) - skipping it this pass.", name)
-                                        continue
-                                    country = originator_countries.get(name)
-                                    for attempt in attempts:
-                                        attempt["originator"] = name
-                                        # country_invested is updated after EVERY
-                                        # attempted amount (not just a confirmed
-                                        # status) so multiple originators sharing the
-                                        # same country can't jointly blow past the cap.
-                                        if country and not attempt.get("error"):
-                                            country_invested[country] = country_invested.get(country, 0.0) + (attempt.get("amount") or 0.0)
-                                        # Same idea, per loan originator (added
-                                        # 2026-08-05, per-originator cap).
-                                        if not attempt.get("error"):
-                                            originator_invested[name] = originator_invested.get(name, 0.0) + (attempt.get("amount") or 0.0)
-                                    pass_attempts.extend(attempts)
+                                    if name not in originator_cap_blocked:
+                                        originator_cap_blocked.append(name)
+                                    del originator_loans[name]
 
-                            investment_attempts.extend(pass_attempts)
+                            budgets = _split_budget_across_available_originators(balance_now, originator_loans)
+                            for name, budget in budgets.items():
+                                log.info("Investing up to %.2f EUR into originator %r's loan(s).", budget, name)
 
-                            if pass_attempts:
-                                if any(a.get("confirmed") for a in pass_attempts):
-                                    # Refresh the balance used for the rest of this run
-                                    # (notification email etc.) and this loop's own exit
-                                    # checks. The real buy response already embeds the
-                                    # post-investment balance (user.accountBalance) - use
-                                    # that directly instead of an extra full page reload
-                                    # when possible, falling back to a real refresh only
-                                    # if that can't be extracted.
-                                    fresh_balance = _extract_balance_from_attempts(pass_attempts)
-                                    if fresh_balance is not None:
-                                        balance_now = fresh_balance
-                                        log.info("Balance updated from the buy response: %.2f EUR (skipped an extra fetch).", balance_now)
-                                    else:
-                                        payload = _with_relogin_retry(lambda: fetch_loans(page, captured_api_calls))
-                                        balance_now = extract_balance(payload)
-                                # else: nothing confirmed this pass - balance/loans are
-                                # unchanged, no refresh needed at all.
-
-                            if not loop_active:
-                                break
-
-                            pass_succeeded = any(a.get("confirmed") and not a.get("error") for a in pass_attempts)
-                            if pass_succeeded:
-                                log.info("Investment confirmed on pass %d - stopping the invest loop.", pass_number)
-                                break
-                            if balance_now < MIN_INVESTMENT_AMOUNT:
-                                log.info("Balance dropped below the minimum - stopping the invest loop (nothing left to invest).")
-                                break
-                            if time.monotonic() >= loop_deadline:
-                                log.warning(
-                                    "Reached the %.1fh safety limit without a successful investment - stopping the invest loop.",
-                                    SWAPER_LOOP_MAX_HOURS,
+                                try:
+                                    # Re-fetch (not just re-apply the filter) right
+                                    # before investing - the discovery-time list can
+                                    # already be stale by now since Swaper's manual
+                                    # inventory is extremely transient (a loan can be
+                                    # grabbed by someone else, or a new one can
+                                    # appear, within seconds). Using the fresh list
+                                    # here (instead of the discovery-time
+                                    # originator_loans[name]) avoids computing shares
+                                    # for/targeting a loan that no longer exists, and
+                                    # correctly picks up any loan that appeared since.
+                                    refreshed_payload = _with_relogin_retry(
+                                        lambda name=name: fetch_loans(page, captured_api_calls, groups=[name])
+                                    )
+                                except Exception:
+                                    log.exception("Failed to re-fetch loans for originator %r before investing - skipping it.", name)
+                                    continue
+                                current_loans = _filter_loans_by_min_interest_rate(
+                                    extract_loans(refreshed_payload), min_interest_rate
                                 )
-                                break
-                            time.sleep(SWAPER_LOOP_POLL_INTERVAL_SECONDS)
+                                if not current_loans:
+                                    log.info("Originator %r no longer has any loan available right before investing - skipping.", name)
+                                    continue
+                                shares = _compute_swaper_loan_shares(budget, current_loans)
+                                try:
+                                    attempts = _with_relogin_retry(
+                                        lambda: _invest_available_loans(page, current_loans, shares, captured_api_calls)
+                                    )
+                                except Exception:
+                                    log.exception("Failed to invest into originator %r's loan(s) - skipping it this run.", name)
+                                    continue
+                                country = originator_countries.get(name)
+                                for attempt in attempts:
+                                    attempt["originator"] = name
+                                    # country_invested is updated after EVERY
+                                    # attempted amount (not just a confirmed
+                                    # status) so multiple originators sharing the
+                                    # same country can't jointly blow past the cap.
+                                    if country and not attempt.get("error"):
+                                        country_invested[country] = country_invested.get(country, 0.0) + (attempt.get("amount") or 0.0)
+                                    # Same idea, per loan originator (added
+                                    # 2026-08-05, per-originator cap).
+                                    if not attempt.get("error"):
+                                        originator_invested[name] = originator_invested.get(name, 0.0) + (attempt.get("amount") or 0.0)
+                                pass_attempts.extend(attempts)
+
+                        investment_attempts.extend(pass_attempts)
+
+                        if pass_attempts:
+                            if any(a.get("confirmed") for a in pass_attempts):
+                                # Refresh the balance used for the rest of this run
+                                # (notification email etc.). The real buy response
+                                # already embeds the post-investment balance
+                                # (user.accountBalance) - use that directly instead
+                                # of an extra full page reload when possible,
+                                # falling back to a real refresh only if that can't
+                                # be extracted.
+                                fresh_balance = _extract_balance_from_attempts(pass_attempts)
+                                if fresh_balance is not None:
+                                    balance_now = fresh_balance
+                                    log.info("Balance updated from the buy response: %.2f EUR (skipped an extra fetch).", balance_now)
+                                else:
+                                    payload = _with_relogin_retry(lambda: fetch_loans(page, captured_api_calls))
+                                    balance_now = extract_balance(payload)
+                            # else: nothing confirmed this run - balance/loans are
+                            # unchanged, no refresh needed at all.
+                        else:
+                            log.info("Nothing to invest this run - stopping, the next scheduled run will check again.")
                     except Exception as exc:
-                        # Unexpected error during the loop itself (not one of the
-                        # already-handled per-originator fetch/invest failures
+                        # Unexpected error during discovery/investing (not one of
+                        # the already-handled per-originator fetch/invest failures
                         # above, which just `continue` past that one originator) -
-                        # stop the bot immediately rather than keep looping
-                        # blindly (explicit user request, see run_error's usage
-                        # below - the summary email is still sent regardless).
-                        log.exception("Unexpected error during the invest loop - stopping.")
+                        # stop the bot immediately rather than keep retrying
+                        # blindly (see run_error's usage below - the summary email
+                        # is still sent regardless).
+                        log.exception("Unexpected error during the invest pass - stopping.")
                         run_error = str(exc)
-                    finally:
-                        if cron_disabled:
-                            set_job_enabled(SWAPER_CRON_JOB_ID, True)
 
                 # Per-country status snapshot for the summary email (added
                 # 2026-07-31, mirrors send_lendermarket_invest_summary_email()'s
