@@ -126,6 +126,15 @@ def get_google_credentials():
         scopes=SCOPES,
     )
     
+# Per-process cache of resolved worksheets, keyed by the name passed to
+# get_worksheet_by_name() - some tabs (e.g. "Répartition géographique") are
+# looked up repeatedly within a single run (once per read/write function),
+# and their real title never changes mid-run, so re-resolving (and
+# re-logging the same case-insensitive-fallback message) every single time
+# is pure waste. Cleared automatically on each new process invocation.
+_worksheet_cache: dict = {}
+
+
 def get_worksheet_by_name(sheet_name: str):
     """
     Retourne la feuille Google Sheets dont le nom correspond à `sheet_name`.
@@ -139,9 +148,18 @@ def get_worksheet_by_name(sheet_name: str):
     d'un onglet peut différer légèrement de la constante utilisée dans le
     code (casse, espaces superflus).
 
+    Le résultat est mis en cache (par nom de feuille) pour le reste du
+    processus courant, pour éviter de refaire cette recherche (et de
+    réafficher le même message de repli insensible à la casse) à chaque
+    appel quand plusieurs fonctions lisent/écrivent la même feuille au
+    cours d'un même run.
+
     Lève `gspread.exceptions.WorksheetNotFound` si aucune feuille ne
     correspond, même après ce fallback insensible à la casse.
     """
+    if sheet_name in _worksheet_cache:
+        return _worksheet_cache[sheet_name]
+
     logger.info("Recherche de la feuille Google Sheets : '%s'", sheet_name)
 
     credentials = get_google_credentials()
@@ -173,6 +191,7 @@ def get_worksheet_by_name(sheet_name: str):
 
     logger.info("Feuille sélectionnée : '%s'", worksheet.title)
 
+    _worksheet_cache[sheet_name] = worksheet
     return worksheet
 
 
