@@ -68,13 +68,34 @@ def _is_transient_network_error(exc: Exception) -> bool:
     return False
 
 
+def _is_service_unavailable_error(exc: Exception) -> bool:
+    """True if `exc` looks like a transient Google Sheets API 503 "The
+    service is currently unavailable" error - a temporary server-side
+    outage/overload, unrelated to our own request rate (unlike the 429
+    quota case above). Seen in a real GitHub Actions run:
+    `gspread.exceptions.APIError: [503]: The service is currently
+    unavailable.` from `client.open_by_key()`.
+    """
+    if isinstance(exc, gspread.exceptions.APIError):
+        try:
+            status_code = exc.response.status_code
+        except AttributeError:
+            status_code = None
+        if status_code == 503:
+            return True
+        if "503" in str(exc) or "currently unavailable" in str(exc):
+            return True
+    return False
+
+
 def _call_with_retry(func, *args, **kwargs):
     """Calls func(*args, **kwargs), retrying with exponential backoff
     (30s, 60s, 120s, 240s, 480s by default) whenever it fails with a
-    Google Sheets API 429 "quota exceeded" error OR a transient network
-    error (connection reset/aborted, timeout), instead of letting it
-    propagate and fail the whole run. Any other exception (or a
-    retryable error that persists after all retries) is re-raised as-is.
+    Google Sheets API 429 "quota exceeded" error, a 503 "service
+    currently unavailable" error, OR a transient network error
+    (connection reset/aborted, timeout), instead of letting it propagate
+    and fail the whole run. Any other exception (or a retryable error
+    that persists after all retries) is re-raised as-is.
     """
     wait_seconds = API_RATE_LIMIT_INITIAL_WAIT_SECONDS
 
@@ -82,7 +103,11 @@ def _call_with_retry(func, *args, **kwargs):
         try:
             return func(*args, **kwargs)
         except Exception as exc:
-            retryable = _is_rate_limit_error(exc) or _is_transient_network_error(exc)
+            retryable = (
+                _is_rate_limit_error(exc)
+                or _is_transient_network_error(exc)
+                or _is_service_unavailable_error(exc)
+            )
             if not retryable or attempt > API_RATE_LIMIT_MAX_RETRIES:
                 raise
             logger.warning(
