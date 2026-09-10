@@ -70,7 +70,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 from shared.notifier import send_peerberry_available_email
-from shared.cron_schedule import ensure_schedule
+from shared.cron_schedule import ensure_schedule, apply_startup_jitter
 from shared.state import load_state, save_state
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
@@ -187,6 +187,8 @@ def run() -> None:
         log.error("PEERBERRY_EMAIL and PEERBERRY_PASSWORD environment variables are required.")
         sys.exit(1)
 
+    apply_startup_jitter(CRON_SCHEDULE_STATE_FILE)
+
     log.info("Starting PeerBerry monitor run (pure HTTP, no browser).")
 
     session = requests.Session()
@@ -221,6 +223,9 @@ def run() -> None:
         log.info("Balance >= %.2f EUR but unchanged since the last notification (%.2f EUR) - skipping.", MIN_AVAILABLE_TO_NOTIFY, last_notified_balance)
     else:
         log.info("Balance < %.2f EUR - not sending an email.", MIN_AVAILABLE_TO_NOTIFY)
+
+    mode = "30m" if available_money < MIN_AVAILABLE_TO_NOTIFY else "2m"
+    ensure_schedule(mode, cron_job_id=PEERBERRY_CRON_JOB_ID, state_file=CRON_SCHEDULE_STATE_FILE)
 
 
 if __name__ == "__main__":

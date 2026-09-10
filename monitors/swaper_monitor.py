@@ -239,7 +239,7 @@ from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeo
 
 from shared.notifier import send_swaper_email, send_swaper_investment_summary_email, send_swaper_api_structure_email
 from shared.state import load_state, save_state
-from shared.cron_schedule import ensure_schedule, set_job_enabled
+from shared.cron_schedule import ensure_schedule, set_job_enabled, apply_startup_jitter
 from shared.notification_gate import should_notify
 from shared.google_sheet import (
     get_selected_swaper_loan_originators,
@@ -969,6 +969,8 @@ def run(headless: bool = True) -> None:
     if not SWAPER_EMAIL or not SWAPER_PASSWORD:
         log.error("SWAPER_EMAIL and SWAPER_PASSWORD environment variables are required.")
         sys.exit(1)
+
+    apply_startup_jitter(CRON_SCHEDULE_STATE_FILE)
 
     state = load_state(STATE_FILE, DEFAULT_STATE)
     gates = state.setdefault("gates", {})

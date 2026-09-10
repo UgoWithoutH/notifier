@@ -85,7 +85,7 @@ from shared.google_sheet import (
 )
 from shared.state import load_state, save_state
 from shared.notification_gate import should_notify
-from shared.cron_schedule import ensure_schedule
+from shared.cron_schedule import ensure_schedule, apply_startup_jitter
 
 load_dotenv()
 
@@ -947,6 +947,7 @@ def invest_selected_lenders(
 
 def run() -> None:
     run_started_at = datetime.now(timezone.utc)
+    apply_startup_jitter(CRON_SCHEDULE_STATE_FILE)
     state = load_state(STATE_FILE, DEFAULT_STATE)
     gates = state.setdefault("gates", {})
 
