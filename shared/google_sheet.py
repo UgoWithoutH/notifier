@@ -128,14 +128,19 @@ def get_google_credentials():
     
 def get_worksheet_by_name(sheet_name: str):
     """
-    Retourne la feuille Google Sheets dont le nom correspond exactement
-    à `sheet_name`.
+    Retourne la feuille Google Sheets dont le nom correspond à `sheet_name`.
 
     Utilise SPREADSHEET_ID et les credentials configurés dans les variables
-    d'environnement.
+    d'environnement. Essaie d'abord une correspondance EXACTE (rapide, un
+    seul appel API) ; si aucune feuille ne porte exactement ce nom, retente
+    en comparant chaque feuille existante de façon insensible à la
+    casse/aux espaces (ex. "répartition géographique" ou "Répartition
+    Géographique" matchent aussi "Répartition géographique") - le nom réel
+    d'un onglet peut différer légèrement de la constante utilisée dans le
+    code (casse, espaces superflus).
 
-    Lève `gspread.exceptions.WorksheetNotFound` si aucune feuille ne porte
-    exactement ce nom.
+    Lève `gspread.exceptions.WorksheetNotFound` si aucune feuille ne
+    correspond, même après ce fallback insensible à la casse.
     """
     logger.info("Recherche de la feuille Google Sheets : '%s'", sheet_name)
 
@@ -147,10 +152,24 @@ def get_worksheet_by_name(sheet_name: str):
         SPREADSHEET_ID
     )
 
-    worksheet = _call_with_retry(
-        spreadsheet.worksheet,
-        sheet_name
-    )
+    try:
+        worksheet = _call_with_retry(
+            spreadsheet.worksheet,
+            sheet_name
+        )
+    except gspread.exceptions.WorksheetNotFound:
+        target = sheet_name.strip().casefold()
+        worksheets = _call_with_retry(spreadsheet.worksheets)
+        worksheet = next(
+            (ws for ws in worksheets if ws.title.strip().casefold() == target),
+            None,
+        )
+        if worksheet is None:
+            raise
+        logger.info(
+            "Aucune feuille nommée exactement '%s' - correspondance insensible "
+            "à la casse trouvée : '%s'.", sheet_name, worksheet.title,
+        )
 
     logger.info("Feuille sélectionnée : '%s'", worksheet.title)
 
