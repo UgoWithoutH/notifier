@@ -58,8 +58,8 @@ BASE_INTERVAL_MINUTES = {"2m": 2, "30m": 30}
 # itself (that's now a plain fixed interval, to avoid rebuilding/re-PATCHing
 # it on every run just to re-randomize it). Adjust these two constants
 # directly to change the sleep range.
-JITTER_RANGE_MINUTES_2M = (0, 3)
-JITTER_RANGE_MINUTES_30M = (0, 10)
+JITTER_RANGE_MINUTES_2M = (0, 1)
+JITTER_RANGE_MINUTES_30M = (0, 15)
 
 
 def _build_fixed_minutes(mode: str) -> list:
