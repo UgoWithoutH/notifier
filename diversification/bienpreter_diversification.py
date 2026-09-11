@@ -996,6 +996,8 @@ def run() -> None:
         all_operations = None
 
     total_invested = balances["capital_to_receive"]
+    avg_invested_balance = None
+    avg_non_invested_balance = None
     if all_operations:
         today_date_str = today_date.strftime("%Y-%m-%d")
         # Rows after today_date belong to a backfilled month's future (real
@@ -1004,6 +1006,20 @@ def run() -> None:
         # is still needed for the backward reconstruction just below, which
         # specifically looks PAST today_date.
         operations_as_of = [r for r in all_operations if r.get("date") and r["date"] <= today_date_str]
+
+        # Day-weighted average invested/non-invested balances (new Sheet
+        # rows "solde moyen pondéré investi"/"non investi", added
+        # 2026-09-08) - computed here (moved 2026-09-11, ahead of Cash
+        # drag below) so Cash drag can be derived FROM these same two
+        # averages instead of a live total_invested snapshot.
+        month_start_date = today_date.replace(day=1)
+        avg_invested_balance, avg_non_invested_balance = compute_average_balances(
+            operations_as_of, month_start_date, today_date
+        )
+        log.info(
+            "Solde moyen pondéré - investi: %.2f EUR, non investi: %.2f EUR (%s to %s).",
+            avg_invested_balance, avg_non_invested_balance, month_start_date, today_date,
+        )
 
         if current_month:
             total_account_value = total  # solde disponible + capital à recevoir, same "as if withdrawn today" value used elsewhere in this repo
@@ -1070,20 +1086,25 @@ def run() -> None:
             )
             lifetime_net_interest = lifetime_gross_interest - lifetime_withholding_tax
 
-            if total_invested > 0:
-                month_start_str = today_date.replace(day=1).strftime("%Y-%m-%d")
-                today_str = today_date.strftime("%Y-%m-%d")
-                avg_idle_cash = compute_average_idle_cash(operations_as_of, month_start_str, today_str)
-                cash_weight = avg_idle_cash / (avg_idle_cash + total_invested)
-                monthly_yield_rate = interest_totals["gross_interest_received"] / total_invested
+            # cash_weight/monthly_yield_rate use the already-computed
+            # avg_invested_balance/avg_non_invested_balance (same figures
+            # as the "solde moyen pondéré" Sheet rows above) instead of
+            # the live total_invested snapshot (fixed 2026-09-11), so this
+            # % is exactly reconstructible from those two Sheet rows. The
+            # lifetime share below still uses total_invested (no
+            # lifetime-average equivalent exists).
+            today_str = today_date.strftime("%Y-%m-%d")
+            if avg_invested_balance is not None and avg_invested_balance > 0:
+                cash_weight = avg_non_invested_balance / (avg_non_invested_balance + avg_invested_balance)
+                monthly_yield_rate = interest_totals["gross_interest_received"] / avg_invested_balance
                 cash_drag_value = cash_weight * monthly_yield_rate
                 log.info(
                     "Computed Cash drag: %.2f%% (avg idle cash %.2f EUR, cash weight %.2f%%, monthly yield %.2f%%).",
-                    cash_drag_value * 100, avg_idle_cash, cash_weight * 100, monthly_yield_rate * 100,
+                    cash_drag_value * 100, avg_non_invested_balance, cash_weight * 100, monthly_yield_rate * 100,
                 )
 
                 deposit_dates = [r["date"] for r in operations_as_of if r.get("date") and r["label"] == "Dépôt de fonds"]
-                if deposit_dates:
+                if deposit_dates and total_invested > 0:
                     since_inception_date = datetime.strptime(min(deposit_dates), "%Y-%m-%d").date()
                     years_elapsed = max((today_date - since_inception_date).days / 365.25, 1 / 365.25)
                     # lifetime_gross_interest already computed above (used
@@ -1131,23 +1152,6 @@ def run() -> None:
                         "XIRR Waterfall shares (since-inception, %.2f years, missed earnings ~%.2f EUR): %r",
                         years_elapsed, missed_earnings, {k: round(v * 100, 4) for k, v in waterfall_shares.items() if v is not None},
                     )
-
-    # Day-weighted average invested/non-invested balances (new Sheet rows
-    # "solde moyen pondéré investi"/"non investi", added 2026-09-08,
-    # rewritten to a real day-by-day calculation 2026-09-08 - see
-    # compute_average_balances()'s docstring for why "investi" no longer
-    # needs a per-transaction outstanding ledger at all).
-    avg_invested_balance = None
-    avg_non_invested_balance = None
-    if all_operations:
-        month_start_date = today_date.replace(day=1)
-        avg_invested_balance, avg_non_invested_balance = compute_average_balances(
-            operations_as_of, month_start_date, today_date
-        )
-        log.info(
-            "Solde moyen pondéré - investi: %.2f EUR, non investi: %.2f EUR (%s to %s).",
-            avg_invested_balance, avg_non_invested_balance, month_start_date, today_date,
-        )
 
     # "total" = solde disponible + capital à recevoir, both scraped from
     # LIVE-only dashboard widgets with no date param and no historical/

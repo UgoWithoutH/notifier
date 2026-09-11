@@ -575,18 +575,30 @@ def compute_average_idle_cash(all_entries: list, start_date: str, end_date: str)
     return total_balance / day_count
 
 
-def compute_average_balances(all_entries: list, start_date, end_date) -> tuple:
+def compute_average_balances(
+    all_entries: list, start_date, end_date,
+    invested_closing_anchor: float = None, non_invested_closing_anchor: float = None,
+) -> tuple:
     """Day-weighted average INVESTED ("outstanding") and NON-INVESTED
     (wallet cash) balances over [start_date, end_date] (`date` objects) -
     for the "solde moyen pondéré investi"/"solde moyen pondéré non
     investi" Sheet rows (added 2026-09-08). Reuses the SAME per-entry
     classifiers as reconstruct_outstanding()/compute_average_idle_cash()
     above (_OUTSTANDING_KINDS/_entry_value), just fed into the generic
-    shared day-weighted-average helper (opening_balance=0.0 at account
-    inception) instead of a point-in-time replay - `all_entries` is
-    expected to cover the account's full history (see
-    get_cached_wallet_transactions()), so the running balance carried into
-    `start_date` from summed prior deltas is accurate."""
+    shared day-weighted-average helper - `all_entries` is expected to
+    cover the account's full history (see get_cached_wallet_transactions()).
+
+    Without an anchor, both averages are rebuilt from account inception
+    (opening_balance=0.0), which can only ever drift if a `kind` isn't
+    fully covered by _OUTSTANDING_KINDS/_entry_value (unverified for
+    inception - see module docstring's exact-reconciliation note for
+    today only). When `invested_closing_anchor`/`non_invested_closing_anchor`
+    are given (the real LIVE `investments_en_cours`/`solde_total` from
+    fetch_balances(), only meaningful for the real current month - no
+    historical equivalent exists via home-metrics), the period's own
+    events are replayed BACKWARDS from that real value instead, bounding
+    any drift risk to just this month's own entries.
+    """
     invested_events = []
     non_invested_events = []
     for entry in all_entries:
@@ -598,8 +610,24 @@ def compute_average_balances(all_entries: list, start_date, end_date) -> tuple:
         if entry.get("kind") in _OUTSTANDING_KINDS:
             invested_events.append((entry_date, -value))
 
-    avg_invested = compute_time_weighted_average(invested_events, start_date, end_date)
-    avg_non_invested = compute_time_weighted_average(non_invested_events, start_date, end_date)
+    if invested_closing_anchor is not None:
+        period_invested = [(d, v) for d, v in invested_events if start_date <= d <= end_date]
+        avg_invested = compute_time_weighted_average(
+            period_invested, start_date, end_date,
+            opening_balance=invested_closing_anchor - sum(v for _, v in period_invested),
+        )
+    else:
+        avg_invested = compute_time_weighted_average(invested_events, start_date, end_date)
+
+    if non_invested_closing_anchor is not None:
+        period_non_invested = [(d, v) for d, v in non_invested_events if start_date <= d <= end_date]
+        avg_non_invested = compute_time_weighted_average(
+            period_non_invested, start_date, end_date,
+            opening_balance=non_invested_closing_anchor - sum(v for _, v in period_non_invested),
+        )
+    else:
+        avg_non_invested = compute_time_weighted_average(non_invested_events, start_date, end_date)
+
     return avg_invested, avg_non_invested
 
 
@@ -639,7 +667,9 @@ def _build_since_inception_cashflows_as_of(all_entries: list, end_date) -> list:
     return signed_cashflows
 
 
-def compute_xirr_block_as_of(all_entries: list, end_date) -> dict:
+def compute_xirr_block_as_of(
+    all_entries: list, end_date, avg_invested_balance: float = None, avg_non_invested_balance: float = None,
+) -> dict:
     """Compute the FULL XIRR pie-chart block (XIRR, Cash drag, XIRR Bonus,
     XIRR Cash drag, XIRR Taxes, XIRR Frais, XIRR Intérêts) as of an arbitrary
     `end_date` - works identically for the current month or a BACKFILLED
@@ -652,6 +682,15 @@ def compute_xirr_block_as_of(all_entries: list, end_date) -> dict:
     exactly: Cash drag is a MONTHLY figure (this month alone), everything
     else is a Shapley decomposition (see shared/xirr_shapley.py) of the
     since-inception XIRR gap through end_date.
+
+    `avg_invested_balance`/`avg_non_invested_balance`: the SAME day-weighted
+    averages already computed by the caller (via compute_average_balances(),
+    for the "solde moyen pondéré" Sheet rows) for the [month_start, end_date]
+    period - used for the monthly "Cash drag" %% instead of the point-in-time
+    outstanding_as_of/wallet balance (fixed 2026-09-11), so that %% is exactly
+    reconstructible from those two Sheet rows. The lifetime XIRR Cash drag
+    share further below still uses outstanding_as_of (no lifetime-average
+    equivalent is computed anywhere).
 
     Returns a dict with any subset of {"XIRR", "Cash drag", "XIRR Bonus",
     "XIRR Cash drag", "XIRR Taxes", "XIRR Frais", "XIRR Intérêts"} that
@@ -677,17 +716,16 @@ def compute_xirr_block_as_of(all_entries: list, end_date) -> dict:
         # divide by the invested amount.
         return result
 
-    month_start_str = end_date.replace(day=1).strftime("%Y-%m-%d")
     end_date_str = end_date.strftime("%Y-%m-%d")
-    avg_idle_cash = compute_average_idle_cash(all_entries, month_start_str, end_date_str)
-    monthly_interest = _sum_in_range(all_entries, {_INTEREST_KIND}, end_date.replace(day=1), end_date)
-    cash_weight = avg_idle_cash / (avg_idle_cash + outstanding_as_of)
-    monthly_yield_rate = monthly_interest / outstanding_as_of
-    result["Cash drag"] = cash_weight * monthly_yield_rate
-    log.info(
-        "Computed Cash drag as of %s: %.2f%% (avg idle cash %.2f EUR, cash weight %.2f%%, monthly yield %.2f%%).",
-        end_date, result["Cash drag"] * 100, avg_idle_cash, cash_weight * 100, monthly_yield_rate * 100,
-    )
+    if avg_invested_balance is not None and avg_invested_balance > 0:
+        monthly_interest = _sum_in_range(all_entries, {_INTEREST_KIND}, end_date.replace(day=1), end_date)
+        cash_weight = avg_non_invested_balance / (avg_non_invested_balance + avg_invested_balance)
+        monthly_yield_rate = monthly_interest / avg_invested_balance
+        result["Cash drag"] = cash_weight * monthly_yield_rate
+        log.info(
+            "Computed Cash drag as of %s: %.2f%% (avg non-invested balance %.2f EUR, cash weight %.2f%%, monthly yield %.2f%%).",
+            end_date, result["Cash drag"] * 100, avg_non_invested_balance, cash_weight * 100, monthly_yield_rate * 100,
+        )
 
     deposit_dates = [
         d for d in (_entry_date(e) for e in all_entries if e.get("kind") in _DEPOSIT_KINDS and _is_confirmed(e))
@@ -806,10 +844,35 @@ def run() -> None:
     current_month = is_current_month()
     today_date = get_report_now(REPORT_TIMEZONE).date()
 
+    # Day-weighted average invested/non-invested balances (new Sheet rows
+    # "solde moyen pondéré investi"/"non investi", added 2026-09-08) -
+    # computed whenever all_entries is available, independent of
+    # current_month, so this also works for a REPORT_DATE-backfilled past
+    # month. Uses the REAL number of days in the period, never a
+    # hardcoded 30. Moved ahead of compute_xirr_block_as_of() below
+    # (2026-09-11) so its own monthly Cash drag can be computed FROM these
+    # same two averages instead of the point-in-time outstanding_as_of.
+    avg_invested_balance = None
+    avg_non_invested_balance = None
+    if all_entries is not None:
+        month_start_date = today_date.replace(day=1)
+        avg_invested_balance, avg_non_invested_balance = compute_average_balances(
+            all_entries, month_start_date, today_date,
+            invested_closing_anchor=balances["investments_en_cours"] if current_month else None,
+            non_invested_closing_anchor=balances["solde_total"] if current_month else None,
+        )
+        log.info(
+            "Solde moyen pondéré - investi: %.2f EUR, non investi: %.2f EUR (%s to %s).",
+            avg_invested_balance, avg_non_invested_balance, month_start_date, today_date,
+        )
+
     xirr_block = {}
     if all_entries is not None:
         try:
-            xirr_block = compute_xirr_block_as_of(all_entries, today_date)
+            xirr_block = compute_xirr_block_as_of(
+                all_entries, today_date,
+                avg_invested_balance=avg_invested_balance, avg_non_invested_balance=avg_non_invested_balance,
+            )
         except Exception:
             log.exception("Failed to compute the XIRR block as of %s.", today_date)
             xirr_block = {}
@@ -866,24 +929,6 @@ def run() -> None:
         section="Crowdfunding immobilier",
         skip_total=skip_total,
     )
-
-    # Day-weighted average invested/non-invested balances (new Sheet rows
-    # "solde moyen pondéré investi"/"non investi", added 2026-09-08) -
-    # computed whenever all_entries is available, independent of
-    # current_month, so this also works for a REPORT_DATE-backfilled past
-    # month. Uses the REAL number of days in the period, never a
-    # hardcoded 30.
-    avg_invested_balance = None
-    avg_non_invested_balance = None
-    if all_entries is not None:
-        month_start_date = today_date.replace(day=1)
-        avg_invested_balance, avg_non_invested_balance = compute_average_balances(
-            all_entries, month_start_date, today_date
-        )
-        log.info(
-            "Solde moyen pondéré - investi: %.2f EUR, non investi: %.2f EUR (%s to %s).",
-            avg_invested_balance, avg_non_invested_balance, month_start_date, today_date,
-        )
 
     # Bricks' block uses its own distinct sub-row labels ("parrainages" /
     # "soldes boostés"), not the generic prime/cashback/concours trio used

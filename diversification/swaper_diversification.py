@@ -1156,19 +1156,55 @@ def run(headless: bool = True) -> None:
         if xirr_value is None:
             log.warning("Could not compute XIRR as of the report date from the reconstructed cashflows.")
 
+    # Day-weighted average invested/non-invested balances (new Sheet rows
+    # "solde moyen pondéré investi"/"non investi", added 2026-09-08) -
+    # computed whenever all_account_entries is available, independent of
+    # current_month, so this also works for a REPORT_DATE-backfilled past
+    # month. Uses the REAL number of days in the period, never a
+    # hardcoded 30. Uses its own local date variables (not `today_date`,
+    # which is reused above as either a string or a date depending on
+    # branch) to avoid any ambiguity. Moved ahead of Cash drag below
+    # (2026-09-11) so Cash drag can be computed FROM these same two
+    # averages instead of a live breakdown["total_invested"] snapshot.
+    avg_invested_balance = None
+    avg_non_invested_balance = None
+    if all_account_entries is not None:
+        report_end_date = get_report_now(REPORT_TIMEZONE).date()
+        report_start_date = report_end_date.replace(day=1)
+        # Real opening balance for report_start_date (from the account-
+        # entries API itself) - anchors the non-invested average, avoiding
+        # any since-inception drift accumulated from a full-history replay
+        # (see compute_average_balances()'s own docstring). Already
+        # fetched as part of this month's statement totals for a live
+        # run, or exposed by compute_xirr_block_as_of() for a backfilled
+        # one - no extra API call needed either way.
+        non_invested_opening_balance = None
+        if current_month and statement_totals is not None:
+            non_invested_opening_balance = statement_totals["opening_balance"]
+        elif not current_month and xirr_backfill_block is not None:
+            non_invested_opening_balance = xirr_backfill_block.get("_month_opening_balance")
+        avg_invested_balance, avg_non_invested_balance = compute_average_balances(
+            all_account_entries, report_start_date, report_end_date, non_invested_opening_balance
+        )
+        log.info(
+            "Solde moyen pondéré - investi: %.2f EUR, non investi: %.2f EUR (%s to %s).",
+            avg_invested_balance, avg_non_invested_balance, report_start_date, report_end_date,
+        )
+
     # Cash drag: how much this month's return was diluted by cash sitting
     # idle (not invested) instead of earning interest. Defined here as
     # `cash_weight * monthly_yield_rate` (both non-annualized, THIS month
     # only, per the user's own definition - "l'impact sur le mois des sous
     # non investi"):
-    #   cash_weight        = avg_idle_cash_this_month / (avg_idle_cash_this_month + total_invested)
-    #   monthly_yield_rate = gross_interest_received_this_month / total_invested
+    #   cash_weight        = avg_non_invested_balance / (avg_non_invested_balance + avg_invested_balance)
+    #   monthly_yield_rate = gross_interest_received_this_month / avg_invested_balance
     # i.e. the number of percentage points THIS MONTH's return was reduced
     # by, assuming the idle cash would otherwise have earned the same rate
-    # as the capital that WAS invested this month. `avg_idle_cash_this_month`
-    # is now a real day-weighted average (see compute_average_idle_cash()) -
-    # a naive (opening+closing)/2 misses idle cash that appears AND gets
-    # invested within the same month, per user request 2026-08-14.
+    # as the capital that WAS invested this month. Uses the same
+    # avg_invested_balance/avg_non_invested_balance as the "solde moyen
+    # pondéré" Sheet rows above (fixed 2026-09-11, previously divided by
+    # the live breakdown["total_invested"] snapshot instead), so this % is
+    # exactly reconstructible from those two Sheet rows.
     cash_drag_value = xirr_backfill_block.get("Cash drag") if (not current_month and xirr_backfill_block) else None
     # Cash drag/taxes' own share of XIRR, on the same since-inception,
     # annualized percentage-point scale as XIRR itself (unlike "Cash drag"
@@ -1194,22 +1230,16 @@ def run(headless: bool = True) -> None:
     # lifetime_statement_totals["earned_interest"] already IS the lifetime
     # net interest figure, used directly.
     interest_xirr_contribution = xirr_backfill_block.get("XIRR Intérêts") if (not current_month and xirr_backfill_block) else None
-    if current_month and statement_totals is not None and breakdown["total_invested"] > 0:
-        month_start_date = get_report_now(REPORT_TIMEZONE).replace(day=1).strftime("%Y-%m-%d")
-        today_date_str = get_report_now(REPORT_TIMEZONE).strftime("%Y-%m-%d")
-        avg_idle_cash = compute_average_idle_cash(
-            all_account_entries or [], statement_totals["opening_balance"], statement_totals["closing_balance"],
-            month_start_date, today_date_str,
-        )
-        cash_weight = avg_idle_cash / (avg_idle_cash + breakdown["total_invested"])
-        monthly_yield_rate = interest_received / breakdown["total_invested"]
+    if current_month and avg_invested_balance is not None and avg_invested_balance > 0:
+        cash_weight = avg_non_invested_balance / (avg_non_invested_balance + avg_invested_balance)
+        monthly_yield_rate = interest_received / avg_invested_balance
         cash_drag_value = cash_weight * monthly_yield_rate
         log.info(
-            "Computed Cash drag: %.2f%% (avg idle cash %.2f EUR, cash weight %.2f%%, monthly yield %.2f%%).",
-            cash_drag_value * 100, avg_idle_cash, cash_weight * 100, monthly_yield_rate * 100,
+            "Computed Cash drag: %.2f%% (avg non-invested balance %.2f EUR, cash weight %.2f%%, monthly yield %.2f%%).",
+            cash_drag_value * 100, avg_non_invested_balance, cash_weight * 100, monthly_yield_rate * 100,
         )
 
-        if lifetime_statement_totals is not None and xirr_cashflow_entries:
+        if lifetime_statement_totals is not None and xirr_cashflow_entries and breakdown["total_invested"] > 0:
             funding_dates = [
                 e["date"] for e in xirr_cashflow_entries
                 if e["transactionType"].strip().upper() == "FUNDING"
@@ -1262,39 +1292,6 @@ def run(headless: bool = True) -> None:
                         "XIRR Waterfall shares (since-inception, %.2f years, missed earnings ~%.2f EUR): %r",
                         years_elapsed, missed_earnings, {k: round(v * 100, 4) for k, v in waterfall_shares.items() if v is not None},
                     )
-
-    # Day-weighted average invested/non-invested balances (new Sheet rows
-    # "solde moyen pondéré investi"/"non investi", added 2026-09-08) -
-    # computed whenever all_account_entries is available, independent of
-    # current_month, so this also works for a REPORT_DATE-backfilled past
-    # month. Uses the REAL number of days in the period, never a
-    # hardcoded 30. Uses its own local date variables (not `today_date`,
-    # which is reused above as either a string or a date depending on
-    # branch) to avoid any ambiguity.
-    avg_invested_balance = None
-    avg_non_invested_balance = None
-    if all_account_entries is not None:
-        report_end_date = get_report_now(REPORT_TIMEZONE).date()
-        report_start_date = report_end_date.replace(day=1)
-        # Real opening balance for report_start_date (from the account-
-        # entries API itself) - anchors the non-invested average, avoiding
-        # any since-inception drift accumulated from a full-history replay
-        # (see compute_average_balances()'s own docstring). Already
-        # fetched as part of this month's statement totals for a live
-        # run, or exposed by compute_xirr_block_as_of() for a backfilled
-        # one - no extra API call needed either way.
-        non_invested_opening_balance = None
-        if current_month and statement_totals is not None:
-            non_invested_opening_balance = statement_totals["opening_balance"]
-        elif not current_month and xirr_backfill_block is not None:
-            non_invested_opening_balance = xirr_backfill_block.get("_month_opening_balance")
-        avg_invested_balance, avg_non_invested_balance = compute_average_balances(
-            all_account_entries, report_start_date, report_end_date, non_invested_opening_balance
-        )
-        log.info(
-            "Solde moyen pondéré - investi: %.2f EUR, non investi: %.2f EUR (%s to %s).",
-            avg_invested_balance, avg_non_invested_balance, report_start_date, report_end_date,
-        )
 
     # "total" comes from the "Currently Allocated" DOM widget plus the
     # uninvested balance (see above), a LIVE-only snapshot with no date

@@ -816,22 +816,28 @@ def _wallet_balance_as_of(entries: list, end_date: date) -> float:
     return balance
 
 
-def compute_average_balances(entries: list, start_date, end_date) -> tuple:
+def compute_average_balances(entries: list, start_date, end_date, invested_closing_anchor: float = None) -> tuple:
     """Day-weighted average INVESTED ("outstanding") and NON-INVESTED
     (wallet cash) balances over [start_date, end_date] (`date` objects) -
     for the "solde moyen pondéré investi"/"solde moyen pondéré non
     investi" Sheet rows (added 2026-09-08). The invested side reuses the
     SAME per-entry classifier as reconstruct_outstanding() above
     (_outstanding_delta_for_entry), fed into the generic shared day-
-    weighted-average helper. The cash side is different: Mintos ledger
-    rows carry a real running `balance` snapshot (forward-fill, see
+    weighted-average helper - rebuilt from account inception
+    (opening_balance=0.0) unless `invested_closing_anchor` is given (the
+    real LIVE loans+bonds outstanding total, only meaningful for the real
+    current month - no historical equivalent exists on Mintos), in which
+    case the period's own events are replayed BACKWARDS from that real
+    value instead, bounding any drift risk to just this month's own
+    entries. The cash side is different and already immune to this: Mintos
+    ledger rows carry a real running `balance` snapshot (forward-fill, see
     compute_average_idle_cash()'s docstring) rather than a per-row signed
     delta - converted here into an equivalent delta sequence (delta =
     balance_after - balance_before per entry, processed in ascending date
     order) so the SAME generic averaging helper can be reused for both
-    sides uniformly. `entries` is expected to cover the account's full
-    history (see get_cached_transactions()), so the running balance
-    carried into `start_date` is accurate."""
+    sides uniformly, with no anchor needed. `entries` is expected to
+    cover the account's full history (see get_cached_transactions()), so
+    the running balance carried into `start_date` is accurate."""
     dated_entries = []
     for entry in entries:
         entry_date = _entry_date(entry)
@@ -857,7 +863,14 @@ def compute_average_balances(entries: list, start_date, end_date) -> tuple:
                 non_invested_events.append((entry_date, balance - running_cash_balance))
                 running_cash_balance = balance
 
-    avg_invested = compute_time_weighted_average(invested_events, start_date, end_date)
+    if invested_closing_anchor is not None:
+        period_invested = [(d, v) for d, v in invested_events if start_date <= d <= end_date]
+        avg_invested = compute_time_weighted_average(
+            period_invested, start_date, end_date,
+            opening_balance=invested_closing_anchor - sum(v for _, v in period_invested),
+        )
+    else:
+        avg_invested = compute_time_weighted_average(invested_events, start_date, end_date)
     avg_non_invested = compute_time_weighted_average(non_invested_events, start_date, end_date)
     return avg_invested, avg_non_invested
 
@@ -1144,19 +1157,44 @@ def run(session: requests.Session | None = None) -> None:
     # lifetime_statement_totals dict already fetched below for Cash
     # drag/XIRR Taxes-Frais (not recomputed a second time).
     interest_xirr_contribution = None
-    if current_month and total_outstanding > 0 and all_entries is not None:
-        month_start_str = today_date.replace(day=1).strftime("%Y-%m-%d")
-        today_str = today_date.strftime("%Y-%m-%d")
-        avg_idle_cash_this_month = compute_average_idle_cash(all_entries, month_start_str, today_str)
-        cash_weight = avg_idle_cash_this_month / (avg_idle_cash_this_month + total_outstanding)
-        monthly_yield_rate = statement_totals["gross_interest_received"] / total_outstanding
-        cash_drag_value = cash_weight * monthly_yield_rate
+
+    # Day-weighted average invested/non-invested balances (new Sheet rows
+    # "solde moyen pondéré investi"/"non investi", added 2026-09-08) -
+    # computed whenever all_entries is available, independent of
+    # current_month, so this also works for a REPORT_DATE-backfilled past
+    # month. Uses the REAL number of days in the period, never a
+    # hardcoded 30. Moved ahead of Cash drag below (2026-09-11) so Cash
+    # drag can be computed FROM these same two averages.
+    avg_invested_balance = None
+    avg_non_invested_balance = None
+    if all_entries is not None:
+        month_start_date = today_date.replace(day=1)
+        avg_invested_balance, avg_non_invested_balance = compute_average_balances(
+            all_entries, month_start_date, today_date,
+            invested_closing_anchor=total_outstanding if current_month else None,
+        )
         log.info(
-            "Computed Cash drag: %.2f%% (avg idle cash %.2f EUR, cash weight %.2f%%, monthly yield %.2f%%).",
-            cash_drag_value * 100, avg_idle_cash_this_month, cash_weight * 100, monthly_yield_rate * 100,
+            "Solde moyen pondéré - investi: %.2f EUR, non investi: %.2f EUR (%s to %s).",
+            avg_invested_balance, avg_non_invested_balance, month_start_date, today_date,
         )
 
-        if xirr_value is not None and signed_cashflows is not None and since_inception_date is not None:
+    # cash_weight/monthly_yield_rate use avg_invested_balance/
+    # avg_non_invested_balance (same figures as the "solde moyen pondéré"
+    # Sheet rows above) instead of the live total_outstanding snapshot
+    # (fixed 2026-09-11), so this % is exactly reconstructible from those
+    # two Sheet rows. The lifetime share below still uses total_outstanding
+    # (no lifetime-average equivalent exists).
+    if current_month and avg_invested_balance is not None and avg_invested_balance > 0 and all_entries is not None:
+        today_str = today_date.strftime("%Y-%m-%d")
+        cash_weight = avg_non_invested_balance / (avg_non_invested_balance + avg_invested_balance)
+        monthly_yield_rate = statement_totals["gross_interest_received"] / avg_invested_balance
+        cash_drag_value = cash_weight * monthly_yield_rate
+        log.info(
+            "Computed Cash drag: %.2f%% (avg non-invested balance %.2f EUR, cash weight %.2f%%, monthly yield %.2f%%).",
+            cash_drag_value * 100, avg_non_invested_balance, cash_weight * 100, monthly_yield_rate * 100,
+        )
+
+        if xirr_value is not None and signed_cashflows is not None and since_inception_date is not None and total_outstanding > 0:
             avg_idle_cash_lifetime = compute_average_idle_cash(all_entries, since_inception_date.strftime("%Y-%m-%d"), today_str)
             cash_weight_lifetime = avg_idle_cash_lifetime / (avg_idle_cash_lifetime + total_outstanding)
             try:
@@ -1242,24 +1280,6 @@ def run(session: requests.Session | None = None) -> None:
         labeled_amounts=labeled_amounts,
         skip_total=not current_month,
     )
-
-    # Day-weighted average invested/non-invested balances (new Sheet rows
-    # "solde moyen pondéré investi"/"non investi", added 2026-09-08) -
-    # computed whenever all_entries is available, independent of
-    # current_month, so this also works for a REPORT_DATE-backfilled past
-    # month. Uses the REAL number of days in the period, never a
-    # hardcoded 30.
-    avg_invested_balance = None
-    avg_non_invested_balance = None
-    if all_entries is not None:
-        month_start_date = today_date.replace(day=1)
-        avg_invested_balance, avg_non_invested_balance = compute_average_balances(
-            all_entries, month_start_date, today_date
-        )
-        log.info(
-            "Solde moyen pondéré - investi: %.2f EUR, non investi: %.2f EUR (%s to %s).",
-            avg_invested_balance, avg_non_invested_balance, month_start_date, today_date,
-        )
 
     # "Cash drag"/"XIRR" and the XIRR Bonus/Cash drag/Taxes-Frais/Intérêts
     # pie-chart shares sit further below Mintos' block (rows already added

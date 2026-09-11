@@ -962,20 +962,45 @@ def reconstruct_outstanding(all_detail_rows: list, end_date: date) -> float:
     return outstanding
 
 
-def compute_average_balances(all_detail_rows: list, start_date: date, end_date: date) -> tuple:
+def compute_average_balances(
+    all_detail_rows: list, start_date: date, end_date: date,
+    invested_closing_anchor: float = None, non_invested_opening_anchor: float = None,
+) -> tuple:
     """Day-weighted average INVESTED ("outstanding") and NON-INVESTED
     (wallet cash) balances over [start_date, end_date] - for the "solde
     moyen pondéré investi"/"solde moyen pondéré non investi" Sheet rows
     (added 2026-09-08). Reuses the SAME per-row classifiers as
     reconstruct_outstanding()/compute_average_idle_cash() above
     (_outstanding_delta_for_label/_cash_delta_for_detail_row), just fed
-    into the generic shared day-weighted-average helper instead of a
-    point-in-time replay - works identically for the real current month or
-    a REPORT_DATE-backfilled past month (start_date/end_date are whatever
-    the caller passes). `all_detail_rows` is expected to cover the
-    account's FULL history (see reconstruct_outstanding()'s docstring), so
-    the running balance carried into `start_date` is accurate with no
-    separate opening-balance anchor needed."""
+    into the generic shared day-weighted-average helper.
+
+    Without an anchor, the running balance is rebuilt from EVERY event
+    since account inception (opening_balance=0.0) - any transaction-label
+    misclassification (an unrecognized label, or "Cancellation fee",
+    deliberately left unclassified - see _outstanding_delta_for_label's
+    docstring) then silently drifts the average forever, never
+    self-correcting. When a real anchor IS available, it's used instead to
+    bound that drift risk to just THIS period's own events instead of the
+    account's entire history:
+    - `invested_closing_anchor`: the real LIVE total outstanding as of
+      `end_date` (fetch_investments()'s own sum, unrelated to the Details
+      ledger) - only meaningful for the real CURRENT month (Afranga has no
+      historical equivalent for a past month's invested total). The
+      period's own invested events are replayed BACKWARDS from it (opening
+      = anchor - net change over the period), so the period's last day is
+      always exactly right and only the days before it depend on this
+      period's own (much smaller) classification risk.
+    - `non_invested_opening_anchor`: the real wallet balance as of
+      `start_date` (Account Statement's own "Opening balance" row, same
+      value compute_average_idle_cash() anchors "Cash drag" on) - this
+      figure IS available for a REPORT_DATE-backfilled past month too (the
+      Account Statement endpoint accepts any date range), so callers
+      should normally always pass this one. The period's own cash events
+      are then replayed FORWARDS from it, exactly like
+      compute_average_idle_cash() does.
+    Falls back to the old inception-anchored reconstruction wherever an
+    anchor isn't passed (None).
+    """
     invested_events = []
     non_invested_events = []
     for row in all_detail_rows:
@@ -990,8 +1015,23 @@ def compute_average_balances(all_detail_rows: list, start_date: date, end_date: 
         invested_events.append((row_date, _outstanding_delta_for_label(label, row.get("net_amount"))))
         non_invested_events.append((row_date, _cash_delta_for_detail_row(row)))
 
-    avg_invested = compute_time_weighted_average(invested_events, start_date, end_date)
-    avg_non_invested = compute_time_weighted_average(non_invested_events, start_date, end_date)
+    if invested_closing_anchor is not None:
+        period_invested_events = [(d, amt) for d, amt in invested_events if start_date <= d <= end_date]
+        net_period_change = sum(amt for _, amt in period_invested_events)
+        avg_invested = compute_time_weighted_average(
+            period_invested_events, start_date, end_date, opening_balance=invested_closing_anchor - net_period_change,
+        )
+    else:
+        avg_invested = compute_time_weighted_average(invested_events, start_date, end_date)
+
+    if non_invested_opening_anchor is not None:
+        period_non_invested_events = [(d, amt) for d, amt in non_invested_events if start_date <= d <= end_date]
+        avg_non_invested = compute_time_weighted_average(
+            period_non_invested_events, start_date, end_date, opening_balance=non_invested_opening_anchor,
+        )
+    else:
+        avg_non_invested = compute_time_weighted_average(non_invested_events, start_date, end_date)
+
     return avg_invested, avg_non_invested
 
 
@@ -1354,24 +1394,58 @@ def run() -> None:
         if xirr_value is None:
             log.warning("Could not compute XIRR as of %s from the reconstructed cashflows.", today_date)
 
-    # Cash drag: how much this month's return was diluted by cash sitting
-    # idle (not invested) instead of earning interest - same definition as
-    # swaper_diversification.py's own Cash drag (see its docstring):
-    #   cash_weight        = avg_idle_cash_this_month / (avg_idle_cash_this_month + total_invested)
-    #   monthly_yield_rate = gross_interest_received_this_month / total_invested
-    if current_month and total_invested > 0:
-        month_start_date = get_report_now(REPORT_TIMEZONE).replace(day=1).strftime("%Y-%m-%d")
-        today_date_str = today_date.strftime("%Y-%m-%d")
-        avg_idle_cash = compute_average_idle_cash(
-            all_detail_rows or [], statement_totals["opening_balance"], statement_totals["closing_balance"],
-            month_start_date, today_date_str,
+    # Day-weighted average invested/non-invested balances (new Sheet rows
+    # "solde moyen pondéré investi"/"non investi", added 2026-09-08) -
+    # computed whenever all_detail_rows is available, independent of
+    # current_month/Cash drag/XIRR above, so this also works for a
+    # REPORT_DATE-backfilled past month. Uses the REAL number of days in
+    # the reporting period (see compute_time_weighted_average()), never a
+    # hardcoded 30. non_invested_opening_anchor is passed UNCONDITIONALLY
+    # (not just for current_month): statement_totals["opening_balance"]
+    # comes from the Account Statement page's own "Opening balance <date>"
+    # row, which get_report_now()/fetch_current_month_statement_totals()
+    # already fetch for whichever month REPORT_DATE points at - a real
+    # historical figure, not a live-only one, unlike invested_closing_anchor
+    # (fetch_investments()'s live total, only meaningful for the real
+    # current month - no historical equivalent exists on Afranga for a
+    # past month's invested total). See compute_average_balances()'s
+    # docstring for why anchoring bounds drift risk to just this month
+    # instead of the account's whole history. Moved ahead of Cash drag
+    # below (2026-09-11) so Cash drag can be computed FROM these same two
+    # averages instead of duplicating the reconstruction.
+    avg_invested_balance = None
+    avg_non_invested_balance = None
+    if all_detail_rows is not None:
+        month_start_date = today_date.replace(day=1)
+        avg_invested_balance, avg_non_invested_balance = compute_average_balances(
+            all_detail_rows, month_start_date, today_date,
+            invested_closing_anchor=total_invested if current_month else None,
+            non_invested_opening_anchor=statement_totals.get("opening_balance"),
         )
-        cash_weight = avg_idle_cash / (avg_idle_cash + total_invested)
-        monthly_yield_rate = statement_totals["gross_interest_received"] / total_invested
+        log.info(
+            "Solde moyen pondéré - investi: %.2f EUR, non investi: %.2f EUR (%s to %s).",
+            avg_invested_balance, avg_non_invested_balance, month_start_date, today_date,
+        )
+
+    # Cash drag: how much this month's return was diluted by cash sitting
+    # idle (not invested) instead of earning interest. cash_weight/
+    # monthly_yield_rate are based on the month's AVERAGE invested balance
+    # (avg_invested_balance, the same figure as the "solde moyen pondéré
+    # investi" Sheet row above) rather than today's live snapshot
+    # (total_invested) - fixed 2026-09-11 so this %, once expanded, is
+    # exactly reconstructible from the two "solde moyen pondéré" Sheet
+    # rows instead of silently mixing a period-average non-invested
+    # balance with a point-in-time invested snapshot:
+    #   cash_weight        = avg_non_invested_balance / (avg_non_invested_balance + avg_invested_balance)
+    #   monthly_yield_rate = gross_interest_received_this_month / avg_invested_balance
+    if current_month and avg_invested_balance is not None and avg_invested_balance > 0:
+        today_date_str = today_date.strftime("%Y-%m-%d")
+        cash_weight = avg_non_invested_balance / (avg_non_invested_balance + avg_invested_balance)
+        monthly_yield_rate = statement_totals["gross_interest_received"] / avg_invested_balance
         cash_drag_value = cash_weight * monthly_yield_rate
         log.info(
-            "Computed Cash drag: %.2f%% (avg idle cash %.2f EUR, cash weight %.2f%%, monthly yield %.2f%%).",
-            cash_drag_value * 100, avg_idle_cash, cash_weight * 100, monthly_yield_rate * 100,
+            "Computed Cash drag: %.2f%% (avg non-invested balance %.2f EUR, cash weight %.2f%%, monthly yield %.2f%%).",
+            cash_drag_value * 100, avg_non_invested_balance, cash_weight * 100, monthly_yield_rate * 100,
         )
 
         if xirr_value is not None and signed_cashflows is not None and lifetime_statement_totals is not None and xirr_cashflow_rows:
@@ -1379,6 +1453,10 @@ def run() -> None:
             if deposit_dates:
                 since_inception_date = datetime.strptime(min(deposit_dates), "%Y-%m-%d").date()
                 years_elapsed = max((today_date - since_inception_date).days / 365.25, 1 / 365.25)
+                # Lifetime shares still use total_invested (today's live
+                # snapshot), not avg_invested_balance - no lifetime-average
+                # equivalent is computed anywhere, and these shares operate
+                # over the since-inception period, not this month's.
                 avg_idle_cash_lifetime = compute_average_idle_cash(
                     all_detail_rows or [], lifetime_statement_totals["opening_balance"], lifetime_statement_totals["closing_balance"],
                     since_inception_date.strftime("%Y-%m-%d"), today_date_str,
@@ -1424,25 +1502,6 @@ def run() -> None:
                     "XIRR Waterfall shares (since-inception, %.2f years, missed earnings ~%.2f EUR): %r",
                     years_elapsed, missed_earnings, {k: round(v * 100, 4) for k, v in waterfall_shares.items() if v is not None},
                 )
-
-    # Day-weighted average invested/non-invested balances (new Sheet rows
-    # "solde moyen pondéré investi"/"non investi", added 2026-09-08) -
-    # computed whenever all_detail_rows is available, independent of
-    # current_month/Cash drag/XIRR above, so this also works for a
-    # REPORT_DATE-backfilled past month. Uses the REAL number of days in
-    # the reporting period (see compute_time_weighted_average()), never a
-    # hardcoded 30.
-    avg_invested_balance = None
-    avg_non_invested_balance = None
-    if all_detail_rows is not None:
-        month_start_date = today_date.replace(day=1)
-        avg_invested_balance, avg_non_invested_balance = compute_average_balances(
-            all_detail_rows, month_start_date, today_date
-        )
-        log.info(
-            "Solde moyen pondéré - investi: %.2f EUR, non investi: %.2f EUR (%s to %s).",
-            avg_invested_balance, avg_non_invested_balance, month_start_date, today_date,
-        )
 
     # "total" is the LIVE sum of active investments' outstanding amounts
     # PLUS the uninvested wallet balance (see above) - no confirmed
