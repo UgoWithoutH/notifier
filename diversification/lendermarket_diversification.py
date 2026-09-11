@@ -666,6 +666,9 @@ def run() -> None:
     avg_non_invested_balance = None
     total_invested_is_reliable = current_month or total_account_value is not None
     if total_invested > 0 and total_invested_is_reliable:
+        # Always computed (even on the preferred path below) purely for the log line - net_new_investment
+        # itself only actually drives invested_at_period_start on the fallback path.
+        net_new_investment = statement_totals["investment_amount"] - statement_totals["received_principal_amount"]
         if monthly_summaries and today_month_key in monthly_summaries and live_total_account_value is not None:
             # Preferred path (2026-09-11): reuse the same monthly-summary cache already fetched for
             # XIRR to reconstruct the PREVIOUS month's real closing invested balance, instead of
@@ -680,7 +683,6 @@ def run() -> None:
         else:
             # Fallback (monthly-summary cache unavailable/this month not cached yet): back out the
             # period start from this month's own net new investment - doesn't handle defaults/write-offs.
-            net_new_investment = statement_totals["investment_amount"] - statement_totals["received_principal_amount"]
             invested_at_period_start = total_invested - net_new_investment
         avg_invested_balance = (invested_at_period_start + total_invested) / 2
         avg_non_invested_balance = (statement_totals["opening_balance"] + statement_totals["closing_balance"]) / 2
