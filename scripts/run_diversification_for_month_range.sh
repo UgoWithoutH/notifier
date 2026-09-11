@@ -8,13 +8,21 @@
 # A single month's run can fail transiently (e.g. a platform's 2FA/TOTP
 # endpoint rejecting a fresh login due to its own anti-abuse rate limiting
 # after several logins in a row - seen for real with Loanch, all 3 already-
-# resilient TOTP candidate codes rejected within ~150ms) - retried once
-# after a longer cooldown, then the month is SKIPPED (not fatal) so every
-# other month in the range still gets attempted. The script's own exit code
-# still reflects whether any month ultimately failed, so a GitHub Actions
-# run still shows red when that happens.
+# resilient TOTP candidate codes rejected within ~150ms) - retried with
+# increasing cooldowns (RETRY_COOLDOWNS_SECONDS), then the month is SKIPPED
+# (not fatal) so every other month in the range still gets attempted. The
+# script's own exit code still reflects whether any month ultimately
+# failed, so a GitHub Actions run still shows red when that happens.
+#
+# A single 60s retry was found (real Income Marketplace backfill run,
+# 2026-09-11) to be insufficient on its own: two separate months each
+# failed BOTH the initial attempt and the one 60s-later retry, but a THIRD
+# month later in the same run (after more cumulative time had elapsed
+# between logins) succeeded on its very first attempt - suggesting the
+# platform's own anti-abuse window can outlast a single 60s cooldown. Now
+# retries with a growing cooldown (60s, then 120s) before giving up.
 set -uo pipefail
-RETRY_COOLDOWN_SECONDS=60
+RETRY_COOLDOWNS_SECONDS=(60 120)
 any_month_failed=0
 
 MODULE="$1"
@@ -62,13 +70,22 @@ while [[ "$current_epoch" -le "$end_epoch" ]]; do
   last_day=$(date -d "${current} +1 month -1 day" +%d/%m/%Y)
   month_label=$(date -d "$current" +%m/%Y)
   echo "=== Running $MODULE for $month_label (REPORT_DATE=$last_day) ==="
-  if ! REPORT_DATE="$last_day" python -m "$MODULE"; then
-    echo "[FAILED] $MODULE failed for $month_label - waiting ${RETRY_COOLDOWN_SECONDS}s (possible transient anti-abuse/rate-limit rejection) then retrying once..." >&2
-    sleep "$RETRY_COOLDOWN_SECONDS"
-    if ! REPORT_DATE="$last_day" python -m "$MODULE"; then
-      echo "[FAILED] $MODULE failed again for $month_label - skipping this month, continuing with the rest of the range." >&2
-      any_month_failed=1
-    fi
+  month_succeeded=0
+  if REPORT_DATE="$last_day" python -m "$MODULE"; then
+    month_succeeded=1
+  else
+    for cooldown in "${RETRY_COOLDOWNS_SECONDS[@]}"; do
+      echo "[FAILED] $MODULE failed for $month_label - waiting ${cooldown}s (possible transient anti-abuse/rate-limit rejection) then retrying..." >&2
+      sleep "$cooldown"
+      if REPORT_DATE="$last_day" python -m "$MODULE"; then
+        month_succeeded=1
+        break
+      fi
+    done
+  fi
+  if [[ "$month_succeeded" -ne 1 ]]; then
+    echo "[FAILED] $MODULE failed for $month_label after ${#RETRY_COOLDOWNS_SECONDS[@]} retries - skipping this month, continuing with the rest of the range." >&2
+    any_month_failed=1
   fi
   current=$(date -d "${current} +1 month" +%Y-%m-01)
   current_epoch=$(date -d "$current" +%s)
