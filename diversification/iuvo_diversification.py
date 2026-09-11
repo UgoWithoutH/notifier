@@ -168,6 +168,7 @@ import requests
 try:
     from shared.google_sheet import fill_current_month_amounts, fill_current_month_bonus_breakdown, fill_geographic_repartition_amounts, fill_geographic_repartition_uninvested_amount
     from shared.report_date import get_report_now, is_current_month
+    from shared.session_cache import load_session_state, save_session_state
     from shared.state import load_state, save_state
     from shared.weighted_average import INVESTED_BALANCE_LABEL, NON_INVESTED_BALANCE_LABEL
     from shared.xirr import compute_xirr
@@ -180,6 +181,7 @@ except ModuleNotFoundError:
         sys.path.insert(0, str(project_root))
     from shared.google_sheet import fill_current_month_amounts, fill_current_month_bonus_breakdown, fill_geographic_repartition_amounts, fill_geographic_repartition_uninvested_amount
     from shared.report_date import get_report_now, is_current_month
+    from shared.session_cache import load_session_state, save_session_state
     from shared.state import load_state, save_state
     from shared.weighted_average import INVESTED_BALANCE_LABEL, NON_INVESTED_BALANCE_LABEL
     from shared.xirr import compute_xirr
@@ -230,6 +232,7 @@ IUVO_PASSWORD = os.environ.get("IUVO_PASSWORD")
 # same monthly-aggregate approximation already used for Lendermarket's XIRR
 # block (see lendermarket_diversification.py's module docstring for the
 # full methodology this mirrors).
+SESSION_STATE_FILE = Path(__file__).parent / "iuvo_diversification_session_state.json"
 XIRR_CASHFLOWS_STATE_FILE = Path(__file__).parent / "iuvo_xirr_cashflows_state.json"
 XIRR_CASHFLOWS_STATE_DEFAULT = {"monthly_summaries": {}, "last_fetched_month": None}
 # Conservative floor for the one-time yearly scan used to find the
@@ -573,10 +576,21 @@ def run() -> None:
     log.info("Starting Iuvo diversification run (pure-HTTP, no browser).")
 
     session = requests.Session()
+    persisted_extra = load_session_state(session, SESSION_STATE_FILE)
+    session_reused = persisted_extra is not None
+    session_token = (persisted_extra or {}).get("session_token")
 
     try:
-        session_token = login(session)
-        balance_data = fetch_balance_and_originators(session, session_token)
+        if session_reused:
+            try:
+                balance_data = fetch_balance_and_originators(session, session_token)
+            except Exception:
+                log.info("Persisted Iuvo session no longer valid - logging in again.")
+                session_reused = False
+        if not session_reused:
+            session_token = login(session)
+            save_session_state(session, SESSION_STATE_FILE, extra={"session_token": session_token})
+            balance_data = fetch_balance_and_originators(session, session_token)
     except Exception:
         log.exception("Failed to log in or fetch Iuvo's balance/loan-originator breakdown.")
         sys.exit(1)

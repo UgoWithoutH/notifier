@@ -137,6 +137,7 @@ from shared.google_sheet import (
     fill_geographic_repartition_uninvested_amount,
 )
 from shared.report_date import get_report_date, is_current_month
+from shared.session_cache import load_session_state, save_session_state
 from shared.state import load_state, save_state
 from shared.weighted_average import INVESTED_BALANCE_LABEL, NON_INVESTED_BALANCE_LABEL, compute_time_weighted_average
 from shared.xirr import compute_xirr
@@ -179,6 +180,7 @@ MAX_STATEMENT_PAGES = 50
 # only launched in 2023 per /api/products' earliest `createdAt`).
 XIRR_HISTORY_START_DATE = date(2000, 1, 1)
 
+SESSION_STATE_FILE = Path(__file__).parent / "nectaro_diversification_session_state.json"
 XIRR_CASHFLOWS_STATE_FILE = Path(__file__).parent / "nectaro_xirr_cashflows_state.json"
 XIRR_CASHFLOWS_STATE_DEFAULT = {"transactions": [], "last_fetched_date": None}
 
@@ -432,11 +434,24 @@ def run() -> None:
     log.info("Starting Nectaro diversification run (pure HTTP, no browser).")
 
     session = requests.Session()
+    persisted_extra = load_session_state(session, SESSION_STATE_FILE)
+    session_reused = persisted_extra is not None
+    token = (persisted_extra or {}).get("token")
     try:
-        token = login(session)
-        headers = {**_HEADERS, "Authorization": f"Bearer {token}"}
-        overview = fetch_overview(session, headers)
-        companies = fetch_portfolio_by_lending_company(session, headers)
+        if session_reused:
+            headers = {**_HEADERS, "Authorization": f"Bearer {token}"}
+            try:
+                overview = fetch_overview(session, headers)
+                companies = fetch_portfolio_by_lending_company(session, headers)
+            except Exception:
+                log.info("Persisted Nectaro session no longer valid - logging in again.")
+                session_reused = False
+        if not session_reused:
+            token = login(session)
+            save_session_state(session, SESSION_STATE_FILE, extra={"token": token})
+            headers = {**_HEADERS, "Authorization": f"Bearer {token}"}
+            overview = fetch_overview(session, headers)
+            companies = fetch_portfolio_by_lending_company(session, headers)
     except Exception:
         log.exception("Failed to log in or fetch Nectaro's portfolio/overview.")
         sys.exit(1)

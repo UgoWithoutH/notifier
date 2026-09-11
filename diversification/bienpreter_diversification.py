@@ -220,6 +220,7 @@ from shared.google_sheet import (
     fill_geographic_repartition_uninvested_amount,
 )
 from shared.report_date import get_report_now, is_current_month
+from shared.session_cache import load_session_state, save_session_state
 from shared.notifier import send_bienpreter_geo_issues_email
 from shared.state import load_state, save_state
 from shared.weighted_average import INVESTED_BALANCE_LABEL, NON_INVESTED_BALANCE_LABEL, compute_time_weighted_average
@@ -234,6 +235,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(me
 log = logging.getLogger("bienpreter_diversification")
 
 LOGIN_URL = "https://www.bienpreter.com/connexion"
+DASHBOARD_URL = "https://www.bienpreter.com/u/tableau-de-bord"
 OPERATIONS_URL = "https://www.bienpreter.com/u/operations"
 MAX_OPERATIONS_PAGES = 300  # safety cap against an infinite loop if pagination ever misbehaves
 # Bienpreter is a French platform; "this month" below means the current
@@ -247,6 +249,7 @@ REPORT_TIMEZONE = ZoneInfo("Europe/Paris")
 # below) - same incremental-fetch idea as afranga_diversification.py's
 # XIRR_CASHFLOWS_STATE_FILE, avoids re-fetching the account's entire
 # history (77+ pages) on every run.
+SESSION_STATE_FILE = Path(__file__).parent / "bienpreter_diversification_session_state.json"
 XIRR_CASHFLOWS_STATE_FILE = Path(__file__).parent / "bienpreter_xirr_cashflows_state.json"
 XIRR_CASHFLOWS_STATE_DEFAULT = {"rows": [], "last_fetched_date": None}
 # XIRR is a since-inception money-weighted return (not per-month) - this
@@ -294,6 +297,18 @@ def login(session: requests.Session) -> str:
         raise RuntimeError(f"Login did not reach the dashboard (still on {r2.url}) - check credentials.")
     log.info("Logged in successfully.")
     return r2.text
+
+
+def _fetch_dashboard_html(session: requests.Session) -> str:
+    """Fetch the dashboard page directly, reusing an already-authenticated
+    session's cookies (no credentials submitted) - used to reuse a
+    persisted session instead of logging in again. Raises if the session
+    has expired (redirected back to the login form)."""
+    r = session.get(DASHBOARD_URL, timeout=30)
+    r.raise_for_status()
+    if "/u/tableau-de-bord" not in r.url:
+        raise RuntimeError(f"Session no longer authenticated (redirected to {r.url}).")
+    return r.text
 
 
 def _parse_amount(text: str):
@@ -924,9 +939,18 @@ def run() -> None:
 
     session = requests.Session()
     session.headers.update(_HEADERS)
+    session_reused = load_session_state(session, SESSION_STATE_FILE) is not None
 
     try:
-        dashboard_html = login(session)
+        if session_reused:
+            try:
+                dashboard_html = _fetch_dashboard_html(session)
+            except Exception:
+                log.info("Persisted Bienpreter session no longer valid - logging in again.")
+                session_reused = False
+        if not session_reused:
+            dashboard_html = login(session)
+            save_session_state(session, SESSION_STATE_FILE)
         balances = fetch_balances(dashboard_html)
     except Exception:
         log.exception("Failed to log in or fetch Bienpreter balances.")

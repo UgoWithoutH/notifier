@@ -95,9 +95,10 @@ Optional:
                                               fill_current_month_bonus_breakdown()
                                               (see shared/google_sheet.py)
 
-No session/cookie persistence (unlike the Playwright-based scripts'
-`storage_state.json` files) - the pure-HTTP login flow above is lightweight
-enough to just run fresh every time, no benefit to caching it.
+Added 2026-09-11: DOES now persist the session (cookies) across runs via
+`SESSION_STATE_FILE`/`shared.session_cache` - avoids a fresh login for
+every month of a `run_diversification_for_month_range.sh` backfill, only
+logging in again if the persisted session stops working.
 """
 
 import os
@@ -105,6 +106,7 @@ import sys
 import logging
 from datetime import date, datetime
 from html.parser import HTMLParser
+from pathlib import Path
 from zoneinfo import ZoneInfo
 
 import requests
@@ -114,6 +116,7 @@ load_dotenv()
 
 from shared.google_sheet import fill_current_month_amounts, fill_current_month_bonus_breakdown, fill_geographic_repartition_amounts
 from shared.report_date import get_report_now, is_current_month
+from shared.session_cache import load_session_state, save_session_state
 from shared.weighted_average import INVESTED_BALANCE_LABEL, NON_INVESTED_BALANCE_LABEL, compute_time_weighted_average
 from shared.xirr import compute_xirr
 from shared.xirr_waterfall import compute_waterfall_xirr_shares
@@ -124,6 +127,7 @@ log = logging.getLogger("goandgrow_diversification")
 LOGIN_URL = "https://app.goandgrow.eu/en/gogrow"
 GOALS_API_URL = "https://api.prd.goandgrow.eu/investor/api/v2/gogrow"
 STATEMENTS_API_URL = "https://api.prd.goandgrow.eu/investor/api/v2/statements"
+SESSION_STATE_FILE = Path(__file__).parent / "goandgrow_diversification_session_state.json"
 PLATFORM_LABEL = "Go & Grow"
 REPORT_TIMEZONE = ZoneInfo("Europe/Paris")
 
@@ -454,10 +458,19 @@ def run() -> None:
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
         "Accept-Language": "en-US,en;q=0.9",
     })
+    session_reused = load_session_state(session, SESSION_STATE_FILE) is not None
 
     try:
-        login(session)
-        goals = fetch_goals(session)
+        if session_reused:
+            try:
+                goals = fetch_goals(session)
+            except Exception:
+                log.info("Persisted Go & Grow session no longer valid - logging in again.")
+                session_reused = False
+        if not session_reused:
+            login(session)
+            save_session_state(session, SESSION_STATE_FILE)
+            goals = fetch_goals(session)
         balance = fetch_total_balance(goals)
     except Exception:
         log.exception("Failed to log in or fetch the Go & Grow balance.")

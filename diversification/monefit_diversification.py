@@ -129,6 +129,7 @@ from dotenv import load_dotenv
 
 from shared.google_sheet import fill_current_month_amounts, fill_current_month_bonus_breakdown, fill_geographic_repartition_amounts
 from shared.report_date import get_report_now, is_current_month
+from shared.session_cache import load_session_state, save_session_state
 from shared.state import load_state, save_state
 from shared.weighted_average import INVESTED_BALANCE_LABEL, NON_INVESTED_BALANCE_LABEL
 from shared.xirr import compute_xirr
@@ -169,6 +170,7 @@ MONEFIT_PASSWORD = os.environ.get("MONEFIT_PASSWORD")
 # balance - so it is NOT used for Cash drag's avg-idle-cash reconstruction
 # (see compute_average_idle_cash() below, which uses the live `mainAccount`
 # snapshot instead).
+SESSION_STATE_FILE = Path(__file__).parent / "monefit_diversification_session_state.json"
 XIRR_CASHFLOWS_STATE_FILE = Path(__file__).parent / "monefit_xirr_cashflows_state.json"
 XIRR_CASHFLOWS_STATE_DEFAULT = {"monthly_summaries": {}, "last_fetched_month": None}
 # Conservative floor for the one-time yearly scan used to find the
@@ -382,10 +384,19 @@ def run() -> None:
 
     session = requests.Session()
     session.headers.update(_HEADERS)
+    session_reused = load_session_state(session, SESSION_STATE_FILE) is not None
 
     try:
-        login(session)
-        vaults = fetch_vaults_breakdown(session)
+        if session_reused:
+            try:
+                vaults = fetch_vaults_breakdown(session)
+            except Exception:
+                log.info("Persisted Monefit session no longer valid - logging in again.")
+                session_reused = False
+        if not session_reused:
+            login(session)
+            save_session_state(session, SESSION_STATE_FILE)
+            vaults = fetch_vaults_breakdown(session)
         balance = vaults["total_wealth"]
     except Exception:
         log.exception("Failed to log in or fetch the Monefit balance.")
