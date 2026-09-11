@@ -168,7 +168,7 @@ from shared.google_sheet import (
     fill_geographic_repartition_uninvested_amount,
 )
 from shared.report_date import get_report_now, is_current_month
-from shared.session_cache import load_session_state, save_session_state
+from shared.session_cache import get_or_refresh_session
 from shared.state import load_state, save_state
 from shared.weighted_average import INVESTED_BALANCE_LABEL, NON_INVESTED_BALANCE_LABEL
 from shared.xirr import compute_xirr
@@ -478,20 +478,14 @@ def run() -> None:
     log.info("Starting Lendermarket diversification run (pure HTTP, no browser).")
 
     session = requests.Session()
-    persisted_extra = load_session_state(session, SESSION_STATE_FILE)
-    session_reused = persisted_extra is not None
-    investor_id = (persisted_extra or {}).get("investor_id")
     try:
-        if session_reused:
-            try:
-                investments = fetch_investments(session, investor_id)
-            except Exception:
-                log.info("Persisted Lendermarket session no longer valid - logging in again.")
-                session_reused = False
-        if not session_reused:
-            investor_id = login(session)
-            save_session_state(session, SESSION_STATE_FILE, extra={"investor_id": investor_id})
-            investments = fetch_investments(session, investor_id)
+        investments, extra = get_or_refresh_session(
+            session, SESSION_STATE_FILE,
+            fetch_fn=lambda extra: fetch_investments(session, extra["investor_id"]),
+            login_fn=lambda: (None, {"investor_id": login(session)}),
+            platform_name="Lendermarket",
+        )
+        investor_id = extra["investor_id"]
     except Exception:
         log.exception("Failed to log in or fetch Lendermarket investments.")
         sys.exit(1)

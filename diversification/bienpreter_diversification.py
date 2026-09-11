@@ -220,7 +220,7 @@ from shared.google_sheet import (
     fill_geographic_repartition_uninvested_amount,
 )
 from shared.report_date import get_report_now, is_current_month
-from shared.session_cache import load_session_state, save_session_state
+from shared.session_cache import get_or_refresh_session
 from shared.notifier import send_bienpreter_geo_issues_email
 from shared.state import load_state, save_state
 from shared.weighted_average import INVESTED_BALANCE_LABEL, NON_INVESTED_BALANCE_LABEL, compute_time_weighted_average
@@ -939,18 +939,14 @@ def run() -> None:
 
     session = requests.Session()
     session.headers.update(_HEADERS)
-    session_reused = load_session_state(session, SESSION_STATE_FILE) is not None
 
     try:
-        if session_reused:
-            try:
-                dashboard_html = _fetch_dashboard_html(session)
-            except Exception:
-                log.info("Persisted Bienpreter session no longer valid - logging in again.")
-                session_reused = False
-        if not session_reused:
-            dashboard_html = login(session)
-            save_session_state(session, SESSION_STATE_FILE)
+        dashboard_html, _ = get_or_refresh_session(
+            session, SESSION_STATE_FILE,
+            fetch_fn=lambda extra: _fetch_dashboard_html(session),
+            login_fn=lambda: (login(session), {}),
+            platform_name="Bienpreter",
+        )
         balances = fetch_balances(dashboard_html)
     except Exception:
         log.exception("Failed to log in or fetch Bienpreter balances.")

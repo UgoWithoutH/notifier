@@ -30,6 +30,7 @@ Callers are expected to:
 import json
 import logging
 from pathlib import Path
+from typing import Any, Callable
 
 import requests
 
@@ -87,3 +88,52 @@ def load_session_state(session: requests.Session, path: Path) -> dict | None:
     if headers:
         session.headers.update(headers)
     return data.get("extra") or {}
+
+
+def get_or_refresh_session(
+    session: requests.Session,
+    path: Path,
+    fetch_fn: Callable[[dict], Any],
+    login_fn: Callable[[], tuple],
+    platform_name: str,
+) -> tuple:
+    """Generic "reuse a persisted session, fall back to a real login" wrapper -
+    factors out the `session_reused`/try-except boilerplate that used to be
+    copy-pasted across every pure-HTTP `*_diversification.py` module (one
+    real bug fix in this pattern previously had to be applied 7+ times
+    separately - see this module's own docstring for the pattern this
+    replaces).
+
+    `fetch_fn(extra: dict) -> result`: makes the platform's own first real
+        authenticated call(s) using the (possibly reused) `session` and any
+        `extra` metadata (e.g. a bearer token/investor id not stored on the
+        session itself), returning whatever the caller wants back.
+    `login_fn() -> (result_or_None, extra: dict)`: performs a real login.
+        If the login call itself already produced the result `fetch_fn`
+        would otherwise compute (e.g. a platform whose login() returns the
+        dashboard HTML/data directly), return `(that_result, extra)` to
+        skip a redundant `fetch_fn` call; otherwise return `(None, extra)`
+        and `fetch_fn(extra)` is called once to get the real result.
+
+    Returns `(result, extra)` - `extra` is whichever dict (persisted or
+    freshly logged-in) was actually used, so callers that need it again
+    later in the same run (e.g. to rebuild an `Authorization` header) don't
+    have to re-derive it themselves.
+
+    Raises whatever `login_fn()`/the final `fetch_fn()` call raises (not
+    caught here) - callers are expected to keep their own outer try/except
+    around this call for the "give up entirely" case, same as before this
+    helper existed.
+    """
+    persisted_extra = load_session_state(session, path)
+    if persisted_extra is not None:
+        try:
+            return fetch_fn(persisted_extra), persisted_extra
+        except Exception:
+            log.info("Persisted %s session no longer valid - logging in again.", platform_name)
+
+    result, extra = login_fn()
+    save_session_state(session, path, extra=extra)
+    if result is not None:
+        return result, extra
+    return fetch_fn(extra), extra
