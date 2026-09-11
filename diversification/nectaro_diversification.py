@@ -503,8 +503,27 @@ def run() -> None:
             cash_events.append((t_date, _cash_delta(t)))
             invested_events.append((t_date, _invested_delta(t)))
 
-        avg_invested_balance = compute_time_weighted_average(invested_events, month_start_date, today_date)
-        avg_non_invested_balance = compute_time_weighted_average(cash_events, month_start_date, today_date)
+        # Anchored on the real LIVE overview["invested_funds"]/["cash_balance"]
+        # (only meaningful for the real current month - no historical
+        # equivalent exists on Nectaro) instead of a pure since-inception
+        # reconstruction (opening_balance=0.0) - bounds any transaction
+        # misclassification drift to just this month's own events instead
+        # of the account's entire history. Falls back to the plain
+        # reconstruction for a backfilled month.
+        if current_month:
+            period_invested = [(d, v) for d, v in invested_events if month_start_date <= d <= today_date]
+            avg_invested_balance = compute_time_weighted_average(
+                period_invested, month_start_date, today_date,
+                opening_balance=overview["invested_funds"] - sum(v for _, v in period_invested),
+            )
+            period_cash = [(d, v) for d, v in cash_events if month_start_date <= d <= today_date]
+            avg_non_invested_balance = compute_time_weighted_average(
+                period_cash, month_start_date, today_date,
+                opening_balance=overview["cash_balance"] - sum(v for _, v in period_cash),
+            )
+        else:
+            avg_invested_balance = compute_time_weighted_average(invested_events, month_start_date, today_date)
+            avg_non_invested_balance = compute_time_weighted_average(cash_events, month_start_date, today_date)
         log.info(
             "Solde moyen pondéré - investi: %.2f EUR, non investi: %.2f EUR (%s to %s).",
             avg_invested_balance, avg_non_invested_balance, month_start_date, today_date,
@@ -567,17 +586,23 @@ def run() -> None:
                 taxes_xirr_contribution = waterfall_shares.get("XIRR Taxes")
                 interest_xirr_contribution = waterfall_shares.get("XIRR Intérêts")
 
-                if total_invested > 0:
-                    avg_idle_cash_month = compute_time_weighted_average(cash_events, month_start_date, today_date)
-                    cash_weight = avg_idle_cash_month / (avg_idle_cash_month + total_invested)
-                    monthly_yield_rate = amounts["gross_interest_received"] / total_invested
+                # cash_weight/monthly_yield_rate use the already-computed
+                # avg_invested_balance/avg_non_invested_balance (same
+                # figures as the "solde moyen pondéré" Sheet rows above)
+                # instead of the live total_invested snapshot (fixed
+                # 2026-09-11), so this % is exactly reconstructible from
+                # those two Sheet rows. The lifetime share below still uses
+                # total_invested (no lifetime-average equivalent exists).
+                if avg_invested_balance is not None and avg_invested_balance > 0:
+                    cash_weight = avg_non_invested_balance / (avg_non_invested_balance + avg_invested_balance)
+                    monthly_yield_rate = amounts["gross_interest_received"] / avg_invested_balance
                     cash_drag_value = cash_weight * monthly_yield_rate
                     log.info(
                         "Computed Cash drag: %.4f%% (avg idle cash %.2f EUR).",
-                        cash_drag_value * 100, avg_idle_cash_month,
+                        cash_drag_value * 100, avg_non_invested_balance,
                     )
 
-                    if deposit_dates:
+                    if deposit_dates and total_invested > 0:
                         since_inception_date = min(deposit_dates)
                         avg_idle_cash_lifetime = compute_time_weighted_average(cash_events, since_inception_date, today_date)
                         cash_weight_lifetime = avg_idle_cash_lifetime / (avg_idle_cash_lifetime + total_invested)
