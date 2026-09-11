@@ -82,7 +82,13 @@ reconstruct_outstanding(). "Cash drag"/"XIRR Cash drag" STAY
 current-month-only (genuinely infeasible to backfill): they need
 `vaults["invested"]`/`vaults["main_account"]`, both LIVE-only snapshots
 with no historical per-date equivalent anywhere on this platform (see the
-comment above `avg_idle_cash`'s own docstring paragraph).
+comment above `avg_idle_cash`'s own docstring paragraph). "Solde moyen
+pondéré non investi" stays current-month-only for the same reason, but
+"investi" is backfillable (added 2026-09-11) using that same month's
+`closing_balance` as a stand-in - SmartSaver auto-invests deposits into a
+vault almost immediately, so idle cash (and thus real cash drag) is
+normally negligible anyway, making closing_balance a good-enough proxy for
+"investi" on a past month.
 
 Added 2026-09-09: switched the XIRR Bonus/Cash drag/Frais/Intérêts shares
 from isolated counterfactuals (cancel ONE factor, XIRR_real - XIRR_without
@@ -634,10 +640,19 @@ def run() -> None:
     # Monefit's SmartSaver product actually DOES split into an "invested"
     # part (money placed in a loan/vault, `vaults["invested"]`) and an
     # uninvested "main account" cash part (`vaults["main_account"]`) -
-    # already used above for Cash drag - but, like Cash drag, both are
-    # LIVE-only snapshots with no historical/date-ranged equivalent (see
-    # the comment above Cash drag's own block) - current-month-only,
-    # reused as constants rather than a true day-weighted average.
+    # already used above for Cash drag. "non investi" stays current-
+    # month-only, live-snapshot-only (unchanged) - genuinely no historical
+    # equivalent exists (see the comment above Cash drag's own block) -
+    # but this is a minor loss in practice: SmartSaver auto-allocates
+    # deposits into vaults almost immediately, so idle cash is normally
+    # tiny anyway, real cash drag on this platform is genuinely close to
+    # 0 most of the time. "investi" CAN be backfilled though (added
+    # 2026-09-11): a backfilled month's `closing_balance` (whole-account
+    # total, see module docstring) already approximates "investi" well for
+    # the same reason - idle cash being consistently near-negligible means
+    # total_wealth - main_account ~= total_wealth, so `closing_balance` is
+    # used as a stand-in for a backfilled month instead of leaving the row
+    # blank.
     avg_invested_balance = None
     avg_non_invested_balance = None
     if current_month:
@@ -646,6 +661,13 @@ def run() -> None:
         log.info(
             "Solde moyen pondéré - investi: %.2f EUR, non investi: %.2f EUR (both constant, live snapshot).",
             avg_invested_balance, avg_non_invested_balance,
+        )
+    elif closing_balance is not None:
+        avg_invested_balance = closing_balance
+        log.info(
+            "Solde moyen pondéré - investi: %.2f EUR (backfilled month, closing_balance stand-in - idle cash "
+            "assumed negligible, non investi left blank).",
+            avg_invested_balance,
         )
 
     bonus_breakdown = {"prime": statement_totals["rewards_bonuses"]}

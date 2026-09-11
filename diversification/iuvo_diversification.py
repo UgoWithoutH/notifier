@@ -169,6 +169,7 @@ try:
     from shared.google_sheet import fill_current_month_amounts, fill_current_month_bonus_breakdown, fill_geographic_repartition_amounts, fill_geographic_repartition_uninvested_amount
     from shared.report_date import get_report_now, is_current_month
     from shared.state import load_state, save_state
+    from shared.weighted_average import INVESTED_BALANCE_LABEL, NON_INVESTED_BALANCE_LABEL
     from shared.xirr import compute_xirr
     from shared.xirr_waterfall import compute_waterfall_xirr_shares
 except ModuleNotFoundError:
@@ -180,19 +181,23 @@ except ModuleNotFoundError:
     from shared.google_sheet import fill_current_month_amounts, fill_current_month_bonus_breakdown, fill_geographic_repartition_amounts, fill_geographic_repartition_uninvested_amount
     from shared.report_date import get_report_now, is_current_month
     from shared.state import load_state, save_state
+    from shared.weighted_average import INVESTED_BALANCE_LABEL, NON_INVESTED_BALANCE_LABEL
     from shared.xirr import compute_xirr
     from shared.xirr_waterfall import compute_waterfall_xirr_shares
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger("iuvo_diversification")
 
-# Iuvo-only Sheet row labels (no per-transaction dated ledger exists here -
-# see module docstring - so these are real point-in-time balances from the
-# account statement, not a day-weighted average like every other platform;
-# the Sheet cells themselves were renamed to these exact labels, unlike the
-# shared "solde moyen pondéré investi"/"non investi" used elsewhere).
-INVESTED_BALANCE_LABEL = "solde investi"
-NON_INVESTED_BALANCE_LABEL = "solde non investi"
+# FIXED 2026-09-11 (live-verified via a read-only Sheet dump): the real
+# Sheet rows under Iuvo are actually labelled "solde moyen pondéré
+# investi"/"solde moyen pondéré non investi" - the SAME shared labels
+# every other platform uses (imported above from shared.weighted_average),
+# not the Iuvo-only "solde investi"/"solde non investi" strings this file
+# used to define locally. Since find_rows_by_texts_below() matches by
+# substring, "solde investi" is NOT a substring of "solde moyen pondéré
+# investi" (extra words in between) - those local labels silently never
+# matched any real row, so this block's two rows were never actually
+# written despite the code computing real values for them every run.
 
 LOGIN_PAGE_URL = "https://iuvo-group.com/en/login/"
 API_BASE = "https://tbp2p.iuvo-group.com"
@@ -515,6 +520,31 @@ def get_cached_monthly_summaries(session: requests.Session, session_token: str, 
     return monthly_summaries
 
 
+def _invested_balance_at_month_end(monthly_summaries: dict, live_total: float, month_key: str):
+    """Reconstruct the real invested balance (P2P + iuvoSAVE receivables)
+    at the END of the given "YYYY-MM" month, working BACKWARD from
+    today's live total account value: every cached month strictly AFTER
+    `month_key` is a real, already-known net external cashflow/earning
+    (deposits - withdrawals + gross interest + bonus), so subtracting all
+    of them from today's live total gives the real total account value at
+    that month's end; invested balance then falls out as a remainder
+    (that total minus the month's own real closing non-invested/wallet
+    balance). Same backward-reconstruction idea already used in run() to
+    get total_invested for a single backfilled reporting month - exposed
+    here as a reusable helper so it can ALSO be applied to the month
+    immediately BEFORE the reporting month, needed to build a genuine
+    weighted-average "solde investi" (see run()'s avg_invested_balance
+    block, added 2026-09-11). Returns None if `month_key` isn't cached."""
+    if month_key not in monthly_summaries:
+        return None
+    value_change_since = sum(
+        s["deposits"] - s["withdrawals"] + s["gross_interest_received"] + s["bonus_cashback_contest"]
+        for k, s in monthly_summaries.items() if k > month_key
+    )
+    total_account_value = live_total - value_change_since
+    return total_account_value - monthly_summaries[month_key]["closing_balance"]
+
+
 def compute_average_idle_cash(monthly_summaries: dict) -> float:
     """Day-weighted average of each cached month's own (opening+closing)/2
     balance, weighted by how many days that month's own query covered -
@@ -591,7 +621,6 @@ def run() -> None:
     # everything NOT sitting idle in the uninvested wallet (receivables in
     # P2P + iuvoSAVE), i.e. total minus available_funds.
     total_invested = balance_data["total"] - balance_data["available_funds"]
-    non_invested_balance = None
     xirr_value = None
     signed_cashflows = None
     total_account_value = None
@@ -630,7 +659,6 @@ def run() -> None:
     if monthly_summaries_as_of:
         if current_month:
             total_account_value = balance_data["total"]
-            non_invested_balance = balance_data["available_funds"]
         else:
             # Backfilled month: reconstruct today_date's total account
             # value by subtracting today's live total every real net
@@ -646,7 +674,6 @@ def run() -> None:
             total_account_value = balance_data["total"] - value_change_since
             closing_balance_as_of = monthly_summaries_as_of[today_month_key]["closing_balance"]
             total_invested = total_account_value - closing_balance_as_of
-            non_invested_balance = closing_balance_as_of
             log.info(
                 "Backfilled month (%s): reconstructed total_account_value=%.2f EUR (live total %.2f EUR - "
                 "%.2f EUR net change since then), closing_balance_as_of=%.2f EUR, total_invested=%.2f EUR.",
@@ -687,15 +714,60 @@ def run() -> None:
             # Cash drag further below, once missed_earnings is available.
             lifetime_gross_interest = sum(s["gross_interest_received"] for s in monthly_summaries_as_of.values())
 
-    if total_invested > 0 and monthly_summaries_as_of:
-        current_month_summary = monthly_summaries_as_of.get(today_month_key) or {}
-        avg_idle_cash_this_month = (current_month_summary.get("opening_balance", 0.0) + current_month_summary.get("closing_balance", 0.0)) / 2
-        cash_weight = avg_idle_cash_this_month / (avg_idle_cash_this_month + total_invested)
-        monthly_yield_rate = current_month_summary.get("gross_interest_received", 0.0) / total_invested
+    # Weighted-average invested/non-invested balances for the reporting
+    # month (Sheet rows "solde investi"/"solde non investi"), rewritten
+    # 2026-09-11: previously a plain point-in-time snapshot (see the
+    # module-level label constants' docstring for why a real day-by-day
+    # average isn't achievable) - now a genuine (opening + closing) / 2
+    # month-long average for both sides. Computed BEFORE Cash drag below
+    # (moved 2026-09-11) so Cash drag's own cash_weight/monthly_yield_rate
+    # can reuse these two AVERAGES instead of mixing an averaged cash
+    # figure with `total_invested` (a raw point-in-time value):
+    #   - "non investi": the month's own real opening/closing wallet
+    #     balance, straight from the account-statement endpoint (same
+    #     figures reused for this month's Cash drag below).
+    #   - "investi": the closing side is `total_invested` (already
+    #     reconstructed/live above); the opening side is the invested
+    #     balance at the END of the PREVIOUS cached month, reconstructed
+    #     via the same backward-from-today's-live-total trick (see
+    #     _invested_balance_at_month_end()) - or 0.0 if the reporting
+    #     month IS the account's very first active month (nothing was
+    #     invested before inception).
+    avg_invested_balance = None
+    avg_non_invested_balance = None
+    if monthly_summaries and today_month_key in monthly_summaries:
+        this_month_summary = monthly_summaries[today_month_key]
+        avg_non_invested_balance = (this_month_summary["opening_balance"] + this_month_summary["closing_balance"]) / 2
+
+        sorted_months = sorted(monthly_summaries)
+        month_index = sorted_months.index(today_month_key)
+        if month_index > 0:
+            invested_opening = _invested_balance_at_month_end(monthly_summaries, balance_data["total"], sorted_months[month_index - 1])
+        else:
+            invested_opening = 0.0  # reporting month is the account's own inception month - nothing invested before it.
+        avg_invested_balance = (invested_opening + total_invested) / 2
+        log.info(
+            "Solde moyen pondéré (mois %s) - investi: %.2f EUR (ouverture %.2f EUR -> clôture %.2f EUR), "
+            "non investi: %.2f EUR (ouverture %.2f EUR -> clôture %.2f EUR).",
+            today_month_key, avg_invested_balance, invested_opening, total_invested,
+            avg_non_invested_balance, this_month_summary["opening_balance"], this_month_summary["closing_balance"],
+        )
+    elif monthly_summaries is not None:
+        # Genuinely missing (not just "cache not built yet" - get_cached_monthly_summaries()
+        # always fetches through real_today regardless of REPORT_DATE, so
+        # by this point monthly_summaries already covers every month from
+        # inception through today, cache or not) - only happens if the
+        # reporting month predates the account's own real inception month
+        # (e.g. a backfill target set before the account existed).
+        log.warning("No monthly summary cached for %s (predates the account's own inception?) - 'solde investi'/'solde non investi' will not be updated.", today_month_key)
+
+    if avg_invested_balance is not None:
+        cash_weight = avg_non_invested_balance / (avg_non_invested_balance + avg_invested_balance)
+        monthly_yield_rate = (monthly_summaries_as_of.get(today_month_key) or {}).get("gross_interest_received", 0.0) / avg_invested_balance
         cash_drag_value = cash_weight * monthly_yield_rate
         log.info(
-            "Computed Cash drag: %.2f%% (avg idle cash %.2f EUR, cash weight %.2f%%, monthly yield %.2f%%).",
-            cash_drag_value * 100, avg_idle_cash_this_month, cash_weight * 100, monthly_yield_rate * 100,
+            "Computed Cash drag: %.2f%% (avg non-invested balance %.2f EUR, cash weight %.2f%%, monthly yield %.2f%%).",
+            cash_drag_value * 100, avg_non_invested_balance, cash_weight * 100, monthly_yield_rate * 100,
         )
 
         if xirr_value is not None and signed_cashflows is not None:
@@ -729,28 +801,6 @@ def run() -> None:
                 avg_idle_cash_lifetime, missed_earnings, {k: round(v * 100, 4) for k, v in waterfall_shares.items() if v is not None},
             )
 
-    # Real point-in-time invested/non-invested balances (Sheet rows
-    # "solde investi"/"solde non investi", rewritten 2026-09-08 - dropped
-    # the day-weighted-average attempt entirely: Iuvo has no per-
-    # transaction dated ledger at all (see module docstring), so a real
-    # day-by-day average isn't achievable without querying the statement
-    # endpoint once per day. "non investi" is the account's real current
-    # available-funds balance (live for the current month, or the
-    # reconstructed closing_balance_as_of for a backfilled month) - this
-    # already reflects every withdrawal exactly (e.g. depositing then
-    # withdrawing the same 2 EUR nets to 0, not still showing 2 EUR),
-    # since it's Iuvo's own real running wallet balance, not a derived
-    # figure. "investi" is total_invested (same reconstructed/live figure
-    # already used for this month's Cash drag math).
-    invested_balance = None
-    if monthly_summaries_as_of and today_month_key in monthly_summaries_as_of:
-        invested_balance = total_invested
-        log.info(
-            "Solde investi: %.2f EUR, solde non investi: %.2f EUR (point-in-time, %s).",
-            invested_balance, non_invested_balance, today_date,
-        )
-
-    # "total" comes from the overview_page's embedded `investors` JS
     # literal, a LIVE-only snapshot; the date-filtered account-statement
     # endpoint has no balance field either (2026-08-06 investigation) -
     # skip total for a backfilled month.
@@ -782,10 +832,10 @@ def run() -> None:
         bonus_breakdown["XIRR Frais"] = frais_xirr_contribution
     if interest_xirr_contribution is not None:
         bonus_breakdown["XIRR Intérêts"] = interest_xirr_contribution
-    if invested_balance is not None:
-        bonus_breakdown[INVESTED_BALANCE_LABEL] = invested_balance
-    if non_invested_balance is not None:
-        bonus_breakdown[NON_INVESTED_BALANCE_LABEL] = non_invested_balance
+    if avg_invested_balance is not None:
+        bonus_breakdown[INVESTED_BALANCE_LABEL] = avg_invested_balance
+    if avg_non_invested_balance is not None:
+        bonus_breakdown[NON_INVESTED_BALANCE_LABEL] = avg_non_invested_balance
     if bonus_breakdown:
         fill_current_month_bonus_breakdown(platform="Iuvo", breakdown=bonus_breakdown)
 
