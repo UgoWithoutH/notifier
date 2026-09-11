@@ -305,11 +305,19 @@ def fetch_statement_summary(session: requests.Session, investor_id: str, start_d
     closing_balance = _amount("closingBalance")
     deposits = _amount("investorDepositsAmount")
     withdrawals = _amount("investorWithdrawalsAmount")
+    # New capital invested into loans vs. principal repaid back to the
+    # wallet during the period - added 2026-09-11 so avg_invested_balance
+    # (see run()) can be a genuine (start+end)/2 average instead of a raw
+    # current snapshot, matching the cash side's own approximation level.
+    investment_amount = _amount("investorInvestmentAmount")
+    received_principal_amount = _amount("investorReceivedPrincipalAmount")
 
     log.info(
         "Parsed statement totals: interest_received=%.2f, bonuses=%.2f, fees=%.2f, "
-        "opening_balance=%.2f, closing_balance=%.2f, deposits=%.2f, withdrawals=%.2f",
+        "opening_balance=%.2f, closing_balance=%.2f, deposits=%.2f, withdrawals=%.2f, "
+        "investment_amount=%.2f, received_principal_amount=%.2f",
         interest_received, bonuses, fees, opening_balance, closing_balance, deposits, withdrawals,
+        investment_amount, received_principal_amount,
     )
     return {
         "interest_received": interest_received,
@@ -319,6 +327,8 @@ def fetch_statement_summary(session: requests.Session, investor_id: str, start_d
         "closing_balance": closing_balance,
         "deposits": deposits,
         "withdrawals": withdrawals,
+        "investment_amount": investment_amount,
+        "received_principal_amount": received_principal_amount,
     }
 
 
@@ -455,6 +465,7 @@ def run() -> None:
         statement_totals = {
             "interest_received": 0.0, "bonuses": 0.0, "fees": 0.0,
             "opening_balance": 0.0, "closing_balance": 0.0, "deposits": 0.0, "withdrawals": 0.0,
+            "investment_amount": 0.0, "received_principal_amount": 0.0,
         }
 
     lenders = aggregate_by_lender(investments)
@@ -598,14 +609,51 @@ def run() -> None:
     # the sum of each cached month's own `interest_received` - computed
     # further down, once monthly_summaries/signed_cashflows are available.
     interest_xirr_contribution = None
-    if total_invested > 0:
-        avg_idle_cash_this_month = (statement_totals["opening_balance"] + statement_totals["closing_balance"]) / 2
-        cash_weight = avg_idle_cash_this_month / (avg_idle_cash_this_month + total_invested)
-        monthly_yield_rate = statement_totals["interest_received"] / total_invested
+    # Day-weighted average invested/non-invested balances (Sheet rows
+    # "solde moyen pondéré investi"/"non investi", added 2026-09-08) -
+    # computed BEFORE Cash drag below so Cash drag's own cash_weight/
+    # monthly_yield_rate can reuse these two AVERAGES instead of mixing an
+    # averaged cash figure with `total_invested` (a raw point-in-time
+    # value), matching afranga_diversification.py's/mintos_diversification.py's
+    # own monthly Cash drag convention. Lendermarket has no per-transaction
+    # dated ledger at all (see module docstring), so neither side can be
+    # truly day-weighted like Mintos - both instead use the SAME coarse
+    # (start-of-period+end-of-period)/2 two-point approximation (best
+    # available at this platform's monthly-aggregate granularity, already
+    # respecting REPORT_DATE for a backfilled month via `statement_totals`).
+    # "non investi" uses the statement API's own opening/closing wallet
+    # balance directly. "investi" (fixed 2026-09-11 - previously just
+    # `total_invested`, a raw current snapshot with no averaging at all)
+    # derives the period's start value from `total_invested` (the
+    # end-of-period value, live or reconstructed above) minus this period's
+    # own net new investment (investorInvestmentAmount -
+    # investorReceivedPrincipalAmount), then averages the two endpoints.
+    # For a backfilled month, `total_invested` is only a trustworthy
+    # end-of-period value once the backward reconstruction above actually
+    # ran (`total_account_value is not None`) - otherwise it's still
+    # today's LIVE total, which would silently mix today's real invested
+    # amount with this backfilled month's own statement_totals below.
+    avg_invested_balance = None
+    avg_non_invested_balance = None
+    total_invested_is_reliable = current_month or total_account_value is not None
+    if total_invested > 0 and total_invested_is_reliable:
+        net_new_investment = statement_totals["investment_amount"] - statement_totals["received_principal_amount"]
+        invested_at_period_start = total_invested - net_new_investment
+        avg_invested_balance = (invested_at_period_start + total_invested) / 2
+        avg_non_invested_balance = (statement_totals["opening_balance"] + statement_totals["closing_balance"]) / 2
+        log.info(
+            "Solde moyen pondéré - investi: %.2f EUR (start %.2f EUR, end %.2f EUR, net new investment %.2f EUR), "
+            "non investi: %.2f EUR (approximation bipoint mensuelle).",
+            avg_invested_balance, invested_at_period_start, total_invested, net_new_investment, avg_non_invested_balance,
+        )
+
+    if avg_invested_balance is not None:
+        cash_weight = avg_non_invested_balance / (avg_non_invested_balance + avg_invested_balance)
+        monthly_yield_rate = statement_totals["interest_received"] / avg_invested_balance
         cash_drag_value = cash_weight * monthly_yield_rate
         log.info(
             "Computed Cash drag: %.2f%% (avg idle cash %.2f EUR, cash weight %.2f%%, monthly yield %.2f%%).",
-            cash_drag_value * 100, avg_idle_cash_this_month, cash_weight * 100, monthly_yield_rate * 100,
+            cash_drag_value * 100, avg_non_invested_balance, cash_weight * 100, monthly_yield_rate * 100,
         )
 
         if xirr_value is not None and signed_cashflows is not None and monthly_summaries_as_of:
@@ -643,26 +691,6 @@ def run() -> None:
                 "XIRR Waterfall shares (since-inception, avg idle cash %.2f EUR, missed earnings ~%.2f EUR): %r",
                 avg_idle_cash_lifetime, missed_earnings, {k: round(v * 100, 4) for k, v in waterfall_shares.items() if v is not None},
             )
-
-    # Day-weighted average invested/non-invested balances (new Sheet rows
-    # "solde moyen pondéré investi"/"non investi", added 2026-09-08).
-    # Lendermarket has no per-transaction dated ledger at all (see module
-    # docstring) - "non investi" reuses the SAME coarse (opening+closing)/2
-    # monthly approximation as Cash drag above (`statement_totals`, the
-    # best available precision for this platform, already respects
-    # REPORT_DATE for a backfilled month). "investi" falls back to the
-    # SAME total_invested point-in-time figure (reconstructed above for a
-    # backfilled month, or live for the current month) already used as a
-    # constant for this month's Cash drag math.
-    avg_invested_balance = None
-    avg_non_invested_balance = None
-    if total_invested > 0:
-        avg_invested_balance = total_invested
-        avg_non_invested_balance = (statement_totals["opening_balance"] + statement_totals["closing_balance"]) / 2
-        log.info(
-            "Solde moyen pondéré - investi: %.2f EUR (constant, point-in-time), non investi: %.2f EUR (approximation mensuelle).",
-            avg_invested_balance, avg_non_invested_balance,
-        )
 
     # "total" comes from a live balance call/summed active investments plus
     # the available (uninvested) balance, and
