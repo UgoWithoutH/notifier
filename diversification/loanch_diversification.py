@@ -222,6 +222,7 @@ from shared.google_sheet import (
     fill_geographic_repartition_uninvested_amount,
 )
 from shared.report_date import get_report_now, is_current_month
+from shared.session_cache import load_session_state, save_session_state
 from shared.state import load_state, save_state
 from shared.weighted_average import INVESTED_BALANCE_LABEL, NON_INVESTED_BALANCE_LABEL, compute_time_weighted_average
 from shared.xirr import compute_xirr
@@ -255,6 +256,7 @@ MAX_TRANSACTIONS_PAGES = 100
 # Cache of every transaction row ever fetched (see get_cached_transactions()
 # below) - avoids re-fetching the account's entire history every run, same
 # idea as peerberry_diversification.XIRR_CASHFLOWS_STATE_FILE.
+SESSION_STATE_FILE = Path(__file__).parent / "loanch_diversification_session_state.json"
 XIRR_CASHFLOWS_STATE_FILE = Path(__file__).parent / "loanch_xirr_cashflows_state.json"
 XIRR_CASHFLOWS_STATE_DEFAULT = {"all_entries": []}
 # Loanch is a French platform and its "Ce mois-ci" filter means the current
@@ -947,9 +949,18 @@ def run() -> None:
     log.info("Starting Loanch diversification run (pure HTTP, no browser - see module docstring for the login() flow).")
 
     session = requests.Session()
+    session_reused = load_session_state(session, SESSION_STATE_FILE) is not None
     try:
-        login(session)
-        investments = fetch_investments(session)
+        if session_reused:
+            try:
+                investments = fetch_investments(session)
+            except Exception:
+                log.info("Persisted Loanch session no longer valid - logging in again.")
+                session_reused = False
+        if not session_reused:
+            login(session)
+            save_session_state(session, SESSION_STATE_FILE)
+            investments = fetch_investments(session)
     except Exception:
         log.exception("Failed to log in or fetch Loanch investments.")
         sys.exit(1)

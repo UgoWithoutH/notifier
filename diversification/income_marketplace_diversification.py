@@ -17,6 +17,16 @@ Auth flow:
        stores them in `localStorage["accessToken"]`/`["refreshToken"]` -
        the accessToken is a ~24h JWT, sent as `Authorization: Bearer
        <accessToken>` on every subsequent call).
+    Added 2026-09-11: `login()` now reuses a persisted session first
+    (accessToken restored into localStorage via Playwright's own
+    storage_state mechanism, `STORAGE_STATE_FILE`) - a real 2FA login is
+    only performed when there's no persisted token or it's stopped working
+    (the ~24h JWT expired). A fresh login on EVERY month of a month-range
+    backfill was found to trigger Income Marketplace's own anti-abuse
+    rate-limiting (2 separate months' logins rejected outright, see repo
+    memory) - reusing the session across the whole backfill (and across
+    scheduled runs, since the state file is cache-persisted in CI too)
+    avoids repeating a real TOTP submission unless truly necessary.
     A DIRECT plain `requests` replay of step 1 (no browser at all) was
     tried and got an HTTP 503 - but the response body was Michelin's own
     "Security threat detected" corporate-proxy block page, NOT a real
@@ -174,6 +184,34 @@ BONUS_TYPE = "2199024"
 XIRR_HISTORY_START_DATE = date(2000, 1, 1)
 XIRR_CASHFLOWS_STATE_FILE = Path(__file__).parent / "income_marketplace_xirr_cashflows_state.json"
 XIRR_CASHFLOWS_STATE_DEFAULT = {"transactions": [], "last_fetched_date": None}
+STORAGE_STATE_FILE = Path(__file__).parent / "income_marketplace_diversification_storage_state.json"
+
+
+def _reuse_persisted_session(page) -> str | None:
+    """Try to reuse a previously persisted session (an accessToken restored
+    into localStorage via Playwright's storage_state, see
+    STORAGE_STATE_FILE) instead of logging in again - assumes the page has
+    already navigated to Income Marketplace's own origin. Returns the
+    still-valid accessToken, or None if there's no persisted token or it no
+    longer works (the ~24h JWT expired)."""
+    token = page.evaluate("() => localStorage.getItem('accessToken')")
+    if not token:
+        return None
+    try:
+        status = page.evaluate(
+            """
+            async ({url, token}) => {
+                const r = await fetch(url, {
+                    headers: {'Accept': 'application/json', 'Authorization': 'Bearer ' + token}
+                });
+                return r.status;
+            }
+            """,
+            {"url": INVESTOR_DETAILS_URL, "token": token},
+        )
+    except Exception:
+        return None
+    return token if status == 200 else None
 
 
 def login(page) -> str:
@@ -181,12 +219,25 @@ def login(page) -> str:
     + INCOME_MARKETPLACE_TOTP_SECRET (2FA is always enabled on the
     observed test account). Returns the real access token (a JWT) from
     localStorage, to use as `Authorization: Bearer <token>` on every
-    subsequent `page.evaluate(fetch(...))` call."""
+    subsequent `page.evaluate(fetch(...))` call.
+
+    Reuses a persisted session first (see STORAGE_STATE_FILE/
+    `_reuse_persisted_session()`) - a fresh login every run (incl. a real
+    TOTP submission) is what triggered Income Marketplace's own anti-abuse
+    2FA rejection during a rapid month-range backfill (see repo memory,
+    2026-09-11), so this skips logging in again as long as the last saved
+    accessToken is still valid."""
+    page.goto(LOGIN_PAGE_URL, wait_until="networkidle", timeout=30000)
+
+    reused_token = _reuse_persisted_session(page)
+    if reused_token:
+        log.info("Reused a previous session (persisted accessToken still valid) - skipping login.")
+        return reused_token
+
     if not INCOME_MARKETPLACE_EMAIL or not INCOME_MARKETPLACE_PASSWORD:
         raise RuntimeError("INCOME_MARKETPLACE_EMAIL and INCOME_MARKETPLACE_PASSWORD environment variables are required.")
 
     log.info("Submitting credentials...")
-    page.goto(LOGIN_PAGE_URL, wait_until="networkidle", timeout=30000)
     page.fill("#input-username", INCOME_MARKETPLACE_EMAIL)
     page.fill("#input-password", INCOME_MARKETPLACE_PASSWORD)
 
@@ -434,9 +485,11 @@ def run() -> None:
     try:
         with sync_playwright() as p:
             browser = p.chromium.launch(headless=True)
-            context = browser.new_context()
+            storage_state = str(STORAGE_STATE_FILE) if STORAGE_STATE_FILE.exists() else None
+            context = browser.new_context(storage_state=storage_state)
             page = context.new_page()
             token = login(page)
+            context.storage_state(path=str(STORAGE_STATE_FILE))
             overview = fetch_investor_details(page, token)
 
             today_date = get_report_date()

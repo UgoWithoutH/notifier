@@ -168,6 +168,7 @@ from shared.google_sheet import (
     fill_geographic_repartition_uninvested_amount,
 )
 from shared.report_date import get_report_now, is_current_month
+from shared.session_cache import load_session_state, save_session_state
 from shared.state import load_state, save_state
 from shared.weighted_average import INVESTED_BALANCE_LABEL, NON_INVESTED_BALANCE_LABEL
 from shared.xirr import compute_xirr
@@ -196,6 +197,7 @@ REPORT_TIMEZONE = ZoneInfo("Europe/Paris")
 # fetch idea as afranga_diversification.py's XIRR_CASHFLOWS_STATE_FILE,
 # just keyed by month instead of by individual dated row (Lendermarket has
 # no per-transaction ledger - see module docstring).
+SESSION_STATE_FILE = Path(__file__).parent / "lendermarket_diversification_session_state.json"
 XIRR_CASHFLOWS_STATE_FILE = Path(__file__).parent / "lendermarket_xirr_cashflows_state.json"
 XIRR_CASHFLOWS_STATE_DEFAULT = {"monthly_summaries": {}, "last_fetched_month": None}
 # Conservative floor for the one-time yearly scan used to find the
@@ -476,9 +478,20 @@ def run() -> None:
     log.info("Starting Lendermarket diversification run (pure HTTP, no browser).")
 
     session = requests.Session()
+    persisted_extra = load_session_state(session, SESSION_STATE_FILE)
+    session_reused = persisted_extra is not None
+    investor_id = (persisted_extra or {}).get("investor_id")
     try:
-        investor_id = login(session)
-        investments = fetch_investments(session, investor_id)
+        if session_reused:
+            try:
+                investments = fetch_investments(session, investor_id)
+            except Exception:
+                log.info("Persisted Lendermarket session no longer valid - logging in again.")
+                session_reused = False
+        if not session_reused:
+            investor_id = login(session)
+            save_session_state(session, SESSION_STATE_FILE, extra={"investor_id": investor_id})
+            investments = fetch_investments(session, investor_id)
     except Exception:
         log.exception("Failed to log in or fetch Lendermarket investments.")
         sys.exit(1)

@@ -175,6 +175,7 @@ from shared.google_sheet import (
     fill_geographic_repartition_uninvested_amount,
 )
 from shared.report_date import get_report_now, is_current_month
+from shared.session_cache import load_session_state, save_session_state
 from shared.state import load_state, save_state
 from shared.weighted_average import INVESTED_BALANCE_LABEL, NON_INVESTED_BALANCE_LABEL, compute_time_weighted_average
 from shared.xirr import compute_xirr
@@ -196,6 +197,7 @@ MAX_LIMIT = 250  # largest value offered by the page's own rows-per-page dropdow
 # get_cached_account_details() below) - same incremental-fetch idea as
 # swaper_diversification.XIRR_CASHFLOWS_STATE_FILE, avoids re-fetching the
 # account's entire history on every monthly run.
+SESSION_STATE_FILE = Path(__file__).parent / "afranga_diversification_session_state.json"
 XIRR_CASHFLOWS_STATE_FILE = Path(__file__).parent / "afranga_xirr_cashflows_state.json"
 XIRR_CASHFLOWS_STATE_DEFAULT = {"cashflows": [], "all_entries": [], "last_fetched_date": None}
 # XIRR is a since-inception money-weighted return (not per-month) - this
@@ -1256,9 +1258,18 @@ def run() -> None:
     log.info("Starting Afranga diversification run (pure HTTP, no browser).")
 
     session = requests.Session()
+    session_reused = load_session_state(session, SESSION_STATE_FILE) is not None
     try:
-        login(session)
-        investments = fetch_investments(session)
+        if session_reused:
+            try:
+                investments = fetch_investments(session)
+            except Exception:
+                log.info("Persisted Afranga session no longer valid - logging in again.")
+                session_reused = False
+        if not session_reused:
+            login(session)
+            save_session_state(session, SESSION_STATE_FILE)
+            investments = fetch_investments(session)
     except Exception:
         log.exception("Failed to log in or fetch Afranga investments.")
         sys.exit(1)
