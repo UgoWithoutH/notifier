@@ -1161,17 +1161,27 @@ def compute_xirr_block_as_of(session: requests.Session, all_detail_rows: list, x
 
     month_start_date = end_date.replace(day=1)
     month_statement_totals = fetch_statement_totals(session, month_start_date, end_date)
-    avg_idle_cash = compute_average_idle_cash(
-        all_detail_rows, month_statement_totals["opening_balance"], month_statement_totals["closing_balance"],
-        month_start_date.strftime("%Y-%m-%d"), end_date.strftime("%Y-%m-%d"),
+    # Cash drag now derived from compute_average_balances() (BOTH sides
+    # period-averaged) instead of mixing avg_idle_cash (a period average)
+    # with outstanding_as_of (a point-in-time snapshot) - fixed 2026-09-11
+    # to match the live current-month path (which already went through
+    # this same fix). No invested_closing_anchor is passed: unlike the
+    # live path, there's no real historical "ground truth" invested total
+    # for a backfilled month to anchor against, so the invested side falls
+    # back to the inception-anchored reconstruction (same as the "solde
+    # moyen pondéré investi" Sheet row for any other backfilled month).
+    avg_invested_month, avg_non_invested_month = compute_average_balances(
+        all_detail_rows, month_start_date, end_date,
+        non_invested_opening_anchor=month_statement_totals["opening_balance"],
     )
-    cash_weight = avg_idle_cash / (avg_idle_cash + outstanding_as_of)
-    monthly_yield_rate = month_statement_totals["gross_interest_received"] / outstanding_as_of
-    result["Cash drag"] = cash_weight * monthly_yield_rate
-    log.info(
-        "Computed Cash drag as of %s (backfilled month): %.2f%% (avg idle cash %.2f EUR, cash weight %.2f%%, monthly yield %.2f%%).",
-        end_date, result["Cash drag"] * 100, avg_idle_cash, cash_weight * 100, monthly_yield_rate * 100,
-    )
+    if avg_invested_month > 0:
+        cash_weight = avg_non_invested_month / (avg_non_invested_month + avg_invested_month)
+        monthly_yield_rate = month_statement_totals["gross_interest_received"] / avg_invested_month
+        result["Cash drag"] = cash_weight * monthly_yield_rate
+        log.info(
+            "Computed Cash drag as of %s (backfilled month): %.2f%% (avg non-invested balance %.2f EUR, cash weight %.2f%%, monthly yield %.2f%%).",
+            end_date, result["Cash drag"] * 100, avg_non_invested_month, cash_weight * 100, monthly_yield_rate * 100,
+        )
 
     deposit_dates = [
         row["date"] for row in xirr_cashflow_rows
