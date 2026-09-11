@@ -764,9 +764,13 @@ def run() -> None:
         # (e.g. a backfill target set before the account existed).
         log.warning("No monthly summary cached for %s (predates the account's own inception?) - 'solde investi'/'solde non investi' will not be updated.", today_month_key)
 
-    if avg_invested_balance is not None:
+    if avg_invested_balance is not None and (avg_invested_balance + avg_non_invested_balance) > 0:
+        # Both averages are 0 for any backfilled month before the account's real inception (nothing invested/held yet) - guard against ZeroDivisionError there.
         cash_weight = avg_non_invested_balance / (avg_non_invested_balance + avg_invested_balance)
-        monthly_yield_rate = (monthly_summaries_as_of.get(today_month_key) or {}).get("gross_interest_received", 0.0) / avg_invested_balance
+        monthly_yield_rate = (
+            (monthly_summaries_as_of.get(today_month_key) or {}).get("gross_interest_received", 0.0) / avg_invested_balance
+            if avg_invested_balance > 0 else 0.0
+        )
         cash_drag_value = cash_weight * monthly_yield_rate
         log.info(
             "Computed Cash drag: %.2f%% (avg non-invested balance %.2f EUR, cash weight %.2f%%, monthly yield %.2f%%).",
