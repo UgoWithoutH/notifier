@@ -435,6 +435,31 @@ def compute_average_idle_cash(monthly_summaries: dict) -> float:
     return total_weighted / total_days
 
 
+def _invested_balance_at_month_end(monthly_summaries: dict, live_total_account_value: float, month_key: str):
+    """Reconstruct the real invested balance at the END of the given "YYYY-MM"
+    month, working BACKWARD from today's live total account value: every
+    cached month strictly AFTER `month_key` is a real, already-known net
+    external cashflow/earning (deposits - withdrawals + interest + bonuses -
+    fees), so subtracting all of them from today's live total gives the real
+    total account value at that month's end; invested balance then falls out
+    as a remainder (that total minus the month's own real closing wallet
+    balance). Same backward-reconstruction idea already used in run() to get
+    total_invested for a backfilled reporting month - exposed here as a
+    reusable helper so it can ALSO be applied to the month immediately BEFORE
+    the reporting month, needed to build a genuine weighted-average "solde
+    investi" without relying on this month's own investment/received-principal
+    fields (which can't distinguish a real repayment from a default/write-off).
+    Returns None if `month_key` isn't cached."""
+    if month_key not in monthly_summaries:
+        return None
+    value_change_since = sum(
+        s["deposits"] - s["withdrawals"] + s["interest_received"] + s["bonuses"] - s["fees"]
+        for k, s in monthly_summaries.items() if k > month_key
+    )
+    total_account_value = live_total_account_value - value_change_since
+    return total_account_value - monthly_summaries[month_key]["closing_balance"]
+
+
 def run() -> None:
     if not LENDERMARKET_EMAIL or not LENDERMARKET_PASSWORD:
         log.error("LENDERMARKET_EMAIL and LENDERMARKET_PASSWORD environment variables are required.")
@@ -497,6 +522,10 @@ def run() -> None:
     available_balance = fetch_account_balance(session, investor_id)
     if available_balance is None:
         log.warning("Could not fetch Lendermarket's available balance - 'total'/'non investi' and XIRR will not be updated.")
+    # Snapshot of the LIVE (real_today) total account value, captured before `total_invested` is
+    # potentially reassigned below for a backfilled month - reused both for that reconstruction and
+    # for _invested_balance_at_month_end()'s own backward walk further down.
+    live_total_account_value = total_invested + available_balance if available_balance is not None else None
 
     # "total" ("en cours") written to the Sheet is invested + uninvested,
     # per user request 2026-08-14 (matching Bienprêter/Iuvo/Bricks/Lande's
@@ -555,7 +584,6 @@ def run() -> None:
                 s["deposits"] - s["withdrawals"] + s["interest_received"] + s["bonuses"] - s["fees"]
                 for k, s in monthly_summaries.items() if k > today_month_key
             )
-            live_total_account_value = total_invested + available_balance
             total_account_value = live_total_account_value - value_change_since
             closing_balance_as_of = monthly_summaries_as_of[today_month_key]["closing_balance"]
             total_invested = total_account_value - closing_balance_as_of
@@ -624,21 +652,36 @@ def run() -> None:
     # "non investi" uses the statement API's own opening/closing wallet
     # balance directly. "investi" (fixed 2026-09-11 - previously just
     # `total_invested`, a raw current snapshot with no averaging at all)
-    # derives the period's start value from `total_invested` (the
-    # end-of-period value, live or reconstructed above) minus this period's
-    # own net new investment (investorInvestmentAmount -
-    # investorReceivedPrincipalAmount), then averages the two endpoints.
-    # For a backfilled month, `total_invested` is only a trustworthy
-    # end-of-period value once the backward reconstruction above actually
-    # ran (`total_account_value is not None`) - otherwise it's still
-    # today's LIVE total, which would silently mix today's real invested
-    # amount with this backfilled month's own statement_totals below.
+    # derives the period's start value via _invested_balance_at_month_end()
+    # (the same backward-reconstruction trick as the backfill branch above,
+    # generalized to the PREVIOUS cached month), falling back to net new
+    # investment (investorInvestmentAmount - investorReceivedPrincipalAmount)
+    # only if the monthly-summary cache is unavailable. For a backfilled
+    # month, `total_invested` is only a trustworthy end-of-period value once
+    # the backward reconstruction above actually ran (`total_account_value
+    # is not None`) - otherwise it's still today's LIVE total, which would
+    # silently mix today's real invested amount with this backfilled
+    # month's own statement_totals below.
     avg_invested_balance = None
     avg_non_invested_balance = None
     total_invested_is_reliable = current_month or total_account_value is not None
     if total_invested > 0 and total_invested_is_reliable:
-        net_new_investment = statement_totals["investment_amount"] - statement_totals["received_principal_amount"]
-        invested_at_period_start = total_invested - net_new_investment
+        if monthly_summaries and today_month_key in monthly_summaries and live_total_account_value is not None:
+            # Preferred path (2026-09-11): reuse the same monthly-summary cache already fetched for
+            # XIRR to reconstruct the PREVIOUS month's real closing invested balance, instead of
+            # inferring it from this month's own investment/received-principal fields (which can't
+            # tell a real repayment apart from a default/write-off).
+            sorted_months = sorted(monthly_summaries)
+            month_index = sorted_months.index(today_month_key)
+            if month_index > 0:
+                invested_at_period_start = _invested_balance_at_month_end(monthly_summaries, live_total_account_value, sorted_months[month_index - 1])
+            else:
+                invested_at_period_start = 0.0  # first cached month - assumes it's the account's real inception (same caveat as Iuvo).
+        else:
+            # Fallback (monthly-summary cache unavailable/this month not cached yet): back out the
+            # period start from this month's own net new investment - doesn't handle defaults/write-offs.
+            net_new_investment = statement_totals["investment_amount"] - statement_totals["received_principal_amount"]
+            invested_at_period_start = total_invested - net_new_investment
         avg_invested_balance = (invested_at_period_start + total_invested) / 2
         avg_non_invested_balance = (statement_totals["opening_balance"] + statement_totals["closing_balance"]) / 2
         log.info(

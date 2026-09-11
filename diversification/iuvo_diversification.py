@@ -744,7 +744,10 @@ def run() -> None:
         if month_index > 0:
             invested_opening = _invested_balance_at_month_end(monthly_summaries, balance_data["total"], sorted_months[month_index - 1])
         else:
-            invested_opening = 0.0  # reporting month is the account's own inception month - nothing invested before it.
+            # Assumes this is the account's real inception month, not just the first month the cache
+            # happens to cover - if the cache started later than the real account creation, this month's
+            # avg_invested_balance would be slightly overstated (caveat, not fixed - no earlier data exists).
+            invested_opening = 0.0
         avg_invested_balance = (invested_opening + total_invested) / 2
         log.info(
             "Solde moyen pondéré (mois %s) - investi: %.2f EUR (ouverture %.2f EUR -> clôture %.2f EUR), "
