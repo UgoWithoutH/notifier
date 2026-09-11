@@ -129,7 +129,7 @@ from dotenv import load_dotenv
 
 from shared.google_sheet import fill_current_month_amounts, fill_current_month_bonus_breakdown, fill_geographic_repartition_amounts
 from shared.report_date import get_report_now, is_current_month
-from shared.session_cache import load_session_state, save_session_state
+from shared.session_cache import get_or_refresh_session
 from shared.state import load_state, save_state
 from shared.weighted_average import INVESTED_BALANCE_LABEL, NON_INVESTED_BALANCE_LABEL
 from shared.xirr import compute_xirr
@@ -384,19 +384,14 @@ def run() -> None:
 
     session = requests.Session()
     session.headers.update(_HEADERS)
-    session_reused = load_session_state(session, SESSION_STATE_FILE) is not None
 
     try:
-        if session_reused:
-            try:
-                vaults = fetch_vaults_breakdown(session)
-            except Exception:
-                log.info("Persisted Monefit session no longer valid - logging in again.")
-                session_reused = False
-        if not session_reused:
-            login(session)
-            save_session_state(session, SESSION_STATE_FILE)
-            vaults = fetch_vaults_breakdown(session)
+        vaults, _ = get_or_refresh_session(
+            session, SESSION_STATE_FILE,
+            fetch_fn=lambda extra: fetch_vaults_breakdown(session),
+            login_fn=lambda: (login(session), {}),
+            platform_name="Monefit",
+        )
         balance = vaults["total_wealth"]
     except Exception:
         log.exception("Failed to log in or fetch the Monefit balance.")

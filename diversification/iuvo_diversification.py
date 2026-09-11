@@ -168,7 +168,7 @@ import requests
 try:
     from shared.google_sheet import fill_current_month_amounts, fill_current_month_bonus_breakdown, fill_geographic_repartition_amounts, fill_geographic_repartition_uninvested_amount
     from shared.report_date import get_report_now, is_current_month
-    from shared.session_cache import load_session_state, save_session_state
+    from shared.session_cache import get_or_refresh_session
     from shared.state import load_state, save_state
     from shared.weighted_average import INVESTED_BALANCE_LABEL, NON_INVESTED_BALANCE_LABEL
     from shared.xirr import compute_xirr
@@ -181,7 +181,7 @@ except ModuleNotFoundError:
         sys.path.insert(0, str(project_root))
     from shared.google_sheet import fill_current_month_amounts, fill_current_month_bonus_breakdown, fill_geographic_repartition_amounts, fill_geographic_repartition_uninvested_amount
     from shared.report_date import get_report_now, is_current_month
-    from shared.session_cache import load_session_state, save_session_state
+    from shared.session_cache import get_or_refresh_session
     from shared.state import load_state, save_state
     from shared.weighted_average import INVESTED_BALANCE_LABEL, NON_INVESTED_BALANCE_LABEL
     from shared.xirr import compute_xirr
@@ -576,21 +576,14 @@ def run() -> None:
     log.info("Starting Iuvo diversification run (pure-HTTP, no browser).")
 
     session = requests.Session()
-    persisted_extra = load_session_state(session, SESSION_STATE_FILE)
-    session_reused = persisted_extra is not None
-    session_token = (persisted_extra or {}).get("session_token")
-
     try:
-        if session_reused:
-            try:
-                balance_data = fetch_balance_and_originators(session, session_token)
-            except Exception:
-                log.info("Persisted Iuvo session no longer valid - logging in again.")
-                session_reused = False
-        if not session_reused:
-            session_token = login(session)
-            save_session_state(session, SESSION_STATE_FILE, extra={"session_token": session_token})
-            balance_data = fetch_balance_and_originators(session, session_token)
+        balance_data, extra = get_or_refresh_session(
+            session, SESSION_STATE_FILE,
+            fetch_fn=lambda extra: fetch_balance_and_originators(session, extra["session_token"]),
+            login_fn=lambda: (None, {"session_token": login(session)}),
+            platform_name="Iuvo",
+        )
+        session_token = extra["session_token"]
     except Exception:
         log.exception("Failed to log in or fetch Iuvo's balance/loan-originator breakdown.")
         sys.exit(1)

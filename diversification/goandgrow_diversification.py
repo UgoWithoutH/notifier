@@ -116,7 +116,7 @@ load_dotenv()
 
 from shared.google_sheet import fill_current_month_amounts, fill_current_month_bonus_breakdown, fill_geographic_repartition_amounts
 from shared.report_date import get_report_now, is_current_month
-from shared.session_cache import load_session_state, save_session_state
+from shared.session_cache import get_or_refresh_session
 from shared.weighted_average import INVESTED_BALANCE_LABEL, NON_INVESTED_BALANCE_LABEL, compute_time_weighted_average
 from shared.xirr import compute_xirr
 from shared.xirr_waterfall import compute_waterfall_xirr_shares
@@ -458,19 +458,14 @@ def run() -> None:
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
         "Accept-Language": "en-US,en;q=0.9",
     })
-    session_reused = load_session_state(session, SESSION_STATE_FILE) is not None
 
     try:
-        if session_reused:
-            try:
-                goals = fetch_goals(session)
-            except Exception:
-                log.info("Persisted Go & Grow session no longer valid - logging in again.")
-                session_reused = False
-        if not session_reused:
-            login(session)
-            save_session_state(session, SESSION_STATE_FILE)
-            goals = fetch_goals(session)
+        goals, _ = get_or_refresh_session(
+            session, SESSION_STATE_FILE,
+            fetch_fn=lambda extra: fetch_goals(session),
+            login_fn=lambda: (login(session), {}),
+            platform_name="Go & Grow",
+        )
         balance = fetch_total_balance(goals)
     except Exception:
         log.exception("Failed to log in or fetch the Go & Grow balance.")
