@@ -848,16 +848,27 @@ def compute_xirr_block_as_of(all_entries: list, end_date, statement_totals: dict
     if outstanding_as_of <= 0:
         return result
 
-    month_start_str = end_date.replace(day=1).strftime("%Y-%m-%d")
     end_date_str = end_date.strftime("%Y-%m-%d")
-    avg_idle_cash = compute_average_idle_cash(all_entries, month_start_str, end_date_str)
-    cash_weight = avg_idle_cash / (avg_idle_cash + outstanding_as_of)
-    monthly_yield_rate = statement_totals["interest_paid"] / outstanding_as_of
-    result["Cash drag"] = cash_weight * monthly_yield_rate
-    log.info(
-        "Computed Cash drag as of %s (backfilled month): %.2f%% (avg idle cash %.2f EUR, cash weight %.2f%%, monthly yield %.2f%%).",
-        end_date, result["Cash drag"] * 100, avg_idle_cash, cash_weight * 100, monthly_yield_rate * 100,
+    # Cash drag now derived from compute_average_balances() (both sides
+    # period-averaged) instead of mixing avg_idle_cash (a period average)
+    # with outstanding_as_of (a point-in-time snapshot) - fixed 2026-09-11
+    # to match the live current-month path. No anchors are passed: Loanch
+    # has no independent closing-balance API to anchor against for either
+    # side (same reason compute_average_balances()'s own docstring gives
+    # for never anchoring here), so both sides fall back to the
+    # inception-anchored reconstruction - same tradeoff the "solde moyen
+    # pondéré" Sheet rows already accept for a backfilled month.
+    avg_invested_month, avg_non_invested_month = compute_average_balances(
+        all_entries, end_date.replace(day=1), end_date,
     )
+    if avg_invested_month > 0:
+        cash_weight = avg_non_invested_month / (avg_non_invested_month + avg_invested_month)
+        monthly_yield_rate = statement_totals["interest_paid"] / avg_invested_month
+        result["Cash drag"] = cash_weight * monthly_yield_rate
+        log.info(
+            "Computed Cash drag as of %s (backfilled month): %.2f%% (avg non-invested balance %.2f EUR, cash weight %.2f%%, monthly yield %.2f%%).",
+            end_date, result["Cash drag"] * 100, avg_non_invested_month, cash_weight * 100, monthly_yield_rate * 100,
+        )
 
     deposit_dates = [
         d for d in (_entry_date(e) for e in all_entries if e.get("transaction_type") == DEPOSIT_TYPE)

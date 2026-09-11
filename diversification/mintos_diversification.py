@@ -944,7 +944,6 @@ def compute_xirr_block_as_of(session: requests.Session, all_entries: list, end_d
         return result
 
     month_start_date = end_date.replace(day=1)
-    avg_idle_cash_month = compute_average_idle_cash(all_entries, month_start_date.strftime("%Y-%m-%d"), end_date.strftime("%Y-%m-%d"))
     try:
         month_statement_totals = fetch_statement_totals(session, month_start_date, end_date)
     except Exception:
@@ -952,10 +951,25 @@ def compute_xirr_block_as_of(session: requests.Session, all_entries: list, end_d
         month_statement_totals = None
 
     if month_statement_totals is not None:
-        cash_weight = avg_idle_cash_month / (avg_idle_cash_month + outstanding_as_of)
-        monthly_yield_rate = month_statement_totals["gross_interest_received"] / outstanding_as_of
-        result["Cash drag"] = cash_weight * monthly_yield_rate
-        log.info("Computed Cash drag as of %s (backfilled month): %.2f%%.", end_date, result["Cash drag"] * 100)
+        # Cash drag now derived from compute_average_balances() (both
+        # sides period-averaged) instead of mixing avg_idle_cash_month (a
+        # period average) with outstanding_as_of (a point-in-time
+        # snapshot) - fixed 2026-09-11 to match the live current-month
+        # path. No invested_closing_anchor is passed: there's no real
+        # historical "ground truth" invested total for a backfilled month
+        # to anchor against, so the invested side falls back to the
+        # inception-anchored reconstruction (the non-invested side is
+        # always accurate regardless, via Mintos's own real running
+        # balance snapshots - see compute_average_balances()'s docstring).
+        avg_invested_month, avg_non_invested_month = compute_average_balances(all_entries, month_start_date, end_date)
+        if avg_invested_month > 0:
+            cash_weight = avg_non_invested_month / (avg_non_invested_month + avg_invested_month)
+            monthly_yield_rate = month_statement_totals["gross_interest_received"] / avg_invested_month
+            result["Cash drag"] = cash_weight * monthly_yield_rate
+            log.info(
+                "Computed Cash drag as of %s (backfilled month): %.2f%% (avg non-invested balance %.2f EUR).",
+                end_date, result["Cash drag"] * 100, avg_non_invested_month,
+            )
 
     try:
         lifetime_statement_totals = fetch_statement_totals(session, since_inception_date, end_date)

@@ -557,6 +557,19 @@ def run() -> None:
             avg_invested_balance, avg_non_invested_balance, month_start_date, today_date,
         )
 
+        # Cash drag now computed for a backfilled month too (not just the
+        # live current month) - only needs the avg balances above (already
+        # backfill-aware) and this period's own already-fetched
+        # gross_interest_received.
+        if avg_invested_balance is not None and avg_invested_balance > 0:
+            cash_weight = avg_non_invested_balance / (avg_non_invested_balance + avg_invested_balance)
+            monthly_yield_rate = amounts["gross_interest_received"] / avg_invested_balance
+            cash_drag_value = cash_weight * monthly_yield_rate
+            log.info(
+                "Computed Cash drag: %.4f%% (avg idle cash %.2f EUR).",
+                cash_drag_value * 100, avg_non_invested_balance,
+            )
+
         if current_month:
             deposit_dates = [
                 _parse_transaction_date(t["createdOn"]) for t in all_transactions if t.get("transactionType") == "DEPOSIT"
@@ -601,22 +614,10 @@ def run() -> None:
                     # all steps are evaluated in the fixed waterfall order
                     # (shared/xirr_waterfall.py).
 
-                # cash_weight/monthly_yield_rate use the already-computed
-                # avg_invested_balance/avg_non_invested_balance (same
-                # figures as the "solde moyen pondéré" Sheet rows above)
-                # instead of the live total_invested snapshot (fixed
-                # 2026-09-11), so this % is exactly reconstructible from
-                # those two Sheet rows. The lifetime share below still uses
-                # total_invested (no lifetime-average equivalent exists).
-                if avg_invested_balance is not None and avg_invested_balance > 0:
-                    cash_weight = avg_non_invested_balance / (avg_non_invested_balance + avg_invested_balance)
-                    monthly_yield_rate = amounts["gross_interest_received"] / avg_invested_balance
-                    cash_drag_value = cash_weight * monthly_yield_rate
-                    log.info(
-                        "Computed Cash drag: %.4f%% (avg idle cash %.2f EUR).",
-                        cash_drag_value * 100, avg_non_invested_balance,
-                    )
-
+                # cash_drag_value is now computed earlier (unconditionally,
+                # backfill-aware) - only the lifetime waterfall shares
+                # still need this current-month-only XIRR block.
+                if cash_drag_value is not None:
                     if deposit_dates and lifetime_summary is not None and total_invested > 0:
                         since_inception_date = min(deposit_dates)
                         avg_idle_cash_lifetime = compute_time_weighted_average(cash_events, since_inception_date, today_date)

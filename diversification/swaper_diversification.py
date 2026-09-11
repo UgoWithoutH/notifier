@@ -896,17 +896,22 @@ def compute_xirr_block_as_of(page, all_entries: list, xirr_cashflow_entries: lis
     # compute_average_balances()'s non-invested average the same way, for
     # a backfilled month, without an extra account-entries API call.
     result["_month_opening_balance"] = month_statement_totals["opening_balance"]
-    avg_idle_cash = compute_average_idle_cash(
-        all_entries, month_statement_totals["opening_balance"], month_statement_totals["closing_balance"],
-        month_start_date.strftime("%Y-%m-%d"), end_date_str,
+    # Cash drag now derived from compute_average_balances() (both sides
+    # period-averaged) instead of mixing avg_idle_cash (a period average)
+    # with outstanding_as_of (a point-in-time snapshot) - fixed 2026-09-11
+    # to match the live current-month path (this function's own docstring
+    # already claimed this was fixed - it wasn't, this call was the gap).
+    avg_invested_month, avg_non_invested_month = compute_average_balances(
+        all_entries, month_start_date, end_date, month_statement_totals["opening_balance"],
     )
-    cash_weight = avg_idle_cash / (avg_idle_cash + outstanding_as_of)
-    monthly_yield_rate = month_statement_totals["earned_interest"] / outstanding_as_of
-    result["Cash drag"] = cash_weight * monthly_yield_rate
-    log.info(
-        "Computed Cash drag as of %s (backfilled month): %.2f%% (avg idle cash %.2f EUR).",
-        end_date, result["Cash drag"] * 100, avg_idle_cash,
-    )
+    if avg_invested_month > 0:
+        cash_weight = avg_non_invested_month / (avg_non_invested_month + avg_invested_month)
+        monthly_yield_rate = month_statement_totals["earned_interest"] / avg_invested_month
+        result["Cash drag"] = cash_weight * monthly_yield_rate
+        log.info(
+            "Computed Cash drag as of %s (backfilled month): %.2f%% (avg non-invested balance %.2f EUR).",
+            end_date, result["Cash drag"] * 100, avg_non_invested_month,
+        )
 
     funding_dates = [
         e["date"] for e in xirr_cashflow_entries
