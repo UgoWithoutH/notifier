@@ -804,11 +804,36 @@ def run() -> None:
     log.info("Starting PeerBerry diversification run (pure HTTP, no browser).")
 
     session = requests.Session()
+
+    def _login_fn():
+        # BUGFIX 2026-09-13: this must actually perform the login (for its
+        # side effect of setting session.headers["Authorization"] to the
+        # freshly returned access_token) rather than just returning
+        # (None, {}) - a lambda that skips calling login(session) entirely
+        # leaves the session unauthenticated, so the retried
+        # fetch_originator_distribution() call below still 401s (see the
+        # 2026-09-13 11:00 CI run for the resulting traceback).
+        #
+        # login()'s own return value (the access_token string) must NOT be
+        # passed back as get_or_refresh_session's "result" either (that was
+        # the ORIGINAL bug, fixed in commit b193421): login() doesn't return
+        # the originator distribution, so treating its return value as the
+        # already-computed result makes get_or_refresh_session skip the
+        # fetch_fn() call that actually retrieves it - normalize_originators()
+        # then ends up iterating over the individual characters of the JWT
+        # string instead of a list of originator dicts.
+        #
+        # So: call login(session) for its side effect, discard its return
+        # value, and return None so get_or_refresh_session goes on to call
+        # fetch_fn(extra) with the now-authenticated session.
+        login(session)
+        return None, {}
+
     try:
         payload, _ = get_or_refresh_session(
             session, SESSION_STATE_FILE,
             fetch_fn=lambda extra: fetch_originator_distribution(session),
-            login_fn=lambda: (None, {}),
+            login_fn=_login_fn,
             platform_name="PeerBerry",
         )
     except Exception:
