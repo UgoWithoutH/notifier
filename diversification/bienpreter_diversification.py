@@ -1001,7 +1001,8 @@ def run() -> None:
     real_today = date.today()  # always the actual current date - operations must be fetched through here so a backfilled today_date can subtract every intervening cashflow/earnings event from today's live total
     xirr_value = None
     bonus_xirr_contribution = None
-    cash_drag_value = None
+    cash_drag_brut_value = None
+    cash_drag_net_value = None
     cash_drag_xirr_contribution = None
     taxes_xirr_contribution = None
     frais_xirr_contribution = None
@@ -1116,11 +1117,13 @@ def run() -> None:
             today_str = today_date.strftime("%Y-%m-%d")
             if avg_invested_balance is not None and avg_invested_balance > 0:
                 cash_weight = avg_non_invested_balance / (avg_non_invested_balance + avg_invested_balance)
-                monthly_yield_rate = interest_totals["gross_interest_received"] / avg_invested_balance
-                cash_drag_value = cash_weight * monthly_yield_rate
+                monthly_yield_rate_brut = interest_totals["gross_interest_received"] / avg_invested_balance
+                monthly_yield_rate_net = interest_totals["net_interest_received"] / avg_invested_balance
+                cash_drag_brut_value = cash_weight * monthly_yield_rate_brut
+                cash_drag_net_value = cash_weight * monthly_yield_rate_net
                 log.info(
-                    "Computed Cash drag: %.2f%% (avg idle cash %.2f EUR, cash weight %.2f%%, monthly yield %.2f%%).",
-                    cash_drag_value * 100, avg_non_invested_balance, cash_weight * 100, monthly_yield_rate * 100,
+                    "Computed Cash drag: brut=%.2f%% net=%.2f%% (avg idle cash %.2f EUR, cash weight %.2f%%).",
+                    cash_drag_brut_value * 100, cash_drag_net_value * 100, avg_non_invested_balance, cash_weight * 100,
                 )
 
                 deposit_dates = [r["date"] for r in operations_as_of if r.get("date") and r["label"] == "Dépôt de fonds"]
@@ -1204,8 +1207,10 @@ def run() -> None:
         "prime": interest_totals["bonus_cashback_contest"],
         "prélèvements": interest_totals["withholding_tax"],
     }
-    if cash_drag_value is not None:
-        bonus_breakdown["Cash drag"] = cash_drag_value
+    if cash_drag_brut_value is not None:
+        bonus_breakdown["Cash drag brut"] = cash_drag_brut_value
+    if cash_drag_net_value is not None:
+        bonus_breakdown["Cash drag net"] = cash_drag_net_value
     if xirr_value is not None:
         bonus_breakdown["XIRR"] = xirr_value
     if bonus_xirr_contribution is not None:

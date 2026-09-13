@@ -632,7 +632,8 @@ def run() -> None:
     signed_cashflows = None
     total_account_value = None
     bonus_xirr_contribution = None
-    cash_drag_value = None
+    cash_drag_brut_value = None
+    cash_drag_net_value = None
     cash_drag_xirr_contribution = None
     taxes_xirr_contribution = 0.0  # Iuvo has no separate withholding-tax transaction type (see module docstring) - genuinely 0, not a placeholder.
     frais_xirr_contribution = 0.0  # Iuvo has no distinct platform-fee transaction type either - genuinely 0, not a placeholder.
@@ -774,14 +775,19 @@ def run() -> None:
     if avg_invested_balance is not None and (avg_invested_balance + avg_non_invested_balance) > 0:
         # Both averages are 0 for any backfilled month before the account's real inception (nothing invested/held yet) - guard against ZeroDivisionError there.
         cash_weight = avg_non_invested_balance / (avg_non_invested_balance + avg_invested_balance)
+        monthly_gross_interest = (monthly_summaries_as_of.get(today_month_key) or {}).get("gross_interest_received", 0.0)
         monthly_yield_rate = (
-            (monthly_summaries_as_of.get(today_month_key) or {}).get("gross_interest_received", 0.0) / avg_invested_balance
+            monthly_gross_interest / avg_invested_balance
             if avg_invested_balance > 0 else 0.0
         )
-        cash_drag_value = cash_weight * monthly_yield_rate
+        cash_drag_brut_value = cash_weight * monthly_yield_rate
+        # Iuvo has no withholding-tax transaction type at all (see module
+        # docstring) - net interest always equals gross here, so "Cash
+        # drag net" is identical to "Cash drag brut", not a placeholder.
+        cash_drag_net_value = cash_drag_brut_value
         log.info(
-            "Computed Cash drag: %.2f%% (avg non-invested balance %.2f EUR, cash weight %.2f%%, monthly yield %.2f%%).",
-            cash_drag_value * 100, avg_non_invested_balance, cash_weight * 100, monthly_yield_rate * 100,
+            "Computed Cash drag: brut=net=%.2f%% (avg non-invested balance %.2f EUR, cash weight %.2f%%, monthly yield %.2f%%).",
+            cash_drag_brut_value * 100, avg_non_invested_balance, cash_weight * 100, monthly_yield_rate * 100,
         )
 
         if xirr_value is not None and signed_cashflows is not None:
@@ -834,8 +840,10 @@ def run() -> None:
     bonus_breakdown = {}
     if xirr_value is not None:
         bonus_breakdown["XIRR"] = xirr_value
-    if cash_drag_value is not None:
-        bonus_breakdown["Cash drag"] = cash_drag_value
+    if cash_drag_brut_value is not None:
+        bonus_breakdown["Cash drag brut"] = cash_drag_brut_value
+    if cash_drag_net_value is not None:
+        bonus_breakdown["Cash drag net"] = cash_drag_net_value
     if bonus_xirr_contribution is not None:
         bonus_breakdown["XIRR Bonus"] = bonus_xirr_contribution
     if cash_drag_xirr_contribution is not None:
