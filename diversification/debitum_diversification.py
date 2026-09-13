@@ -509,7 +509,8 @@ def run() -> None:
     # Since-inception XIRR/Cash drag block - see module docstring for the
     # full methodology (mirrors nectaro_diversification.py's design).
     xirr_value = None
-    cash_drag_value = None
+    cash_drag_brut_value = None
+    cash_drag_net_value = None
     bonus_xirr_contribution = None
     cash_drag_xirr_contribution = None
     taxes_xirr_contribution = None
@@ -571,11 +572,13 @@ def run() -> None:
         # gross_interest_received.
         if avg_invested_balance is not None and avg_invested_balance > 0:
             cash_weight = avg_non_invested_balance / (avg_non_invested_balance + avg_invested_balance)
-            monthly_yield_rate = amounts["gross_interest_received"] / avg_invested_balance
-            cash_drag_value = cash_weight * monthly_yield_rate
+            monthly_yield_rate_brut = amounts["gross_interest_received"] / avg_invested_balance
+            monthly_yield_rate_net = amounts["net_interest_received"] / avg_invested_balance
+            cash_drag_brut_value = cash_weight * monthly_yield_rate_brut
+            cash_drag_net_value = cash_weight * monthly_yield_rate_net
             log.info(
-                "Computed Cash drag: %.4f%% (avg idle cash %.2f EUR).",
-                cash_drag_value * 100, avg_non_invested_balance,
+                "Computed Cash drag: brut=%.4f%% net=%.4f%% (avg idle cash %.2f EUR).",
+                cash_drag_brut_value * 100, cash_drag_net_value * 100, avg_non_invested_balance,
             )
 
         if current_month:
@@ -622,10 +625,10 @@ def run() -> None:
                     # all steps are evaluated in the fixed waterfall order
                     # (shared/xirr_waterfall.py).
 
-                # cash_drag_value is now computed earlier (unconditionally,
+                # cash_drag_brut_value is now computed earlier (unconditionally,
                 # backfill-aware) - only the lifetime waterfall shares
                 # still need this current-month-only XIRR block.
-                if cash_drag_value is not None:
+                if cash_drag_brut_value is not None:
                     if deposit_dates and lifetime_summary is not None and total_invested > 0:
                         since_inception_date = min(deposit_dates)
                         avg_idle_cash_lifetime = compute_time_weighted_average(cash_events, since_inception_date, today_date)
@@ -700,8 +703,10 @@ def run() -> None:
         bonus_breakdown["prime"] = amounts["bonus_cashback_contest"]
     if xirr_value is not None:
         bonus_breakdown["XIRR"] = xirr_value
-    if cash_drag_value is not None:
-        bonus_breakdown["Cash drag"] = cash_drag_value
+    if cash_drag_brut_value is not None:
+        bonus_breakdown["Cash drag brut"] = cash_drag_brut_value
+    if cash_drag_net_value is not None:
+        bonus_breakdown["Cash drag net"] = cash_drag_net_value
     if bonus_xirr_contribution is not None:
         bonus_breakdown["XIRR Bonus"] = bonus_xirr_contribution
     if cash_drag_xirr_contribution is not None:

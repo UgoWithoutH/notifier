@@ -964,11 +964,14 @@ def compute_xirr_block_as_of(session: requests.Session, all_entries: list, end_d
         avg_invested_month, avg_non_invested_month = compute_average_balances(all_entries, month_start_date, end_date)
         if avg_invested_month > 0:
             cash_weight = avg_non_invested_month / (avg_non_invested_month + avg_invested_month)
-            monthly_yield_rate = month_statement_totals["gross_interest_received"] / avg_invested_month
-            result["Cash drag"] = cash_weight * monthly_yield_rate
+            month_net_interest = month_statement_totals["gross_interest_received"] - month_statement_totals["withholding_tax"]
+            monthly_yield_rate_brut = month_statement_totals["gross_interest_received"] / avg_invested_month
+            monthly_yield_rate_net = month_net_interest / avg_invested_month
+            result["Cash drag brut"] = cash_weight * monthly_yield_rate_brut
+            result["Cash drag net"] = cash_weight * monthly_yield_rate_net
             log.info(
-                "Computed Cash drag as of %s (backfilled month): %.2f%% (avg non-invested balance %.2f EUR).",
-                end_date, result["Cash drag"] * 100, avg_non_invested_month,
+                "Computed Cash drag as of %s (backfilled month): brut=%.2f%% net=%.2f%% (avg non-invested balance %.2f EUR).",
+                end_date, result["Cash drag brut"] * 100, result["Cash drag net"] * 100, avg_non_invested_month,
             )
 
     try:
