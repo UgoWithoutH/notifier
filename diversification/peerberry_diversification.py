@@ -808,7 +808,7 @@ def run() -> None:
         payload, _ = get_or_refresh_session(
             session, SESSION_STATE_FILE,
             fetch_fn=lambda extra: fetch_originator_distribution(session),
-            login_fn=lambda: (login(session), {}),
+            login_fn=lambda: (None, {}),
             platform_name="PeerBerry",
         )
     except Exception:
