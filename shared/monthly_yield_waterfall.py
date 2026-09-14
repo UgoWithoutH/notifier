@@ -1,28 +1,35 @@
-"""Linear waterfall decomposition of THIS MONTH's gross return (%), the
-non-annualized sibling of shared/xirr_waterfall.py's since-inception XIRR
-waterfall.
+"""Linear waterfall decomposition of THIS MONTH's gross return (%),
+ANNUALIZED by a simple x12 (not compounding), the sibling of
+shared/xirr_waterfall.py's since-inception XIRR waterfall.
 
 Added 2026-09-14 per explicit user request: alongside the existing
 since-inception "XIRR"/"XIRR Intérêts"/"XIRR Cash drag"/"XIRR Bonus"/"XIRR
 Taxes"/"XIRR Frais" pie-chart block, each platform now ALSO reports a
-"Rendements % brut" figure for the calendar month of the run - the
-non-annualized, simple ("gain / average balance") return over that month
-alone - split into "Intérêts brut %" / "Cash drag brut %" / "Bonus brut %"
-/ "Frais brut %" / "Taxes brut %" shares that sum EXACTLY to "Rendements %
-brut".
+"Rendements % brut" figure for the calendar month of the run - split into
+"Intérêts brut %" / "Cash drag brut %" / "Bonus brut %" / "Frais brut %" /
+"Taxes brut %" shares that sum EXACTLY to "Rendements % brut".
+
+UPDATED 2026-09-14 (same day): annualized via a plain x12 multiplier per
+explicit user request, rather than left as the raw one-month figure. This
+is a SIMPLE (linear) annualization - "if every month looked like this one,
+12 of them in a row" - NOT a compounding one: it does not account for
+reinvestment/compounding the way XIRR's own annualization does (XIRR
+solves `(1 + rate)^t` over real elapsed time). The two are deliberately
+different scales/methodologies and shouldn't be expected to match exactly
+even for an account with a stable monthly return - "Rendements % brut"
+answers "at this month's pace, annualized linearly", while "XIRR" answers
+"the real annualized, compounding, money-weighted return since inception".
 
 Why this does NOT need shared/xirr_waterfall.py's Newton-Raphson/bisection
-machinery: XIRR is an ANNUALIZED, COMPOUNDING rate - non-linear in its
-cashflows, so isolating "how much of the rate is due to interest alone"
-requires re-solving the IRR equation at each step and taking the resulting
-rate's delta (see shared/xirr_waterfall.py's module docstring). A single
-calendar month's SIMPLE return (gain divided by that month's average
-balance) is, by contrast, perfectly LINEAR in its component gains/losses:
+machinery: unlike XIRR, a single calendar month's SIMPLE return (gain
+divided by that month's average balance) is perfectly LINEAR in its
+component gains/losses:
     (a + b + c + d + e) / avg_balance == a/avg_balance + b/avg_balance + ...
-so each step's share is just that step's own EUR delta divided by the
-month's average TOTAL balance (invested + non-invested/idle cash) - no
-re-solving, no reconciliation gap to fold anywhere, shares sum EXACTLY to
-the total by construction (floating-point rounding aside).
+and multiplying a sum by a constant (x12) distributes over it the same
+way, so each step's share is just that step's own EUR delta divided by
+the month's average TOTAL balance (invested + non-invested/idle cash),
+times 12 - no re-solving, no reconciliation gap to fold anywhere, shares
+sum EXACTLY to the total by construction (floating-point rounding aside).
 
 Same "walk from a 0% baseline in a fixed order" mental model as the XIRR
 waterfall, for consistency across the two blocks:
@@ -41,6 +48,7 @@ so "Cash drag brut %" comes out NEGATIVE (a real cost, consistent with
 """
 
 DEFAULT_TOLERANCE = 0.0001
+MONTHS_PER_YEAR = 12
 
 
 def compute_monthly_yield_shares(
@@ -50,9 +58,10 @@ def compute_monthly_yield_shares(
     log_context: str = "",
     tolerance: float = DEFAULT_TOLERANCE,
 ) -> dict[str, float | None]:
-    """Decompose this month's simple gross return into one additive share
-    per step (an ORDERED list of (name, delta_eur) pairs), each share
-    being `delta_eur / avg_total_balance`.
+    """Decompose this month's simple gross return into one additive,
+    ANNUALIZED (x12, non-compounding - see module docstring) share per
+    step (an ORDERED list of (name, delta_eur) pairs), each share being
+    `(delta_eur / avg_total_balance) * 12`.
 
     Returns {step_name: share_or_None} - None for every step if
     `avg_total_balance` isn't strictly positive (soft-fail, same
@@ -60,7 +69,7 @@ def compute_monthly_yield_shares(
     be computed this run", not "was computed as zero").
 
     Since this is linear (unlike XIRR), shares always sum EXACTLY to
-    `sum(delta for _, delta in steps) / avg_total_balance` - the
+    `(sum(delta for _, delta in steps) / avg_total_balance) * 12` - the
     `tolerance` check is purely a floating-point sanity net (logged as a
     warning if it ever fires, which would indicate a bug in this
     function, not real-world data noise).
@@ -68,10 +77,10 @@ def compute_monthly_yield_shares(
     if avg_total_balance <= 0:
         return {name: None for name, _ in steps}
 
-    shares = {name: delta / avg_total_balance for name, delta in steps}
+    shares = {name: (delta / avg_total_balance) * MONTHS_PER_YEAR for name, delta in steps}
 
     if log is not None:
-        total = sum(delta for _, delta in steps) / avg_total_balance
+        total = (sum(delta for _, delta in steps) / avg_total_balance) * MONTHS_PER_YEAR
         gap = abs(sum(shares.values()) - total)
         if gap > tolerance:
             log.warning(
