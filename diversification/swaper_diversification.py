@@ -907,10 +907,15 @@ def compute_xirr_block_as_of(page, all_entries: list, xirr_cashflow_entries: lis
     if avg_invested_month > 0:
         cash_weight = avg_non_invested_month / (avg_non_invested_month + avg_invested_month)
         monthly_yield_rate = month_statement_totals["earned_interest"] / avg_invested_month
-        result["Cash drag"] = cash_weight * monthly_yield_rate
+        result["Cash drag brut"] = cash_weight * monthly_yield_rate
+        # Swaper has no gross/net/withholding-tax breakdown (see amounts
+        # dict further below in run()) - net interest equals gross here,
+        # so "Cash drag net" is identical to "Cash drag brut", not a
+        # placeholder.
+        result["Cash drag net"] = result["Cash drag brut"]
         log.info(
-            "Computed Cash drag as of %s (backfilled month): %.2f%% (avg non-invested balance %.2f EUR).",
-            end_date, result["Cash drag"] * 100, avg_non_invested_month,
+            "Computed Cash drag as of %s (backfilled month): brut=net=%.2f%% (avg non-invested balance %.2f EUR).",
+            end_date, result["Cash drag brut"] * 100, avg_non_invested_month,
         )
 
     funding_dates = [
@@ -1210,7 +1215,8 @@ def run(headless: bool = True) -> None:
     # pondéré" Sheet rows above (fixed 2026-09-11, previously divided by
     # the live breakdown["total_invested"] snapshot instead), so this % is
     # exactly reconstructible from those two Sheet rows.
-    cash_drag_value = xirr_backfill_block.get("Cash drag") if (not current_month and xirr_backfill_block) else None
+    cash_drag_brut_value = xirr_backfill_block.get("Cash drag brut") if (not current_month and xirr_backfill_block) else None
+    cash_drag_net_value = xirr_backfill_block.get("Cash drag net") if (not current_month and xirr_backfill_block) else None
     # Cash drag/taxes' own share of XIRR, on the same since-inception,
     # annualized percentage-point scale as XIRR itself (unlike "Cash drag"
     # above, which is a monthly-only figure) - computed from
@@ -1238,10 +1244,15 @@ def run(headless: bool = True) -> None:
     if current_month and avg_invested_balance is not None and avg_invested_balance > 0:
         cash_weight = avg_non_invested_balance / (avg_non_invested_balance + avg_invested_balance)
         monthly_yield_rate = interest_received / avg_invested_balance
-        cash_drag_value = cash_weight * monthly_yield_rate
+        cash_drag_brut_value = cash_weight * monthly_yield_rate
+        # Swaper has no withholding-tax data at all (see amounts
+        # ["withholding_tax"] above) - net interest equals gross here, so
+        # "Cash drag net" is identical to "Cash drag brut", not a
+        # placeholder.
+        cash_drag_net_value = cash_drag_brut_value
         log.info(
-            "Computed Cash drag: %.2f%% (avg non-invested balance %.2f EUR, cash weight %.2f%%, monthly yield %.2f%%).",
-            cash_drag_value * 100, avg_non_invested_balance, cash_weight * 100, monthly_yield_rate * 100,
+            "Computed Cash drag: brut=net=%.2f%% (avg non-invested balance %.2f EUR, cash weight %.2f%%, monthly yield %.2f%%).",
+            cash_drag_brut_value * 100, avg_non_invested_balance, cash_weight * 100, monthly_yield_rate * 100,
         )
 
         if lifetime_statement_totals is not None and xirr_cashflow_entries and breakdown["total_invested"] > 0:
@@ -1326,8 +1337,10 @@ def run(headless: bool = True) -> None:
     bonus_breakdown = {"prime": referral_bonus_earned}
     if xirr_value is not None:
         bonus_breakdown["XIRR"] = xirr_value
-    if cash_drag_value is not None:
-        bonus_breakdown["Cash drag"] = cash_drag_value
+    if cash_drag_brut_value is not None:
+        bonus_breakdown["Cash drag brut"] = cash_drag_brut_value
+    if cash_drag_net_value is not None:
+        bonus_breakdown["Cash drag net"] = cash_drag_net_value
     # Pie-chart source data (percentage points, same scale as XIRR): each
     # component's own share of the since-inception XIRR - written to new
     # sub-rows only if the user has added them to the Sheet (soft-fail
