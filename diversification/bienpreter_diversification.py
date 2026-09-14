@@ -224,6 +224,7 @@ from shared.session_cache import get_or_refresh_session
 from shared.notifier import send_bienpreter_geo_issues_email
 from shared.state import load_state, save_state
 from shared.weighted_average import INVESTED_BALANCE_LABEL, NON_INVESTED_BALANCE_LABEL, compute_time_weighted_average
+from shared.monthly_yield_waterfall import compute_monthly_yield_shares
 from shared.xirr import compute_xirr
 from shared.xirr_waterfall import compute_waterfall_xirr_shares
 
@@ -1007,6 +1008,8 @@ def run() -> None:
     taxes_xirr_contribution = None
     frais_xirr_contribution = None
     interest_xirr_contribution = None
+    rendement_brut_value = None
+    monthly_yield_shares: dict = {}
 
     all_operations = None
     try:
@@ -1126,6 +1129,31 @@ def run() -> None:
                     cash_drag_brut_value * 100, cash_drag_net_value * 100, avg_non_invested_balance, cash_weight * 100,
                 )
 
+                # Monthly gross-yield waterfall ("Rendements % brut" block,
+                # added 2026-09-14) - the non-annualized, this-month-only
+                # sibling of the since-inception XIRR waterfall below. See
+                # shared/monthly_yield_waterfall.py's module docstring for
+                # why this is a plain division (no IRR-solving needed).
+                # Bienprêter has no platform-fee concept distinct from
+                # withholding tax (same reasoning as "XIRR Frais" below).
+                avg_total_balance_month = avg_invested_balance + avg_non_invested_balance
+                missed_earnings_month = cash_drag_brut_value * avg_total_balance_month
+                monthly_yield_steps = [
+                    ("Intérêts brut %", interest_totals["gross_interest_received"] + missed_earnings_month),
+                    ("Cash drag brut %", -missed_earnings_month),
+                    ("Bonus brut %", interest_totals["bonus_cashback_contest"]),
+                    ("Frais brut %", 0.0),
+                    ("Taxes brut %", -interest_totals["withholding_tax"]),
+                ]
+                monthly_yield_shares = compute_monthly_yield_shares(
+                    avg_total_balance_month, monthly_yield_steps, log=log, log_context="Bienprêter",
+                )
+                rendement_brut_value = sum(v for v in monthly_yield_shares.values() if v is not None)
+                log.info(
+                    "Monthly gross-yield waterfall shares: Rendements %% brut=%.2f%% %r",
+                    rendement_brut_value * 100, {k: round(v * 100, 4) for k, v in monthly_yield_shares.items() if v is not None},
+                )
+
                 deposit_dates = [r["date"] for r in operations_as_of if r.get("date") and r["label"] == "Dépôt de fonds"]
                 if deposit_dates and total_invested > 0:
                     since_inception_date = datetime.strptime(min(deposit_dates), "%Y-%m-%d").date()
@@ -1211,6 +1239,12 @@ def run() -> None:
         bonus_breakdown["Cash drag brut"] = cash_drag_brut_value
     if cash_drag_net_value is not None:
         bonus_breakdown["Cash drag net"] = cash_drag_net_value
+    if rendement_brut_value is not None:
+        bonus_breakdown["Rendements % brut"] = rendement_brut_value
+    for step_name in ("Intérêts brut %", "Cash drag brut %", "Bonus brut %", "Frais brut %", "Taxes brut %"):
+        step_value = monthly_yield_shares.get(step_name)
+        if step_value is not None:
+            bonus_breakdown[step_name] = step_value
     if xirr_value is not None:
         bonus_breakdown["XIRR"] = xirr_value
     if bonus_xirr_contribution is not None:

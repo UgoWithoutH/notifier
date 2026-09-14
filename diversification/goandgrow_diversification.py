@@ -118,6 +118,7 @@ from shared.google_sheet import fill_current_month_amounts, fill_current_month_b
 from shared.report_date import get_report_now, is_current_month
 from shared.session_cache import get_or_refresh_session
 from shared.weighted_average import INVESTED_BALANCE_LABEL, NON_INVESTED_BALANCE_LABEL, compute_time_weighted_average
+from shared.monthly_yield_waterfall import compute_monthly_yield_shares
 from shared.xirr import compute_xirr
 from shared.xirr_waterfall import compute_waterfall_xirr_shares
 
@@ -532,6 +533,33 @@ def run() -> None:
         skip_total=skip_total,
     )
 
+    # Monthly gross-yield waterfall ("Rendements % brut" block, added
+    # 2026-09-14) - the non-annualized, this-month-only sibling of the
+    # since-inception XIRR waterfall below. See
+    # shared/monthly_yield_waterfall.py's module docstring for why this
+    # is a plain division (no IRR-solving needed). "Cash drag brut %" is
+    # ALWAYS hardcoded 0.0 (same reasoning as "Cash drag"/"XIRR Cash
+    # drag" above - no idle-cash wallet exists on this account) and
+    # "Taxes brut %" stays 0.0 too (no withholding tax on this platform).
+    rendement_brut_value = None
+    monthly_yield_shares: dict = {}
+    if avg_invested_balance is not None and avg_invested_balance > 0:
+        monthly_yield_steps = [
+            ("Intérêts brut %", statement_totals["interest_received"]),
+            ("Cash drag brut %", 0.0),
+            ("Bonus brut %", statement_totals["bonus_cashback_contest"]),
+            ("Frais brut %", -statement_totals["fees"]),
+            ("Taxes brut %", 0.0),
+        ]
+        monthly_yield_shares = compute_monthly_yield_shares(
+            avg_invested_balance, monthly_yield_steps, log=log, log_context="Go & Grow",
+        )
+        rendement_brut_value = sum(v for v in monthly_yield_shares.values() if v is not None)
+        log.info(
+            "Monthly gross-yield waterfall shares: Rendements %% brut=%.2f%% %r",
+            rendement_brut_value * 100, {k: round(v * 100, 4) for k, v in monthly_yield_shares.items() if v is not None},
+        )
+
     # Since-inception XIRR (money-weighted return) + the XIRR Bonus/Cash
     # drag/Taxes-Frais/Intérêts pie-chart shares - unlike Iuvo/Lendermarket/
     # Monefit, Go & Grow's statements API already gives a REAL per-
@@ -631,6 +659,12 @@ def run() -> None:
     # script fills an existing row by label, it doesn't insert new
     # labelled rows into this block.
     bonus_breakdown = {"prime": statement_totals["bonus_cashback_contest"], "frais": statement_totals["fees"]}
+    if rendement_brut_value is not None:
+        bonus_breakdown["Rendements % brut"] = rendement_brut_value
+    for step_name in ("Intérêts brut %", "Cash drag brut %", "Bonus brut %", "Frais brut %", "Taxes brut %"):
+        step_value = monthly_yield_shares.get(step_name)
+        if step_value is not None:
+            bonus_breakdown[step_name] = step_value
     if xirr_value is not None:
         bonus_breakdown["XIRR"] = xirr_value
         bonus_breakdown["Cash drag brut"] = 0.0

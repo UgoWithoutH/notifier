@@ -212,6 +212,7 @@ from shared.google_sheet import (
 )
 from shared.report_date import get_report_date, is_current_month
 from shared.weighted_average import INVESTED_BALANCE_LABEL, NON_INVESTED_BALANCE_LABEL, compute_time_weighted_average
+from shared.monthly_yield_waterfall import compute_monthly_yield_shares
 from shared.xirr import compute_xirr
 from shared.xirr_waterfall import compute_waterfall_xirr_shares
 
@@ -681,6 +682,9 @@ def run(session: requests.Session | None = None) -> None:
     taxes_xirr_contribution = 0.0  # Lande has no confirmed withholding-tax transaction type, see module docstring - genuinely 0, not a placeholder.
     frais_xirr_contribution = 0.0  # Lande has no distinct fee concept, see module docstring - genuinely 0, not a placeholder.
     interest_xirr_contribution = None
+    rendement_brut_value = None
+    monthly_yield_shares: dict = {}
+    monthly_bonus = 0.0
     if all_entries:
         signed_cashflows = []
         deposit_dates = []
@@ -697,6 +701,8 @@ def run(session: requests.Session | None = None) -> None:
                 signed_cashflows.append((entry["date"], -entry["amount"]))
             elif _is_bonus(label):
                 lifetime_bonus += entry["amount"]
+                if entry["date"] >= month_start_date:
+                    monthly_bonus += entry["amount"]
 
         since_inception_date = min(deposit_dates) if deposit_dates else None
         signed_cashflows.append((today_date, total))
@@ -779,6 +785,32 @@ def run(session: requests.Session | None = None) -> None:
             cash_drag_brut_value * 100, avg_non_invested_balance, cash_weight * 100, monthly_yield_rate * 100,
         )
 
+        # Monthly gross-yield waterfall ("Rendements % brut" block, added
+        # 2026-09-14) - the non-annualized, this-month-only sibling of the
+        # since-inception XIRR waterfall below. See
+        # shared/monthly_yield_waterfall.py's module docstring for why
+        # this is a plain division (no IRR-solving needed). Lande has no
+        # confirmed withholding-tax transaction type or distinct fee
+        # concept (both brut % hardcoded 0.0, same reasoning as
+        # taxes_xirr_contribution/frais_xirr_contribution above).
+        avg_total_balance_month = avg_invested_balance + avg_non_invested_balance
+        missed_earnings_month = cash_drag_brut_value * avg_total_balance_month
+        monthly_yield_steps = [
+            ("Intérêts brut %", gross_interest_received + missed_earnings_month),
+            ("Cash drag brut %", -missed_earnings_month),
+            ("Bonus brut %", monthly_bonus),
+            ("Frais brut %", 0.0),
+            ("Taxes brut %", 0.0),
+        ]
+        monthly_yield_shares = compute_monthly_yield_shares(
+            avg_total_balance_month, monthly_yield_steps, log=log, log_context="Lande",
+        )
+        rendement_brut_value = sum(v for v in monthly_yield_shares.values() if v is not None)
+        log.info(
+            "Monthly gross-yield waterfall shares: Rendements %% brut=%.2f%% %r",
+            rendement_brut_value * 100, {k: round(v * 100, 4) for k, v in monthly_yield_shares.items() if v is not None},
+        )
+
         if (xirr_value is not None and signed_cashflows is not None and since_inception_date is not None
                 and lifetime_interest is not None and total_invested is not None and total_invested > 0):
             avg_idle_cash_lifetime = compute_average_idle_cash(all_entries, since_inception_date, today_date)
@@ -842,6 +874,12 @@ def run(session: requests.Session | None = None) -> None:
         bonus_breakdown["Cash drag brut"] = cash_drag_brut_value
     if cash_drag_net_value is not None:
         bonus_breakdown["Cash drag net"] = cash_drag_net_value
+    if rendement_brut_value is not None:
+        bonus_breakdown["Rendements % brut"] = rendement_brut_value
+    for step_name in ("Intérêts brut %", "Cash drag brut %", "Bonus brut %", "Frais brut %", "Taxes brut %"):
+        step_value = monthly_yield_shares.get(step_name)
+        if step_value is not None:
+            bonus_breakdown[step_name] = step_value
     if bonus_xirr_contribution is not None:
         bonus_breakdown["XIRR Bonus"] = bonus_xirr_contribution
     if cash_drag_xirr_contribution is not None:

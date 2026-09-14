@@ -189,6 +189,7 @@ from shared.report_date import get_report_now, is_current_month
 from shared.session_cache import get_or_refresh_session
 from shared.state import load_state, save_state
 from shared.weighted_average import INVESTED_BALANCE_LABEL, NON_INVESTED_BALANCE_LABEL, compute_time_weighted_average
+from shared.monthly_yield_waterfall import compute_monthly_yield_shares
 from shared.xirr import compute_xirr
 from shared.xirr_waterfall import compute_waterfall_xirr_shares
 from monitors.peerberry_monitor import login, PEERBERRY_EMAIL, PEERBERRY_PASSWORD, _HEADERS, fetch_available_money
@@ -912,6 +913,9 @@ def run() -> None:
     taxes_xirr_contribution = None
     frais_xirr_contribution = None
     interest_xirr_contribution = None
+    rendement_brut_value = None
+    monthly_yield_shares: dict = {}
+    monthly_sale_fees = 0.0
     if current_month and all_entries and available_money is not None:
         total_account_value = total_invested + available_money
         signed_cashflows = []
@@ -936,6 +940,10 @@ def run() -> None:
             if e.get("details") == "REFERRAL_FEE" and (_entry_date(e) or date(1970, 1, 1)) >= today_date.replace(day=1)
         )
         lifetime_referral_bonus = sum(_entry_amount(e) for e in all_entries if e.get("details") == "REFERRAL_FEE")
+        monthly_sale_fees = sum(
+            _entry_amount(e) for e in all_entries
+            if e.get("details") == "INVESTMENT_SALE_FEE" and (_entry_date(e) or date(1970, 1, 1)) >= today_date.replace(day=1)
+        )
 
         signed_cashflows.append((today_date, total_account_value))
 
@@ -1011,6 +1019,33 @@ def run() -> None:
         log.info(
             "Computed Cash drag: brut=net=%.2f%% (avg non-invested balance %.2f EUR, cash weight %.2f%%, monthly yield %.2f%%).",
             cash_drag_brut_value * 100, avg_non_invested_balance, cash_weight * 100, monthly_yield_rate * 100,
+        )
+
+        # Monthly gross-yield waterfall ("Rendements % brut" block, added
+        # 2026-09-14) - the non-annualized, this-month-only sibling of the
+        # since-inception XIRR waterfall below. See
+        # shared/monthly_yield_waterfall.py's module docstring for why
+        # this is a plain division (no IRR-solving needed). PeerBerry has
+        # no withholding-tax data at all (Taxes brut % hardcoded 0.0,
+        # same reasoning as "XIRR Taxes" below); monthly_sale_fees is
+        # already negative-signed (a real cost, see INVESTMENT_SALE_FEE
+        # above), so it is added directly (not negated) here.
+        avg_total_balance_month = avg_invested_balance + avg_non_invested_balance
+        missed_earnings_month = cash_drag_brut_value * avg_total_balance_month
+        monthly_yield_steps = [
+            ("Intérêts brut %", interest_income + missed_earnings_month),
+            ("Cash drag brut %", -missed_earnings_month),
+            ("Bonus brut %", monthly_referral_bonus),
+            ("Frais brut %", monthly_sale_fees),
+            ("Taxes brut %", 0.0),
+        ]
+        monthly_yield_shares = compute_monthly_yield_shares(
+            avg_total_balance_month, monthly_yield_steps, log=log, log_context="PeerBerry",
+        )
+        rendement_brut_value = sum(v for v in monthly_yield_shares.values() if v is not None)
+        log.info(
+            "Monthly gross-yield waterfall shares: Rendements %% brut=%.2f%% %r",
+            rendement_brut_value * 100, {k: round(v * 100, 4) for k, v in monthly_yield_shares.items() if v is not None},
         )
 
         if xirr_value is not None and signed_cashflows is not None and since_inception_date is not None and total_invested > 0:
@@ -1125,6 +1160,12 @@ def run() -> None:
         bonus_breakdown["Cash drag brut"] = cash_drag_brut_value
     if cash_drag_net_value is not None:
         bonus_breakdown["Cash drag net"] = cash_drag_net_value
+    if rendement_brut_value is not None:
+        bonus_breakdown["Rendements % brut"] = rendement_brut_value
+    for step_name in ("Intérêts brut %", "Cash drag brut %", "Bonus brut %", "Frais brut %", "Taxes brut %"):
+        step_value = monthly_yield_shares.get(step_name)
+        if step_value is not None:
+            bonus_breakdown[step_name] = step_value
     if bonus_xirr_contribution is not None:
         bonus_breakdown["XIRR Bonus"] = bonus_xirr_contribution
     if cash_drag_xirr_contribution is not None:

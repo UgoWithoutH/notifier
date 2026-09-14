@@ -178,6 +178,7 @@ from shared.report_date import get_report_now, is_current_month
 from shared.session_cache import get_or_refresh_session
 from shared.state import load_state, save_state
 from shared.weighted_average import INVESTED_BALANCE_LABEL, NON_INVESTED_BALANCE_LABEL, compute_time_weighted_average
+from shared.monthly_yield_waterfall import compute_monthly_yield_shares
 from shared.xirr import compute_xirr
 from shared.xirr_waterfall import compute_waterfall_xirr_shares
 
@@ -1188,6 +1189,32 @@ def compute_xirr_block_as_of(session: requests.Session, all_detail_rows: list, x
             end_date, result["Cash drag brut"] * 100, result["Cash drag net"] * 100, avg_non_invested_month, cash_weight * 100,
         )
 
+        # Monthly gross-yield waterfall ("Rendements % brut" block, added
+        # 2026-09-14) - the non-annualized, this-month-only sibling of the
+        # since-inception XIRR waterfall below. See
+        # shared/monthly_yield_waterfall.py's module docstring for why
+        # this is a plain division (no IRR-solving needed). Afranga has
+        # no platform-fee concept distinct from withholding tax (same
+        # reasoning as "XIRR Frais" below).
+        avg_total_balance_month = avg_invested_month + avg_non_invested_month
+        missed_earnings_month = result["Cash drag brut"] * avg_total_balance_month
+        monthly_yield_steps = [
+            ("Intérêts brut %", month_statement_totals["gross_interest_received"] + missed_earnings_month),
+            ("Cash drag brut %", -missed_earnings_month),
+            ("Bonus brut %", month_statement_totals["bonus_total"]),
+            ("Frais brut %", 0.0),
+            ("Taxes brut %", -month_statement_totals["withholding_tax"]),
+        ]
+        monthly_yield_shares = compute_monthly_yield_shares(
+            avg_total_balance_month, monthly_yield_steps, log=log, log_context=f"Afranga as of {end_date}",
+        )
+        result["Rendements % brut"] = sum(v for v in monthly_yield_shares.values() if v is not None)
+        result.update({k: v for k, v in monthly_yield_shares.items() if v is not None})
+        log.info(
+            "Monthly gross-yield waterfall shares as of %s: Rendements %% brut=%.2f%% %r",
+            end_date, result["Rendements % brut"] * 100, {k: round(v * 100, 4) for k, v in monthly_yield_shares.items() if v is not None},
+        )
+
     deposit_dates = [
         row["date"] for row in xirr_cashflow_rows
         if row["label"] == "Deposited funds" and row["date"] <= end_date.strftime("%Y-%m-%d")
@@ -1364,6 +1391,8 @@ def run() -> None:
     taxes_xirr_contribution = None
     frais_xirr_contribution = None
     interest_xirr_contribution = None
+    rendement_brut_value = None
+    monthly_yield_shares: dict = {}
     if current_month and xirr_cashflow_rows is not None and uninvested_balance is not None:
         total_account_value = total_invested + uninvested_balance
         signed_cashflows = []
@@ -1407,6 +1436,11 @@ def run() -> None:
         xirr_value = xirr_block.get("XIRR")
         cash_drag_brut_value = xirr_block.get("Cash drag brut")
         cash_drag_net_value = xirr_block.get("Cash drag net")
+        rendement_brut_value = xirr_block.get("Rendements % brut")
+        monthly_yield_shares = {
+            k: xirr_block[k] for k in ("Intérêts brut %", "Cash drag brut %", "Bonus brut %", "Frais brut %", "Taxes brut %")
+            if k in xirr_block
+        }
         bonus_xirr_contribution = xirr_block.get("XIRR Bonus")
         cash_drag_xirr_contribution = xirr_block.get("XIRR Cash drag")
         taxes_xirr_contribution = xirr_block.get("XIRR Taxes")
@@ -1469,6 +1503,31 @@ def run() -> None:
         log.info(
             "Computed Cash drag: brut=%.2f%% net=%.2f%% (avg non-invested balance %.2f EUR, cash weight %.2f%%).",
             cash_drag_brut_value * 100, cash_drag_net_value * 100, avg_non_invested_balance, cash_weight * 100,
+        )
+
+        # Monthly gross-yield waterfall ("Rendements % brut" block, added
+        # 2026-09-14) - the non-annualized, this-month-only sibling of the
+        # since-inception XIRR waterfall below. See
+        # shared/monthly_yield_waterfall.py's module docstring for why
+        # this is a plain division (no IRR-solving needed). Afranga has
+        # no platform-fee concept distinct from withholding tax (same
+        # reasoning as "XIRR Frais" below).
+        avg_total_balance_month = avg_invested_balance + avg_non_invested_balance
+        missed_earnings_month = cash_drag_brut_value * avg_total_balance_month
+        monthly_yield_steps = [
+            ("Intérêts brut %", statement_totals["gross_interest_received"] + missed_earnings_month),
+            ("Cash drag brut %", -missed_earnings_month),
+            ("Bonus brut %", statement_totals["bonus_total"]),
+            ("Frais brut %", 0.0),
+            ("Taxes brut %", -statement_totals["withholding_tax"]),
+        ]
+        monthly_yield_shares = compute_monthly_yield_shares(
+            avg_total_balance_month, monthly_yield_steps, log=log, log_context="Afranga",
+        )
+        rendement_brut_value = sum(v for v in monthly_yield_shares.values() if v is not None)
+        log.info(
+            "Monthly gross-yield waterfall shares: Rendements %% brut=%.2f%% %r",
+            rendement_brut_value * 100, {k: round(v * 100, 4) for k, v in monthly_yield_shares.items() if v is not None},
         )
 
         if xirr_value is not None and signed_cashflows is not None and lifetime_statement_totals is not None and xirr_cashflow_rows:
@@ -1569,6 +1628,12 @@ def run() -> None:
         bonus_breakdown["Cash drag brut"] = cash_drag_brut_value
     if cash_drag_net_value is not None:
         bonus_breakdown["Cash drag net"] = cash_drag_net_value
+    if rendement_brut_value is not None:
+        bonus_breakdown["Rendements % brut"] = rendement_brut_value
+    for step_name in ("Intérêts brut %", "Cash drag brut %", "Bonus brut %", "Frais brut %", "Taxes brut %"):
+        step_value = monthly_yield_shares.get(step_name)
+        if step_value is not None:
+            bonus_breakdown[step_name] = step_value
     if bonus_xirr_contribution is not None:
         bonus_breakdown["XIRR Bonus"] = bonus_xirr_contribution
     if cash_drag_xirr_contribution is not None:

@@ -114,6 +114,7 @@ from shared.google_sheet import (
 from shared.report_date import get_report_now, is_current_month
 from shared.state import load_state, save_state
 from shared.weighted_average import INVESTED_BALANCE_LABEL, NON_INVESTED_BALANCE_LABEL, compute_time_weighted_average
+from shared.monthly_yield_waterfall import compute_monthly_yield_shares
 from shared.xirr import compute_xirr
 from shared.xirr_waterfall import compute_waterfall_xirr_shares
 
@@ -918,6 +919,35 @@ def compute_xirr_block_as_of(page, all_entries: list, xirr_cashflow_entries: lis
             end_date, result["Cash drag brut"] * 100, avg_non_invested_month,
         )
 
+        # Monthly gross-yield waterfall ("Rendements % brut" block, added
+        # 2026-09-14) - the non-annualized, this-month-only sibling of the
+        # since-inception XIRR waterfall below. See
+        # shared/monthly_yield_waterfall.py's module docstring for why
+        # this is a plain division (no IRR-solving needed). "Bonus brut
+        # %" is hardcoded 0.0 here (same reasoning as "XIRR Bonus" being
+        # omitted from the backfill steps above - fetch_referral_bonus_
+        # earned() has no date breakdown at all, currently 0.00 EUR on
+        # this account). Swaper has no withholding-tax or distinct
+        # platform-fee concept (both brut % hardcoded 0.0 too).
+        avg_total_balance_month = avg_invested_month + avg_non_invested_month
+        missed_earnings_month = result["Cash drag brut"] * avg_total_balance_month
+        monthly_yield_steps = [
+            ("Intérêts brut %", month_statement_totals["earned_interest"] + missed_earnings_month),
+            ("Cash drag brut %", -missed_earnings_month),
+            ("Bonus brut %", 0.0),
+            ("Frais brut %", 0.0),
+            ("Taxes brut %", 0.0),
+        ]
+        monthly_yield_shares = compute_monthly_yield_shares(
+            avg_total_balance_month, monthly_yield_steps, log=log, log_context=f"Swaper as of {end_date}",
+        )
+        result["Rendements % brut"] = sum(v for v in monthly_yield_shares.values() if v is not None)
+        result.update({k: v for k, v in monthly_yield_shares.items() if v is not None})
+        log.info(
+            "Monthly gross-yield waterfall shares as of %s: Rendements %% brut=%.2f%% %r",
+            end_date, result["Rendements % brut"] * 100, {k: round(v * 100, 4) for k, v in monthly_yield_shares.items() if v is not None},
+        )
+
     funding_dates = [
         e["date"] for e in xirr_cashflow_entries
         if e["transactionType"].strip().upper() == "FUNDING" and e["date"] <= end_date_str
@@ -1217,6 +1247,11 @@ def run(headless: bool = True) -> None:
     # exactly reconstructible from those two Sheet rows.
     cash_drag_brut_value = xirr_backfill_block.get("Cash drag brut") if (not current_month and xirr_backfill_block) else None
     cash_drag_net_value = xirr_backfill_block.get("Cash drag net") if (not current_month and xirr_backfill_block) else None
+    rendement_brut_value = xirr_backfill_block.get("Rendements % brut") if (not current_month and xirr_backfill_block) else None
+    monthly_yield_shares: dict = (
+        {k: xirr_backfill_block[k] for k in ("Intérêts brut %", "Cash drag brut %", "Bonus brut %", "Frais brut %", "Taxes brut %") if k in xirr_backfill_block}
+        if (not current_month and xirr_backfill_block) else {}
+    )
     # Cash drag/taxes' own share of XIRR, on the same since-inception,
     # annualized percentage-point scale as XIRR itself (unlike "Cash drag"
     # above, which is a monthly-only figure) - computed from
@@ -1253,6 +1288,35 @@ def run(headless: bool = True) -> None:
         log.info(
             "Computed Cash drag: brut=net=%.2f%% (avg non-invested balance %.2f EUR, cash weight %.2f%%, monthly yield %.2f%%).",
             cash_drag_brut_value * 100, avg_non_invested_balance, cash_weight * 100, monthly_yield_rate * 100,
+        )
+
+        # Monthly gross-yield waterfall ("Rendements % brut" block, added
+        # 2026-09-14) - the non-annualized, this-month-only sibling of the
+        # since-inception XIRR waterfall below. See
+        # shared/monthly_yield_waterfall.py's module docstring for why
+        # this is a plain division (no IRR-solving needed). "Bonus brut
+        # %" is hardcoded 0.0 (referral_bonus_earned is a LIFETIME
+        # cumulative total with no monthly breakdown available, see
+        # fetch_referral_bonus_earned()'s own docstring - using it here
+        # would wildly overstate this single month's bonus). Swaper has
+        # no withholding-tax or distinct platform-fee concept (both brut
+        # % hardcoded 0.0 too).
+        avg_total_balance_month = avg_invested_balance + avg_non_invested_balance
+        missed_earnings_month = cash_drag_brut_value * avg_total_balance_month
+        monthly_yield_steps = [
+            ("Intérêts brut %", interest_received + missed_earnings_month),
+            ("Cash drag brut %", -missed_earnings_month),
+            ("Bonus brut %", 0.0),
+            ("Frais brut %", 0.0),
+            ("Taxes brut %", 0.0),
+        ]
+        monthly_yield_shares = compute_monthly_yield_shares(
+            avg_total_balance_month, monthly_yield_steps, log=log, log_context="Swaper",
+        )
+        rendement_brut_value = sum(v for v in monthly_yield_shares.values() if v is not None)
+        log.info(
+            "Monthly gross-yield waterfall shares: Rendements %% brut=%.2f%% %r",
+            rendement_brut_value * 100, {k: round(v * 100, 4) for k, v in monthly_yield_shares.items() if v is not None},
         )
 
         if lifetime_statement_totals is not None and xirr_cashflow_entries and breakdown["total_invested"] > 0:
@@ -1341,6 +1405,12 @@ def run(headless: bool = True) -> None:
         bonus_breakdown["Cash drag brut"] = cash_drag_brut_value
     if cash_drag_net_value is not None:
         bonus_breakdown["Cash drag net"] = cash_drag_net_value
+    if rendement_brut_value is not None:
+        bonus_breakdown["Rendements % brut"] = rendement_brut_value
+    for step_name in ("Intérêts brut %", "Cash drag brut %", "Bonus brut %", "Frais brut %", "Taxes brut %"):
+        step_value = monthly_yield_shares.get(step_name)
+        if step_value is not None:
+            bonus_breakdown[step_name] = step_value
     # Pie-chart source data (percentage points, same scale as XIRR): each
     # component's own share of the since-inception XIRR - written to new
     # sub-rows only if the user has added them to the Sheet (soft-fail
