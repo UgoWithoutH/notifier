@@ -15,12 +15,24 @@ SMTP_PASSWORD = os.environ.get("SMTP_PASSWORD")
 EMAIL_FROM = os.environ.get("EMAIL_FROM", SMTP_USER)
 EMAIL_TO = os.environ.get("EMAIL_TO")
 
+# Same unconfirmed candidate field names as
+# monitors/swaper_monitor.py's _ORIGINATOR_FIELD_CANDIDATES - the real
+# field holding the loan originator's name on a raw loan dict from
+# /rest/public/loans has never been confirmed against live data, so the
+# first one present on the loan is used rather than assuming a single name.
+_ORIGINATOR_FIELD_CANDIDATES = ("company", "loanOriginator", "originator", "originatorName", "group")
+
 
 def _format_loan(loan: dict) -> str:
-    """Format a single loan as one line: identifier, available amount, and
-    yield (interest rate) - the only 3 things asked for, no extra fields
-    and no URL."""
+    """Format a single loan as one line: identifier, originator, available
+    amount, and yield (interest rate)."""
     number = loan.get("number") or loan.get("id")
+
+    originator = next(
+        (loan[field] for field in _ORIGINATOR_FIELD_CANDIDATES if loan.get(field)),
+        None,
+    )
+    originator_str = f" ({originator})" if originator else ""
 
     amount = loan.get("amount")
     try:
@@ -34,7 +46,7 @@ def _format_loan(loan: dict) -> str:
     except (TypeError, ValueError):
         interest_str = "n/a"
 
-    return f"Prêt {number} : {amount_str} | rendement {interest_str}"
+    return f"Prêt {number}{originator_str} : {amount_str} | rendement {interest_str}"
 
 
 def send_swaper_email(balance: float, loans: list) -> None:
