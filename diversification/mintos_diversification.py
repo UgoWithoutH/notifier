@@ -964,11 +964,14 @@ def compute_xirr_block_as_of(session: requests.Session, all_entries: list, end_d
         avg_invested_month, avg_non_invested_month = compute_average_balances(all_entries, month_start_date, end_date)
         if avg_invested_month > 0:
             cash_weight = avg_non_invested_month / (avg_non_invested_month + avg_invested_month)
-            monthly_yield_rate = month_statement_totals["gross_interest_received"] / avg_invested_month
-            result["Cash drag"] = cash_weight * monthly_yield_rate
+            month_net_interest = month_statement_totals["gross_interest_received"] - month_statement_totals["withholding_tax"]
+            monthly_yield_rate_brut = month_statement_totals["gross_interest_received"] / avg_invested_month
+            monthly_yield_rate_net = month_net_interest / avg_invested_month
+            result["Cash drag brut"] = cash_weight * monthly_yield_rate_brut
+            result["Cash drag net"] = cash_weight * monthly_yield_rate_net
             log.info(
-                "Computed Cash drag as of %s (backfilled month): %.2f%% (avg non-invested balance %.2f EUR).",
-                end_date, result["Cash drag"] * 100, avg_non_invested_month,
+                "Computed Cash drag as of %s (backfilled month): brut=%.2f%% net=%.2f%% (avg non-invested balance %.2f EUR).",
+                end_date, result["Cash drag brut"] * 100, result["Cash drag net"] * 100, avg_non_invested_month,
             )
 
     try:
@@ -1154,7 +1157,8 @@ def run(session: requests.Session | None = None) -> None:
             # Taxes/Intérêts further below (Shapley game, added
             # 2026-09-09) once missed_earnings is known.
 
-    cash_drag_value = None
+    cash_drag_brut_value = None
+    cash_drag_net_value = None
     cash_drag_xirr_contribution = None
     taxes_xirr_contribution = None
     frais_xirr_contribution = None
@@ -1201,11 +1205,13 @@ def run(session: requests.Session | None = None) -> None:
     if current_month and avg_invested_balance is not None and avg_invested_balance > 0 and all_entries is not None:
         today_str = today_date.strftime("%Y-%m-%d")
         cash_weight = avg_non_invested_balance / (avg_non_invested_balance + avg_invested_balance)
-        monthly_yield_rate = statement_totals["gross_interest_received"] / avg_invested_balance
-        cash_drag_value = cash_weight * monthly_yield_rate
+        monthly_yield_rate_brut = statement_totals["gross_interest_received"] / avg_invested_balance
+        monthly_yield_rate_net = net_interest_received / avg_invested_balance
+        cash_drag_brut_value = cash_weight * monthly_yield_rate_brut
+        cash_drag_net_value = cash_weight * monthly_yield_rate_net
         log.info(
-            "Computed Cash drag: %.2f%% (avg non-invested balance %.2f EUR, cash weight %.2f%%, monthly yield %.2f%%).",
-            cash_drag_value * 100, avg_non_invested_balance, cash_weight * 100, monthly_yield_rate * 100,
+            "Computed Cash drag: brut=%.2f%% net=%.2f%% (avg non-invested balance %.2f EUR, cash weight %.2f%%).",
+            cash_drag_brut_value * 100, cash_drag_net_value * 100, avg_non_invested_balance, cash_weight * 100,
         )
 
         if xirr_value is not None and signed_cashflows is not None and since_inception_date is not None and total_outstanding > 0:
@@ -1262,7 +1268,8 @@ def run(session: requests.Session | None = None) -> None:
             log.exception("Failed to compute the XIRR block as of %s.", today_date)
             xirr_block = {}
         xirr_value = xirr_block.get("XIRR")
-        cash_drag_value = xirr_block.get("Cash drag")
+        cash_drag_brut_value = xirr_block.get("Cash drag brut")
+        cash_drag_net_value = xirr_block.get("Cash drag net")
         bonus_xirr_contribution = xirr_block.get("XIRR Bonus")
         cash_drag_xirr_contribution = xirr_block.get("XIRR Cash drag")
         taxes_xirr_contribution = xirr_block.get("XIRR Taxes")
@@ -1313,8 +1320,10 @@ def run(session: requests.Session | None = None) -> None:
     bonus_breakdown = {}
     if xirr_value is not None:
         bonus_breakdown["XIRR"] = xirr_value
-    if cash_drag_value is not None:
-        bonus_breakdown["Cash drag"] = cash_drag_value
+    if cash_drag_brut_value is not None:
+        bonus_breakdown["Cash drag brut"] = cash_drag_brut_value
+    if cash_drag_net_value is not None:
+        bonus_breakdown["Cash drag net"] = cash_drag_net_value
     if bonus_xirr_contribution is not None:
         bonus_breakdown["XIRR Bonus"] = bonus_xirr_contribution
     if cash_drag_xirr_contribution is not None:
