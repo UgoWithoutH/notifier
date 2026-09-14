@@ -132,6 +132,7 @@ from shared.report_date import get_report_now, is_current_month
 from shared.session_cache import get_or_refresh_session
 from shared.state import load_state, save_state
 from shared.weighted_average import INVESTED_BALANCE_LABEL, NON_INVESTED_BALANCE_LABEL
+from shared.monthly_yield_waterfall import compute_monthly_yield_shares
 from shared.xirr import compute_xirr
 from shared.xirr_waterfall import compute_waterfall_xirr_shares
 
@@ -488,6 +489,8 @@ def run() -> None:
     # Cash drag's lifetime_yield_rate (`lifetime_interest_total`) IS the
     # lifetime net interest figure, reused directly here.
     interest_xirr_contribution = None
+    rendement_brut_value = None
+    monthly_yield_shares: dict = {}
     monthly_summaries = None
     total_invested = vaults["invested"]
     avg_idle_cash = vaults["main_account"]
@@ -594,6 +597,32 @@ def run() -> None:
             cash_drag_brut_value * 100, avg_idle_cash, cash_weight * 100, monthly_yield_rate * 100,
         )
 
+        # Monthly gross-yield waterfall ("Rendements % brut" block, added
+        # 2026-09-14) - the non-annualized, this-month-only sibling of the
+        # since-inception XIRR waterfall below. See
+        # shared/monthly_yield_waterfall.py's module docstring for why
+        # this is a plain division (no IRR-solving needed). Monefit has
+        # genuine, real platform fees ("fees" field) but no withholding-
+        # tax data at all (Taxes brut % hardcoded 0.0, same reasoning as
+        # "XIRR Taxes" above).
+        avg_total_balance_month = total_invested + avg_idle_cash
+        missed_earnings_month = cash_drag_brut_value * avg_total_balance_month
+        monthly_yield_steps = [
+            ("Intérêts brut %", statement_totals["daily_returns"] + missed_earnings_month),
+            ("Cash drag brut %", -missed_earnings_month),
+            ("Bonus brut %", statement_totals["rewards_bonuses"]),
+            ("Frais brut %", -statement_totals["fees"]),
+            ("Taxes brut %", 0.0),
+        ]
+        monthly_yield_shares = compute_monthly_yield_shares(
+            avg_total_balance_month, monthly_yield_steps, log=log, log_context="Monefit",
+        )
+        rendement_brut_value = sum(v for v in monthly_yield_shares.values() if v is not None)
+        log.info(
+            "Monthly gross-yield waterfall shares: Rendements %% brut=%.2f%% %r",
+            rendement_brut_value * 100, {k: round(v * 100, 4) for k, v in monthly_yield_shares.items() if v is not None},
+        )
+
         if xirr_value is not None and signed_cashflows is not None and monthly_summaries:
             cash_weight_lifetime = cash_weight  # no real historical idle-cash time series - reuse the live snapshot (see comment above).
             lifetime_gross_interest_total = sum(s["daily_returns"] for s in monthly_summaries.values())
@@ -688,6 +717,12 @@ def run() -> None:
         bonus_breakdown["Cash drag brut"] = cash_drag_brut_value
     if cash_drag_net_value is not None:
         bonus_breakdown["Cash drag net"] = cash_drag_net_value
+    if rendement_brut_value is not None:
+        bonus_breakdown["Rendements % brut"] = rendement_brut_value
+    for step_name in ("Intérêts brut %", "Cash drag brut %", "Bonus brut %", "Frais brut %", "Taxes brut %"):
+        step_value = monthly_yield_shares.get(step_name)
+        if step_value is not None:
+            bonus_breakdown[step_name] = step_value
     if bonus_xirr_contribution is not None:
         bonus_breakdown["XIRR Bonus"] = bonus_xirr_contribution
     if cash_drag_xirr_contribution is not None:

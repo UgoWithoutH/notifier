@@ -288,6 +288,7 @@ from shared.google_sheet import (
 from shared.report_date import get_report_date, is_current_month
 from shared.state import load_state, save_state
 from shared.weighted_average import INVESTED_BALANCE_LABEL, NON_INVESTED_BALANCE_LABEL, compute_time_weighted_average
+from shared.monthly_yield_waterfall import compute_monthly_yield_shares
 from shared.xirr import compute_xirr
 from shared.xirr_waterfall import compute_waterfall_xirr_shares
 
@@ -1123,9 +1124,11 @@ def run(session: requests.Session | None = None) -> None:
     bonus_xirr_contribution = None
     since_inception_date = None
     lifetime_bonus = 0.0
+    month_bonus = 0.0
     if current_month and all_entries:
         signed_cashflows = []
         deposit_dates = []
+        month_start_date_for_bonus = today_date.replace(day=1)
         for entry in all_entries:
             entry_date = _entry_date(entry)
             if entry_date is None:
@@ -1141,6 +1144,13 @@ def run(session: requests.Session | None = None) -> None:
                 signed_cashflows.append((entry_date, -_entry_amount(entry)))
             elif _is_bonus(label):
                 lifetime_bonus += _entry_amount(entry)
+                # Mintos has no live bonus/cashback feature today (see
+                # module docstring), but this stays generic - a future
+                # bonus type matched by _is_bonus() would be correctly
+                # scoped to the run's calendar month here, for "Bonus
+                # brut %" (see monthly gross-yield waterfall below).
+                if entry_date >= month_start_date_for_bonus:
+                    month_bonus += _entry_amount(entry)
 
         since_inception_date = min(deposit_dates) if deposit_dates else None
         signed_cashflows.append((today_date, total_with_cash))
@@ -1159,6 +1169,8 @@ def run(session: requests.Session | None = None) -> None:
 
     cash_drag_brut_value = None
     cash_drag_net_value = None
+    rendement_brut_value = None
+    monthly_yield_shares: dict = {}
     cash_drag_xirr_contribution = None
     taxes_xirr_contribution = None
     frais_xirr_contribution = None
@@ -1212,6 +1224,33 @@ def run(session: requests.Session | None = None) -> None:
         log.info(
             "Computed Cash drag: brut=%.2f%% net=%.2f%% (avg non-invested balance %.2f EUR, cash weight %.2f%%).",
             cash_drag_brut_value * 100, cash_drag_net_value * 100, avg_non_invested_balance, cash_weight * 100,
+        )
+
+        # Monthly gross-yield waterfall ("Rendements % brut" block, added
+        # 2026-09-14) - the non-annualized, this-month-only sibling of the
+        # since-inception XIRR waterfall below. Linear (see
+        # shared/monthly_yield_waterfall.py's module docstring), so no
+        # IRR-solving needed: each step's EUR delta / avg_total_balance.
+        # Mintos has no platform-fee concept (XIRR Frais hardcoded 0.0
+        # below, same here) and no live bonus/cashback feature today
+        # (month_bonus stays 0.0 unless _is_bonus() ever matches a real
+        # entry this month).
+        avg_total_balance_month = avg_invested_balance + avg_non_invested_balance
+        missed_earnings_month = cash_drag_brut_value * avg_total_balance_month
+        monthly_yield_steps = [
+            ("Intérêts brut %", statement_totals["gross_interest_received"] + missed_earnings_month),
+            ("Cash drag brut %", -missed_earnings_month),
+            ("Bonus brut %", month_bonus),
+            ("Frais brut %", 0.0),
+            ("Taxes brut %", -statement_totals["withholding_tax"]),
+        ]
+        monthly_yield_shares = compute_monthly_yield_shares(
+            avg_total_balance_month, monthly_yield_steps, log=log, log_context="Mintos",
+        )
+        rendement_brut_value = sum(v for v in monthly_yield_shares.values() if v is not None)
+        log.info(
+            "Monthly gross-yield waterfall shares: Rendements %% brut=%.2f%% %r",
+            rendement_brut_value * 100, {k: round(v * 100, 4) for k, v in monthly_yield_shares.items() if v is not None},
         )
 
         if xirr_value is not None and signed_cashflows is not None and since_inception_date is not None and total_outstanding > 0:
@@ -1324,6 +1363,12 @@ def run(session: requests.Session | None = None) -> None:
         bonus_breakdown["Cash drag brut"] = cash_drag_brut_value
     if cash_drag_net_value is not None:
         bonus_breakdown["Cash drag net"] = cash_drag_net_value
+    if rendement_brut_value is not None:
+        bonus_breakdown["Rendements % brut"] = rendement_brut_value
+    for step_name in ("Intérêts brut %", "Cash drag brut %", "Bonus brut %", "Frais brut %", "Taxes brut %"):
+        step_value = monthly_yield_shares.get(step_name)
+        if step_value is not None:
+            bonus_breakdown[step_name] = step_value
     if bonus_xirr_contribution is not None:
         bonus_breakdown["XIRR Bonus"] = bonus_xirr_contribution
     if cash_drag_xirr_contribution is not None:

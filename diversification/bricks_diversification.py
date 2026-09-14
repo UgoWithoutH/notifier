@@ -223,6 +223,7 @@ except ModuleNotFoundError:
 from shared.session_cache import get_or_refresh_session
 from shared.state import load_state, save_state
 from shared.weighted_average import INVESTED_BALANCE_LABEL, NON_INVESTED_BALANCE_LABEL, compute_time_weighted_average
+from shared.monthly_yield_waterfall import compute_monthly_yield_shares
 from shared.xirr import compute_xirr
 from shared.xirr_waterfall import compute_waterfall_xirr_shares
 
@@ -731,6 +732,34 @@ def compute_xirr_block_as_of(
         log.info(
             "Computed Cash drag as of %s: brut=%.2f%% net=%.2f%% (avg non-invested balance %.2f EUR, cash weight %.2f%%).",
             end_date, result["Cash drag brut"] * 100, result["Cash drag net"] * 100, avg_non_invested_balance, cash_weight * 100,
+        )
+
+        # Monthly gross-yield waterfall ("Rendements % brut" block, added
+        # 2026-09-14) - the non-annualized, this-month-only sibling of the
+        # since-inception XIRR waterfall below. See
+        # shared/monthly_yield_waterfall.py's module docstring for why
+        # this is a plain division (no IRR-solving needed). Bricks has no
+        # platform-fee concept distinct from withholding tax (same
+        # reasoning as "XIRR Frais" below).
+        monthly_bonus = _sum_in_range(all_entries, _BONUS_KINDS, end_date.replace(day=1), end_date)
+        monthly_withholding_tax = -monthly_tax_raw
+        avg_total_balance_month = avg_invested_balance + avg_non_invested_balance
+        missed_earnings_month = result["Cash drag brut"] * avg_total_balance_month
+        monthly_yield_steps = [
+            ("Intérêts brut %", monthly_interest + missed_earnings_month),
+            ("Cash drag brut %", -missed_earnings_month),
+            ("Bonus brut %", monthly_bonus),
+            ("Frais brut %", 0.0),
+            ("Taxes brut %", -monthly_withholding_tax),
+        ]
+        monthly_yield_shares = compute_monthly_yield_shares(
+            avg_total_balance_month, monthly_yield_steps, log=log, log_context=f"Bricks as of {end_date}",
+        )
+        result["Rendements % brut"] = sum(v for v in monthly_yield_shares.values() if v is not None)
+        result.update({k: v for k, v in monthly_yield_shares.items() if v is not None})
+        log.info(
+            "Monthly gross-yield waterfall shares as of %s: Rendements %% brut=%.2f%% %r",
+            end_date, result["Rendements % brut"] * 100, {k: round(v * 100, 4) for k, v in monthly_yield_shares.items() if v is not None},
         )
 
     deposit_dates = [

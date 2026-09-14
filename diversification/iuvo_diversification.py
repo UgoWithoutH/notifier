@@ -167,6 +167,7 @@ import requests
 
 try:
     from shared.google_sheet import fill_current_month_amounts, fill_current_month_bonus_breakdown, fill_geographic_repartition_amounts, fill_geographic_repartition_uninvested_amount
+    from shared.monthly_yield_waterfall import compute_monthly_yield_shares
     from shared.report_date import get_report_now, is_current_month
     from shared.session_cache import get_or_refresh_session
     from shared.state import load_state, save_state
@@ -180,6 +181,7 @@ except ModuleNotFoundError:
     if str(project_root) not in sys.path:
         sys.path.insert(0, str(project_root))
     from shared.google_sheet import fill_current_month_amounts, fill_current_month_bonus_breakdown, fill_geographic_repartition_amounts, fill_geographic_repartition_uninvested_amount
+    from shared.monthly_yield_waterfall import compute_monthly_yield_shares
     from shared.report_date import get_report_now, is_current_month
     from shared.session_cache import get_or_refresh_session
     from shared.state import load_state, save_state
@@ -645,6 +647,8 @@ def run() -> None:
     # cached month's own gross_interest_received - computed below once
     # monthly_summaries is available.
     interest_xirr_contribution = None
+    rendement_brut_value = None
+    monthly_yield_shares: dict = {}
     monthly_summaries = None
     try:
         investor_account_id = _fetch_investor_account_id(session, session_token)
@@ -790,6 +794,33 @@ def run() -> None:
             cash_drag_brut_value * 100, avg_non_invested_balance, cash_weight * 100, monthly_yield_rate * 100,
         )
 
+        # Monthly gross-yield waterfall ("Rendements % brut" block, added
+        # 2026-09-14) - the non-annualized, this-month-only sibling of the
+        # since-inception XIRR waterfall below. See
+        # shared/monthly_yield_waterfall.py's module docstring for why
+        # this is a plain division (no IRR-solving needed). Iuvo has no
+        # separate withholding-tax or platform-fee transaction type
+        # (both brut % hardcoded 0.0, same reasoning as
+        # taxes_xirr_contribution/frais_xirr_contribution above).
+        monthly_bonus = (monthly_summaries_as_of.get(today_month_key) or {}).get("bonus_cashback_contest", 0.0)
+        avg_total_balance_month = avg_invested_balance + avg_non_invested_balance
+        missed_earnings_month = cash_drag_brut_value * avg_total_balance_month
+        monthly_yield_steps = [
+            ("Intérêts brut %", monthly_gross_interest + missed_earnings_month),
+            ("Cash drag brut %", -missed_earnings_month),
+            ("Bonus brut %", monthly_bonus),
+            ("Frais brut %", 0.0),
+            ("Taxes brut %", 0.0),
+        ]
+        monthly_yield_shares = compute_monthly_yield_shares(
+            avg_total_balance_month, monthly_yield_steps, log=log, log_context="Iuvo",
+        )
+        rendement_brut_value = sum(v for v in monthly_yield_shares.values() if v is not None)
+        log.info(
+            "Monthly gross-yield waterfall shares: Rendements %% brut=%.2f%% %r",
+            rendement_brut_value * 100, {k: round(v * 100, 4) for k, v in monthly_yield_shares.items() if v is not None},
+        )
+
         if xirr_value is not None and signed_cashflows is not None:
             avg_idle_cash_lifetime = compute_average_idle_cash(monthly_summaries_as_of)
             cash_weight_lifetime = avg_idle_cash_lifetime / (avg_idle_cash_lifetime + total_invested)
@@ -844,6 +875,12 @@ def run() -> None:
         bonus_breakdown["Cash drag brut"] = cash_drag_brut_value
     if cash_drag_net_value is not None:
         bonus_breakdown["Cash drag net"] = cash_drag_net_value
+    if rendement_brut_value is not None:
+        bonus_breakdown["Rendements % brut"] = rendement_brut_value
+    for step_name in ("Intérêts brut %", "Cash drag brut %", "Bonus brut %", "Frais brut %", "Taxes brut %"):
+        step_value = monthly_yield_shares.get(step_name)
+        if step_value is not None:
+            bonus_breakdown[step_name] = step_value
     if bonus_xirr_contribution is not None:
         bonus_breakdown["XIRR Bonus"] = bonus_xirr_contribution
     if cash_drag_xirr_contribution is not None:

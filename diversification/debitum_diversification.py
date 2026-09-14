@@ -174,6 +174,7 @@ from shared.report_date import get_report_date, is_current_month
 from shared.session_cache import get_or_refresh_session
 from shared.state import load_state, save_state
 from shared.weighted_average import INVESTED_BALANCE_LABEL, NON_INVESTED_BALANCE_LABEL, compute_time_weighted_average
+from shared.monthly_yield_waterfall import compute_monthly_yield_shares
 from shared.xirr import compute_xirr
 from shared.xirr_waterfall import compute_waterfall_xirr_shares
 
@@ -516,6 +517,8 @@ def run() -> None:
     taxes_xirr_contribution = None
     frais_xirr_contribution = None
     interest_xirr_contribution = None
+    rendement_brut_value = None
+    monthly_yield_shares: dict = {}
     avg_invested_balance = None
     avg_non_invested_balance = None
     earliest_transaction_date = None
@@ -579,6 +582,33 @@ def run() -> None:
             log.info(
                 "Computed Cash drag: brut=%.4f%% net=%.4f%% (avg idle cash %.2f EUR).",
                 cash_drag_brut_value * 100, cash_drag_net_value * 100, avg_non_invested_balance,
+            )
+
+            # Monthly gross-yield waterfall ("Rendements % brut" block,
+            # added 2026-09-14) - the non-annualized, this-period-only
+            # sibling of the since-inception XIRR waterfall below. See
+            # shared/monthly_yield_waterfall.py's module docstring for why
+            # this is a plain division (no IRR-solving needed). Computed
+            # for a backfilled month too, same as Cash drag above (both
+            # only need this period's own already-fetched amounts).
+            # Debitum has no platform-fee concept distinct from
+            # withholding tax (same reasoning as "XIRR Frais" below).
+            avg_total_balance_month = avg_invested_balance + avg_non_invested_balance
+            missed_earnings_month = cash_drag_brut_value * avg_total_balance_month
+            monthly_yield_steps = [
+                ("Intérêts brut %", amounts["gross_interest_received"] + missed_earnings_month),
+                ("Cash drag brut %", -missed_earnings_month),
+                ("Bonus brut %", amounts["bonus_cashback_contest"]),
+                ("Frais brut %", 0.0),
+                ("Taxes brut %", -amounts["withholding_tax"]),
+            ]
+            monthly_yield_shares = compute_monthly_yield_shares(
+                avg_total_balance_month, monthly_yield_steps, log=log, log_context="Debitum",
+            )
+            rendement_brut_value = sum(v for v in monthly_yield_shares.values() if v is not None)
+            log.info(
+                "Monthly gross-yield waterfall shares: Rendements %% brut=%.2f%% %r",
+                rendement_brut_value * 100, {k: round(v * 100, 4) for k, v in monthly_yield_shares.items() if v is not None},
             )
 
         if current_month:
@@ -707,6 +737,12 @@ def run() -> None:
         bonus_breakdown["Cash drag brut"] = cash_drag_brut_value
     if cash_drag_net_value is not None:
         bonus_breakdown["Cash drag net"] = cash_drag_net_value
+    if rendement_brut_value is not None:
+        bonus_breakdown["Rendements % brut"] = rendement_brut_value
+    for step_name in ("Intérêts brut %", "Cash drag brut %", "Bonus brut %", "Frais brut %", "Taxes brut %"):
+        step_value = monthly_yield_shares.get(step_name)
+        if step_value is not None:
+            bonus_breakdown[step_name] = step_value
     if bonus_xirr_contribution is not None:
         bonus_breakdown["XIRR Bonus"] = bonus_xirr_contribution
     if cash_drag_xirr_contribution is not None:

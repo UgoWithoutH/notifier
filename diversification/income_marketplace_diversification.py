@@ -153,6 +153,7 @@ from shared.google_sheet import (
 from shared.report_date import get_report_date, is_current_month
 from shared.state import load_state, save_state
 from shared.weighted_average import INVESTED_BALANCE_LABEL, NON_INVESTED_BALANCE_LABEL, compute_time_weighted_average
+from shared.monthly_yield_waterfall import compute_monthly_yield_shares
 from shared.xirr import compute_xirr
 from shared.xirr_waterfall import compute_waterfall_xirr_shares
 
@@ -525,6 +526,8 @@ def run() -> None:
             taxes_xirr_contribution = 0.0  # no withholding-tax category exists at all, see docstring
             frais_xirr_contribution = 0.0  # no distinct fee category exists either, same reasoning
             interest_xirr_contribution = None
+            rendement_brut_value = None
+            monthly_yield_shares: dict = {}
             avg_invested_balance = None
             avg_non_invested_balance = None
 
@@ -586,6 +589,35 @@ def run() -> None:
                     log.info(
                         "Computed Cash drag: brut=%.4f%% net=%.4f%% (avg idle cash %.2f EUR).",
                         cash_drag_brut_value * 100, cash_drag_net_value * 100, avg_non_invested_balance,
+                    )
+
+                    # Monthly gross-yield waterfall ("Rendements % brut"
+                    # block, added 2026-09-14) - the non-annualized,
+                    # this-period-only sibling of the since-inception XIRR
+                    # waterfall below. See
+                    # shared/monthly_yield_waterfall.py's module docstring
+                    # for why this is a plain division (no IRR-solving
+                    # needed). Computed for a backfilled month too, same
+                    # as Cash drag above. No withholding-tax or fee
+                    # category exists at all (both brut % hardcoded 0.0,
+                    # same reasoning as taxes_xirr_contribution/
+                    # frais_xirr_contribution above).
+                    avg_total_balance_month = avg_invested_balance + avg_non_invested_balance
+                    missed_earnings_month = cash_drag_brut_value * avg_total_balance_month
+                    monthly_yield_steps = [
+                        ("Intérêts brut %", amounts["gross_interest_received"] + missed_earnings_month),
+                        ("Cash drag brut %", -missed_earnings_month),
+                        ("Bonus brut %", amounts["bonus_cashback_contest"]),
+                        ("Frais brut %", 0.0),
+                        ("Taxes brut %", 0.0),
+                    ]
+                    monthly_yield_shares = compute_monthly_yield_shares(
+                        avg_total_balance_month, monthly_yield_steps, log=log, log_context="Income Marketplace",
+                    )
+                    rendement_brut_value = sum(v for v in monthly_yield_shares.values() if v is not None)
+                    log.info(
+                        "Monthly gross-yield waterfall shares: Rendements %% brut=%.2f%% %r",
+                        rendement_brut_value * 100, {k: round(v * 100, 4) for k, v in monthly_yield_shares.items() if v is not None},
                     )
 
                 if current_month:
@@ -682,6 +714,12 @@ def run() -> None:
     }
     if amounts["bonus_cashback_contest"]:
         bonus_breakdown["prime"] = amounts["bonus_cashback_contest"]
+    if rendement_brut_value is not None:
+        bonus_breakdown["Rendements % brut"] = rendement_brut_value
+    for step_name in ("Intérêts brut %", "Cash drag brut %", "Bonus brut %", "Frais brut %", "Taxes brut %"):
+        step_value = monthly_yield_shares.get(step_name)
+        if step_value is not None:
+            bonus_breakdown[step_name] = step_value
     if xirr_value is not None:
         bonus_breakdown["XIRR"] = xirr_value
     if cash_drag_brut_value is not None:
