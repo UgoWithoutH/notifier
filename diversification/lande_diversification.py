@@ -763,15 +763,20 @@ def run(session: requests.Session | None = None) -> None:
     # snapshot (fixed 2026-09-11), so this % is exactly reconstructible
     # from those two Sheet rows. The lifetime XIRR Cash drag share below
     # still uses total_invested (no lifetime-average equivalent exists).
-    cash_drag_value = None
+    cash_drag_brut_value = None
+    cash_drag_net_value = None
     cash_drag_xirr_contribution = None
     if all_entries is not None and avg_invested_balance is not None and avg_invested_balance > 0:
         cash_weight = avg_non_invested_balance / (avg_non_invested_balance + avg_invested_balance)
         monthly_yield_rate = gross_interest_received / avg_invested_balance
-        cash_drag_value = cash_weight * monthly_yield_rate
+        cash_drag_brut_value = cash_weight * monthly_yield_rate
+        # Lande has no confirmed withholding-tax transaction type (see
+        # module docstring) - net interest equals gross here, so "Cash
+        # drag net" is identical to "Cash drag brut", not a placeholder.
+        cash_drag_net_value = cash_drag_brut_value
         log.info(
-            "Computed Cash drag: %.2f%% (avg idle cash %.2f EUR, cash weight %.2f%%, monthly yield %.2f%%).",
-            cash_drag_value * 100, avg_non_invested_balance, cash_weight * 100, monthly_yield_rate * 100,
+            "Computed Cash drag: brut=net=%.2f%% (avg idle cash %.2f EUR, cash weight %.2f%%, monthly yield %.2f%%).",
+            cash_drag_brut_value * 100, avg_non_invested_balance, cash_weight * 100, monthly_yield_rate * 100,
         )
 
         if (xirr_value is not None and signed_cashflows is not None and since_inception_date is not None
@@ -833,8 +838,10 @@ def run(session: requests.Session | None = None) -> None:
     bonus_breakdown = {}
     if xirr_value is not None:
         bonus_breakdown["XIRR"] = xirr_value
-    if cash_drag_value is not None:
-        bonus_breakdown["Cash drag"] = cash_drag_value
+    if cash_drag_brut_value is not None:
+        bonus_breakdown["Cash drag brut"] = cash_drag_brut_value
+    if cash_drag_net_value is not None:
+        bonus_breakdown["Cash drag net"] = cash_drag_net_value
     if bonus_xirr_contribution is not None:
         bonus_breakdown["XIRR Bonus"] = bonus_xirr_contribution
     if cash_drag_xirr_contribution is not None:

@@ -721,12 +721,16 @@ def compute_xirr_block_as_of(
     end_date_str = end_date.strftime("%Y-%m-%d")
     if avg_invested_balance is not None and avg_invested_balance > 0:
         monthly_interest = _sum_in_range(all_entries, {_INTEREST_KIND}, end_date.replace(day=1), end_date)
+        monthly_tax_raw = _sum_in_range(all_entries, {_TAX_KIND}, end_date.replace(day=1), end_date)
+        monthly_net_interest = monthly_interest + monthly_tax_raw
         cash_weight = avg_non_invested_balance / (avg_non_invested_balance + avg_invested_balance)
-        monthly_yield_rate = monthly_interest / avg_invested_balance
-        result["Cash drag"] = cash_weight * monthly_yield_rate
+        monthly_yield_rate_brut = monthly_interest / avg_invested_balance
+        monthly_yield_rate_net = monthly_net_interest / avg_invested_balance
+        result["Cash drag brut"] = cash_weight * monthly_yield_rate_brut
+        result["Cash drag net"] = cash_weight * monthly_yield_rate_net
         log.info(
-            "Computed Cash drag as of %s: %.2f%% (avg non-invested balance %.2f EUR, cash weight %.2f%%, monthly yield %.2f%%).",
-            end_date, result["Cash drag"] * 100, avg_non_invested_balance, cash_weight * 100, monthly_yield_rate * 100,
+            "Computed Cash drag as of %s: brut=%.2f%% net=%.2f%% (avg non-invested balance %.2f EUR, cash weight %.2f%%).",
+            end_date, result["Cash drag brut"] * 100, result["Cash drag net"] * 100, avg_non_invested_balance, cash_weight * 100,
         )
 
     deposit_dates = [
