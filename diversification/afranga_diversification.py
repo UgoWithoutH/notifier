@@ -1098,8 +1098,24 @@ def compute_xirr_as_of(session: requests.Session, all_detail_rows: list, xirr_ca
     end_date (via the existing date-range-aware fetch_statement_totals()).
     Returns None if compute_xirr() can't find a solution.
     """
+    # closing_balance_as_of used to query from XIRR_HISTORY_START_DATE
+    # (2000-01-01) - a multi-decade-wide range that can time out on
+    # Afranga's Account Statement endpoint for older backfilled months
+    # (same 504 root cause fixed for Swaper on 2026-09-16). closing_balance
+    # is a point-in-time snapshot AT end_date, so narrowing the query's
+    # start to the account's REAL earliest deposit date (not an arbitrary
+    # cutoff) is safe and avoids the multi-decade query.
+    deposit_dates_before_end = [
+        row["date"] for row in xirr_cashflow_rows
+        if row["label"] == "Deposited funds" and row["date"] <= end_date.strftime("%Y-%m-%d")
+    ]
+    history_start_date = (
+        datetime.strptime(min(deposit_dates_before_end), "%Y-%m-%d").date()
+        if deposit_dates_before_end else XIRR_HISTORY_START_DATE
+    )
+
     outstanding_as_of = reconstruct_outstanding(all_detail_rows, end_date)
-    closing_balance_as_of = fetch_statement_totals(session, XIRR_HISTORY_START_DATE, end_date)["closing_balance"]
+    closing_balance_as_of = fetch_statement_totals(session, history_start_date, end_date)["closing_balance"]
     _warn_if_wallet_balance_mismatch(all_detail_rows, end_date, closing_balance_as_of)
 
     total_value_as_of = outstanding_as_of + closing_balance_as_of
@@ -1142,9 +1158,24 @@ def compute_xirr_block_as_of(session: requests.Session, all_detail_rows: list, x
     a wrong/0 value).
     """
     result: dict = {}
+    # closing_balance_as_of used to query from XIRR_HISTORY_START_DATE
+    # (2000-01-01) - a multi-decade-wide range that can time out on
+    # Afranga's Account Statement endpoint for older backfilled months
+    # (same 504 root cause fixed for Swaper on 2026-09-16). closing_balance
+    # is a point-in-time snapshot AT end_date, so narrowing the query's
+    # start to the account's REAL earliest deposit date (not an arbitrary
+    # cutoff) is safe and avoids the multi-decade query.
+    deposit_dates_before_end = [
+        row["date"] for row in xirr_cashflow_rows
+        if row["label"] == "Deposited funds" and row["date"] <= end_date.strftime("%Y-%m-%d")
+    ]
+    history_start_date = (
+        datetime.strptime(min(deposit_dates_before_end), "%Y-%m-%d").date()
+        if deposit_dates_before_end else XIRR_HISTORY_START_DATE
+    )
 
     outstanding_as_of = reconstruct_outstanding(all_detail_rows, end_date)
-    closing_balance_as_of = fetch_statement_totals(session, XIRR_HISTORY_START_DATE, end_date)["closing_balance"]
+    closing_balance_as_of = fetch_statement_totals(session, history_start_date, end_date)["closing_balance"]
     _warn_if_wallet_balance_mismatch(all_detail_rows, end_date, closing_balance_as_of)
     total_value_as_of = outstanding_as_of + closing_balance_as_of
 
