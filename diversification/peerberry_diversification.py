@@ -1042,6 +1042,11 @@ def run() -> None:
         xirr_value = xirr_block.get("XIRR")
         cash_drag_brut_value = xirr_block.get("Cash drag brut")
         cash_drag_net_value = xirr_block.get("Cash drag net")
+        rendement_brut_value = xirr_block.get("Rendements % brut")
+        monthly_yield_shares = {
+            k: xirr_block[k] for k in ("Intérêts brut %", "Cash drag brut %", "Bonus brut %", "Frais brut %", "Taxes brut %")
+            if k in xirr_block
+        }
         bonus_xirr_contribution = xirr_block.get("XIRR Bonus")
         cash_drag_xirr_contribution = xirr_block.get("XIRR Cash drag")
         taxes_xirr_contribution = xirr_block.get("XIRR Taxes")
