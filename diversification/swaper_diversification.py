@@ -873,8 +873,26 @@ def compute_xirr_block_as_of(page, all_entries: list, xirr_cashflow_entries: lis
     result: dict = {}
     end_date_str = end_date.strftime("%Y-%m-%d")
 
+    # The closing-balance-as-of lookup below used to query from
+    # XIRR_HISTORY_START_DATE ("2000-01-01") - a ~26-year-wide range that
+    # Swaper's account-entries API reliably times out on (504) - fixed
+    # 2026-09-16. closing_balance is a point-in-time snapshot AT end_date
+    # (same assumption already relied on by the since-inception fetches
+    # further below in this same function), so narrowing the query's start
+    # to the account's REAL earliest funding date - not an arbitrary cutoff
+    # like 2024 - is both safe and exactly what those other calls already
+    # do successfully. Computed from xirr_cashflow_entries (no extra
+    # network call).
+    funding_dates_before_end = [
+        e["date"] for e in xirr_cashflow_entries
+        if e["transactionType"].strip().upper() == "FUNDING" and e["date"] <= end_date_str
+    ]
+    if not funding_dates_before_end:
+        return result
+    since_inception_date_early = min(funding_dates_before_end)
+
     outstanding_as_of = reconstruct_outstanding(all_entries, end_date)
-    closing_balance_as_of = fetch_statement_totals(page, XIRR_HISTORY_START_DATE, end_date_str)["closing_balance"]
+    closing_balance_as_of = fetch_statement_totals(page, since_inception_date_early, end_date_str)["closing_balance"]
     _warn_if_wallet_balance_mismatch(all_entries, end_date, closing_balance_as_of)
     total_value_as_of = outstanding_as_of + closing_balance_as_of
 

@@ -666,8 +666,21 @@ def compute_xirr_block_as_of(session: requests.Session, all_entries: list, end_d
     result: dict = {}
     end_date_str = end_date.strftime("%Y-%m-%d")
 
+    # closing_balance_as_of used to query from XIRR_HISTORY_START_DATE
+    # (2000-01-01) - a multi-decade-wide range that can time out on
+    # PeerBerry's account-entries endpoint for older backfilled months
+    # (same 504 root cause fixed for Swaper on 2026-09-16). closing_balance
+    # is a point-in-time snapshot AT end_date, so narrowing the query's
+    # start to the account's REAL earliest deposit date (not an arbitrary
+    # cutoff) is safe and avoids the multi-decade query.
+    deposit_dates_before_end = [
+        d for e in all_entries
+        if (d := _entry_date(e)) is not None and d <= end_date and e.get("details") == "DEPOSIT"
+    ]
+    history_start_date = min(deposit_dates_before_end).strftime("%Y-%m-%d") if deposit_dates_before_end else XIRR_HISTORY_START_DATE
+
     outstanding_as_of = reconstruct_outstanding(all_entries, end_date)
-    closing_balance_as_of = fetch_statement_summary(session, XIRR_HISTORY_START_DATE, end_date_str)["closing_balance"]
+    closing_balance_as_of = fetch_statement_summary(session, history_start_date, end_date_str)["closing_balance"]
     _warn_if_wallet_balance_mismatch(all_entries, end_date, closing_balance_as_of)
     total_value_as_of = outstanding_as_of + closing_balance_as_of
 
