@@ -751,6 +751,46 @@ def compute_xirr_block_as_of(session: requests.Session, all_entries: list, end_d
             end_date, result["Cash drag brut"] * 100, avg_non_invested_month, cash_weight * 100, monthly_yield_rate * 100,
         )
 
+        # Monthly gross-yield waterfall ("Rendements % brut" block) for
+        # this BACKFILLED month - was missing entirely until 2026-09-16
+        # (only the live/current-month path in run() ever populated
+        # "Rendements % brut"/"Intérêts brut %"/"Cash drag brut %"/"Bonus
+        # brut %"/"Frais brut %"/"Taxes brut %", so every backfilled month
+        # left those six Sheet columns empty). Mirrors the live path's
+        # steps exactly (see run() below), just scoped to
+        # [month_start_date, end_date] instead of
+        # [today_date.replace(day=1), today_date]. PeerBerry has no
+        # withholding-tax data at all (Taxes brut % hardcoded 0.0, same
+        # reasoning as "XIRR Taxes" below); INVESTMENT_SALE_FEE amounts
+        # are already negative-signed (a real cost), so summed directly
+        # (not negated) here.
+        month_referral_bonus_backfill = sum(
+            _entry_amount(e) for e in all_entries
+            if e.get("details") == "REFERRAL_FEE" and (_entry_date(e) or date.max) >= month_start_date and (_entry_date(e) or date.min) <= end_date
+        )
+        month_sale_fees_backfill = sum(
+            _entry_amount(e) for e in all_entries
+            if e.get("details") == "INVESTMENT_SALE_FEE" and (_entry_date(e) or date.max) >= month_start_date and (_entry_date(e) or date.min) <= end_date
+        )
+        avg_total_balance_month = avg_invested_month + avg_non_invested_month
+        missed_earnings_month = result["Cash drag brut"] * avg_total_balance_month
+        monthly_yield_steps = [
+            ("Intérêts brut %", month_statement["interest_income"] + missed_earnings_month),
+            ("Cash drag brut %", -missed_earnings_month),
+            ("Bonus brut %", month_referral_bonus_backfill),
+            ("Frais brut %", month_sale_fees_backfill),
+            ("Taxes brut %", 0.0),
+        ]
+        monthly_yield_shares = compute_monthly_yield_shares(
+            avg_total_balance_month, monthly_yield_steps, log=log, log_context=f"PeerBerry as of {end_date}",
+        )
+        result["Rendements % brut"] = sum(v for v in monthly_yield_shares.values() if v is not None)
+        result.update({k: v for k, v in monthly_yield_shares.items() if v is not None})
+        log.info(
+            "Monthly gross-yield waterfall shares as of %s (backfilled month): Rendements %% brut=%.2f%% %r",
+            end_date, result["Rendements % brut"] * 100, {k: round(v * 100, 4) for k, v in monthly_yield_shares.items() if v is not None},
+        )
+
     deposit_dates = [
         d for d in (_entry_date(e) for e in all_entries if e.get("details") == "DEPOSIT")
         if d is not None and d <= end_date

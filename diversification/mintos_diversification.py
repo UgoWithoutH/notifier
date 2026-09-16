@@ -988,6 +988,43 @@ def compute_xirr_block_as_of(session: requests.Session, all_entries: list, end_d
                 end_date, result["Cash drag brut"] * 100, result["Cash drag net"] * 100, avg_non_invested_month,
             )
 
+            # Monthly gross-yield waterfall ("Rendements % brut" block) for
+            # this BACKFILLED month - was missing entirely until
+            # 2026-09-16 (only the live/current-month path in run() ever
+            # populated "Rendements % brut"/"Intérêts brut %"/"Cash drag
+            # brut %"/"Bonus brut %"/"Frais brut %"/"Taxes brut %", so
+            # every backfilled month left those six Sheet columns empty).
+            # Mirrors the live path's steps exactly (see run() below), just
+            # scoped to [month_start_date, end_date] instead of
+            # [today_date.replace(day=1), today_date]. Mintos has no
+            # platform-fee concept (XIRR Frais hardcoded 0.0 below, same
+            # here) and no live bonus/cashback feature today, but this
+            # stays generic - a future bonus type matched by _is_bonus()
+            # would be correctly scoped to this backfilled month here.
+            month_bonus_backfill = sum(
+                _entry_amount(e) for e in all_entries
+                if _is_bonus(_extract_action_label(e.get("details") or ""))
+                and (_entry_date(e) or date.max) >= month_start_date and (_entry_date(e) or date.min) <= end_date
+            )
+            avg_total_balance_month = avg_invested_month + avg_non_invested_month
+            missed_earnings_month = result["Cash drag brut"] * avg_total_balance_month
+            monthly_yield_steps = [
+                ("Intérêts brut %", month_statement_totals["gross_interest_received"] + missed_earnings_month),
+                ("Cash drag brut %", -missed_earnings_month),
+                ("Bonus brut %", month_bonus_backfill),
+                ("Frais brut %", 0.0),
+                ("Taxes brut %", -month_statement_totals["withholding_tax"]),
+            ]
+            monthly_yield_shares = compute_monthly_yield_shares(
+                avg_total_balance_month, monthly_yield_steps, log=log, log_context=f"Mintos as of {end_date}",
+            )
+            result["Rendements % brut"] = sum(v for v in monthly_yield_shares.values() if v is not None)
+            result.update({k: v for k, v in monthly_yield_shares.items() if v is not None})
+            log.info(
+                "Monthly gross-yield waterfall shares as of %s (backfilled month): Rendements %% brut=%.2f%% %r",
+                end_date, result["Rendements % brut"] * 100, {k: round(v * 100, 4) for k, v in monthly_yield_shares.items() if v is not None},
+            )
+
     try:
         lifetime_statement_totals = fetch_statement_totals(session, since_inception_date, end_date)
     except Exception:
