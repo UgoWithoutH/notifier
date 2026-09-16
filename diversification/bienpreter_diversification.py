@@ -1118,15 +1118,32 @@ def run() -> None:
             # lifetime share below still uses total_invested (no
             # lifetime-average equivalent exists).
             today_str = today_date.strftime("%Y-%m-%d")
-            if avg_invested_balance is not None and avg_invested_balance > 0:
-                cash_weight = avg_non_invested_balance / (avg_non_invested_balance + avg_invested_balance)
-                monthly_yield_rate_brut = interest_totals["gross_interest_received"] / avg_invested_balance
-                monthly_yield_rate_net = interest_totals["net_interest_received"] / avg_invested_balance
+            # Cash drag/Rendements % brut's DENOMINATOR uses the PREVIOUS
+            # calendar month's average balances, not this month's - added
+            # 2026-09-15. Bienprêter pays interest with a one-month lag (a
+            # given month's accrued interest is only credited/visible the
+            # FOLLOWING month), so the interest actually received THIS
+            # month was earned by whatever capital was invested during the
+            # PRIOR month, not this one. The NUMERATOR
+            # (interest_totals[...] below) deliberately stays on THIS
+            # month. Deliberately a SEPARATE pair of averages from
+            # avg_invested_balance/avg_non_invested_balance above (which
+            # stays THIS month - it feeds the standalone "solde moyen
+            # pondéré" Sheet rows, unrelated to this fix).
+            prev_month_end_date = month_start_date - timedelta(days=1)
+            prev_month_start_date = prev_month_end_date.replace(day=1)
+            avg_invested_prev_month, avg_non_invested_prev_month = compute_average_balances(
+                operations_as_of, prev_month_start_date, prev_month_end_date
+            )
+            if avg_invested_prev_month is not None and avg_invested_prev_month > 0:
+                cash_weight = avg_non_invested_prev_month / (avg_non_invested_prev_month + avg_invested_prev_month)
+                monthly_yield_rate_brut = interest_totals["gross_interest_received"] / avg_invested_prev_month
+                monthly_yield_rate_net = interest_totals["net_interest_received"] / avg_invested_prev_month
                 cash_drag_brut_value = cash_weight * monthly_yield_rate_brut
                 cash_drag_net_value = cash_weight * monthly_yield_rate_net
                 log.info(
                     "Computed Cash drag: brut=%.2f%% net=%.2f%% (avg idle cash %.2f EUR, cash weight %.2f%%).",
-                    cash_drag_brut_value * 100, cash_drag_net_value * 100, avg_non_invested_balance, cash_weight * 100,
+                    cash_drag_brut_value * 100, cash_drag_net_value * 100, avg_non_invested_prev_month, cash_weight * 100,
                 )
 
                 # Monthly gross-yield waterfall ("Rendements % brut" block,
@@ -1136,7 +1153,7 @@ def run() -> None:
                 # why this is a plain division (no IRR-solving needed).
                 # Bienprêter has no platform-fee concept distinct from
                 # withholding tax (same reasoning as "XIRR Frais" below).
-                avg_total_balance_month = avg_invested_balance + avg_non_invested_balance
+                avg_total_balance_month = avg_invested_prev_month + avg_non_invested_prev_month
                 missed_earnings_month = cash_drag_brut_value * avg_total_balance_month
                 monthly_yield_steps = [
                     ("Intérêts brut %", interest_totals["gross_interest_received"] + missed_earnings_month),

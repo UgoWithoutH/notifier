@@ -686,14 +686,19 @@ def compute_xirr_block_as_of(
     else is a Shapley decomposition (see shared/xirr_shapley.py) of the
     since-inception XIRR gap through end_date.
 
-    `avg_invested_balance`/`avg_non_invested_balance`: the SAME day-weighted
-    averages already computed by the caller (via compute_average_balances(),
-    for the "solde moyen pondéré" Sheet rows) for the [month_start, end_date]
-    period - used for the monthly "Cash drag" %% instead of the point-in-time
-    outstanding_as_of/wallet balance (fixed 2026-09-11), so that %% is exactly
-    reconstructible from those two Sheet rows. The lifetime XIRR Cash drag
-    share further below still uses outstanding_as_of (no lifetime-average
-    equivalent is computed anywhere).
+    `avg_invested_balance`/`avg_non_invested_balance`: day-weighted averages
+    computed by the caller via compute_average_balances() over the PREVIOUS
+    calendar month (changed 2026-09-15 - see the caller's own comment for
+    why: Bricks' one-month interest-crediting lag means the interest
+    received in end_date's month was earned by the PRIOR month's capital).
+    Used as the DENOMINATOR for the monthly "Cash drag"/"Rendements % brut"
+    %% instead of the point-in-time outstanding_as_of/wallet balance (fixed
+    2026-09-11). Note these are therefore NO LONGER the same figures as the
+    "solde moyen pondéré" Sheet rows (which stay on end_date's own month).
+    The NUMERATOR (monthly interest/bonus/tax below) still sums over
+    end_date's OWN month. The lifetime XIRR Cash drag share further below
+    still uses outstanding_as_of (no lifetime-average equivalent is
+    computed anywhere).
 
     Returns a dict with any subset of {"XIRR", "Cash drag", "XIRR Bonus",
     "XIRR Cash drag", "XIRR Taxes", "XIRR Frais", "XIRR Intérêts"} that
@@ -905,12 +910,39 @@ def run() -> None:
             avg_invested_balance, avg_non_invested_balance, month_start_date, today_date,
         )
 
+    # Cash drag/Rendements % brut's DENOMINATOR uses the PREVIOUS calendar
+    # month's average balances, not this month's - added 2026-09-15. Bricks
+    # pays interest with a one-month lag (a given month's accrued interest
+    # is only credited/visible the FOLLOWING month), so the interest
+    # actually received in `today_date`'s month was earned by whatever
+    # capital was invested during the PRIOR month, not this one. The
+    # NUMERATOR (monthly_interest/monthly_bonus/monthly_tax inside
+    # compute_xirr_block_as_of(), all summed over end_date's OWN month)
+    # deliberately stays on THIS month. Deliberately a SEPARATE pair of
+    # averages from avg_invested_balance/avg_non_invested_balance above
+    # (which stays THIS month - it feeds the standalone "solde moyen
+    # pondéré" Sheet rows, unrelated to this fix). No anchors are passed:
+    # the live balances are only a valid anchor for TODAY, not for the end
+    # of the previous month.
+    avg_invested_prev_month = None
+    avg_non_invested_prev_month = None
+    if all_entries is not None:
+        prev_month_end_date = month_start_date - timedelta(days=1)
+        prev_month_start_date = prev_month_end_date.replace(day=1)
+        avg_invested_prev_month, avg_non_invested_prev_month = compute_average_balances(
+            all_entries, prev_month_start_date, prev_month_end_date,
+        )
+        log.info(
+            "Solde moyen pondéré (mois N-1, dénominateur du rendement) - investi: %.2f EUR, non investi: %.2f EUR (%s to %s).",
+            avg_invested_prev_month, avg_non_invested_prev_month, prev_month_start_date, prev_month_end_date,
+        )
+
     xirr_block = {}
     if all_entries is not None:
         try:
             xirr_block = compute_xirr_block_as_of(
                 all_entries, today_date,
-                avg_invested_balance=avg_invested_balance, avg_non_invested_balance=avg_non_invested_balance,
+                avg_invested_balance=avg_invested_prev_month, avg_non_invested_balance=avg_non_invested_prev_month,
             )
         except Exception:
             log.exception("Failed to compute the XIRR block as of %s.", today_date)

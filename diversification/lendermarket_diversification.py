@@ -703,9 +703,57 @@ def run() -> None:
             avg_invested_balance, invested_at_period_start, total_invested, net_new_investment, avg_non_invested_balance,
         )
 
-    if avg_invested_balance is not None:
-        cash_weight = avg_non_invested_balance / (avg_non_invested_balance + avg_invested_balance)
-        monthly_yield_rate = statement_totals["interest_received"] / avg_invested_balance
+    # Cash drag/Rendements % brut's DENOMINATOR uses the PREVIOUS calendar
+    # month's average balances, not this month's - added 2026-09-15.
+    # Lendermarket pays interest with a one-month lag (a given month's
+    # accrued interest is only credited/visible the FOLLOWING month), so
+    # the interest actually received in the reporting month was earned by
+    # whatever capital was invested during the PRIOR month, not this one.
+    # The NUMERATOR (statement_totals["interest_received"]/bonuses/fees
+    # below, all from the reporting month's OWN statement) deliberately
+    # stays on THIS month. Deliberately a SEPARATE pair of averages from
+    # avg_invested_balance/avg_non_invested_balance above (which stays
+    # THIS month - it feeds the standalone "solde moyen pondéré" Sheet
+    # rows, unrelated to this fix). Built the same coarse
+    # (opening+closing)/2 way, just shifted one month back: the previous
+    # month's own cached summary gives its wallet opening/closing
+    # directly, and its invested opening/closing are the reconstructed
+    # invested balances at the end of the two months before the reporting
+    # one (see _invested_balance_at_month_end()). Only available on the
+    # monthly-summary-cache path - the net-new-investment fallback above
+    # has no N-1 equivalent.
+    avg_invested_prev_month = None
+    avg_non_invested_prev_month = None
+    if monthly_summaries and today_month_key in monthly_summaries and live_total_account_value is not None:
+        sorted_months = sorted(monthly_summaries)
+        month_index = sorted_months.index(today_month_key)
+        if month_index > 0:
+            prev_month_key = sorted_months[month_index - 1]
+            prev_summary = monthly_summaries[prev_month_key]
+            avg_non_invested_prev_month = (prev_summary["opening_balance"] + prev_summary["closing_balance"]) / 2
+            prev_invested_closing = _invested_balance_at_month_end(monthly_summaries, live_total_account_value, prev_month_key)
+            if month_index > 1:
+                prev_invested_opening = _invested_balance_at_month_end(monthly_summaries, live_total_account_value, sorted_months[month_index - 2])
+            else:
+                prev_invested_opening = 0.0  # the previous month is the first cached month - assumes it's the account's real inception (same caveat as above).
+            if prev_invested_closing is not None and prev_invested_opening is not None:
+                avg_invested_prev_month = (prev_invested_opening + prev_invested_closing) / 2
+                log.info(
+                    "Solde moyen pondéré (mois N-1 %s, dénominateur du rendement) - investi: %.2f EUR "
+                    "(start %.2f EUR, end %.2f EUR), non investi: %.2f EUR.",
+                    prev_month_key, avg_invested_prev_month, prev_invested_opening, prev_invested_closing,
+                    avg_non_invested_prev_month,
+                )
+        else:
+            log.warning(
+                "No previous month cached before %s - Cash drag/'Rendements %% brut' will not be updated "
+                "(they now divide by the PREVIOUS month's average balances, see comment above).",
+                today_month_key,
+            )
+
+    if avg_invested_prev_month is not None and avg_invested_prev_month > 0:
+        cash_weight = avg_non_invested_prev_month / (avg_non_invested_prev_month + avg_invested_prev_month)
+        monthly_yield_rate = statement_totals["interest_received"] / avg_invested_prev_month
         cash_drag_brut_value = cash_weight * monthly_yield_rate
         # Lendermarket has no withholding-tax data source (see module
         # docstring) - net interest equals gross here, so "Cash drag net"
@@ -713,7 +761,7 @@ def run() -> None:
         cash_drag_net_value = cash_drag_brut_value
         log.info(
             "Computed Cash drag: brut=net=%.2f%% (avg idle cash %.2f EUR, cash weight %.2f%%, monthly yield %.2f%%).",
-            cash_drag_brut_value * 100, avg_non_invested_balance, cash_weight * 100, monthly_yield_rate * 100,
+            cash_drag_brut_value * 100, avg_non_invested_prev_month, cash_weight * 100, monthly_yield_rate * 100,
         )
 
         # Monthly gross-yield waterfall ("Rendements % brut" block, added
@@ -724,7 +772,7 @@ def run() -> None:
         # has no withholding-tax data source (Taxes brut % hardcoded 0.0,
         # same reasoning as taxes_xirr_contribution above); "fees" is a
         # genuine, distinct platform fee (same as "XIRR Frais" below).
-        avg_total_balance_month = avg_invested_balance + avg_non_invested_balance
+        avg_total_balance_month = avg_invested_prev_month + avg_non_invested_prev_month
         missed_earnings_month = cash_drag_brut_value * avg_total_balance_month
         monthly_yield_steps = [
             ("Intérêts brut %", statement_totals["interest_received"] + missed_earnings_month),
