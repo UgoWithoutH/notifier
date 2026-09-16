@@ -762,19 +762,39 @@ def run(session: requests.Session | None = None) -> None:
                     {k: round(v * 100, 4) for k, v in waterfall_shares.items() if v is not None},
                 )
 
-    # Cash drag/monthly_yield_rate are based on the month's AVERAGE
-    # invested/non-invested balances (avg_invested_balance/
-    # avg_non_invested_balance, the same figures as the "solde moyen
-    # pondéré" Sheet rows above) rather than the live total_invested
-    # snapshot (fixed 2026-09-11), so this % is exactly reconstructible
-    # from those two Sheet rows. The lifetime XIRR Cash drag share below
-    # still uses total_invested (no lifetime-average equivalent exists).
+    # Cash drag/Rendements % brut's DENOMINATOR uses the PREVIOUS calendar
+    # month's average balances, not this month's - added 2026-09-15. Lande
+    # pays interest with a one-month lag (a given month's accrued interest
+    # is only credited/visible the FOLLOWING month), so the interest
+    # actually received this month (gross_interest_received) was earned by
+    # whatever capital was invested during the PRIOR month, not this one.
+    # The NUMERATOR (gross_interest_received/bonus below) deliberately
+    # stays on THIS month. Deliberately a SEPARATE pair of averages from
+    # avg_invested_balance/avg_non_invested_balance above (which stays
+    # THIS month - it feeds the standalone "solde moyen pondéré" Sheet
+    # rows, unrelated to this fix). No anchors are passed: the live
+    # balances are only a valid anchor for TODAY, not for the end of the
+    # previous month. The lifetime XIRR Cash drag share below still uses
+    # total_invested (no lifetime-average equivalent exists).
+    avg_invested_prev_month = None
+    avg_non_invested_prev_month = None
+    if all_entries is not None:
+        prev_month_end_date = month_start_date - timedelta(days=1)
+        prev_month_start_date = prev_month_end_date.replace(day=1)
+        avg_invested_prev_month, avg_non_invested_prev_month = compute_average_balances(
+            all_entries, prev_month_start_date, prev_month_end_date,
+        )
+        log.info(
+            "Solde moyen pondéré (mois N-1, dénominateur du rendement) - investi: %.2f EUR, non investi: %.2f EUR (%s to %s).",
+            avg_invested_prev_month, avg_non_invested_prev_month, prev_month_start_date, prev_month_end_date,
+        )
+
     cash_drag_brut_value = None
     cash_drag_net_value = None
     cash_drag_xirr_contribution = None
-    if all_entries is not None and avg_invested_balance is not None and avg_invested_balance > 0:
-        cash_weight = avg_non_invested_balance / (avg_non_invested_balance + avg_invested_balance)
-        monthly_yield_rate = gross_interest_received / avg_invested_balance
+    if all_entries is not None and avg_invested_prev_month is not None and avg_invested_prev_month > 0:
+        cash_weight = avg_non_invested_prev_month / (avg_non_invested_prev_month + avg_invested_prev_month)
+        monthly_yield_rate = gross_interest_received / avg_invested_prev_month
         cash_drag_brut_value = cash_weight * monthly_yield_rate
         # Lande has no confirmed withholding-tax transaction type (see
         # module docstring) - net interest equals gross here, so "Cash
@@ -782,7 +802,7 @@ def run(session: requests.Session | None = None) -> None:
         cash_drag_net_value = cash_drag_brut_value
         log.info(
             "Computed Cash drag: brut=net=%.2f%% (avg idle cash %.2f EUR, cash weight %.2f%%, monthly yield %.2f%%).",
-            cash_drag_brut_value * 100, avg_non_invested_balance, cash_weight * 100, monthly_yield_rate * 100,
+            cash_drag_brut_value * 100, avg_non_invested_prev_month, cash_weight * 100, monthly_yield_rate * 100,
         )
 
         # Monthly gross-yield waterfall ("Rendements % brut" block, added
@@ -793,7 +813,7 @@ def run(session: requests.Session | None = None) -> None:
         # confirmed withholding-tax transaction type or distinct fee
         # concept (both brut % hardcoded 0.0, same reasoning as
         # taxes_xirr_contribution/frais_xirr_contribution above).
-        avg_total_balance_month = avg_invested_balance + avg_non_invested_balance
+        avg_total_balance_month = avg_invested_prev_month + avg_non_invested_prev_month
         missed_earnings_month = cash_drag_brut_value * avg_total_balance_month
         monthly_yield_steps = [
             ("Intérêts brut %", gross_interest_received + missed_earnings_month),

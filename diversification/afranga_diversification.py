@@ -1164,18 +1164,29 @@ def compute_xirr_block_as_of(session: requests.Session, all_detail_rows: list, x
 
     month_start_date = end_date.replace(day=1)
     month_statement_totals = fetch_statement_totals(session, month_start_date, end_date)
-    # Cash drag now derived from compute_average_balances() (BOTH sides
-    # period-averaged) instead of mixing avg_idle_cash (a period average)
-    # with outstanding_as_of (a point-in-time snapshot) - fixed 2026-09-11
-    # to match the live current-month path (which already went through
-    # this same fix). No invested_closing_anchor is passed: unlike the
-    # live path, there's no real historical "ground truth" invested total
-    # for a backfilled month to anchor against, so the invested side falls
-    # back to the inception-anchored reconstruction (same as the "solde
-    # moyen pondéré investi" Sheet row for any other backfilled month).
+    # Cash drag/Rendements % brut's DENOMINATOR (average balances) uses the
+    # PREVIOUS calendar month, not this one - added 2026-09-15. Afranga
+    # pays interest with a one-month lag (a given month's accrued interest
+    # is only credited/visible the FOLLOWING month), so the interest
+    # actually received in `end_date`'s month was earned by whatever
+    # capital was invested during the PRIOR month, not this one. The
+    # NUMERATOR (month_statement_totals - interest/bonus/withholding tax)
+    # deliberately stays on THIS month below (it's the real money that
+    # moved this month). This is separate from the "solde moyen pondéré
+    # investi/non investi" Sheet rows (still this month, computed
+    # elsewhere in run()) - those describe this month's own balances as a
+    # metric in their own right, unrelated to this interest-lag fix.
+    prev_month_end_date = month_start_date - timedelta(days=1)
+    prev_month_start_date = prev_month_end_date.replace(day=1)
+    prev_month_statement_totals = fetch_statement_totals(session, prev_month_start_date, prev_month_end_date)
+    # No invested_closing_anchor is passed: there's no real historical
+    # "ground truth" invested total for a past month to anchor against, so
+    # the invested side falls back to the inception-anchored
+    # reconstruction (same as the "solde moyen pondéré investi" Sheet row
+    # for any other backfilled month).
     avg_invested_month, avg_non_invested_month = compute_average_balances(
-        all_detail_rows, month_start_date, end_date,
-        non_invested_opening_anchor=month_statement_totals["opening_balance"],
+        all_detail_rows, prev_month_start_date, prev_month_end_date,
+        non_invested_opening_anchor=prev_month_statement_totals["opening_balance"],
     )
     if avg_invested_month > 0:
         cash_weight = avg_non_invested_month / (avg_non_invested_month + avg_invested_month)
@@ -1491,18 +1502,40 @@ def run() -> None:
     # exactly reconstructible from the two "solde moyen pondéré" Sheet
     # rows instead of silently mixing a period-average non-invested
     # balance with a point-in-time invested snapshot:
-    #   cash_weight        = avg_non_invested_balance / (avg_non_invested_balance + avg_invested_balance)
-    #   monthly_yield_rate = gross_interest_received_this_month / avg_invested_balance
-    if current_month and avg_invested_balance is not None and avg_invested_balance > 0:
+    #   cash_weight        = avg_non_invested_prev_month / (avg_non_invested_prev_month + avg_invested_prev_month)
+    #   monthly_yield_rate = gross_interest_received_this_month / avg_invested_prev_month
+    # (both averages now the PREVIOUS month's - see the note just below.)
+    # Cash drag/Rendements % brut's DENOMINATOR uses the PREVIOUS calendar
+    # month's average balances, not this month's - added 2026-09-15. See
+    # the matching comment in compute_xirr_block_as_of() above for why
+    # (Afranga's one-month interest-crediting lag). Deliberately a
+    # SEPARATE pair of averages from avg_invested_balance/
+    # avg_non_invested_balance above (which stays THIS month - it feeds
+    # the standalone "solde moyen pondéré" Sheet rows, unrelated to this
+    # fix). No invested_closing_anchor: the live invested total
+    # (total_invested) is only a valid anchor for TODAY, not for the end
+    # of the previous month.
+    avg_invested_prev_month = None
+    avg_non_invested_prev_month = None
+    if current_month and all_detail_rows is not None:
+        prev_month_end_date = month_start_date - timedelta(days=1)
+        prev_month_start_date = prev_month_end_date.replace(day=1)
+        prev_month_statement_totals = fetch_statement_totals(session, prev_month_start_date, prev_month_end_date)
+        avg_invested_prev_month, avg_non_invested_prev_month = compute_average_balances(
+            all_detail_rows, prev_month_start_date, prev_month_end_date,
+            non_invested_opening_anchor=prev_month_statement_totals["opening_balance"],
+        )
+
+    if current_month and avg_invested_prev_month is not None and avg_invested_prev_month > 0:
         today_date_str = today_date.strftime("%Y-%m-%d")
-        cash_weight = avg_non_invested_balance / (avg_non_invested_balance + avg_invested_balance)
-        monthly_yield_rate_brut = statement_totals["gross_interest_received"] / avg_invested_balance
-        monthly_yield_rate_net = statement_totals["net_interest_received"] / avg_invested_balance
+        cash_weight = avg_non_invested_prev_month / (avg_non_invested_prev_month + avg_invested_prev_month)
+        monthly_yield_rate_brut = statement_totals["gross_interest_received"] / avg_invested_prev_month
+        monthly_yield_rate_net = statement_totals["net_interest_received"] / avg_invested_prev_month
         cash_drag_brut_value = cash_weight * monthly_yield_rate_brut
         cash_drag_net_value = cash_weight * monthly_yield_rate_net
         log.info(
             "Computed Cash drag: brut=%.2f%% net=%.2f%% (avg non-invested balance %.2f EUR, cash weight %.2f%%).",
-            cash_drag_brut_value * 100, cash_drag_net_value * 100, avg_non_invested_balance, cash_weight * 100,
+            cash_drag_brut_value * 100, cash_drag_net_value * 100, avg_non_invested_prev_month, cash_weight * 100,
         )
 
         # Monthly gross-yield waterfall ("Rendements % brut" block, added
@@ -1512,7 +1545,7 @@ def run() -> None:
         # this is a plain division (no IRR-solving needed). Afranga has
         # no platform-fee concept distinct from withholding tax (same
         # reasoning as "XIRR Frais" below).
-        avg_total_balance_month = avg_invested_balance + avg_non_invested_balance
+        avg_total_balance_month = avg_invested_prev_month + avg_non_invested_prev_month
         missed_earnings_month = cash_drag_brut_value * avg_total_balance_month
         monthly_yield_steps = [
             ("Intérêts brut %", statement_totals["gross_interest_received"] + missed_earnings_month),

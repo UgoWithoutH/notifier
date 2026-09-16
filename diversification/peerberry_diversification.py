@@ -703,9 +703,26 @@ def compute_xirr_block_as_of(session: requests.Session, all_entries: list, end_d
     # passed: there's no real historical "ground truth" invested total for
     # a backfilled month to anchor against, so the invested side falls
     # back to the inception-anchored reconstruction.
+    # Cash drag/Rendements % brut's DENOMINATOR uses the PREVIOUS calendar
+    # month's average balances, not this month's - added 2026-09-15.
+    # PeerBerry pays interest with a one-month lag (a given month's accrued
+    # interest is only credited/visible the FOLLOWING month), so the
+    # interest actually received in end_date's month was earned by whatever
+    # capital was invested during the PRIOR month, not this one. The
+    # NUMERATOR (month_statement[...] below, from end_date's OWN month)
+    # deliberately stays on THIS month. A second statement-summary fetch is
+    # needed here purely for the previous month's own opening balance (the
+    # anchor the non-invested side replays forward from). This is separate
+    # from the "solde moyen pondéré" Sheet rows (still this month, computed
+    # in run()).
+    prev_month_end_date = month_start_date - timedelta(days=1)
+    prev_month_start_date = prev_month_end_date.replace(day=1)
+    prev_month_statement = fetch_statement_summary(
+        session, prev_month_start_date.strftime("%Y-%m-%d"), prev_month_end_date.strftime("%Y-%m-%d"),
+    )
     avg_invested_month, avg_non_invested_month = compute_average_balances(
-        all_entries, month_start_date, end_date,
-        non_invested_opening_anchor=month_statement["opening_balance"],
+        all_entries, prev_month_start_date, prev_month_end_date,
+        non_invested_opening_anchor=prev_month_statement["opening_balance"],
     )
     if avg_invested_month > 0:
         cash_weight = avg_non_invested_month / (avg_non_invested_month + avg_invested_month)
@@ -1001,16 +1018,40 @@ def run() -> None:
             avg_invested_balance, avg_non_invested_balance, month_start_date, today_date,
         )
 
-    # cash_weight/monthly_yield_rate use avg_invested_balance/
-    # avg_non_invested_balance (same figures as the "solde moyen pondéré"
-    # Sheet rows above) instead of the live total_invested snapshot (fixed
-    # 2026-09-11), so this % is exactly reconstructible from those two
-    # Sheet rows. The lifetime share below still uses total_invested (no
-    # lifetime-average equivalent exists).
-    if current_month and avg_invested_balance is not None and avg_invested_balance > 0 and all_entries is not None:
+    # cash_weight/monthly_yield_rate use period AVERAGES rather than the
+    # live total_invested snapshot (fixed 2026-09-11). The lifetime share
+    # below still uses total_invested (no lifetime-average equivalent
+    # exists).
+    # Cash drag/Rendements % brut's DENOMINATOR uses the PREVIOUS calendar
+    # month's average balances, not this month's - added 2026-09-15. See
+    # the matching comment in compute_xirr_block_as_of() above for why
+    # (PeerBerry's one-month interest-crediting lag). Deliberately a
+    # SEPARATE pair of averages from avg_invested_balance/
+    # avg_non_invested_balance above (which stays THIS month - it feeds the
+    # standalone "solde moyen pondéré" Sheet rows, unrelated to this fix).
+    # No invested_closing_anchor: the live invested total is only a valid
+    # anchor for TODAY, not for the end of the previous month.
+    avg_invested_prev_month = None
+    avg_non_invested_prev_month = None
+    if all_entries is not None:
+        prev_month_end_date = month_start_date - timedelta(days=1)
+        prev_month_start_date = prev_month_end_date.replace(day=1)
+        prev_month_statement = fetch_statement_summary(
+            session, prev_month_start_date.strftime("%Y-%m-%d"), prev_month_end_date.strftime("%Y-%m-%d"),
+        )
+        avg_invested_prev_month, avg_non_invested_prev_month = compute_average_balances(
+            all_entries, prev_month_start_date, prev_month_end_date,
+            non_invested_opening_anchor=prev_month_statement["opening_balance"],
+        )
+        log.info(
+            "Solde moyen pondéré (mois N-1, dénominateur du rendement) - investi: %.2f EUR, non investi: %.2f EUR (%s to %s).",
+            avg_invested_prev_month, avg_non_invested_prev_month, prev_month_start_date, prev_month_end_date,
+        )
+
+    if current_month and avg_invested_prev_month is not None and avg_invested_prev_month > 0 and all_entries is not None:
         today_str = today_date.strftime("%Y-%m-%d")
-        cash_weight = avg_non_invested_balance / (avg_non_invested_balance + avg_invested_balance)
-        monthly_yield_rate = interest_income / avg_invested_balance
+        cash_weight = avg_non_invested_prev_month / (avg_non_invested_prev_month + avg_invested_prev_month)
+        monthly_yield_rate = interest_income / avg_invested_prev_month
         cash_drag_brut_value = cash_weight * monthly_yield_rate
         # PeerBerry has no gross/net/withholding-tax breakdown (see
         # amounts dict below) - net interest equals gross here, so "Cash
@@ -1018,7 +1059,7 @@ def run() -> None:
         cash_drag_net_value = cash_drag_brut_value
         log.info(
             "Computed Cash drag: brut=net=%.2f%% (avg non-invested balance %.2f EUR, cash weight %.2f%%, monthly yield %.2f%%).",
-            cash_drag_brut_value * 100, avg_non_invested_balance, cash_weight * 100, monthly_yield_rate * 100,
+            cash_drag_brut_value * 100, avg_non_invested_prev_month, cash_weight * 100, monthly_yield_rate * 100,
         )
 
         # Monthly gross-yield waterfall ("Rendements % brut" block, added
@@ -1030,7 +1071,7 @@ def run() -> None:
         # same reasoning as "XIRR Taxes" below); monthly_sale_fees is
         # already negative-signed (a real cost, see INVESTMENT_SALE_FEE
         # above), so it is added directly (not negated) here.
-        avg_total_balance_month = avg_invested_balance + avg_non_invested_balance
+        avg_total_balance_month = avg_invested_prev_month + avg_non_invested_prev_month
         missed_earnings_month = cash_drag_brut_value * avg_total_balance_month
         monthly_yield_steps = [
             ("Intérêts brut %", interest_income + missed_earnings_month),
