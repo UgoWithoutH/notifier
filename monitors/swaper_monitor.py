@@ -149,6 +149,35 @@ Sheet reads are soft-fail (fall back to the module default / disable
 country blocking on a read error), same pattern as every other soft-fail
 Sheet read in this repo.
 
+Greedy fill-in-order across originators + loans (changed 2026-09-19,
+explicit user request after reviewing a real investment summary email
+where a 136.82 EUR balance only got 13.57 EUR + 63.53 EUR invested because
+of the 2026-07-25 equal-split design: "je ne veux pas de part égale, il
+met tout le solde qu'il peut sur les prêts qu'il trouve et si plusieurs
+prêts il met ce qu'il peut sur le premier ensuite le deuxième etc"). Both
+the per-originator split (`_split_budget_across_available_originators()`,
+removed) and the per-loan equal split (`_compute_swaper_loan_shares()`'s
+old algorithm) are gone. Originators with >=1 loan available are now
+visited in their natural order (`_available_originators_in_order()` -
+the order they were discovered in, i.e. the Google Sheet's selected-
+originators order), each offered the FULL remaining balance rather than
+a fixed pre-split share. Within one originator, `_compute_swaper_loan_shares()`
+now fills its available loans GREEDILY in listing order: loan 1 gets
+min(remaining_budget, loan 1's own `amount`), loan 2 gets
+min(what's left, loan 2's own `amount`), etc., stopping once the budget
+drops below MIN_INVESTMENT_AMOUNT or loans run out. Whatever budget a
+given originator's loans can't absorb carries over to the next originator
+(`remaining_budget` in `run()`), instead of being stranded as that
+originator's own unspent leftover. Net effect: as much of the balance as
+possible gets placed, and within any originator earlier-listed loans are
+filled before later ones instead of everyone getting an equal slice. A
+same-day follow-up request ("je ne veux plus le Priorité par originator
+enlève le") dropped an initial version of this change that also
+prioritized "Wandoo Finance Group" ahead of every other originator - that
+priority ordering (`PRIORITY_LOAN_ORIGINATORS`/`_order_originators_by_priority()`)
+was removed again a few minutes later; originators are visited in plain
+discovery order, with no special-cased name.
+
 Post-login flow switched to pure HTTP (added 2026-08-01, explicit user
 request for speed - "login en playwright et après le reste en pur http"):
 `login()` still drives a real Playwright browser (the only step genuinely
@@ -608,26 +637,25 @@ def fetch_loans_by_selected_originators(page, captured_api_calls: list, selected
     return grouped
 
 
-def _split_budget_across_available_originators(available_money: float, originator_loans: dict) -> dict:
-    """Split `available_money` EVENLY across the loan originators that
-    currently have at least one loan available - per explicit user spec
-    (2026-07-25): "si un seul loan on met tout sur lui mais si deux loans
-    on divise par 2 sur les deux loans" (1 originator with loans -> gets
-    the full balance, 2 -> 50/50 each, etc.). Originators with no loans
-    currently available (empty list) get nothing and aren't counted in the
-    split.
+def _available_originators_in_order(originator_loans: dict) -> list:
+    """Order the loan originators that currently have >=1 loan available,
+    keeping their original `originator_loans` order (i.e. the order the
+    Google Sheet's selected originators were discovered in this run) - NO
+    priority originator anymore (added 2026-09-19, then removed again the
+    same day per explicit user request: "je ne veux plus le Priorité par
+    originator enlève le"). Originators with no loans currently available
+    (empty list) are excluded.
 
-    `originator_loans`: {originator_name: [loan, ...]} - only originators
-    with a non-empty loan list are considered.
+    `originator_loans`: {originator_name: [loan, ...]}.
 
-    Returns {originator_name: budget} for originators that should be
-    invested into this run.
+    Returns an ordered list of originator names to invest into this run,
+    fully-funding one before moving to the next (see run()'s invest loop -
+    the whole remaining budget is offered to each originator in this
+    order, not a fixed pre-split share - that part of the 2026-09-19
+    change is kept, only the Wandoo-first priority was reverted).
     """
-    available_originators = [name for name, loans in originator_loans.items() if loans]
-    if not available_originators:
-        return {}
-    share = round(available_money / len(available_originators), 2)
-    return {name: share for name in available_originators}
+    return [name for name, loans in originator_loans.items() if loans]
+
 
 
 def _redact_sensitive_headers(headers: dict) -> dict:
@@ -652,30 +680,33 @@ def _redact_sensitive_headers(headers: dict) -> dict:
 
 
 def _compute_swaper_loan_shares(budget: float, loans: list, min_investment: float = MIN_INVESTMENT_AMOUNT) -> dict:
-    """Split `budget` (one originator's own share of the account balance,
-    see `_split_budget_across_available_originators()`) EQUALLY across
-    `loans` (that same originator's currently available loans) - exact same
-    algorithm as monitors/lendermarket_monitor.py's `_compute_loan_shares()`,
-    per explicit user request 2026-07-25: "je ne veux pas de reste < 10e".
+    """Greedily fill `loans` (that originator's currently available loans,
+    kept in LISTING order) one after another with as much of `budget` as
+    each can actually take, instead of splitting the budget evenly across
+    them - replaces the old equal-split algorithm (removed 2026-09-19,
+    explicit user request: "il met tout le solde qu'il peut sur les prêts
+    qu'il trouve et si plusieurs prêts il met ce qu'il peut sur le premier
+    ensuite le deuxième etc", overriding the 2026-07-25 equal-split
+    decision quoted in the module docstring above). Combined with
+    `_available_originators_in_order()`, one originator's loans are fully
+    funded (in listing order) before any leftover budget moves on to the
+    next originator - see run()'s invest loop.
 
-    Two adjustments on top of a plain `budget / len(loans)`:
-    - If the equal share would be below `min_investment`, fewer loans are
-      funded instead (as many as `budget // min_investment` allows, kept in
-      listing order) so every funded loan still gets at least
-      `min_investment`.
-    - If a loan's own `amount` is smaller than its equal share, that loan is
-      capped at what it can actually take and the excess is redistributed
-      across the other loans in the same pass (equal share recomputed on
-      what's left) - repeated until stable.
+    For each loan in order: invest `min(remaining_budget, loan's own
+    `amount`)`, but only if that is >= `min_investment` (a loan that can
+    only take less than the minimum is skipped - not funded, not
+    "wasted" - the next loan in the list is tried with the same remaining
+    budget). Stops as soon as remaining budget drops below
+    `min_investment` or the loan list is exhausted.
 
     Returns `{loan_id: amount}` for every loan that ends up funded (amount
-    rounded to 2 decimals); loans below `min_investment` after all
-    adjustments are simply omitted (that leftover stays unspent for this
-    originator this run - originators are fully independent of each other,
-    no cross-originator redistribution).
+    rounded to 2 decimals).
     """
-    caps = {}
+    shares = {}
+    remaining = budget
     for loan in loans:
+        if remaining < min_investment:
+            break
         loan_id = loan.get("id")
         if loan_id is None:
             continue
@@ -683,41 +714,14 @@ def _compute_swaper_loan_shares(budget: float, loans: list, min_investment: floa
             cap = float(loan.get("amount") or 0)
         except (TypeError, ValueError):
             cap = 0.0
-        if cap > 0:
-            caps[loan_id] = cap
-
-    # Keep insertion (listing) order for deterministic drop/keep decisions below.
-    active = list(caps.keys())
-    remaining = budget
-    shares = {}
-
-    while active:
-        if remaining < min_investment:
-            break
-
-        equal_share = remaining / len(active)
-        if equal_share < min_investment:
-            max_active = int(remaining // min_investment)
-            if max_active <= 0:
-                break
-            if max_active < len(active):
-                active = active[:max_active]
+        if cap <= 0:
             continue
-
-        capped_any = False
-        for loan_id in list(active):
-            if caps[loan_id] < equal_share:
-                shares[loan_id] = caps[loan_id]
-                remaining -= caps[loan_id]
-                active.remove(loan_id)
-                capped_any = True
-        if capped_any:
+        amount = min(remaining, cap)
+        if amount < min_investment:
             continue
-
-        for loan_id in active:
-            shares[loan_id] = round(equal_share, 2)
-        break
-
+        amount = round(amount, 2)
+        shares[loan_id] = amount
+        remaining -= amount
     return shares
 
 
@@ -1209,8 +1213,35 @@ def run(headless: bool = True) -> None:
                                         originator_cap_blocked.append(name)
                                     del originator_loans[name]
 
-                            budgets = _split_budget_across_available_originators(balance_now, originator_loans)
-                            for name, budget in budgets.items():
+                            # Sequential fill instead of an even split (changed
+                            # 2026-09-19, explicit user request: "il met tout
+                            # le solde qu'il peut sur les prêts qu'il trouve
+                            # et si plusieurs prêts il met ce qu'il peut sur
+                            # le premier ensuite le deuxième etc"; an earlier
+                            # version of this same change also prioritized
+                            # "Wandoo Finance Group" first, reverted minutes
+                            # later per "je ne veux plus le Priorité par
+                            # originator enlève le" - originators are now
+                            # visited in plain discovery order, no special
+                            # casing). `remaining_budget` carries over from
+                            # one originator to the next: the first available
+                            # originator is offered the FULL balance and
+                            # greedily fills as many of its own loans as it
+                            # can (see `_compute_swaper_loan_shares()`'s
+                            # greedy algorithm); whatever is left over only
+                            # then moves on to the next originator, and so on
+                            # - no originator gets a fixed pre-split share
+                            # anymore.
+                            remaining_budget = balance_now
+                            for name in _available_originators_in_order(originator_loans):
+                                if remaining_budget < MIN_INVESTMENT_AMOUNT:
+                                    log.info(
+                                        "Remaining budget %.2f EUR is below the minimum - stopping the "
+                                        "sequential invest loop before originator %r.",
+                                        remaining_budget, name,
+                                    )
+                                    break
+                                budget = remaining_budget
                                 log.info("Investing up to %.2f EUR into originator %r's loan(s).", budget, name)
 
                                 try:
@@ -1257,6 +1288,12 @@ def run(headless: bool = True) -> None:
                                     # 2026-08-05, per-originator cap).
                                     if not attempt.get("error"):
                                         originator_invested[name] = originator_invested.get(name, 0.0) + (attempt.get("amount") or 0.0)
+                                    # Carry any unspent budget over to the next
+                                    # originator in discovery order (see above) -
+                                    # only amounts that weren't an outright
+                                    # error are treated as actually spent.
+                                    if not attempt.get("error"):
+                                        remaining_budget -= (attempt.get("amount") or 0.0)
                                 pass_attempts.extend(attempts)
 
                         investment_attempts.extend(pass_attempts)
