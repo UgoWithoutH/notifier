@@ -1407,7 +1407,6 @@ def run(headless: bool = True) -> None:
         )
         send_swaper_investment_summary_email(
             investment_attempts,
-            captured_api_calls,
             min_interest_rate=min_interest_rate,
             country_threshold_percentage=country_threshold_percentage,
             country_status=country_status,
