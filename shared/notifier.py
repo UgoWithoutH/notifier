@@ -91,7 +91,6 @@ def send_swaper_email(balance: float, loans: list) -> None:
 
 def send_swaper_investment_summary_email(
     attempts: list,
-    captured_api_calls: list,
     min_interest_rate: float | None = None,
     country_threshold_percentage: float | None = None,
     country_status: dict | None = None,
@@ -107,31 +106,32 @@ def send_swaper_investment_summary_email(
 
     Sent EVERY time at least one investment was attempted this run (not
     one-time - real money moves every time, so it should always be
-    visible), listing each attempt (loan number/id, amount, whether an
-    unrecognized confirmation modal appeared, whether an error occurred).
-    Attaches the raw captured `/rest/` API calls (added 2026-07-25, same
-    day, explicit user request: "envoie bien tout ce dont tu auras besoin
-    pour après essayer de faire en full http request le bot") as a `.json`
-    file - for every loans-listing/filter/invest call observed this run:
-    method, full url, ALL header NAMES for both request and response
-    (values redacted for cookies/auth/csrf - see `_redact_sensitive_headers()`
-    - so the shape of what's required is visible without leaking a live,
-    short-lived session token), the raw request POST body, the response
-    status and body. Together with `monitors/swaper_monitor.py`'s already-
-    documented `login()`/`handle_two_factor()` flow (NOT captured this way,
-    deliberately, to never risk logging a plaintext password/2FA code),
-    this should carry everything needed to later attempt reproducing the
-    loans-listing/filter/invest calls as plain HTTP requests (mirroring
-    monitors/lendermarket_monitor.py's `requests.Session`-based bot),
-    instead of driving a real browser - also useful right now, to confirm
-    each investment attempt actually succeeded (status code/body).
+    visible).
 
-    Each attempt's own `confirm_api_calls` (added 2026-08-01, per explicit
-    user request: "je veux absolument r\u00e9cup\u00e9rer la requ\u00eate api pour
-    investir par mail je veux des logs d\u00e9taill\u00e9s") - the real /rest/ call(s)
-    fired by clicking the modal's "Confirm" button - are rendered DIRECTLY
-    in the email BODY (method/url/status + response body, not just buried
-    in the JSON attachment), right under that attempt's own line.
+    BODY kept as a short summary (changed 2026-09-19, explicit user
+    request: "je veux que le mail soit plus épuré, un résumé"): one line
+    per attempt (loan/originator/amount/outcome) - no raw request/response
+    detail inline anymore (previously each attempt's `confirm_api_calls`
+    were also dumped into the body, method/url/status/truncated body; that
+    detail moved to the attachment below instead, so the body stays
+    scannable at a glance), plus the existing short interest-rate/
+    per-country/per-originator cap sections.
+
+    ATTACHMENT changed the same day, same request ("la requête envoyée et
+    la réponse pour investir je veux bien ça en pièce jointe... ça
+    remplacera ce qui était envoyé en pièce jointe"): now contains ONLY
+    the real investment calls - each attempt's `confirm_api_calls` (the
+    `GET is-manual-investment-approved` + `POST .../buy` pair fired by
+    clicking the modal's "Confirm" button, see
+    monitors/swaper_monitor.py's `_invest_available_loans()`), one entry
+    per call with method/url/status/headers(redacted)/request body/
+    response body, tagged with which loan/originator/amount it belongs
+    to. This REPLACES the previous attachment, which used to dump every
+    `/rest/` call observed during the whole run (loans-listing/filter
+    calls included, via the now-removed `captured_api_calls` parameter) -
+    that full-run capture is no longer attached here; it still exists
+    separately for `send_swaper_api_structure_email()`'s own diagnostics
+    email (unaffected by this change).
 
     `min_interest_rate`/`country_threshold_percentage`/`country_status`/
     `country_blocked` (added 2026-07-31, mirrors
@@ -181,7 +181,7 @@ def send_swaper_investment_summary_email(
         prefix = f"[{originator}] " if originator else ""
         line = f"- {prefix}Pr\u00eat {label} : {attempt.get('amount'):.2f} \u20ac"
         if attempt.get("error"):
-            line += " -- ERREUR pendant la requ\u00eate HTTP, voir les logs"
+            line += " -- ERREUR pendant la requ\u00eate HTTP, voir la pi\u00e8ce jointe"
         elif attempt.get("not_approved"):
             line += " -- Swaper indique que l'investissement manuel n'est pas approuv\u00e9 pour ce pr\u00eat, investissement stopp\u00e9"
         elif attempt.get("confirmed"):
@@ -189,12 +189,6 @@ def send_swaper_investment_summary_email(
         else:
             line += " -- non confirm\u00e9, voir la pi\u00e8ce jointe"
         body_lines.append(line)
-        for call in attempt.get("confirm_api_calls") or []:
-            body_lines.append(
-                f"    -> Requ\u00eate API d'investissement : {call.get('method')} {call.get('url')} "
-                f"-> HTTP {call.get('status')}"
-            )
-            body_lines.append(f"       Corps r\u00e9ponse : {(call.get('body') or '')[:1000]}")
     body_lines.append("")
 
     if min_interest_rate is not None:
@@ -240,13 +234,9 @@ def send_swaper_investment_summary_email(
         )
         body_lines.append("")
     body_lines.append(
-        "Le fichier joint contient les vraies requ\u00eates/r\u00e9ponses HTTP /rest/ observ\u00e9es "
-        "pendant ce run (m\u00e9thode/URL/toutes les en-t\u00eates - valeurs sensibles redacted - "
-        "corps/statut), pour les appels de listing/filtre de pr\u00eats, de v\u00e9rification "
-        "d'approbation ET d'achat. V\u00e9rifie le statut de la requ\u00eate d'achat pour confirmer "
-        "qu'elle a bien r\u00e9ussi. Depuis le 2026-08-01, tout ce flux (apr\u00e8s connexion) est "
-        "fait en pur HTTP (sans navigateur) - seule la connexion/2FA reste bas\u00e9e sur le "
-        "navigateur (voir monitors/swaper_monitor.py) et n'est jamais captur\u00e9e ici."
+        "La pi\u00e8ce jointe contient la requ\u00eate d'investissement r\u00e9elle envoy\u00e9e \u00e0 Swaper "
+        "et sa r\u00e9ponse pour chaque pr\u00eat (v\u00e9rification d'approbation + achat) - m\u00e9thode/URL/"
+        "en-t\u00eates (valeurs sensibles redacted)/corps/statut."
     )
     body = "\n".join(body_lines)
 
@@ -256,16 +246,25 @@ def send_swaper_investment_summary_email(
     msg["Subject"] = subject
     msg.attach(MIMEText(body, "plain"))
 
-    # `attempts` (see _invest_available_loans()'s docstring for its shape:
-    # loan_id/loan_number/amount/confirmed/not_approved/error/
-    # confirm_api_calls) is included alongside captured_api_calls so the
-    # full per-attempt detail is in the attachment, not just living in the
-    # in-memory `attempts` list.
-    attachment_payload = {"attempts": attempts, "captured_api_calls": captured_api_calls}
-    attachment_text = json.dumps(attachment_payload, indent=2, ensure_ascii=False, default=str)
+    # Attachment now holds ONLY the real investment request/response pairs
+    # (each attempt's own `confirm_api_calls`), not every `/rest/` call
+    # observed during the whole run - see this function's docstring for
+    # what this replaces.
+    investment_calls = []
+    for attempt in attempts:
+        label = attempt.get("loan_number") or attempt.get("loan_id")
+        for call in attempt.get("confirm_api_calls") or []:
+            investment_calls.append({
+                "loan_number": label,
+                "loan_id": attempt.get("loan_id"),
+                "originator": attempt.get("originator"),
+                "amount": attempt.get("amount"),
+                **call,
+            })
+    attachment_text = json.dumps(investment_calls, indent=2, ensure_ascii=False, default=str)
     attachment = MIMEText(attachment_text, "plain", "utf-8")
     attachment.add_header(
-        "Content-Disposition", "attachment", filename="swaper_investment_api_calls.json"
+        "Content-Disposition", "attachment", filename="swaper_investment_requests.json"
     )
     msg.attach(attachment)
 
