@@ -1041,18 +1041,26 @@ def run() -> None:
                 _log_invest_diagnostics("run_error", error=invest_error, traceback=traceback.format_exc())
                 log.exception("Unexpected error during the Lendermarket auto-invest step.")
 
-            # The bot runs BEFORE the loan-availability recap below - re-fetch
-            # the real balance from the server now (instead of reusing the
-            # pre-invest value, or invest_selected_lenders()'s own computed
-            # balance_after estimate) so the recap/notification email further
-            # down reflects the account's state AFTER this run's investments,
-            # per explicit user request.
-            refreshed_balance = fetch_account_balance(session, investor_id)
-            if refreshed_balance is not None:
-                balance = refreshed_balance
-            else:
-                log.warning("Could not refresh the Lendermarket balance after auto-invest, falling back to the estimated post-invest balance for the recap.")
-                balance = invest_stats.get("balance_after", balance)
+            # The bot runs BEFORE the loan-availability recap below, so the
+            # recap/notification email further down must reflect the
+            # account's state AFTER this run's investments. Previously this
+            # re-fetched the balance from the server right after investing
+            # and TRUSTED that live value over the already-accurate computed
+            # one - removed 2026-09-19 (explicit user request, real bug
+            # report: "le mail que je reçois se base sur les données du
+            # compte avant investissement... je ne veux pas recevoir le
+            # mail [...] si solde <10€ et que des prêts sont disponible").
+            # Lendermarket's balance endpoint appears to lag a moment behind
+            # a just-submitted investment (same class of eventual-
+            # consistency issue already documented for Swaper in this repo,
+            # see swaper_monitor.py's `_extract_balance_from_attempts()`),
+            # so that live re-fetch could return the PRE-invest balance and
+            # silently overwrite the correct value with it. `balance_after`
+            # (from `invest_selected_lenders()`) is fully deterministic - it
+            # only decrements by an amount once `attempt_investment()`
+            # returned an HTTP success for that exact call - so it's used
+            # directly here instead, with no live re-fetch at all.
+            balance = invest_stats.get("balance_after", balance)
 
             if invest_stats.get("invest_attempts", 0) > 0 or invest_error:
                 log.info("Auto-invest run finished: %s", invest_stats)
