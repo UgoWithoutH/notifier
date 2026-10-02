@@ -49,10 +49,13 @@ Bearer` auth):
     company).
   - `POST /gtw/loans/api/balances/v3/transactions-summary` body
     `{"transactionTypes": [], "periodFrame": "CUSTOM"|"ALLTIME",
-    "period": {"from": "YYYY-MM-DD", "to": "YYYY-MM-DD"}|null}` -> a
+    "period": {"start": "YYYY-MM-DD", "end": "YYYY-MM-DD"}|null}` -> a
     SERVER-SIDE PRE-AGGREGATED summary for the given range: `interest`
     (gross interest received), `totalTax` (withholding tax), `bonusReferral`
     (referral/loyalty bonus - AFFILIATE-type transactions), `principal`.
+    GOTCHA (found 2026-10-02): the period keys are `start`/`end`; the old
+    `from`/`to` were silently ignored, so every CUSTOM call returned LIFETIME
+    totals (interest, tax and bonus all wrong per month).
     An EMPTY `transactionTypes` array means "every type included" (per
     explicit user request "regarde dans le filtre tout les transactions
     type pour tous les prendre en compte") - confirmed live this is the
@@ -330,7 +333,7 @@ def fetch_transactions_summary(session: requests.Session, headers: dict, start_d
         body = {
             "transactionTypes": [],
             "periodFrame": "CUSTOM",
-            "period": {"from": start_date.strftime("%Y-%m-%d"), "to": end_date.strftime("%Y-%m-%d")},
+            "period": {"start": start_date.strftime("%Y-%m-%d"), "end": end_date.strftime("%Y-%m-%d")},
         }
     r = session.post(TRANSACTIONS_SUMMARY_URL, json=body, headers=headers, timeout=20)
     r.raise_for_status()
@@ -341,7 +344,7 @@ def _fetch_all_transactions_page(session: requests.Session, headers: dict, start
     body = {
         "transactionTypes": [],
         "periodFrame": "CUSTOM",
-        "period": {"from": start_date.strftime("%Y-%m-%d"), "to": end_date.strftime("%Y-%m-%d")},
+        "period": {"start": start_date.strftime("%Y-%m-%d"), "end": end_date.strftime("%Y-%m-%d")},
     }
     r = session.post(
         ALL_TRANSACTIONS_URL,
@@ -495,14 +498,13 @@ def run() -> None:
         month_summary = fetch_transactions_summary(session, headers, month_start_date, today_date)
         gross_interest = month_summary.get("interest", 0.0) or 0.0
         withholding_tax = month_summary.get("totalTax", 0.0) or 0.0
-        bonus = month_summary.get("bonusReferral", 0.0) or 0.0
         amounts["gross_interest_received"] = gross_interest
         amounts["net_interest_received"] = gross_interest - withholding_tax
         amounts["withholding_tax"] = withholding_tax
-        amounts["bonus_cashback_contest"] = bonus
+        # Monthly bonus is summed from AFFILIATE ledger rows below, not from `bonusReferral`.
         log.info(
-            "This month's totals: gross_interest=%.2f EUR, withholding_tax=%.2f EUR, bonus=%.2f EUR.",
-            gross_interest, withholding_tax, bonus,
+            "This month's totals: gross_interest=%.2f EUR, withholding_tax=%.2f EUR.",
+            gross_interest, withholding_tax,
         )
     except Exception:
         log.exception("Failed to fetch this month's transactions summary - defaulting interest/tax/bonus to 0.0.")
@@ -530,6 +532,19 @@ def run() -> None:
         log.exception("Failed to fetch the since-inception transaction history - XIRR/Cash drag will not be updated.")
 
     if all_transactions is not None:
+        month_bonus = 0.0
+        for t in all_transactions:
+            if t.get("transactionType") != "AFFILIATE":
+                continue
+            try:
+                t_date = _parse_transaction_date(t["createdOn"])
+            except (KeyError, ValueError):
+                continue
+            if month_start_date <= t_date <= today_date:
+                month_bonus += t.get("amount", 0.0)
+        amounts["bonus_cashback_contest"] = month_bonus
+        log.info("This month's bonus (AFFILIATE transactions, %s to %s): %.2f EUR.", month_start_date, today_date, month_bonus)
+
         cash_events = []
         invested_events = []
         for t in all_transactions:
