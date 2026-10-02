@@ -64,8 +64,9 @@ Data endpoints (all under api.nectaro.eu, `Authorization: Bearer` auth):
     compatible with any new type Nectaro might add later without needing
     a code change. Real types confirmed live on the test account:
     DEPOSIT, WITHDRAWAL (not observed yet, forward-looking), INVESTMENT,
-    PRINCIPAL, INTEREST, TAXATION, REWARD (bonus/cashback, not observed
-    yet - genuinely 0 so far, not a placeholder).
+    PRINCIPAL, INTEREST, TAXATION (tax on interest), REWARD (bonus, gross),
+    REWARD_TAXATION (tax on a REWARD, ~5%; a separate type, confirmed live
+    2026-10-02).
     `direction` is a clean, generic "IN credits the cash wallet, OUT
     debits it" scheme (confirmed against every observed type) - much
     simpler than Afranga's CSS-class-based direction-in/direction-out
@@ -468,15 +469,19 @@ def run() -> None:
         month_start_date = today_date.replace(day=1)
         this_month_transactions = fetch_all_statement_transactions(session, headers, month_start_date, today_date)
         gross_interest = sum(t["amount"] for t in this_month_transactions if t.get("type") == "INTEREST")
-        withholding_tax = sum(t["amount"] for t in this_month_transactions if t.get("type") == "TAXATION")
+        bonus_tax = sum(t["amount"] for t in this_month_transactions if t.get("type") == "REWARD_TAXATION")
+        interest_tax = sum(t["amount"] for t in this_month_transactions if t.get("type") == "TAXATION")
+        withholding_tax = interest_tax + bonus_tax
         bonus = sum(t["amount"] for t in this_month_transactions if t.get("type") == "REWARD")
         amounts["gross_interest_received"] = gross_interest
-        amounts["net_interest_received"] = gross_interest - withholding_tax
+        amounts["net_interest_received"] = gross_interest - interest_tax
         amounts["withholding_tax"] = withholding_tax
+        amounts["withholding_tax_interest"] = interest_tax
+        amounts["withholding_tax_bonus"] = bonus_tax
         amounts["bonus_cashback_contest"] = bonus
         log.info(
-            "This month's statement totals: gross_interest=%.2f EUR, withholding_tax=%.2f EUR, bonus=%.2f EUR.",
-            gross_interest, withholding_tax, bonus,
+            "This month's statement totals: gross_interest=%.2f EUR, tax on interest=%.2f EUR, tax on bonus=%.2f EUR, bonus=%.2f EUR.",
+            gross_interest, interest_tax, bonus_tax, bonus,
         )
     except Exception:
         log.exception("Failed to fetch this month's statement totals - defaulting interest/tax/bonus to 0.0.")
@@ -633,7 +638,9 @@ def run() -> None:
                 )
 
                 lifetime_bonus_total = sum(t["amount"] for t in all_transactions if t.get("type") == "REWARD")
-                lifetime_withholding_tax = sum(t["amount"] for t in all_transactions if t.get("type") == "TAXATION")
+                lifetime_withholding_tax = sum(
+                    t["amount"] for t in all_transactions if t.get("type") in ("TAXATION", "REWARD_TAXATION")
+                )
                 lifetime_gross_interest = sum(t["amount"] for t in all_transactions if t.get("type") == "INTEREST")
 
                 # Waterfall decomposition (switched from Shapley
@@ -703,8 +710,10 @@ def run() -> None:
     )
 
     bonus_breakdown = {
-        "prélèvements": amounts["withholding_tax"],
+        "prélèvements": amounts.get("withholding_tax_interest", amounts["withholding_tax"]),
     }
+    if "withholding_tax_bonus" in amounts:
+        bonus_breakdown["prélèvements bonus"] = amounts["withholding_tax_bonus"]
     if amounts["bonus_cashback_contest"]:
         bonus_breakdown["prime"] = amounts["bonus_cashback_contest"]
     if rendement_brut_value is not None:
