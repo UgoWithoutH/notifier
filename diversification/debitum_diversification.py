@@ -450,6 +450,25 @@ def _invested_delta_for_transaction(transaction: dict) -> float:
     return 0.0
 
 
+def _bonus_tax_for_period(transactions: list, start_date: date, end_date: date) -> float:
+    """Sum (positive) of TAX rows withheld on AFFILIATE bonuses in [start_date, end_date].
+    A bonus's TAX row shares the same id UUID suffix as its AFFILIATE row."""
+    affiliate_suffixes = {
+        t["id"].rsplit(":", 1)[-1] for t in transactions if t.get("transactionType") == "AFFILIATE" and t.get("id")
+    }
+    total = 0.0
+    for t in transactions:
+        if t.get("transactionType") != "TAX" or t.get("id", "").rsplit(":", 1)[-1] not in affiliate_suffixes:
+            continue
+        try:
+            t_date = _parse_transaction_date(t["createdOn"])
+        except (KeyError, ValueError):
+            continue
+        if start_date <= t_date <= end_date:
+            total -= t.get("amount", 0.0)
+    return total
+
+
 def run() -> None:
     if not DEBITUM_EMAIL or not DEBITUM_PASSWORD:
         log.error("DEBITUM_EMAIL and DEBITUM_PASSWORD environment variables are required.")
@@ -544,6 +563,14 @@ def run() -> None:
                 month_bonus += t.get("amount", 0.0)
         amounts["bonus_cashback_contest"] = month_bonus
         log.info("This month's bonus (AFFILIATE transactions, %s to %s): %.2f EUR.", month_start_date, today_date, month_bonus)
+
+        # The summary's totalTax covers interest AND bonus tax - split them.
+        month_bonus_tax = _bonus_tax_for_period(all_transactions, month_start_date, today_date)
+        month_interest_tax = amounts["withholding_tax"] - month_bonus_tax
+        amounts["withholding_tax_bonus"] = month_bonus_tax
+        amounts["withholding_tax_interest"] = month_interest_tax
+        amounts["net_interest_received"] = amounts["gross_interest_received"] - month_interest_tax
+        log.info("This month's taxes: on interest=%.2f EUR, on bonus=%.2f EUR.", month_interest_tax, month_bonus_tax)
 
         cash_events = []
         invested_events = []
@@ -761,8 +788,10 @@ def run() -> None:
     )
 
     bonus_breakdown = {
-        "prélèvements": amounts["withholding_tax"],
+        "prélèvements": amounts.get("withholding_tax_interest", amounts["withholding_tax"]),
     }
+    if "withholding_tax_bonus" in amounts:
+        bonus_breakdown["prélèvements bonus"] = amounts["withholding_tax_bonus"]
     if amounts["bonus_cashback_contest"]:
         bonus_breakdown["prime"] = amounts["bonus_cashback_contest"]
     if xirr_value is not None:
