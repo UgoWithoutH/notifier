@@ -451,14 +451,17 @@ def _invested_delta_for_transaction(transaction: dict) -> float:
 
 
 def _bonus_tax_for_period(transactions: list, start_date: date, end_date: date) -> float:
-    """Sum (positive) of TAX rows withheld on AFFILIATE bonuses in [start_date, end_date].
-    A bonus's TAX row shares the same id UUID suffix as its AFFILIATE row."""
+    """Sum (positive) of TAX rows withheld on bonuses in [start_date, end_date].
+    An AFFILIATE's TAX row shares its id UUID suffix; a CASHBACK's TAX row shares its createdOn second."""
     affiliate_suffixes = {
         t["id"].rsplit(":", 1)[-1] for t in transactions if t.get("transactionType") == "AFFILIATE" and t.get("id")
     }
+    cashback_seconds = {t["createdOn"][:19] for t in transactions if t.get("transactionType") == "CASHBACK" and t.get("createdOn")}
     total = 0.0
     for t in transactions:
-        if t.get("transactionType") != "TAX" or t.get("id", "").rsplit(":", 1)[-1] not in affiliate_suffixes:
+        if t.get("transactionType") != "TAX":
+            continue
+        if t.get("id", "").rsplit(":", 1)[-1] not in affiliate_suffixes and t.get("createdOn", "")[:19] not in cashback_seconds:
             continue
         try:
             t_date = _parse_transaction_date(t["createdOn"])
@@ -520,10 +523,11 @@ def run() -> None:
         amounts["gross_interest_received"] = gross_interest
         amounts["net_interest_received"] = gross_interest - withholding_tax
         amounts["withholding_tax"] = withholding_tax
-        # Monthly bonus is summed from AFFILIATE ledger rows below, not from `bonusReferral`.
+        # bonusReferral covers every bonus type (AFFILIATE + CASHBACK...), unlike summing AFFILIATE rows alone.
+        amounts["bonus_cashback_contest"] = month_summary.get("bonusReferral", 0.0) or 0.0
         log.info(
-            "This month's totals: gross_interest=%.2f EUR, withholding_tax=%.2f EUR.",
-            gross_interest, withholding_tax,
+            "This month's totals: gross_interest=%.2f EUR, withholding_tax=%.2f EUR, bonus=%.2f EUR.",
+            gross_interest, withholding_tax, amounts["bonus_cashback_contest"],
         )
     except Exception:
         log.exception("Failed to fetch this month's transactions summary - defaulting interest/tax/bonus to 0.0.")
@@ -551,19 +555,6 @@ def run() -> None:
         log.exception("Failed to fetch the since-inception transaction history - XIRR/Cash drag will not be updated.")
 
     if all_transactions is not None:
-        month_bonus = 0.0
-        for t in all_transactions:
-            if t.get("transactionType") != "AFFILIATE":
-                continue
-            try:
-                t_date = _parse_transaction_date(t["createdOn"])
-            except (KeyError, ValueError):
-                continue
-            if month_start_date <= t_date <= today_date:
-                month_bonus += t.get("amount", 0.0)
-        amounts["bonus_cashback_contest"] = month_bonus
-        log.info("This month's bonus (AFFILIATE transactions, %s to %s): %.2f EUR.", month_start_date, today_date, month_bonus)
-
         # The summary's totalTax covers interest AND bonus tax - split them.
         month_bonus_tax = _bonus_tax_for_period(all_transactions, month_start_date, today_date)
         month_interest_tax = amounts["withholding_tax"] - month_bonus_tax
