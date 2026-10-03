@@ -98,9 +98,9 @@ Data endpoints (all under api.getincome.com, `Authorization: Bearer` auth):
 Since-inception XIRR/Cash drag block (mirrors nectaro_diversification.py's
 design almost exactly, including using the SAME shared
 `shared.weighted_average.compute_time_weighted_average()` helper for
-"solde moyen pondéré investi"/"non investi"): gated behind
-`is_current_month()` (LIVE-only, needs today's real total account value) -
-NOT yet extended to support a REPORT_DATE-backfilled past month.
+"solde moyen pondéré investi"/"non investi"): also supports a
+REPORT_DATE-backfilled past month - the account value at that date is the
+live balances minus every cash/invested movement after it (see run()).
 
 Added 2026-09-09: switched the XIRR Bonus/Cash drag/Intérêts shares from
 isolated counterfactuals (cancel ONE factor, XIRR_real - XIRR_without that
@@ -480,10 +480,7 @@ def run() -> None:
         log.error("INCOME_MARKETPLACE_EMAIL and INCOME_MARKETPLACE_PASSWORD environment variables are required.")
         sys.exit(1)
 
-    # XIRR/Cash drag (like "total" elsewhere in this repo) is a LIVE-only
-    # snapshot metric (needs TODAY's real total account value as its final
-    # cashflow) - not yet extended to support a REPORT_DATE-backfilled past
-    # month.
+    # Needs the live balances as final cashflow; for a backfilled month they are backed out to the report date.
     current_month = is_current_month()
 
     log.info("Starting Income Marketplace diversification run.")
@@ -536,9 +533,11 @@ def run() -> None:
             avg_invested_balance = None
             avg_non_invested_balance = None
 
+            # Fetched through the real today so a backfill can back out later events.
+            real_today = date.today()
             all_transactions = None
             try:
-                all_transactions = get_cached_statement_transactions(page, token, today_date)
+                all_transactions = get_cached_statement_transactions(page, token, max(today_date, real_today))
             except Exception:
                 log.exception("Failed to fetch the since-inception statement history - XIRR/Cash drag will not be updated.")
 
@@ -655,15 +654,33 @@ def run() -> None:
                         rendement_brut_value * 100, {k: round(v * 100, 4) for k, v in monthly_yield_shares.items() if v is not None},
                     )
 
-                if current_month:
+                transactions_as_of = []
+                for t in all_transactions:
+                    try:
+                        if _parse_transaction_date(t["date"]) <= today_date:
+                            transactions_as_of.append(t)
+                    except (KeyError, ValueError, TypeError):
+                        continue
+
+                if transactions_as_of:
                     deposit_dates = [
-                        _parse_transaction_date(t["date"]) for t in all_transactions if t["account_type"] == DEPOSIT_TYPE
+                        _parse_transaction_date(t["date"]) for t in transactions_as_of if t["account_type"] == DEPOSIT_TYPE
                     ]
-                    total_invested = overview["invested_total"]
-                    total_account_value = total_invested + overview["cash_balance"]
+                    if today_date >= real_today:
+                        total_invested = overview["invested_total"]
+                        cash_value = overview["cash_balance"]
+                    else:
+                        # Backfill: back out every cash/invested movement after the report date from the live balances.
+                        total_invested = overview["invested_total"] - sum(v for d, v in invested_events if d > today_date)
+                        cash_value = overview["cash_balance"] - sum(v for d, v in cash_events if d > today_date)
+                        log.info(
+                            "Backfilled account value as of %s: invested=%.2f EUR, cash=%.2f EUR.",
+                            today_date, total_invested, cash_value,
+                        )
+                    total_account_value = total_invested + cash_value
 
                     signed_cashflows = []
-                    for t in all_transactions:
+                    for t in transactions_as_of:
                         if t["account_type"] not in (DEPOSIT_TYPE, WITHDRAWAL_TYPE):
                             continue
                         try:
@@ -687,8 +704,8 @@ def run() -> None:
                             xirr_value * 100, total_account_value,
                         )
 
-                        lifetime_bonus_total = sum(t["amount"] for t in all_transactions if t["account_type"] == BONUS_TYPE)
-                        lifetime_gross_interest = sum(t["amount"] for t in all_transactions if t["account_type"] == INTEREST_TYPE)
+                        lifetime_bonus_total = sum(t["amount"] for t in transactions_as_of if t["account_type"] == BONUS_TYPE)
+                        lifetime_gross_interest = sum(t["amount"] for t in transactions_as_of if t["account_type"] == INTEREST_TYPE)
 
                         # cash_drag_brut_value is now computed earlier
                         # (unconditionally, backfill-aware) - only the

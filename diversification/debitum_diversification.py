@@ -90,9 +90,9 @@ Bearer` auth):
 
 Since-inception XIRR/Cash drag block (mirrors nectaro_diversification.py's
 design exactly - see that module's own docstring for the full
-methodology): gated behind `is_current_month()` (LIVE-only, needs today's
-real total account value) - NOT extended to support a REPORT_DATE-
-backfilled past month (same documented scope limitation as Nectaro).
+methodology): supports a REPORT_DATE-backfilled past month too - the account
+value at that date is the live balances minus every cash/invested movement
+after it (see run()).
   - XIRR cashflows: every DEPOSIT (negative, money invested) and
     WITHDRAWAL (positive, money returned) transaction, since account
     inception, fetched incrementally via `debitum_xirr_cashflows_state.json`
@@ -482,10 +482,7 @@ def run() -> None:
         log.error("DEBITUM_EMAIL and DEBITUM_PASSWORD environment variables are required.")
         sys.exit(1)
 
-    # XIRR/Cash drag (like "total" elsewhere in this repo) is a LIVE-only
-    # snapshot metric (needs TODAY's real total account value as its final
-    # cashflow) - not yet extended to support a REPORT_DATE-backfilled past
-    # month (see module docstring), so gated behind is_current_month().
+    # Needs the live balances as final cashflow; for a backfilled month they are backed out to the report date.
     current_month = is_current_month()
 
     log.info("Starting Debitum diversification run (pure HTTP, no browser).")
@@ -553,9 +550,11 @@ def run() -> None:
     avg_non_invested_balance = None
     earliest_transaction_date = None
 
+    # Fetched through the real today (not the report date) so a backfill can back out later events.
+    real_today = date.today()
     all_transactions = None
     try:
-        all_transactions = get_cached_all_transactions(session, headers, today_date)
+        all_transactions = get_cached_all_transactions(session, headers, max(today_date, real_today))
     except Exception:
         log.exception("Failed to fetch the since-inception transaction history - XIRR/Cash drag will not be updated.")
 
@@ -668,12 +667,23 @@ def run() -> None:
                 rendement_brut_value * 100, {k: round(v * 100, 4) for k, v in monthly_yield_shares.items() if v is not None},
             )
 
-        if current_month:
+        if earliest_transaction_date is not None and earliest_transaction_date <= today_date:
             deposit_dates = [
-                _parse_transaction_date(t["createdOn"]) for t in all_transactions if t.get("transactionType") == "DEPOSIT"
+                _parse_transaction_date(t["createdOn"]) for t in all_transactions
+                if t.get("transactionType") == "DEPOSIT" and _parse_transaction_date(t["createdOn"]) <= today_date
             ]
-            total_invested = balances["invested_funds"]
-            total_account_value = total_invested + balances["cash_balance"]
+            if today_date >= real_today:
+                total_invested = balances["invested_funds"]
+                cash_value = balances["cash_balance"]
+            else:
+                # Backfill: back out every cash/invested movement after the report date from the live balances.
+                total_invested = balances["invested_funds"] - sum(v for d, v in invested_events if d > today_date)
+                cash_value = balances["cash_balance"] - sum(v for d, v in cash_events if d > today_date)
+                log.info(
+                    "Backfilled account value as of %s: invested=%.2f EUR, cash=%.2f EUR.",
+                    today_date, total_invested, cash_value,
+                )
+            total_account_value = total_invested + cash_value
 
             signed_cashflows = []
             for t in all_transactions:
@@ -683,6 +693,8 @@ def run() -> None:
                 try:
                     t_date = _parse_transaction_date(t["createdOn"])
                 except (KeyError, ValueError):
+                    continue
+                if t_date > today_date:
                     continue
                 amount = t.get("amount", 0.0)
                 # Debitum's `amount` is wallet-signed (DEPOSIT > 0, WITHDRAWAL < 0), so investor-side flow is -amount for both.
@@ -699,7 +711,11 @@ def run() -> None:
                 )
 
                 try:
-                    lifetime_summary = fetch_transactions_summary(session, headers, None, None)
+                    lifetime_summary = (
+                        fetch_transactions_summary(session, headers, None, None)
+                        if today_date >= real_today
+                        else fetch_transactions_summary(session, headers, XIRR_HISTORY_START_DATE, today_date)
+                    )
                 except Exception:
                     log.exception("Failed to fetch lifetime transactions summary - XIRR Bonus/Taxes/Intérêts shares will not be updated.")
                     lifetime_summary = None
