@@ -185,6 +185,8 @@ XIRR_HISTORY_START_DATE = date(2000, 1, 1)
 SESSION_STATE_FILE = Path(__file__).parent / "nectaro_diversification_session_state.json"
 XIRR_CASHFLOWS_STATE_FILE = Path(__file__).parent / "nectaro_xirr_cashflows_state.json"
 XIRR_CASHFLOWS_STATE_DEFAULT = {"transactions": [], "last_fetched_date": None}
+# Rows can be posted days after their own date, so re-fetch this many days before the cache frontier.
+XIRR_CACHE_OVERLAP_DAYS = 30
 
 
 def login(session: requests.Session) -> str:
@@ -358,9 +360,12 @@ def get_cached_statement_transactions(session: requests.Session, headers: dict, 
     cached = {t["id"]: t for t in state["transactions"]}
 
     last_fetched_date_str = state.get("last_fetched_date")
+    last_fetched_date = (
+        datetime.strptime(last_fetched_date_str, "%Y-%m-%d").date() if last_fetched_date_str else None
+    )
     fetch_start = (
-        datetime.strptime(last_fetched_date_str, "%Y-%m-%d").date()
-        if last_fetched_date_str
+        max(XIRR_HISTORY_START_DATE, last_fetched_date - timedelta(days=XIRR_CACHE_OVERLAP_DAYS))
+        if last_fetched_date
         else XIRR_HISTORY_START_DATE
     )
 
@@ -380,7 +385,7 @@ def get_cached_statement_transactions(session: requests.Session, headers: dict, 
         cached[row["id"]] = row
 
     state["transactions"] = list(cached.values())
-    state["last_fetched_date"] = end_date.strftime("%Y-%m-%d")
+    state["last_fetched_date"] = max(end_date, last_fetched_date or end_date).strftime("%Y-%m-%d")
     save_state(XIRR_CASHFLOWS_STATE_FILE, state)
 
     log.info("%d cached statement transaction(s) in total.", len(cached))
