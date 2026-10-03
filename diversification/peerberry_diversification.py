@@ -215,6 +215,8 @@ REPORT_TIMEZONE = ZoneInfo("Europe/Paris")
 SESSION_STATE_FILE = Path(__file__).parent / "peerberry_diversification_session_state.json"
 XIRR_CASHFLOWS_STATE_FILE = Path(__file__).parent / "peerberry_xirr_cashflows_state.json"
 XIRR_CASHFLOWS_STATE_DEFAULT = {"all_entries": [], "last_fetched_date": None}
+# Rows can be posted days after their own date, so re-fetch this many days before the cache frontier.
+XIRR_CACHE_OVERLAP_DAYS = 30
 # XIRR is a since-inception money-weighted return (not per-month) - this
 # start date is early enough to cover any real account's full history
 # (PeerBerry itself only launched in 2017).
@@ -408,7 +410,11 @@ def get_cached_transactions(session: requests.Session, end_date: str) -> list:
     """
     state = load_state(XIRR_CASHFLOWS_STATE_FILE, XIRR_CASHFLOWS_STATE_DEFAULT)
     cached_entries = state.get("all_entries") or []
-    start_date = state.get("last_fetched_date") or XIRR_HISTORY_START_DATE
+    last_fetched_date = state.get("last_fetched_date")
+    start_date = (
+        max(XIRR_HISTORY_START_DATE, (datetime.strptime(last_fetched_date, "%Y-%m-%d") - timedelta(days=XIRR_CACHE_OVERLAP_DAYS)).strftime("%Y-%m-%d"))
+        if last_fetched_date else XIRR_HISTORY_START_DATE
+    )
 
     log.info(
         "Found %d cached transaction(s) (last fetched up to %s) - fetching only new entries from %s to %s...",

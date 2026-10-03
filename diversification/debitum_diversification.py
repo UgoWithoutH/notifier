@@ -216,6 +216,8 @@ XIRR_HISTORY_START_DATE = date(2000, 1, 1)
 SESSION_STATE_FILE = Path(__file__).parent / "debitum_diversification_session_state.json"
 XIRR_CASHFLOWS_STATE_FILE = Path(__file__).parent / "debitum_xirr_cashflows_state.json"
 XIRR_CASHFLOWS_STATE_DEFAULT = {"transactions": [], "last_fetched_date": None}
+# Rows can be posted days after their own date, so re-fetch this many days before the cache frontier.
+XIRR_CACHE_OVERLAP_DAYS = 30
 
 
 def login(session: requests.Session) -> str:
@@ -382,9 +384,12 @@ def get_cached_all_transactions(session: requests.Session, headers: dict, end_da
     cached = {t["id"]: t for t in state["transactions"]}
 
     last_fetched_date_str = state.get("last_fetched_date")
+    last_fetched_date = (
+        datetime.strptime(last_fetched_date_str, "%Y-%m-%d").date() if last_fetched_date_str else None
+    )
     fetch_start = (
-        datetime.strptime(last_fetched_date_str, "%Y-%m-%d").date()
-        if last_fetched_date_str
+        max(XIRR_HISTORY_START_DATE, last_fetched_date - timedelta(days=XIRR_CACHE_OVERLAP_DAYS))
+        if last_fetched_date
         else XIRR_HISTORY_START_DATE
     )
 
@@ -404,7 +409,7 @@ def get_cached_all_transactions(session: requests.Session, headers: dict, end_da
         cached[row["id"]] = row
 
     state["transactions"] = list(cached.values())
-    state["last_fetched_date"] = end_date.strftime("%Y-%m-%d")
+    state["last_fetched_date"] = max(end_date, last_fetched_date or end_date).strftime("%Y-%m-%d")
     save_state(XIRR_CASHFLOWS_STATE_FILE, state)
 
     log.info("%d cached transaction(s) in total.", len(cached))
@@ -680,7 +685,8 @@ def run() -> None:
                 except (KeyError, ValueError):
                     continue
                 amount = t.get("amount", 0.0)
-                signed_cashflows.append((t_date, -amount if ttype == "DEPOSIT" else amount))
+                # Debitum's `amount` is wallet-signed (DEPOSIT > 0, WITHDRAWAL < 0), so investor-side flow is -amount for both.
+                signed_cashflows.append((t_date, -amount))
             signed_cashflows.append((today_date, total_account_value))
 
             xirr_value = compute_xirr(signed_cashflows)

@@ -183,6 +183,8 @@ INTEREST_TYPE = "2199023"
 BONUS_TYPE = "2199024"
 
 XIRR_HISTORY_START_DATE = date(2000, 1, 1)
+# Rows can show up in the statement days after their own Date (e.g. a withdrawal dated 09-29 only visible on 10-02), so re-fetch this many days before the cache frontier.
+XIRR_CACHE_OVERLAP_DAYS = 30
 XIRR_CASHFLOWS_STATE_FILE = Path(__file__).parent / "income_marketplace_xirr_cashflows_state.json"
 XIRR_CASHFLOWS_STATE_DEFAULT = {"transactions": [], "last_fetched_date": None}
 STORAGE_STATE_FILE = Path(__file__).parent / "income_marketplace_diversification_storage_state.json"
@@ -410,9 +412,12 @@ def get_cached_statement_transactions(page, token: str, end_date: date) -> list:
     }
 
     last_fetched_date_str = state.get("last_fetched_date")
+    last_fetched_date = (
+        datetime.strptime(last_fetched_date_str, "%Y-%m-%d").date() if last_fetched_date_str else None
+    )
     fetch_start = (
-        datetime.strptime(last_fetched_date_str, "%Y-%m-%d").date()
-        if last_fetched_date_str
+        max(XIRR_HISTORY_START_DATE, last_fetched_date - timedelta(days=XIRR_CACHE_OVERLAP_DAYS))
+        if last_fetched_date
         else XIRR_HISTORY_START_DATE
     )
 
@@ -435,7 +440,7 @@ def get_cached_statement_transactions(page, token: str, end_date: date) -> list:
         cached[key] = row
 
     state["transactions"] = list(cached.values())
-    state["last_fetched_date"] = end_date.strftime("%Y-%m-%d")
+    state["last_fetched_date"] = max(end_date, last_fetched_date or end_date).strftime("%Y-%m-%d")
     save_state(XIRR_CASHFLOWS_STATE_FILE, state)
 
     log.info("%d cached statement transaction(s) in total.", len(cached))
@@ -548,6 +553,15 @@ def run() -> None:
                         continue
                     cash_events.append((t_date, _cash_delta_for_type(t["account_type"], t["amount"])))
                     invested_events.append((t_date, _invested_delta_for_type(t["account_type"], t["amount"])))
+
+                if current_month:
+                    reconstructed_cash = sum(v for _, v in cash_events)
+                    if abs(reconstructed_cash - overview["cash_balance"]) > 0.05:
+                        log.warning(
+                            "Reconstructed wallet balance (%.2f EUR) != live cash balance (%.2f EUR) - "
+                            "statement history is likely incomplete, XIRR may be wrong.",
+                            reconstructed_cash, overview["cash_balance"],
+                        )
 
                 # Anchored on the real LIVE overview["invested_total"]/
                 # ["cash_balance"] (only meaningful for the real current

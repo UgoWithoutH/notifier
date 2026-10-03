@@ -147,6 +147,8 @@ XIRR_CASHFLOWS_STATE_FILE = Path(__file__).parent / "swaper_xirr_cashflows_state
 # Cash drag reconstruction reuses the SAME incremental fetch instead of
 # re-fetching the whole history every run - see get_cached_account_cashflows().
 XIRR_CASHFLOWS_STATE_DEFAULT = {"cashflows": [], "all_entries": [], "last_fetched_date": None}
+# Rows can be posted days after their own date, so re-fetch this many days before the cache frontier.
+XIRR_CACHE_OVERLAP_DAYS = 30
 # Verified live 2026-08-14 (full-history probe): pageSize=1000 returned this
 # account's entire history (352 records) in one page - a larger pageSize
 # (5000) was REJECTED by the API with HTTP 400 (undocumented server-side
@@ -575,7 +577,11 @@ def get_cached_account_cashflows(page, end_date: str) -> tuple:
     state = load_state(XIRR_CASHFLOWS_STATE_FILE, XIRR_CASHFLOWS_STATE_DEFAULT)
     cached_cashflows = state["cashflows"]
     cached_all_entries = state.get("all_entries", [])
-    start_date = state["last_fetched_date"] or XIRR_HISTORY_START_DATE
+    last_fetched_date = state["last_fetched_date"]
+    start_date = (
+        max(XIRR_HISTORY_START_DATE, (datetime.strptime(last_fetched_date, "%Y-%m-%d") - timedelta(days=XIRR_CACHE_OVERLAP_DAYS)).strftime("%Y-%m-%d"))
+        if last_fetched_date else XIRR_HISTORY_START_DATE
+    )
     if not cached_all_entries and cached_cashflows and start_date != XIRR_HISTORY_START_DATE:
         # Migration from a pre-"all_entries" cache file: last_fetched_date is
         # already advanced but all_entries was never populated - force ONE
@@ -620,7 +626,7 @@ def get_cached_account_cashflows(page, end_date: str) -> tuple:
         seen_entries.add(key)
         merged_all_entries.append(entry)
 
-    save_state(XIRR_CASHFLOWS_STATE_FILE, {"cashflows": merged_cashflows, "all_entries": merged_all_entries, "last_fetched_date": end_date})
+    save_state(XIRR_CASHFLOWS_STATE_FILE, {"cashflows": merged_cashflows, "all_entries": merged_all_entries, "last_fetched_date": max(end_date, last_fetched_date or end_date)})
     log.info(
         "XIRR cashflow cache now holds %d cashflow(s)/%d total entrie(s) (was %d/%d before this run).",
         len(merged_cashflows), len(merged_all_entries), len(cached_cashflows), len(cached_all_entries),
