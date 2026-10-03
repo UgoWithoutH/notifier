@@ -253,6 +253,8 @@ REPORT_TIMEZONE = ZoneInfo("Europe/Paris")
 SESSION_STATE_FILE = Path(__file__).parent / "bienpreter_diversification_session_state.json"
 XIRR_CASHFLOWS_STATE_FILE = Path(__file__).parent / "bienpreter_xirr_cashflows_state.json"
 XIRR_CASHFLOWS_STATE_DEFAULT = {"rows": [], "last_fetched_date": None}
+# Rows can be posted days after their own date, so re-fetch this many days before the cache frontier.
+XIRR_CACHE_OVERLAP_DAYS = 30
 # XIRR is a since-inception money-weighted return (not per-month) - this
 # start date is early enough to cover any real account's full history.
 XIRR_HISTORY_START_DATE = date(2000, 1, 1)
@@ -701,9 +703,12 @@ def get_cached_operations(session: requests.Session, end_date: date) -> list:
     """
     state = load_state(XIRR_CASHFLOWS_STATE_FILE, XIRR_CASHFLOWS_STATE_DEFAULT)
     cached_rows = state.get("rows", [])
+    last_fetched_date = (
+        datetime.strptime(state["last_fetched_date"], "%Y-%m-%d").date() if state.get("last_fetched_date") else None
+    )
     start_date = (
-        datetime.strptime(state["last_fetched_date"], "%Y-%m-%d").date()
-        if state.get("last_fetched_date") else XIRR_HISTORY_START_DATE
+        max(XIRR_HISTORY_START_DATE, last_fetched_date - timedelta(days=XIRR_CACHE_OVERLAP_DAYS))
+        if last_fetched_date else XIRR_HISTORY_START_DATE
     )
 
     if start_date > end_date:
@@ -731,7 +736,10 @@ def get_cached_operations(session: requests.Session, end_date: date) -> list:
         seen.add(key)
         merged.append(row)
 
-    save_state(XIRR_CASHFLOWS_STATE_FILE, {"rows": merged, "last_fetched_date": end_date.strftime("%Y-%m-%d")})
+    save_state(XIRR_CASHFLOWS_STATE_FILE, {
+        "rows": merged,
+        "last_fetched_date": max(end_date, last_fetched_date or end_date).strftime("%Y-%m-%d"),
+    })
     log.info("Operations cache now holds %d row(s) (was %d before this run).", len(merged), len(cached_rows))
     return merged
 
