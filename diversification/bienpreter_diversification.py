@@ -252,7 +252,9 @@ REPORT_TIMEZONE = ZoneInfo("Europe/Paris")
 # history (77+ pages) on every run.
 SESSION_STATE_FILE = Path(__file__).parent / "bienpreter_diversification_session_state.json"
 XIRR_CASHFLOWS_STATE_FILE = Path(__file__).parent / "bienpreter_xirr_cashflows_state.json"
-XIRR_CASHFLOWS_STATE_DEFAULT = {"rows": [], "last_fetched_date": None}
+# Bump when the cached row shape changes (v2: interest/embedded tax parsed from each row's detail panel).
+XIRR_CACHE_SCHEMA_VERSION = 2
+XIRR_CASHFLOWS_STATE_DEFAULT = {"rows": [], "last_fetched_date": None, "schema_version": XIRR_CACHE_SCHEMA_VERSION}
 # Rows can be posted days after their own date, so re-fetch this many days before the cache frontier.
 XIRR_CACHE_OVERLAP_DAYS = 30
 # XIRR is a since-inception money-weighted return (not per-month) - this
@@ -651,11 +653,35 @@ def _fetch_operations_page(session: requests.Session, start_date: str, end_date:
             except ValueError:
                 row_date = None
 
+        label = _strip_tags(name_match.group(1)) if name_match else None
+        amount_text = _strip_tags(amount_match.group(1)) if amount_match else None
+        interest_texts = [_strip_tags(t) for t in interest_matches]
+        embedded_tax = 0.0
+
+        # Repayment rows carry a "Capital remboursé / Intérêts remboursés / Prélèvements fiscaux et sociaux"
+        # panel. Older rows (and early repayments) have no `.transaction__interests` cell at all, and their
+        # amount is NET of the tax (no separate "Prélèvements fiscaux" row) - so the panel is the only
+        # complete source for gross interest and that embedded tax.
+        details_match = re.search(r'transaction__project__details[^>]*>(.*?)</div>\s*</td>', row_html, re.DOTALL)
+        if details_match:
+            details_text = html.unescape(_strip_tags(details_match.group(1)))
+            panel_interests = re.findall(r"Intérêts remboursés\s*:\s*([\d.,\s]+?)\s*€", details_text)
+            if panel_interests:
+                interest_texts = panel_interests
+            if label and label.startswith("Remboursement"):
+                panel_capital = sum(_parse_amount(t) or 0.0 for t in re.findall(r"Capital remboursé\s*:\s*([\d.,\s]+?)\s*€", details_text))
+                panel_tax = sum(_parse_amount(t) or 0.0 for t in re.findall(r"Prélèvements fiscaux et sociaux\s*:\s*([\d.,\s]+?)\s*€", details_text))
+                panel_interest_total = sum(_parse_amount(t) or 0.0 for t in interest_texts)
+                row_amount = abs(_parse_amount(amount_text) or 0.0)
+                if panel_tax > 0 and abs(row_amount - (panel_capital + panel_interest_total - panel_tax)) <= 0.011:
+                    embedded_tax = panel_tax
+
         rows.append(
             {
-                "label": _strip_tags(name_match.group(1)) if name_match else None,
-                "amountText": _strip_tags(amount_match.group(1)) if amount_match else None,
-                "interestTexts": [_strip_tags(t) for t in interest_matches],
+                "label": label,
+                "amountText": amount_text,
+                "interestTexts": interest_texts,
+                "embeddedTax": embedded_tax,
                 "date": row_date,
                 "balance": _parse_amount(_strip_tags(balance_match.group(1))) if balance_match else None,
             }
@@ -702,6 +728,9 @@ def get_cached_operations(session: requests.Session, end_date: date) -> list:
     different transactions extremely unlikely.
     """
     state = load_state(XIRR_CASHFLOWS_STATE_FILE, XIRR_CASHFLOWS_STATE_DEFAULT)
+    if state.get("schema_version") != XIRR_CACHE_SCHEMA_VERSION:
+        log.info("Operations cache has an outdated row shape - discarding it and re-fetching the full history.")
+        state = dict(XIRR_CASHFLOWS_STATE_DEFAULT)
     cached_rows = state.get("rows", [])
     last_fetched_date = (
         datetime.strptime(state["last_fetched_date"], "%Y-%m-%d").date() if state.get("last_fetched_date") else None
@@ -739,6 +768,7 @@ def get_cached_operations(session: requests.Session, end_date: date) -> list:
     save_state(XIRR_CASHFLOWS_STATE_FILE, {
         "rows": merged,
         "last_fetched_date": max(end_date, last_fetched_date or end_date).strftime("%Y-%m-%d"),
+        "schema_version": XIRR_CACHE_SCHEMA_VERSION,
     })
     log.info("Operations cache now holds %d row(s) (was %d before this run).", len(merged), len(cached_rows))
     return merged
@@ -840,6 +870,7 @@ def _total_account_value_delta_for_row(row: dict) -> float:
         delta += amount
     elif label == "Prélèvements fiscaux":
         delta -= amount
+    delta -= row.get("embeddedTax") or 0.0
     for interest_text in row.get("interestTexts") or []:
         delta += _parse_amount(interest_text) or 0.0
     return delta
@@ -920,6 +951,7 @@ def fetch_current_month_interest_totals(session: requests.Session) -> dict:
             gross_interest_received += _parse_amount(interest_text) or 0.0
 
         label = row.get("label") or ""
+        withholding_tax += row.get("embeddedTax") or 0.0
         if label == "Pr\u00e9l\u00e8vements fiscaux":
             withholding_tax += abs(_parse_amount(row.get("amountText")) or 0.0)
         elif label == "Bonus":
@@ -1115,7 +1147,7 @@ def run() -> None:
 
             lifetime_withholding_tax = sum(
                 abs(_parse_amount(r.get("amountText")) or 0.0) for r in operations_as_of if r["label"] == "Prélèvements fiscaux"
-            )
+            ) + sum(r.get("embeddedTax") or 0.0 for r in operations_as_of)
             lifetime_net_interest = lifetime_gross_interest - lifetime_withholding_tax
 
             # cash_weight/monthly_yield_rate use the already-computed
