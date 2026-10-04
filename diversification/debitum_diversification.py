@@ -443,16 +443,17 @@ def _cash_delta_for_transaction(transaction: dict) -> float:
     return transaction.get("amount", 0.0)
 
 
-# Signed delta to the INVESTED (outstanding) balance - only "INVESTMENT"
-# is known to move money INTO investedEur (its own `amount` is negative,
-# mirroring SUBSCRIPTION's real debit for the same loan purchase, see the
-# module docstring's accounting-quirk paragraph) - so the invested balance
-# INCREASES by -amount. No principal-repayment transaction type has been
+# Signed delta to the INVESTED (outstanding) balance - "SUBSCRIPTION" is
+# the real cash debit (see the module docstring's accounting-quirk
+# paragraph), so the invested balance INCREASES by -amount at that date.
+# Using "INVESTMENT" (booked ~12h-1 day later) left that money in neither
+# bucket for a day, understating the day-weighted average total balance
+# (-6.8% in 08/2026) - the neutral INVESTMENT row is ignored here. No principal-repayment transaction type has been
 # observed yet on this (young) account to decrease it - every other type
 # is treated as neutral here, same "don't guess" convention as elsewhere
 # in this repo. If a real principal-repayment type is ever observed, add
 # it here (decrease = -amount) instead of leaving this at 0.0.
-_INVESTED_INCREASE_TRANSACTION_TYPES = {"INVESTMENT"}
+_INVESTED_INCREASE_TRANSACTION_TYPES = {"SUBSCRIPTION"}
 
 
 def _invested_delta_for_transaction(transaction: dict) -> float:
