@@ -464,6 +464,8 @@ _CASH_DEBIT_TRANSACTION_TYPES = {"INVESTMENT"}
 _CASH_CREDIT_TRANSACTION_TYPES = {
     "FUNDING", "REPAYMENT_PRINCIPAL", "REPAYMENT_INTEREST",
     "BUYBACK_PRINCIPAL", "BUYBACK_INTEREST", "EXTENSION_INTEREST",
+    # Secondary-market sale of a loan share: cash comes back in (see _OUTSTANDING_DECREASE_TYPES).
+    "INVESTMENT_SELL",
 }
 
 
@@ -538,7 +540,8 @@ def compute_average_idle_cash(entries: list, opening_balance: float, closing_bal
     if day_count == 0:
         return (opening_balance + closing_balance) / 2
 
-    if abs(running_balance - closing_balance) > 0.05:
+    # Per-entry amounts are rounded to cents, so ~0.1 EUR of drift over hundreds of entries is expected.
+    if abs(running_balance - closing_balance) > 0.10:
         log.warning(
             "Reconstructed closing balance (%.2f EUR) from all account-entries types doesn't match the API's own closing_balance (%.2f EUR) - "
             "an unmapped transactionType may exist; the average idle cash below may be slightly off.",
@@ -693,7 +696,8 @@ def fetch_referral_bonus_earned(page) -> float:
 # below to compute this figure for an arbitrary PAST end_date, mirroring
 # afranga_diversification.reconstruct_outstanding()/_outstanding_delta_for_label().
 _OUTSTANDING_INCREASE_TYPES = {"INVESTMENT"}
-_OUTSTANDING_DECREASE_TYPES = {"REPAYMENT_PRINCIPAL", "BUYBACK_PRINCIPAL"}
+# INVESTMENT_SELL = loan share sold on the secondary market; credited at par (verified exact vs the live outstanding, 2026-10).
+_OUTSTANDING_DECREASE_TYPES = {"REPAYMENT_PRINCIPAL", "BUYBACK_PRINCIPAL", "INVESTMENT_SELL"}
 
 
 def _outstanding_delta_for_entry(transaction_type: str, amount: float) -> float:
@@ -842,7 +846,7 @@ def _warn_if_wallet_balance_mismatch(all_entries: list, end_date, closing_balanc
         except (TypeError, ValueError):
             continue
         reconstructed += _cash_delta_for_entry(transaction_type, amount)
-    if abs(reconstructed - closing_balance_as_of) > 0.05:
+    if abs(reconstructed - closing_balance_as_of) > 0.10:
         log.warning(
             "Reconstructed uninvested-cash balance (%.2f EUR) as of %s doesn't match the API's own closing_balance "
             "(%.2f EUR) for the same date - the terminal value used for this XIRR-as-of computation may be wrong.",

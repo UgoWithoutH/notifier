@@ -183,6 +183,7 @@ MONEFIT_PASSWORD = os.environ.get("MONEFIT_PASSWORD")
 SESSION_STATE_FILE = Path(__file__).parent / "monefit_diversification_session_state.json"
 XIRR_CASHFLOWS_STATE_FILE = Path(__file__).parent / "monefit_xirr_cashflows_state.json"
 XIRR_CASHFLOWS_STATE_DEFAULT = {"monthly_summaries": {}, "last_fetched_month": None}
+XIRR_CACHE_SCHEMA_VERSION = 2
 # Conservative floor for the one-time yearly scan used to find the
 # account's real inception year (see _find_first_active_year()) - well
 # before Monefit SmartSaver existed, just a safety bound on the scan length.
@@ -316,6 +317,23 @@ def fetch_statement_summary(session: requests.Session, start_date: date, end_dat
         log.warning("Could not parse 'closingBalance' %r.", result.get("closingBalance"))
         closing_balance = None
 
+    # Live audit 2026-10: the endpoint's `interestIncome`/`totalEarnings`
+    # are ~0 (e.g. 0.00000775 for a month in which the balance grew by
+    # ~40 EUR) - SmartSaver compounds the vault interest inside the balance
+    # and never reports it there. The ledger identity closing = opening +
+    # deposits - withdrawals + interest + bonus - fees is exact, so the real
+    # gross interest is derived from it whenever it clearly exceeds the
+    # reported figure.
+    if closing_balance is not None:
+        ledger_interest = round(closing_balance - opening_balance - deposits + withdrawals - rewards_bonuses + fees, 2)
+        if ledger_interest > daily_returns + 0.01:
+            log.info(
+                "account/summary interestIncome (%.2f EUR) is far below the balance-ledger interest (%.2f EUR) "
+                "for %s to %s - using the ledger figure.",
+                daily_returns, ledger_interest, start_date, end_date,
+            )
+            daily_returns = ledger_interest
+
     log.info(
         "Parsed statement totals: daily_returns=%.2f, vault_interest=%.2f, rewards_bonuses=%.2f, matured_vaults=%.2f, "
         "deposits=%.2f, withdrawals=%.2f, fees=%.2f, opening_balance=%.2f, closing_balance=%s",
@@ -371,6 +389,11 @@ def get_cached_monthly_summaries(session: requests.Session, today: date) -> dict
     lendermarket_diversification.get_cached_monthly_summaries()/
     iuvo_diversification.get_cached_monthly_summaries()."""
     state = load_state(XIRR_CASHFLOWS_STATE_FILE, XIRR_CASHFLOWS_STATE_DEFAULT)
+    if state.get("schema_version") != XIRR_CACHE_SCHEMA_VERSION:
+        # v1 summaries stored the API's near-zero interestIncome - refetch
+        # every month with the ledger-derived interest.
+        log.info("Monthly summaries cache has an outdated schema - discarding it and refetching everything.")
+        state = {}
     monthly_summaries = dict(state.get("monthly_summaries") or {})
     last_fetched_month = state.get("last_fetched_month")
 
@@ -409,6 +432,7 @@ def get_cached_monthly_summaries(session: requests.Session, today: date) -> dict
     save_state(XIRR_CASHFLOWS_STATE_FILE, {
         "monthly_summaries": monthly_summaries,
         "last_fetched_month": f"{today.year:04d}-{today.month:02d}",
+        "schema_version": XIRR_CACHE_SCHEMA_VERSION,
     })
     log.info("Monthly summaries cache now holds %d month(s).", len(monthly_summaries))
     return monthly_summaries
