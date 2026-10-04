@@ -514,7 +514,9 @@ def fetch_statement_totals(session: requests.Session, start_date: date, end_date
     for row in parsed_rows:
         label = row.get("label") or ""
         if label.startswith("Gross interest received"):
-            gross_interest_received = _parse_amount(row.get("value"))
+            gross_interest_received += _parse_amount(row.get("value"))
+        elif label == "Interest received from early repayment":
+            gross_interest_received += _parse_amount(row.get("value"))
         elif label == "Withholding Tax":
             withholding_tax = _parse_amount(row.get("value"))
         elif label.startswith("Opening balance"):
@@ -896,7 +898,7 @@ _OUTSTANDING_INCREASE_LABELS = {"Investments in loans"}
 # are inspected live and this can be classified with confidence.
 _OUTSTANDING_NEUTRAL_LABELS = {
     "Deposited funds", "Withdrawn funds", "Withholding Tax",
-    "Interest received", "Bonus received", "Cashback bonus",
+    "Interest received", "Interest received from early repayment", "Bonus received", "Cashback bonus",
     "Registration Bonus",
 }
 
@@ -930,7 +932,8 @@ def _outstanding_delta_for_label(label: str, net_amount: float) -> float:
     if label in _OUTSTANDING_INCREASE_LABELS:
         return abs(net_amount or 0.0)
     lowered = label.lower()
-    if "principal" in lowered or "savesmart" in lowered:
+    # "<id> Loan <id> [<originator>] Secondary Market Sale": loan sold on the secondary market, principal leaves the invested balance (cash received at par, verified exact vs live outstanding 2026-10).
+    if "principal" in lowered or "savesmart" in lowered or "secondary market sale" in lowered:
         return -abs(net_amount or 0.0)
     if label in _OUTSTANDING_NEUTRAL_LABELS:
         return 0.0

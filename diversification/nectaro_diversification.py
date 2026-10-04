@@ -276,8 +276,18 @@ def fetch_overview(session: requests.Session, headers: dict) -> dict:
 
     cash_balance = customer.get("cashAccountBalance", 0.0)
     invested_funds = dashboard.get("investedFunds", customer.get("portfolioAmount", 0.0))
-    log.info("Overview: cash_balance=%.2f EUR, invested_funds=%.2f EUR.", cash_balance, invested_funds)
-    return {"cash_balance": cash_balance, "invested_funds": invested_funds}
+    # `pendingPayments`: loan payments already due/received by the lending
+    # company but not yet credited to the wallet (live audit 2026-10: the
+    # platform's own `totalValue` = investedFunds + pendingPayments + cash,
+    # and the statement ledger reconciles to that totalValue exactly, NOT to
+    # investedFunds + cash). Kept separate from `invested_funds` so the
+    # residue-based geographic breakdown still sums to invested_funds.
+    pending_payments = dashboard.get("pendingPayments", 0.0) or 0.0
+    log.info(
+        "Overview: cash_balance=%.2f EUR, invested_funds=%.2f EUR, pending_payments=%.2f EUR.",
+        cash_balance, invested_funds, pending_payments,
+    )
+    return {"cash_balance": cash_balance, "invested_funds": invested_funds, "pending_payments": pending_payments}
 
 
 def fetch_portfolio_by_lending_company(session: requests.Session, headers: dict) -> list:
@@ -457,7 +467,7 @@ def run() -> None:
     today_date = get_report_date()
 
     amounts = {
-        "total": overview["invested_funds"] + overview["cash_balance"],
+        "total": overview["invested_funds"] + overview["cash_balance"] + overview.get("pending_payments", 0.0),
         "gross_interest_received": 0.0,
         "net_interest_received": 0.0,
         "withholding_tax": 0.0,
@@ -632,7 +642,10 @@ def run() -> None:
                     "Backfilled account value as of %s: invested=%.2f EUR, cash=%.2f EUR.",
                     today_date, total_invested, cash_value,
                 )
-            total_account_value = total_invested + cash_value
+            # Pending payments are part of the platform's own totalValue (see
+            # fetch_overview()); for a backfilled date the current amount is
+            # used as an approximation (no historical equivalent exists).
+            total_account_value = total_invested + cash_value + overview.get("pending_payments", 0.0)
 
             signed_cashflows = []
             for t in transactions_as_of:
