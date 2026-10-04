@@ -489,6 +489,24 @@ def fetch_account_balance(session: requests.Session, investor_id: str) -> float 
         return None
 
 
+def fetch_account_pending_payments(session: requests.Session, investor_id: str) -> float:
+    """Fetch `investorPendingPaymentsAmount` (EUR): repayments already received
+    by the platform but not yet credited to the wallet/statement - part of
+    the platform's own `investorAccountValueAmount`. Returns 0.0 on failure."""
+    try:
+        r = session.get(
+            BALANCE_API_URL,
+            params={"currency": "EUR"},
+            headers=_xsrf_headers(session, investor_id),
+            timeout=20,
+        )
+        r.raise_for_status()
+        return float((r.json().get("data") or {}).get("investorPendingPaymentsAmount") or 0.0)
+    except Exception:
+        log.exception("Failed to fetch the Lendermarket pending payments - assuming 0.0.")
+        return 0.0
+
+
 def login_and_fetch_balance() -> tuple:
     """Log in once and return `(session, investor_id, balance)` - the
     authenticated session/investor_id are kept (unlike the old

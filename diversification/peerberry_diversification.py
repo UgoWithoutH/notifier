@@ -972,6 +972,26 @@ def run() -> None:
         except Exception:
             log.exception("Failed to load the cached transaction history - XIRR will not be updated for this backfilled month.")
             all_entries = None
+        # A stale cache (last real run older than the backfilled month's
+        # end) silently drops every transaction in between and corrupts the
+        # reconstructed wallet/outstanding (live audit 2026-10: cache stopped
+        # at 2026-08-14, backfilled 08/2026 XIRR came out at -54.88%).
+        # Refreshing up to the REAL wall-clock day is safe for the cache
+        # (never a simulated/future date, see 2026-08-21 BUGFIX) - skipped
+        # when the cache already covers the backfilled month's end.
+        real_today = datetime.now(REPORT_TIMEZONE).date()
+        cache_last_fetched = None
+        try:
+            raw_last_fetched = load_state(XIRR_CASHFLOWS_STATE_FILE, XIRR_CASHFLOWS_STATE_DEFAULT).get("last_fetched_date")
+            cache_last_fetched = datetime.strptime(raw_last_fetched, "%Y-%m-%d").date() if raw_last_fetched else None
+        except Exception:
+            cache_last_fetched = None
+        if all_entries and (cache_last_fetched is None or cache_last_fetched < today_date) and real_today >= today_date:
+            try:
+                log.info("Cached transactions only go up to %s - refreshing up to the real day %s before the backfill.", cache_last_fetched, real_today)
+                all_entries = get_cached_transactions(session, real_today.strftime("%Y-%m-%d"))
+            except Exception:
+                log.exception("Failed to refresh the stale transaction cache - using the cached rows as-is (backfilled XIRR may be wrong).")
 
     xirr_value = None
     signed_cashflows = None

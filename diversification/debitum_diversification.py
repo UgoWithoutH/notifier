@@ -215,7 +215,9 @@ XIRR_HISTORY_START_DATE = date(2000, 1, 1)
 
 SESSION_STATE_FILE = Path(__file__).parent / "debitum_diversification_session_state.json"
 XIRR_CASHFLOWS_STATE_FILE = Path(__file__).parent / "debitum_xirr_cashflows_state.json"
-XIRR_CASHFLOWS_STATE_DEFAULT = {"transactions": [], "last_fetched_date": None}
+# v2: rows are keyed by (id, transactionType) - an INTEREST_REPAYMENT and its INTEREST_BOOST_REPAYMENT share one `id`.
+XIRR_CACHE_SCHEMA_VERSION = 2
+XIRR_CASHFLOWS_STATE_DEFAULT = {"transactions": [], "last_fetched_date": None, "schema_version": None}
 # Rows can be posted days after their own date, so re-fetch this many days before the cache frontier.
 XIRR_CACHE_OVERLAP_DAYS = 30
 
@@ -381,7 +383,10 @@ def get_cached_all_transactions(session: requests.Session, headers: dict, end_da
     XIRR_CASHFLOWS_STATE_FILE and deduped by Debitum's own transaction
     `id` field (a real, stable, per-row unique string, confirmed live)."""
     state = load_state(XIRR_CASHFLOWS_STATE_FILE, XIRR_CASHFLOWS_STATE_DEFAULT)
-    cached = {t["id"]: t for t in state["transactions"]}
+    if state.get("schema_version") != XIRR_CACHE_SCHEMA_VERSION:
+        log.info("Transactions cache has an outdated shape - discarding it and re-fetching the full history.")
+        state = dict(XIRR_CASHFLOWS_STATE_DEFAULT)
+    cached = {(t["id"], t.get("transactionType")): t for t in state["transactions"]}
 
     last_fetched_date_str = state.get("last_fetched_date")
     last_fetched_date = (
@@ -406,9 +411,10 @@ def get_cached_all_transactions(session: requests.Session, headers: dict, end_da
     log.info("Fetching transactions from %s to %s (incremental cache)...", fetch_start, end_date)
     new_rows = fetch_all_transactions(session, headers, fetch_start, end_date)
     for row in new_rows:
-        cached[row["id"]] = row
+        cached[(row["id"], row.get("transactionType"))] = row
 
     state["transactions"] = list(cached.values())
+    state["schema_version"] = XIRR_CACHE_SCHEMA_VERSION
     state["last_fetched_date"] = max(end_date, last_fetched_date or end_date).strftime("%Y-%m-%d")
     save_state(XIRR_CASHFLOWS_STATE_FILE, state)
 
