@@ -107,6 +107,15 @@ counterfactual as "taxes_xirr_contribution"/"XIRR Taxes/Frais" (the
 "taxes/frais" log message name was itself a hint this was ambiguous) - now
 correctly attributed to "XIRR Frais" only.
 
+Added 2026-10-04: vault interest. account/summary's interestIncome/bonus
+only cover main-account interest and rewards - interest accruing inside
+vaults (~39 EUR/month here) is in neither, yet is part of the "Total Wealth"
+closing balance. fetch_statement_summary() derives it as `vault_interest` =
+closing - opening - net deposits - interestIncome - bonus + fees (verified
+against the sum of the vaults' own `earned` fields), and it is now added to
+interest everywhere (Sheet "interets brut", XIRR waterfalls, Cash drag,
+monthly yield waterfall). Old caches without it are refetched once.
+
 Required env vars:
     MONEFIT_EMAIL, MONEFIT_PASSWORD    -> Monefit SmartSaver account credentials
 Optional:
@@ -276,6 +285,24 @@ def fetch_statement_summary(session: requests.Session, start_date: date, end_dat
             log.warning("Could not parse %r %r - defaulting to 0.0.", key, result.get(key))
             return 0.0
 
+    def _raw(key):
+        try:
+            return float(result.get(key) or 0.0)
+        except (TypeError, ValueError):
+            return 0.0
+
+    # Vault interest accrues inside the vault balance and is absent from interestIncome/bonus -
+    # derive it from the wealth change (maturities/payouts only move money between vaults and cash).
+    vault_interest = 0.0
+    if result.get("closingBalance") is not None:
+        vault_interest = (
+            _raw("closingBalance") - _raw("openingBalance") - (_raw("depositSum") - _raw("withdrawalSum"))
+            - _raw("interestIncome") - _raw("bonus") + _raw("fees")
+        )
+        vault_interest = round(vault_interest, 2) if abs(vault_interest) >= 0.005 else 0.0
+    else:
+        log.warning("No 'closingBalance' - vault interest cannot be derived, defaulting to 0.0.")
+
     daily_returns = _amount("interestIncome")
     rewards_bonuses = _amount("bonus")
     matured_vaults = _amount("maturedVaults")
@@ -290,12 +317,13 @@ def fetch_statement_summary(session: requests.Session, start_date: date, end_dat
         closing_balance = None
 
     log.info(
-        "Parsed statement totals: daily_returns=%.2f, rewards_bonuses=%.2f, matured_vaults=%.2f, "
+        "Parsed statement totals: daily_returns=%.2f, vault_interest=%.2f, rewards_bonuses=%.2f, matured_vaults=%.2f, "
         "deposits=%.2f, withdrawals=%.2f, fees=%.2f, opening_balance=%.2f, closing_balance=%s",
-        daily_returns, rewards_bonuses, matured_vaults, deposits, withdrawals, fees, opening_balance, closing_balance,
+        daily_returns, vault_interest, rewards_bonuses, matured_vaults, deposits, withdrawals, fees, opening_balance, closing_balance,
     )
     return {
         "daily_returns": daily_returns,
+        "vault_interest": vault_interest,
         "rewards_bonuses": rewards_bonuses,
         "matured_vaults": matured_vaults,
         "deposits": deposits,
@@ -304,6 +332,11 @@ def fetch_statement_summary(session: requests.Session, start_date: date, end_dat
         "opening_balance": opening_balance,
         "closing_balance": closing_balance,
     }
+
+
+def _total_interest(summary: dict) -> float:
+    """Main-account interest plus vault interest (absent from entries cached before vault support)."""
+    return summary["daily_returns"] + summary.get("vault_interest", 0.0)
 
 
 def fetch_current_month_statement_totals(session: requests.Session) -> dict:
@@ -340,6 +373,11 @@ def get_cached_monthly_summaries(session: requests.Session, today: date) -> dict
     state = load_state(XIRR_CASHFLOWS_STATE_FILE, XIRR_CASHFLOWS_STATE_DEFAULT)
     monthly_summaries = dict(state.get("monthly_summaries") or {})
     last_fetched_month = state.get("last_fetched_month")
+
+    if any("vault_interest" not in s for s in monthly_summaries.values()):
+        log.info("Cached monthly summaries predate vault interest support - refetching the full history.")
+        monthly_summaries = {}
+        last_fetched_month = None
 
     if last_fetched_month:
         start_year, start_month = (int(part) for part in last_fetched_month.split("-"))
@@ -406,13 +444,14 @@ def run() -> None:
             "Failed to fetch this month's From daily returns/Rewards & bonuses/Matured Vaults - "
             "defaulting all three to 0.0."
         )
-        statement_totals = {"daily_returns": 0.0, "rewards_bonuses": 0.0, "matured_vaults": 0.0, "deposits": 0.0, "withdrawals": 0.0, "fees": 0.0, "opening_balance": 0.0, "closing_balance": None}
+        statement_totals = {"daily_returns": 0.0, "vault_interest": 0.0, "rewards_bonuses": 0.0, "matured_vaults": 0.0, "deposits": 0.0, "withdrawals": 0.0, "fees": 0.0, "opening_balance": 0.0, "closing_balance": None}
 
+    interest_total = _total_interest(statement_totals)
     originators = [{"originator": LOAN_ORIGINATOR_LABEL, "outstanding": balance}]
     log.info("Monefit balance: %.2f EUR", balance)
     log.info(
-        "This month's From daily returns: %.2f EUR, Rewards & bonuses: %.2f EUR, Matured Vaults: %.2f EUR",
-        statement_totals["daily_returns"], statement_totals["rewards_bonuses"], statement_totals["matured_vaults"],
+        "This month's From daily returns: %.2f EUR, Vault interest: %.2f EUR, Rewards & bonuses: %.2f EUR, Matured Vaults: %.2f EUR",
+        statement_totals["daily_returns"], statement_totals["vault_interest"], statement_totals["rewards_bonuses"], statement_totals["matured_vaults"],
     )
 
     # Monefit's account/summary API has no gross/net/withholding-tax
@@ -443,11 +482,12 @@ def run() -> None:
 
     amounts = {
         "total": total,
-        "gross_interest_received": statement_totals["daily_returns"],
-        "net_interest_received": statement_totals["daily_returns"],
+        "gross_interest_received": interest_total,
+        "net_interest_received": interest_total,
         "withholding_tax": 0.0,
         "bonus_cashback_contest": statement_totals["rewards_bonuses"],
         "daily_returns": statement_totals["daily_returns"],
+        "vault_interest": statement_totals["vault_interest"],
         "rewards_bonuses": statement_totals["rewards_bonuses"],
         "matured_vaults": statement_totals["matured_vaults"],
     }
@@ -560,7 +600,7 @@ def run() -> None:
                 # full 4-step waterfall further below whenever Cash drag
                 # CAN be computed (current month only).
                 lifetime_fees_total = sum(s["fees"] for s in relevant_summaries.values())
-                lifetime_gross_interest_total_as_of = sum(s["daily_returns"] for s in relevant_summaries.values())
+                lifetime_gross_interest_total_as_of = sum(_total_interest(s) for s in relevant_summaries.values())
 
                 # Monefit has genuine, real platform fees ("fees" field,
                 # see module docstring) but NO withholding-tax data at all
@@ -586,7 +626,7 @@ def run() -> None:
 
     if current_month and total_invested > 0:
         cash_weight = avg_idle_cash / (avg_idle_cash + total_invested)
-        monthly_yield_rate = statement_totals["daily_returns"] / total_invested
+        monthly_yield_rate = interest_total / total_invested
         cash_drag_brut_value = cash_weight * monthly_yield_rate
         # Monefit has no withholding-tax data at all (see module
         # docstring) - net interest equals gross here, so "Cash drag net"
@@ -608,7 +648,7 @@ def run() -> None:
         avg_total_balance_month = total_invested + avg_idle_cash
         missed_earnings_month = cash_drag_brut_value * avg_total_balance_month
         monthly_yield_steps = [
-            ("Intérêts brut %", statement_totals["daily_returns"] + missed_earnings_month),
+            ("Intérêts brut %", interest_total + missed_earnings_month),
             ("Cash drag brut %", -missed_earnings_month),
             ("Bonus brut %", statement_totals["rewards_bonuses"]),
             ("Frais brut %", -statement_totals["fees"]),
@@ -625,7 +665,7 @@ def run() -> None:
 
         if xirr_value is not None and signed_cashflows is not None and monthly_summaries:
             cash_weight_lifetime = cash_weight  # no real historical idle-cash time series - reuse the live snapshot (see comment above).
-            lifetime_gross_interest_total = sum(s["daily_returns"] for s in monthly_summaries.values())
+            lifetime_gross_interest_total = sum(_total_interest(s) for s in monthly_summaries.values())
             lifetime_yield_rate = lifetime_gross_interest_total / total_invested
             cash_drag_lifetime_total = cash_weight_lifetime * lifetime_yield_rate
             missed_earnings = cash_drag_lifetime_total * (avg_idle_cash + total_invested)
