@@ -588,6 +588,20 @@ def run() -> None:
     if monthly_summaries:
         monthly_summaries_as_of = {k: v for k, v in monthly_summaries.items() if k <= today_month_key}
 
+        # Before the account's first activity the backward reconstruction only leaves residual noise
+        # (e.g. 0.28 EUR -> "solde moyen pondéré investi" 0.14), so skip the whole month.
+        first_activity_key = min(
+            (k for k, s in monthly_summaries.items()
+             if s["deposits"] or s["withdrawals"] or s["opening_balance"] or s["closing_balance"]),
+            default=None,
+        )
+        if not current_month and (first_activity_key is None or today_month_key < first_activity_key):
+            log.info(
+                "Account had no activity yet in %s (first activity: %s) - nothing written for this month.",
+                today_month_key, first_activity_key,
+            )
+            return
+
     xirr_value = None
     signed_cashflows = None
     total_account_value = None
