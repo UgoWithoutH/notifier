@@ -805,46 +805,47 @@ def run() -> None:
             rendement_brut_value * 100, {k: round(v * 100, 4) for k, v in monthly_yield_shares.items() if v is not None},
         )
 
-        if xirr_value is not None and signed_cashflows is not None and monthly_summaries_as_of:
-            avg_idle_cash_lifetime = compute_average_idle_cash(monthly_summaries_as_of)
-            cash_weight_lifetime = avg_idle_cash_lifetime / (avg_idle_cash_lifetime + total_invested)
-            lifetime_gross_interest_total = sum(s["interest_received"] for s in monthly_summaries_as_of.values())
-            lifetime_yield_rate = lifetime_gross_interest_total / total_invested
-            cash_drag_lifetime_total = cash_weight_lifetime * lifetime_yield_rate
-            missed_earnings = cash_drag_lifetime_total * (avg_idle_cash_lifetime + total_invested)
-            lifetime_fees_total = sum(s["fees"] for s in monthly_summaries_as_of.values())
-            # Interest inside pending payments is in the account value but not yet in the statement.
-            ledger_value = sum(
-                s["deposits"] - s["withdrawals"] + s["interest_received"] + s["bonuses"] - s["fees"]
-                for s in monthly_summaries_as_of.values()
-            )
-            pending_interest = max(0.0, total_account_value - ledger_value)
-            # Waterfall decomposition (switched from Shapley 2026-09-09,
-            # see shared/xirr_waterfall.py's module docstring for why) -
-            # walks a true 0%-return baseline up to total_account_value in
-            # the fixed order Intérêts -> Cash drag -> Bonus -> Frais (no
-            # Taxes step - Lendermarket has no withholding-tax data source
-            # at all, hardcoded 0.0 instead, see module docstring).
-            # "investorFeeAmount" is a genuine, distinct platform FEE (not
-            # a tax) - mapped to "XIRR Frais" here.
-            steps = [
-                ("XIRR Intérêts", lifetime_gross_interest_total + pending_interest + missed_earnings),
-                ("XIRR Cash drag", -missed_earnings),
-                ("XIRR Bonus", lifetime_bonus_total),
-                ("XIRR Frais", -lifetime_fees_total),
-            ]
-            waterfall_shares = compute_waterfall_xirr_shares(
-                signed_cashflows[:-1], today_date, total_account_value, steps,
-                log=log, log_context="Lendermarket",
-            )
-            bonus_xirr_contribution = waterfall_shares.get("XIRR Bonus")
-            cash_drag_xirr_contribution = waterfall_shares.get("XIRR Cash drag")
-            frais_xirr_contribution = waterfall_shares.get("XIRR Frais")
-            interest_xirr_contribution = waterfall_shares.get("XIRR Intérêts")
-            log.info(
-                "XIRR Waterfall shares (since-inception, avg idle cash %.2f EUR, missed earnings ~%.2f EUR): %r",
-                avg_idle_cash_lifetime, missed_earnings, {k: round(v * 100, 4) for k, v in waterfall_shares.items() if v is not None},
-            )
+    # Lifetime shares don't need the previous month's balances (first month of the account).
+    if xirr_value is not None and signed_cashflows is not None and monthly_summaries_as_of and total_invested > 0:
+        avg_idle_cash_lifetime = compute_average_idle_cash(monthly_summaries_as_of)
+        cash_weight_lifetime = avg_idle_cash_lifetime / (avg_idle_cash_lifetime + total_invested)
+        lifetime_gross_interest_total = sum(s["interest_received"] for s in monthly_summaries_as_of.values())
+        lifetime_yield_rate = lifetime_gross_interest_total / total_invested
+        cash_drag_lifetime_total = cash_weight_lifetime * lifetime_yield_rate
+        missed_earnings = cash_drag_lifetime_total * (avg_idle_cash_lifetime + total_invested)
+        lifetime_fees_total = sum(s["fees"] for s in monthly_summaries_as_of.values())
+        # Interest inside pending payments is in the account value but not yet in the statement.
+        ledger_value = sum(
+            s["deposits"] - s["withdrawals"] + s["interest_received"] + s["bonuses"] - s["fees"]
+            for s in monthly_summaries_as_of.values()
+        )
+        pending_interest = max(0.0, total_account_value - ledger_value)
+        # Waterfall decomposition (switched from Shapley 2026-09-09,
+        # see shared/xirr_waterfall.py's module docstring for why) -
+        # walks a true 0%-return baseline up to total_account_value in
+        # the fixed order Intérêts -> Cash drag -> Bonus -> Frais (no
+        # Taxes step - Lendermarket has no withholding-tax data source
+        # at all, hardcoded 0.0 instead, see module docstring).
+        # "investorFeeAmount" is a genuine, distinct platform FEE (not
+        # a tax) - mapped to "XIRR Frais" here.
+        steps = [
+            ("XIRR Intérêts", lifetime_gross_interest_total + pending_interest + missed_earnings),
+            ("XIRR Cash drag", -missed_earnings),
+            ("XIRR Bonus", lifetime_bonus_total),
+            ("XIRR Frais", -lifetime_fees_total),
+        ]
+        waterfall_shares = compute_waterfall_xirr_shares(
+            signed_cashflows[:-1], today_date, total_account_value, steps,
+            log=log, log_context="Lendermarket",
+        )
+        bonus_xirr_contribution = waterfall_shares.get("XIRR Bonus")
+        cash_drag_xirr_contribution = waterfall_shares.get("XIRR Cash drag")
+        frais_xirr_contribution = waterfall_shares.get("XIRR Frais")
+        interest_xirr_contribution = waterfall_shares.get("XIRR Intérêts")
+        log.info(
+            "XIRR Waterfall shares (since-inception, avg idle cash %.2f EUR, missed earnings ~%.2f EUR): %r",
+            avg_idle_cash_lifetime, missed_earnings, {k: round(v * 100, 4) for k, v in waterfall_shares.items() if v is not None},
+        )
 
     # "total" comes from a live balance call/summed active investments plus
     # the available (uninvested) balance, and
