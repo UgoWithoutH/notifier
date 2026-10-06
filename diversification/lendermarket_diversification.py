@@ -458,6 +458,13 @@ def _invested_balance_at_month_end(monthly_summaries: dict, live_total_account_v
     Returns None if `month_key` isn't cached."""
     if month_key not in monthly_summaries:
         return None
+    # Before the first deposit nothing can be invested; the backward walk would otherwise leave a small
+    # residual (pending payments, write-offs...) that blows up any ratio divided by it.
+    net_deposited_through = sum(
+        s["deposits"] - s["withdrawals"] for k, s in monthly_summaries.items() if k <= month_key
+    )
+    if net_deposited_through < 0.005:
+        return 0.0
     value_change_since = sum(
         s["deposits"] - s["withdrawals"] + s["interest_received"] + s["bonuses"] - s["fees"]
         for k, s in monthly_summaries.items() if k > month_key
