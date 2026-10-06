@@ -1,4 +1,5 @@
-"""LOCAL-ONLY helper: opens a real, visible browser on mintos.com and
+"""LOCAL-ONLY helper: opens a new tab in your REAL Chrome (a plain OS
+process, not launched through Playwright) on mintos.com and
 automatically fills in your email/password (MINTOS_EMAIL/MINTOS_PASSWORD)
 and, if a 2FA page appears, your TOTP code (MINTOS_TOTP_SECRET) - then
 captures the resulting session cookies and immediately runs the full
@@ -20,8 +21,17 @@ it in the visible window, then continues automatically from there
 (including automating the 2FA step that follows, so you don't need to
 type your TOTP code either).
 
+Real Chrome vs. Playwright-launched Chromium: a real Chrome started as a
+normal process (with `--remote-debugging-port` and a persistent dedicated
+profile) has no automation launch signature and keeps its cookies/history
+between runs, which gives reCAPTCHA a much better trust signal than a blank
+fresh Chromium every time. It is NOT your everyday Chrome profile: since
+Chrome 136, `--remote-debugging-port` is ignored on the default profile, so
+a separate profile (kept in your home folder) is used. If a Chrome with that
+profile is already running on the debug port, a new tab is opened in it.
+
 Usage: `python -m diversification.mintos_get_session`
-1. A visible Chromium window opens on the Mintos login page.
+1. A tab opens in real Chrome on the Mintos login page.
 2. Email/password are filled and submitted automatically.
 3. IF a CAPTCHA puzzle appears on THIS login/password page (unpredictable,
    detected by looking for the reCAPTCHA iframe), the script pauses and
@@ -63,6 +73,7 @@ the fetched data to the Sheet.
 """
 
 import os
+import subprocess
 import sys
 import time
 import logging
@@ -83,10 +94,60 @@ log = logging.getLogger("mintos_get_session")
 
 LOGIN_URL = "https://www.mintos.com/fr/login/"
 LOGIN_WAIT_TIMEOUT_MS = 15_000  # after auto-submitting credentials, how long to wait before assuming a CAPTCHA is blocking
+DEBUG_PORT = 9334  # distinct from lande_get_session.py's 9333 so both can run side by side
+CHROME_CANDIDATES = [
+    r"C:\Program Files\Google\Chrome\Application\chrome.exe",
+    r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
+    os.path.expandvars(r"%LOCALAPPDATA%\Google\Chrome\Application\chrome.exe"),
+]
+# Persistent (not TEMP) so cookies/history survive between runs and reCAPTCHA sees a lived-in profile.
+PROFILE_DIR = os.path.join(os.path.expanduser("~"), ".mintos_get_session_chrome_profile")
+CDP_URL = f"http://localhost:{DEBUG_PORT}"
 
 MINTOS_EMAIL = os.environ.get("MINTOS_EMAIL")
 MINTOS_PASSWORD = os.environ.get("MINTOS_PASSWORD")
 MINTOS_TOTP_SECRET = os.environ.get("MINTOS_TOTP_SECRET")
+
+
+def _find_chrome() -> str:
+    for path in CHROME_CANDIDATES:
+        if os.path.exists(path):
+            return path
+    raise RuntimeError(
+        f"Could not find chrome.exe in any of: {CHROME_CANDIDATES}. "
+        "Install Google Chrome, or edit CHROME_CANDIDATES in this file."
+    )
+
+
+def _debug_port_open() -> bool:
+    try:
+        return requests.get(f"{CDP_URL}/json/version", timeout=1).ok
+    except requests.RequestException:
+        return False
+
+
+def _ensure_real_chrome_running() -> None:
+    if _debug_port_open():
+        log.info("Real Chrome already running on debug port %s - a new tab will be opened in it.", DEBUG_PORT)
+        return
+    chrome_path = _find_chrome()
+    log.info("Launching real Chrome (%s) with a persistent profile, remote debugging on :%s ...", chrome_path, DEBUG_PORT)
+    subprocess.Popen([
+        chrome_path,
+        f"--remote-debugging-port={DEBUG_PORT}",
+        f"--user-data-dir={PROFILE_DIR}",
+        "--no-first-run",
+        "--no-default-browser-check",
+        "about:blank",
+    ])
+    for _ in range(20):
+        if _debug_port_open():
+            return
+        time.sleep(0.5)
+    raise RuntimeError(
+        f"Chrome did not expose the debug port {DEBUG_PORT}. If a Chrome using the profile "
+        f"{PROFILE_DIR} is already open without it, close that window and retry."
+    )
 
 
 def _dismiss_cookie_banner(page) -> None:
@@ -177,9 +238,10 @@ def build_session_from_cookies(cookies: dict) -> requests.Session:
 
 
 def main() -> None:
+    _ensure_real_chrome_running()
     with sync_playwright() as p:
-        browser = p.chromium.launch(headless=False)
-        context = browser.new_context(locale="fr-FR")
+        browser = p.chromium.connect_over_cdp(CDP_URL)
+        context = browser.contexts[0]
         page = context.new_page()
 
         log.info("Navigating to the Mintos login page...")
@@ -206,6 +268,8 @@ def main() -> None:
 
         raw_cookies = context.cookies()
         wanted = {c["name"]: c["value"] for c in raw_cookies if c["name"] in ("PHPSESSID", "MW_SESSION_ID")}
+        page.close()
+        # Only disconnects Playwright - the real Chrome process stays open.
         browser.close()
 
     if "PHPSESSID" not in wanted or "MW_SESSION_ID" not in wanted:
