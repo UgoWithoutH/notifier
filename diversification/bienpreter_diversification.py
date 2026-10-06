@@ -136,6 +136,14 @@ genuine, independently-measured figure (same category of computation as
 Bonus/Taxes, not a derived leftover), so the two can be compared/sanity-
 checked against each other on the sheet/dashboard side.
 
+UPDATE 2026-10-06: the backward reconstruction below is NO LONGER used by
+run() - it propagated every later loss/drift (e.g. loans sold at a
+discount) into past months and gave absurd XIRRs (330769% for 2025-04).
+A backfilled month's total_account_value is now rebuilt FORWARD from
+inception via _total_account_value_delta_for_row() (same as
+compute_average_balances()). The lifetime XIRR waterfall shares also no
+longer depend on the previous month having a balance (first-month accounts).
+
 UPDATE 2026-09-07 (implemented via backward reconstruction, resolving the
 limitation noted below): forward-reconstructing "capital à recevoir" for
 an arbitrary past date is still impossible (see the unchanged paragraph
@@ -1088,19 +1096,18 @@ def run() -> None:
         if current_month:
             total_account_value = total  # solde disponible + capital à recevoir, same "as if withdrawn today" value used elsewhere in this repo
         else:
-            # Backfilled month: reconstruct today_date's total account
-            # value by subtracting today's live total every real external
-            # cashflow/interest/bonus/tax event dated after today_date, then
-            # derive capital à recevoir as a remainder (total minus the real
-            # replayed "Solde indicatif" cash balance) - see module docstring.
-            value_change_since = _net_value_change(all_operations, today_date, real_today)
-            total_account_value = total - value_change_since
-            available_balance_as_of = _balance_as_of(all_operations, today_date)
+            # Backfilled month: rebuild today_date's total account value
+            # FORWARD from inception (same per-row deltas as
+            # compute_average_balances()). The old backward reconstruction
+            # from today's live total carried every later loss/drift into
+            # past months and produced absurd XIRRs (e.g. 330769% for 2025-04).
+            total_account_value = sum(_total_account_value_delta_for_row(r) for r in operations_as_of)
+            available_balance_as_of = _balance_as_of(operations_as_of, today_date)
             total_invested = total_account_value - available_balance_as_of
             log.info(
-                "Backfilled month (%s): reconstructed total_account_value=%.2f EUR (live total %.2f EUR - "
-                "%.2f EUR net change since then), available_balance_as_of=%.2f EUR, total_invested=%.2f EUR.",
-                today_date, total_account_value, total, value_change_since, available_balance_as_of, total_invested,
+                "Backfilled month (%s): forward-reconstructed total_account_value=%.2f EUR, "
+                "available_balance_as_of=%.2f EUR, total_invested=%.2f EUR.",
+                today_date, total_account_value, available_balance_as_of, total_invested,
             )
 
         signed_cashflows = []
@@ -1211,55 +1218,57 @@ def run() -> None:
                     rendement_brut_value * 100, {k: round(v * 100, 4) for k, v in monthly_yield_shares.items() if v is not None},
                 )
 
-                deposit_dates = [r["date"] for r in operations_as_of if r.get("date") and r["label"] == "Dépôt de fonds"]
-                if deposit_dates and total_invested > 0:
-                    since_inception_date = datetime.strptime(min(deposit_dates), "%Y-%m-%d").date()
-                    years_elapsed = max((today_date - since_inception_date).days / 365.25, 1 / 365.25)
-                    # lifetime_gross_interest already computed above (used
-                    # by XIRR Intérêts too) - reused here, not recomputed.
-                    avg_idle_cash_lifetime = compute_average_idle_cash(
-                        operations_as_of, since_inception_date.strftime("%Y-%m-%d"), today_str
-                    )
-                    cash_weight_lifetime = avg_idle_cash_lifetime / (avg_idle_cash_lifetime + total_invested)
-                    lifetime_yield_rate = lifetime_gross_interest / total_invested
-                    cash_drag_lifetime_total = cash_weight_lifetime * lifetime_yield_rate
-                    missed_earnings = cash_drag_lifetime_total * (avg_idle_cash_lifetime + total_invested)
+            # Lifetime waterfall does not depend on the previous month's balances,
+            # so it must also run for an account's first month (no prior capital).
+            deposit_dates = [r["date"] for r in operations_as_of if r.get("date") and r["label"] == "Dépôt de fonds"]
+            if deposit_dates and total_invested > 0:
+                since_inception_date = datetime.strptime(min(deposit_dates), "%Y-%m-%d").date()
+                years_elapsed = max((today_date - since_inception_date).days / 365.25, 1 / 365.25)
+                # lifetime_gross_interest already computed above (used
+                # by XIRR Intérêts too) - reused here, not recomputed.
+                avg_idle_cash_lifetime = compute_average_idle_cash(
+                    operations_as_of, since_inception_date.strftime("%Y-%m-%d"), today_str
+                )
+                cash_weight_lifetime = avg_idle_cash_lifetime / (avg_idle_cash_lifetime + total_invested)
+                lifetime_yield_rate = lifetime_gross_interest / total_invested
+                cash_drag_lifetime_total = cash_weight_lifetime * lifetime_yield_rate
+                missed_earnings = cash_drag_lifetime_total * (avg_idle_cash_lifetime + total_invested)
 
-                    # Waterfall decomposition (switched from Shapley
-                    # 2026-09-09, see shared/xirr_waterfall.py's module
-                    # docstring for why): walks a true 0%-return baseline
-                    # up to total_account_value in the fixed order
-                    # Intérêts -> Cash drag -> Bonus -> Frais -> Taxes,
-                    # using GROSS interest (not net) at the Intérêts step
-                    # and subtracting missed_earnings right after - each
-                    # euro counted exactly once, so the shares sum
-                    # EXACTLY to XIRR real (checked at runtime via a
-                    # warning log). Bienprêter has no platform-fee
-                    # concept distinct from withholding tax
-                    # ("Prélèvements fiscaux" is the only fiscal/fee-like
-                    # operation type ever seen on this account) - "XIRR
-                    # Frais" is hardcoded to 0.0 rather than
-                    # duplicating/inventing a value, and is skipped from
-                    # the steps below.
-                    steps = [
-                        ("XIRR Intérêts", lifetime_gross_interest + missed_earnings),
-                        ("XIRR Cash drag", -missed_earnings),
-                        ("XIRR Bonus", lifetime_bonus_total),
-                        ("XIRR Taxes", -lifetime_withholding_tax),
-                    ]
-                    waterfall_shares = compute_waterfall_xirr_shares(
-                        signed_cashflows[:-1], today_date, total_account_value, steps,
-                        log=log, log_context="Bienprêter",
-                    )
-                    bonus_xirr_contribution = waterfall_shares.get("XIRR Bonus")
-                    cash_drag_xirr_contribution = waterfall_shares.get("XIRR Cash drag")
-                    taxes_xirr_contribution = waterfall_shares.get("XIRR Taxes")
-                    frais_xirr_contribution = 0.0
-                    interest_xirr_contribution = waterfall_shares.get("XIRR Intérêts")
-                    log.info(
-                        "XIRR Waterfall shares (since-inception, %.2f years, missed earnings ~%.2f EUR): %r",
-                        years_elapsed, missed_earnings, {k: round(v * 100, 4) for k, v in waterfall_shares.items() if v is not None},
-                    )
+                # Waterfall decomposition (switched from Shapley
+                # 2026-09-09, see shared/xirr_waterfall.py's module
+                # docstring for why): walks a true 0%-return baseline
+                # up to total_account_value in the fixed order
+                # Intérêts -> Cash drag -> Bonus -> Frais -> Taxes,
+                # using GROSS interest (not net) at the Intérêts step
+                # and subtracting missed_earnings right after - each
+                # euro counted exactly once, so the shares sum
+                # EXACTLY to XIRR real (checked at runtime via a
+                # warning log). Bienprêter has no platform-fee
+                # concept distinct from withholding tax
+                # ("Prélèvements fiscaux" is the only fiscal/fee-like
+                # operation type ever seen on this account) - "XIRR
+                # Frais" is hardcoded to 0.0 rather than
+                # duplicating/inventing a value, and is skipped from
+                # the steps below.
+                steps = [
+                    ("XIRR Intérêts", lifetime_gross_interest + missed_earnings),
+                    ("XIRR Cash drag", -missed_earnings),
+                    ("XIRR Bonus", lifetime_bonus_total),
+                    ("XIRR Taxes", -lifetime_withholding_tax),
+                ]
+                waterfall_shares = compute_waterfall_xirr_shares(
+                    signed_cashflows[:-1], today_date, total_account_value, steps,
+                    log=log, log_context="Bienprêter",
+                )
+                bonus_xirr_contribution = waterfall_shares.get("XIRR Bonus")
+                cash_drag_xirr_contribution = waterfall_shares.get("XIRR Cash drag")
+                taxes_xirr_contribution = waterfall_shares.get("XIRR Taxes")
+                frais_xirr_contribution = 0.0
+                interest_xirr_contribution = waterfall_shares.get("XIRR Intérêts")
+                log.info(
+                    "XIRR Waterfall shares (since-inception, %.2f years, missed earnings ~%.2f EUR): %r",
+                    years_elapsed, missed_earnings, {k: round(v * 100, 4) for k, v in waterfall_shares.items() if v is not None},
+                )
 
     # "total" = solde disponible + capital à recevoir, both scraped from
     # LIVE-only dashboard widgets with no date param and no historical/
