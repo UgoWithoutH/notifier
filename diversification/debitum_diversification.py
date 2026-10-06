@@ -739,50 +739,49 @@ def run() -> None:
                 # cash_drag_brut_value is now computed earlier (unconditionally,
                 # backfill-aware) - only the lifetime waterfall shares
                 # still need this current-month-only XIRR block.
-                if cash_drag_brut_value is not None:
-                    if deposit_dates and lifetime_summary is not None and total_invested > 0:
-                        since_inception_date = min(deposit_dates)
-                        avg_idle_cash_lifetime = compute_time_weighted_average(cash_events, since_inception_date, today_date)
-                        cash_weight_lifetime = avg_idle_cash_lifetime / (avg_idle_cash_lifetime + total_invested)
-                        lifetime_yield_rate = lifetime_gross_interest / total_invested
-                        cash_drag_lifetime_total = cash_weight_lifetime * lifetime_yield_rate
-                        missed_earnings = cash_drag_lifetime_total * (avg_idle_cash_lifetime + total_invested)
+                if deposit_dates and lifetime_summary is not None and total_invested > 0:
+                    since_inception_date = min(deposit_dates)
+                    avg_idle_cash_lifetime = compute_time_weighted_average(cash_events, since_inception_date, today_date)
+                    cash_weight_lifetime = avg_idle_cash_lifetime / (avg_idle_cash_lifetime + total_invested)
+                    lifetime_yield_rate = lifetime_gross_interest / total_invested
+                    cash_drag_lifetime_total = cash_weight_lifetime * lifetime_yield_rate
+                    missed_earnings = cash_drag_lifetime_total * (avg_idle_cash_lifetime + total_invested)
 
-                        # Waterfall decomposition (switched from Shapley
-                        # 2026-09-09, see shared/xirr_waterfall.py's
-                        # module docstring for why): walks a true
-                        # 0%-return baseline up to total_account_value in
-                        # the fixed order Intérêts -> Cash drag -> Bonus
-                        # -> Frais -> Taxes, using GROSS interest (not
-                        # net) at the Intérêts step and subtracting
-                        # missed_earnings right after - each euro counted
-                        # exactly once, so the shares sum EXACTLY to XIRR
-                        # real (checked at runtime via a warning log).
-                        # Debitum has no platform-fee concept distinct
-                        # from withholding tax (transactions-summary only
-                        # ever exposes "totalTax", no separate fee field)
-                        # - "XIRR Frais" is hardcoded to 0.0 rather than
-                        # duplicating/inventing a value, and is skipped
-                        # from the steps below.
-                        steps = [
-                            ("XIRR Intérêts", lifetime_gross_interest + missed_earnings),
-                            ("XIRR Cash drag", -missed_earnings),
-                            ("XIRR Bonus", lifetime_bonus_total),
-                            ("XIRR Taxes", -lifetime_withholding_tax),
-                        ]
-                        waterfall_shares = compute_waterfall_xirr_shares(
-                            signed_cashflows[:-1], today_date, total_account_value, steps,
-                            log=log, log_context="Debitum",
-                        )
-                        bonus_xirr_contribution = waterfall_shares.get("XIRR Bonus")
-                        cash_drag_xirr_contribution = waterfall_shares.get("XIRR Cash drag")
-                        taxes_xirr_contribution = waterfall_shares.get("XIRR Taxes")
-                        frais_xirr_contribution = 0.0
-                        interest_xirr_contribution = waterfall_shares.get("XIRR Intérêts")
-                        log.info(
-                            "XIRR Waterfall shares (since-inception, missed earnings ~%.2f EUR): %r",
-                            missed_earnings, {k: round(v * 100, 4) for k, v in waterfall_shares.items() if v is not None},
-                        )
+                    # Waterfall decomposition (switched from Shapley
+                    # 2026-09-09, see shared/xirr_waterfall.py's
+                    # module docstring for why): walks a true
+                    # 0%-return baseline up to total_account_value in
+                    # the fixed order Intérêts -> Cash drag -> Bonus
+                    # -> Frais -> Taxes, using GROSS interest (not
+                    # net) at the Intérêts step and subtracting
+                    # missed_earnings right after - each euro counted
+                    # exactly once, so the shares sum EXACTLY to XIRR
+                    # real (checked at runtime via a warning log).
+                    # Debitum has no platform-fee concept distinct
+                    # from withholding tax (transactions-summary only
+                    # ever exposes "totalTax", no separate fee field)
+                    # - "XIRR Frais" is hardcoded to 0.0 rather than
+                    # duplicating/inventing a value, and is skipped
+                    # from the steps below.
+                    steps = [
+                        ("XIRR Intérêts", lifetime_gross_interest + missed_earnings),
+                        ("XIRR Cash drag", -missed_earnings),
+                        ("XIRR Bonus", lifetime_bonus_total),
+                        ("XIRR Taxes", -lifetime_withholding_tax),
+                    ]
+                    waterfall_shares = compute_waterfall_xirr_shares(
+                        signed_cashflows[:-1], today_date, total_account_value, steps,
+                        log=log, log_context="Debitum",
+                    )
+                    bonus_xirr_contribution = waterfall_shares.get("XIRR Bonus")
+                    cash_drag_xirr_contribution = waterfall_shares.get("XIRR Cash drag")
+                    taxes_xirr_contribution = waterfall_shares.get("XIRR Taxes")
+                    frais_xirr_contribution = 0.0
+                    interest_xirr_contribution = waterfall_shares.get("XIRR Intérêts")
+                    log.info(
+                        "XIRR Waterfall shares (since-inception, missed earnings ~%.2f EUR): %r",
+                        missed_earnings, {k: round(v * 100, 4) for k, v in waterfall_shares.items() if v is not None},
+                    )
 
     # For a backfilled (non-current) month, only write to the Sheet if the
     # account actually existed by then (had at least one real transaction
