@@ -260,8 +260,9 @@ REPORT_TIMEZONE = ZoneInfo("Europe/Paris")
 # history (77+ pages) on every run.
 SESSION_STATE_FILE = Path(__file__).parent / "bienpreter_diversification_session_state.json"
 XIRR_CASHFLOWS_STATE_FILE = Path(__file__).parent / "bienpreter_xirr_cashflows_state.json"
-# Bump when the cached row shape changes (v2: interest/embedded tax parsed from each row's detail panel).
-XIRR_CACHE_SCHEMA_VERSION = 2
+# Bump when the cached row shape changes (v2: interest/embedded tax parsed from each row's detail panel;
+# v3: v2 caches still held pre-panel-parsing rows with no interest for early 2025, forcing a full refetch).
+XIRR_CACHE_SCHEMA_VERSION = 3
 XIRR_CASHFLOWS_STATE_DEFAULT = {"rows": [], "last_fetched_date": None, "schema_version": XIRR_CACHE_SCHEMA_VERSION}
 # Rows can be posted days after their own date, so re-fetch this many days before the cache frontier.
 XIRR_CACHE_OVERLAP_DAYS = 30

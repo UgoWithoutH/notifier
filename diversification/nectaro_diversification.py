@@ -702,38 +702,37 @@ def run() -> None:
                 # cash_drag_brut_value is now computed earlier (unconditionally,
                 # backfill-aware) - only the lifetime waterfall shares
                 # still need this current-month-only XIRR block.
-                if cash_drag_brut_value is not None:
-                    if deposit_dates and total_invested > 0:
-                        since_inception_date = min(deposit_dates)
-                        avg_idle_cash_lifetime = compute_time_weighted_average(cash_events, since_inception_date, today_date)
-                        cash_weight_lifetime = avg_idle_cash_lifetime / (avg_idle_cash_lifetime + total_invested)
-                        lifetime_yield_rate = lifetime_gross_interest / total_invested
-                        cash_drag_lifetime_total = cash_weight_lifetime * lifetime_yield_rate
-                        missed_earnings = cash_drag_lifetime_total * (avg_idle_cash_lifetime + total_invested)
+                if deposit_dates and total_invested > 0:
+                    since_inception_date = min(deposit_dates)
+                    avg_idle_cash_lifetime = compute_time_weighted_average(cash_events, since_inception_date, today_date)
+                    cash_weight_lifetime = avg_idle_cash_lifetime / (avg_idle_cash_lifetime + total_invested)
+                    lifetime_yield_rate = lifetime_gross_interest / total_invested
+                    cash_drag_lifetime_total = cash_weight_lifetime * lifetime_yield_rate
+                    missed_earnings = cash_drag_lifetime_total * (avg_idle_cash_lifetime + total_invested)
 
-                        # Waterfall decomposition (switched from Shapley
-                        # 2026-09-09, see shared/xirr_waterfall.py's
-                        # module docstring for why) - full 4-step walk,
-                        # overriding the 3-step (no cash drag) partial
-                        # result computed further above.
-                        steps = [
-                            ("XIRR Intérêts", lifetime_gross_interest + missed_earnings),
-                            ("XIRR Cash drag", -missed_earnings),
-                            ("XIRR Bonus", lifetime_bonus_total),
-                            ("XIRR Taxes", -lifetime_withholding_tax),
-                        ]
-                        waterfall_shares = compute_waterfall_xirr_shares(
-                            signed_cashflows[:-1], today_date, total_account_value, steps,
-                            log=log, log_context="Nectaro",
-                        )
-                        bonus_xirr_contribution = waterfall_shares.get("XIRR Bonus")
-                        cash_drag_xirr_contribution = waterfall_shares.get("XIRR Cash drag")
-                        taxes_xirr_contribution = waterfall_shares.get("XIRR Taxes")
-                        interest_xirr_contribution = waterfall_shares.get("XIRR Intérêts")
-                        log.info(
-                            "XIRR Waterfall shares (since-inception, missed earnings ~%.2f EUR): %r",
-                            missed_earnings, {k: round(v * 100, 4) for k, v in waterfall_shares.items() if v is not None},
-                        )
+                    # Waterfall decomposition (switched from Shapley
+                    # 2026-09-09, see shared/xirr_waterfall.py's
+                    # module docstring for why) - full 4-step walk,
+                    # overriding the 3-step (no cash drag) partial
+                    # result computed further above.
+                    steps = [
+                        ("XIRR Intérêts", lifetime_gross_interest + missed_earnings),
+                        ("XIRR Cash drag", -missed_earnings),
+                        ("XIRR Bonus", lifetime_bonus_total),
+                        ("XIRR Taxes", -lifetime_withholding_tax),
+                    ]
+                    waterfall_shares = compute_waterfall_xirr_shares(
+                        signed_cashflows[:-1], today_date, total_account_value, steps,
+                        log=log, log_context="Nectaro",
+                    )
+                    bonus_xirr_contribution = waterfall_shares.get("XIRR Bonus")
+                    cash_drag_xirr_contribution = waterfall_shares.get("XIRR Cash drag")
+                    taxes_xirr_contribution = waterfall_shares.get("XIRR Taxes")
+                    interest_xirr_contribution = waterfall_shares.get("XIRR Intérêts")
+                    log.info(
+                        "XIRR Waterfall shares (since-inception, missed earnings ~%.2f EUR): %r",
+                        missed_earnings, {k: round(v * 100, 4) for k, v in waterfall_shares.items() if v is not None},
+                    )
 
     fill_current_month_amounts(
         platform="Nectaro",

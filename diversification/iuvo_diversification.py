@@ -876,36 +876,37 @@ def run() -> None:
             rendement_brut_value * 100, {k: round(v * 100, 4) for k, v in monthly_yield_shares.items() if v is not None},
         )
 
-        if xirr_value is not None and signed_cashflows is not None:
-            avg_idle_cash_lifetime = compute_average_idle_cash(monthly_summaries_as_of)
-            cash_weight_lifetime = avg_idle_cash_lifetime / (avg_idle_cash_lifetime + total_invested)
-            lifetime_interest_total = sum(s["gross_interest_received"] for s in monthly_summaries_as_of.values())
-            lifetime_yield_rate = lifetime_interest_total / total_invested
-            cash_drag_lifetime_total = cash_weight_lifetime * lifetime_yield_rate
-            missed_earnings = cash_drag_lifetime_total * (avg_idle_cash_lifetime + total_invested)
+    # Lifetime shares don't need the previous month's balances (first month of the account).
+    if xirr_value is not None and signed_cashflows is not None and total_invested > 0:
+        avg_idle_cash_lifetime = compute_average_idle_cash(monthly_summaries_as_of)
+        cash_weight_lifetime = avg_idle_cash_lifetime / (avg_idle_cash_lifetime + total_invested)
+        lifetime_interest_total = sum(s["gross_interest_received"] for s in monthly_summaries_as_of.values())
+        lifetime_yield_rate = lifetime_interest_total / total_invested
+        cash_drag_lifetime_total = cash_weight_lifetime * lifetime_yield_rate
+        missed_earnings = cash_drag_lifetime_total * (avg_idle_cash_lifetime + total_invested)
 
-            # Waterfall decomposition (switched from Shapley 2026-09-09,
-            # see shared/xirr_waterfall.py's module docstring for why) -
-            # Taxes/Frais excluded from the steps (both hardcoded 0.0,
-            # Iuvo has no withholding-tax nor distinct fee transaction
-            # type at all, see module docstring). No withholding tax
-            # here, so lifetime_gross_interest already is the net figure.
-            steps = [
-                ("XIRR Intérêts", lifetime_gross_interest + missed_earnings),
-                ("XIRR Cash drag", -missed_earnings),
-                ("XIRR Bonus", lifetime_bonus_total),
-            ]
-            waterfall_shares = compute_waterfall_xirr_shares(
-                signed_cashflows[:-1], today_date, total_account_value, steps,
-                log=log, log_context="Iuvo",
-            )
-            bonus_xirr_contribution = waterfall_shares.get("XIRR Bonus")
-            cash_drag_xirr_contribution = waterfall_shares.get("XIRR Cash drag")
-            interest_xirr_contribution = waterfall_shares.get("XIRR Intérêts")
-            log.info(
-                "XIRR Waterfall shares (since-inception, avg idle cash %.2f EUR, missed earnings ~%.2f EUR): %r",
-                avg_idle_cash_lifetime, missed_earnings, {k: round(v * 100, 4) for k, v in waterfall_shares.items() if v is not None},
-            )
+        # Waterfall decomposition (switched from Shapley 2026-09-09,
+        # see shared/xirr_waterfall.py's module docstring for why) -
+        # Taxes/Frais excluded from the steps (both hardcoded 0.0,
+        # Iuvo has no withholding-tax nor distinct fee transaction
+        # type at all, see module docstring). No withholding tax
+        # here, so lifetime_gross_interest already is the net figure.
+        steps = [
+            ("XIRR Intérêts", lifetime_gross_interest + missed_earnings),
+            ("XIRR Cash drag", -missed_earnings),
+            ("XIRR Bonus", lifetime_bonus_total),
+        ]
+        waterfall_shares = compute_waterfall_xirr_shares(
+            signed_cashflows[:-1], today_date, total_account_value, steps,
+            log=log, log_context="Iuvo",
+        )
+        bonus_xirr_contribution = waterfall_shares.get("XIRR Bonus")
+        cash_drag_xirr_contribution = waterfall_shares.get("XIRR Cash drag")
+        interest_xirr_contribution = waterfall_shares.get("XIRR Intérêts")
+        log.info(
+            "XIRR Waterfall shares (since-inception, avg idle cash %.2f EUR, missed earnings ~%.2f EUR): %r",
+            avg_idle_cash_lifetime, missed_earnings, {k: round(v * 100, 4) for k, v in waterfall_shares.items() if v is not None},
+        )
 
     # literal, a LIVE-only snapshot; the date-filtered account-statement
     # endpoint has no balance field either (2026-08-06 investigation) -

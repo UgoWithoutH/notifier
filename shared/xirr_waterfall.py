@@ -95,6 +95,8 @@ def compute_waterfall_xirr_shares(
             ok = False
         else:
             shares[name] = xirr_next - xirr_prev
+            if abs(shares[name]) < 1e-9:  # root-finder noise, not a real share
+                shares[name] = 0.0
         xirr_prev = xirr_next
 
     if log is not None:
