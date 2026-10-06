@@ -716,13 +716,10 @@ def compute_xirr_block_as_of(
     if xirr_value is None:
         log.warning("Could not compute XIRR as of %s from the reconstructed cashflows.", end_date)
         return result
+    if abs(xirr_value) < 1e-9:  # root-finder noise
+        xirr_value = 0.0
     result["XIRR"] = xirr_value
     log.info("Computed XIRR as of %s: %.2f%% (total value=%.2f EUR).", end_date, xirr_value * 100, total_value_as_of)
-
-    if outstanding_as_of <= 0:
-        # Nothing invested at end_date - Cash drag/the pie shares below all
-        # divide by the invested amount.
-        return result
 
     end_date_str = end_date.strftime("%Y-%m-%d")
     if avg_invested_balance is not None and avg_invested_balance > 0:
@@ -779,11 +776,15 @@ def compute_xirr_block_as_of(
     lifetime_bonus = _lifetime_sum_as_of(all_entries, _BONUS_KINDS, end_date)
 
     avg_idle_cash_lifetime = compute_average_idle_cash(all_entries, since_inception_str, end_date_str)
-    cash_weight_lifetime = avg_idle_cash_lifetime / (avg_idle_cash_lifetime + outstanding_as_of)
     lifetime_gross_interest = _lifetime_sum_as_of(all_entries, {_INTEREST_KIND}, end_date)
-    lifetime_yield_rate = lifetime_gross_interest / outstanding_as_of
-    cash_drag_lifetime_total = cash_weight_lifetime * lifetime_yield_rate
-    missed_earnings = cash_drag_lifetime_total * (avg_idle_cash_lifetime + outstanding_as_of)
+    if outstanding_as_of > 0:
+        cash_weight_lifetime = avg_idle_cash_lifetime / (avg_idle_cash_lifetime + outstanding_as_of)
+        lifetime_yield_rate = lifetime_gross_interest / outstanding_as_of
+        cash_drag_lifetime_total = cash_weight_lifetime * lifetime_yield_rate
+        missed_earnings = cash_drag_lifetime_total * (avg_idle_cash_lifetime + outstanding_as_of)
+    else:
+        # Nothing invested at end_date: no yield rate to extrapolate idle cash from.
+        missed_earnings = 0.0
 
     # withholding_tax's own `value` is already negative (see module
     # docstring) - flip it here to a positive "amount withheld" figure,
