@@ -1124,6 +1124,8 @@ def run() -> None:
         signed_cashflows.append((today_date, total_account_value))
 
         xirr_value = compute_xirr(signed_cashflows)
+        if xirr_value is not None and abs(xirr_value) < 1e-9:
+            xirr_value = 0.0  # solver noise (e.g. -3.7e-15) when there is genuinely no return yet
         if xirr_value is None:
             log.warning("Could not compute XIRR from %d cashflow(s) - XIRR row will not be updated.", len(signed_cashflows) - 1)
         else:
