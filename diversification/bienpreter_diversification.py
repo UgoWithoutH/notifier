@@ -783,6 +783,30 @@ def get_cached_operations(session: requests.Session, end_date: date) -> list:
     return merged
 
 
+def _day_end_balances(rows: list) -> list:
+    """[(day, closing 'Solde indicatif')] ascending. Same-day rows have no reliable order in the cache,
+    so each day's sequence is rebuilt by chaining balance == previous balance + amount."""
+    by_day = {}
+    for r in rows:
+        if r.get("date") and r.get("balance") is not None:
+            by_day.setdefault(r["date"], []).append(r)
+    result = []
+    current = 0.0
+    for day in sorted(by_day):
+        remaining = list(by_day[day])
+        while remaining:
+            nxt = next(
+                (r for r in remaining if abs(current + (_parse_amount(r.get("amountText")) or 0.0) - r["balance"]) <= 0.011),
+                None,
+            )
+            if nxt is None:
+                nxt = remaining[-1]
+            remaining.remove(nxt)
+            current = nxt["balance"]
+        result.append((day, current))
+    return result
+
+
 def compute_average_idle_cash(rows: list, start_date: str, end_date: str) -> float:
     """Day-weighted average uninvested-cash balance across [start_date,
     end_date] ("YYYY-MM-DD" strings). Unlike
@@ -801,10 +825,7 @@ def compute_average_idle_cash(rows: list, start_date: str, end_date: str) -> flo
     row is available at all (e.g. before the account's very first
     transaction).
     """
-    dated_balances = sorted(
-        ((r["date"], r["balance"]) for r in rows if r.get("date") and r.get("balance") is not None),
-        key=lambda t: t[0],
-    )
+    dated_balances = _day_end_balances(rows)
     if not dated_balances:
         return 0.0
 
@@ -847,10 +868,7 @@ def _balance_as_of(rows: list, as_of_date: date) -> float:
     backfilled month's "solde disponible" (see module docstring's
     2026-09-07 backward-reconstruction addition)."""
     as_of_str = as_of_date.strftime("%Y-%m-%d")
-    dated_balances = sorted(
-        ((r["date"], r["balance"]) for r in rows if r.get("date") and r.get("balance") is not None),
-        key=lambda t: t[0],
-    )
+    dated_balances = _day_end_balances(rows)
     balance = 0.0
     for day_str, bal in dated_balances:
         if day_str > as_of_str:
