@@ -633,15 +633,19 @@ def find_rows_by_texts_below(grid, start_row, start_col, texts: list, max_rows: 
 
         value_lower = value.lower().strip()
 
-        for key in list(remaining.keys()):
-            if key in value_lower:
-                original_text = remaining.pop(key)
-                found[original_text] = row_idx
-                logger.info(
-                    "Loan originator trouvé : '%s' -> ligne %s",
-                    original_text,
-                    row_idx
-                )
+        # Une ligne n'est attribuée qu'à UNE clé : l'égalité exacte d'abord, sinon la clé
+        # la plus longue (ex. "cash drag brut %" ne doit pas aussi capter "cash drag brut").
+        candidates = [key for key in remaining if key in value_lower]
+        if not candidates:
+            continue
+        key = value_lower if value_lower in candidates else max(candidates, key=len)
+        original_text = remaining.pop(key)
+        found[original_text] = row_idx
+        logger.info(
+            "Loan originator trouvé : '%s' -> ligne %s",
+            original_text,
+            row_idx
+        )
 
     if remaining:
         logger.warning(
