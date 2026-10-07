@@ -663,7 +663,8 @@ def run() -> None:
 
 
     if current_month and total_invested > 0:
-        cash_weight = avg_idle_cash / (avg_idle_cash + total_invested)
+        # The main account earns daily returns too (interestIncome), so it is not idle cash: no drag.
+        cash_weight = 0.0
         monthly_yield_rate = interest_total / total_invested
         cash_drag_brut_value = cash_weight * monthly_yield_rate
         # Monefit has no withholding-tax data at all (see module
