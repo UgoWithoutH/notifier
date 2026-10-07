@@ -4,6 +4,7 @@ __pycache__/
 *.pyc
 .env
 portfolio_imports/
+portfolio/sheet_metals.py
 error_screenshot.png
 swaper_storage_state.json
 swaper_state.json

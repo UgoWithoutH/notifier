@@ -35,7 +35,11 @@ USER_AGENT = (
     "Chrome/146.0.0.0 Safari/537.36"
 )
 
-CSV_HEADERS = ["Nom", "ISIN", "Quantité", "Cours", "Valorisation", "PRU", "Devise"]
+# Trade Republic exposes the CTO as productType DEFAULT and the PEA as TAX_WRAPPER.
+ACCOUNT_LABELS = {"DEFAULT": "CTO", "TAX_WRAPPER": "PEA"}
+# Persistent, append-only history of every transaction; keep it, the Sheet import reads from it.
+LEDGER_NAME = "transactions.json"
+CSV_HEADERS = ["Compte", "Nom", "ISIN", "Quantité", "Cours", "Valorisation", "PRU", "Devise"]
 
 
 def _require_env(name: str) -> str:
@@ -73,7 +77,13 @@ def _process(session: requests.Session, process_id: str, headers: dict[str, str]
         f"{API_URL}/api/v2/auth/web/login/processes/{process_id}", headers=headers, timeout=30
     )
     if response.status_code >= 400:
-        raise SystemExit(f"Suivi de connexion Trade Republic refusé (HTTP {response.status_code}).")
+        try:
+            code = response.json()["errors"][0]["errorCode"]
+        except (ValueError, KeyError, IndexError, TypeError):
+            code = "?"
+        raise SystemExit(
+            f"Suivi de connexion Trade Republic refusé (HTTP {response.status_code}, {code})."
+        )
     return response.json()
 
 
@@ -146,18 +156,74 @@ class _Socket:
             await self._ws.send(f"unsub {message_id}")
 
 
-def _account_number(session: requests.Session) -> str:
+def _refresh_session(session: requests.Session) -> None:
     session.get(f"{API_URL}/api/v1/auth/web/session", timeout=30).raise_for_status()
-    response = session.get(f"{API_URL}/api/v2/auth/account", timeout=30)
-    response.raise_for_status()
-    number = response.json().get("securitiesAccountNumber")
-    if not number:
-        raise SystemExit("Numéro de compte-titres introuvable dans la réponse Trade Republic.")
-    return number
 
 
-async def _fetch_positions(session: requests.Session) -> list[dict]:
-    account_number = _account_number(session)
+def _load_ledger(path: Path) -> dict:
+    return json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
+
+
+def _save_ledger(path: Path, ledger: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(json.dumps(ledger, ensure_ascii=False, indent=1), encoding="utf-8")
+    tmp.replace(path)
+
+
+async def _update_ledger(socket: _Socket, accounts: list[dict], path: Path) -> int:
+    """Add new transactions (with their detail) to the persistent ledger; never removes entries."""
+    ledger = _load_ledger(path)
+    variants = [("", {})] + [
+        (
+            ACCOUNT_LABELS.get(a.get("productType", ""), a.get("productType", "")),
+            {"secAccNo": a["securitiesAccountNumber"]},
+        )
+        for a in accounts
+    ]
+    added = 0
+    for label, extra in variants:
+        after = None
+        while True:
+            payload = {"type": "timelineTransactions", **extra}
+            if after:
+                payload["after"] = after
+            try:
+                page = await socket.request(payload)
+            except RuntimeError:
+                if not extra:
+                    raise
+                print(f"Historique indisponible pour le compte {label}.")
+                break
+            items = page.get("items", [])
+            changed = False
+            for item in items:
+                entry = ledger.get(item["id"])
+                if entry is None:
+                    ledger[item["id"]] = {"account": label or None, "item": item}
+                    added += 1
+                    changed = True
+                elif label and not entry.get("account"):
+                    entry["account"] = label
+                    changed = True
+            after = (page.get("cursors") or {}).get("after")
+            if not items or not after or not changed:
+                break
+
+    pending = [key for key, entry in ledger.items() if "detail" not in entry]
+    for count, key in enumerate(pending, start=1):
+        try:
+            ledger[key]["detail"] = await socket.request({"type": "timelineDetailV2", "id": key})
+        except RuntimeError:
+            continue
+        if count % 25 == 0:
+            _save_ledger(path, ledger)
+    _save_ledger(path, ledger)
+    return added
+
+
+async def _fetch_positions(session: requests.Session, ledger_path: Path) -> list[dict]:
+    _refresh_session(session)
     cookies = "; ".join(
         f"{cookie.name}={cookie.value}"
         for cookie in session.cookies
@@ -183,39 +249,49 @@ async def _fetch_positions(session: requests.Session) -> list[dict]:
             raise RuntimeError(f"Connexion WebSocket refusée : {reply}")
         socket = _Socket(websocket)
 
-        portfolio = await socket.request(
-            {"type": "compactPortfolioByType", "secAccNo": account_number}
-        )
+        pairs = await socket.request({"type": "accountPairs"})
         rows = []
-        for category in portfolio.get("categories", []):
-            for position in category.get("positions", []):
-                isin = position.get("isin") or position["instrumentId"]
-                quantity = float(position["netSize"])
-                if quantity <= 0:
-                    continue
-                instrument = await socket.request({"type": "instrument", "id": isin})
-                ticker = await socket.request({"type": "ticker", "id": f"{isin}.{EXCHANGE}"})
-                price = next(
-                    (
-                        float(ticker[side]["price"])
-                        for side in ("last", "bid", "ask")
-                        if ticker.get(side, {}).get("price")
-                    ),
-                    None,
-                )
-                if price is None:
-                    raise RuntimeError(f"Cours introuvable pour {isin}")
-                rows.append(
-                    {
-                        "Nom": instrument.get("shortName") or instrument.get("name") or isin,
-                        "ISIN": isin,
-                        "Quantité": quantity,
-                        "Cours": price,
-                        "Valorisation": round(quantity * price, 2),
-                        "PRU": float(position["averageBuyIn"]),
-                        "Devise": "EUR",
-                    }
-                )
+        for account in pairs.get("accounts", []):
+            product_type = account.get("productType", "")
+            label = ACCOUNT_LABELS.get(product_type, product_type)
+            portfolio = await socket.request(
+                {"type": "compactPortfolioByType", "secAccNo": account["securitiesAccountNumber"]}
+            )
+            for category in portfolio.get("categories", []):
+                for position in category.get("positions", []):
+                    isin = position.get("isin") or position["instrumentId"]
+                    quantity = float(position["netSize"])
+                    if quantity <= 0:
+                        continue
+                    instrument = await socket.request({"type": "instrument", "id": isin})
+                    ticker = await socket.request({"type": "ticker", "id": f"{isin}.{EXCHANGE}"})
+                    price = next(
+                        (
+                            float(ticker[side]["price"])
+                            for side in ("last", "bid", "ask")
+                            if ticker.get(side, {}).get("price")
+                        ),
+                        None,
+                    )
+                    if price is None:
+                        raise RuntimeError(f"Cours introuvable pour {isin}")
+                    rows.append(
+                        {
+                            "Compte": label,
+                            "Nom": instrument.get("shortName") or instrument.get("name") or isin,
+                            "ISIN": isin,
+                            "Quantité": quantity,
+                            "Cours": price,
+                            "Valorisation": round(quantity * price, 2),
+                            "PRU": float(position["averageBuyIn"]) or None,
+                            "Devise": "EUR",
+                        }
+                    )
+        try:
+            added = await _update_ledger(socket, pairs.get("accounts", []), ledger_path)
+            print(f"Historique : {added} nouvelle(s) transaction(s) dans {ledger_path.name}.")
+        except Exception as error:
+            print(f"Historique non mis à jour : {error}")
         return rows
 
 
@@ -241,7 +317,7 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    rows = asyncio.run(_fetch_positions(login()))
+    rows = asyncio.run(_fetch_positions(login(), args.output_dir / LEDGER_NAME))
     if not rows:
         raise SystemExit("Aucune position Trade Republic trouvée.")
     path = write_csv(rows, args.output_dir)
