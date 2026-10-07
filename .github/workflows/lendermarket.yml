@@ -26,12 +26,13 @@ jobs:
       - name: Install Python dependencies
         run: pip install -r requirements.txt
 
-      - name: Restore persisted state (already-notified loan IDs + cron schedule)
+      - name: Restore persisted state (already-notified loan IDs + cron schedule + session)
         uses: actions/cache/restore@v4
         with:
           path: |
             monitors/lendermarket_state.json
             monitors/lendermarket_cron_schedule_state.json
+            monitors/lendermarket_monitor_session_state.json
           key: lendermarket-state-${{ github.run_id }}
           restore-keys: |
             lendermarket-state-
@@ -53,11 +54,12 @@ jobs:
           EMAIL_TO: ${{ secrets.EMAIL_TO }}
         run: python -m monitors.lendermarket_monitor
 
-      - name: Save persisted state (already-notified loan IDs + cron schedule) for the next run
+      - name: Save persisted state (already-notified loan IDs + cron schedule + session) for the next run
         if: always()
         uses: actions/cache/save@v4
         with:
           path: |
             monitors/lendermarket_state.json
             monitors/lendermarket_cron_schedule_state.json
+            monitors/lendermarket_monitor_session_state.json
           key: lendermarket-state-${{ github.run_id }}

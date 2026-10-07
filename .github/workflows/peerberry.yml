@@ -28,16 +28,15 @@ jobs:
       # No Playwright/Chromium install needed - PeerBerry logs in via a pure-
       # HTTP replay of its login/2FA API flow instead (see
       # monitors/peerberry_monitor.py's module docstring) - just
-      # `requests`/`pyotp`, already in requirements.txt. No session/cookie
-      # persistence needed either (that login flow is lightweight enough to
-      # run fresh every time) - only the notification-gate state and cron
-      # schedule state are still persisted below.
-      - name: Restore persisted state (last notified balance + cron schedule)
+      # `requests`/`pyotp`, already in requirements.txt. The session (bearer
+      # token) is persisted too and reused until it expires, then refreshed.
+      - name: Restore persisted state (last notified balance + cron schedule + session)
         uses: actions/cache/restore@v4
         with:
           path: |
             monitors/peerberry_cron_schedule_state.json
             monitors/peerberry_state.json
+            monitors/peerberry_monitor_session_state.json
           key: peerberry-state-${{ github.run_id }}
           restore-keys: |
             peerberry-state-
@@ -57,11 +56,12 @@ jobs:
           EMAIL_TO: ${{ secrets.EMAIL_TO }}
         run: python -m monitors.peerberry_monitor
 
-      - name: Save persisted state (last notified balance + cron schedule) for the next run
+      - name: Save persisted state (last notified balance + cron schedule + session) for the next run
         if: always()
         uses: actions/cache/save@v4
         with:
           path: |
             monitors/peerberry_cron_schedule_state.json
             monitors/peerberry_state.json
+            monitors/peerberry_monitor_session_state.json
           key: peerberry-state-${{ github.run_id }}

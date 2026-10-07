@@ -72,6 +72,7 @@ load_dotenv()
 from shared.notifier import send_peerberry_available_email
 from shared.cron_schedule import ensure_schedule, apply_startup_jitter
 from shared.state import load_state, save_state
+from shared.session_cache import get_or_refresh_session
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger("peerberry_monitor")
@@ -82,6 +83,7 @@ TFA_URL = f"{API_BASE}/v1/investor/login/2fa"
 OVERVIEW_API_URL = f"{API_BASE}/v1/investor/overview"
 CRON_SCHEDULE_STATE_FILE = Path(__file__).parent / "peerberry_cron_schedule_state.json"
 STATE_FILE = Path(__file__).parent / "peerberry_state.json"
+SESSION_STATE_FILE = Path(__file__).parent / "peerberry_monitor_session_state.json"
 
 PEERBERRY_EMAIL = os.environ.get("PEERBERRY_EMAIL")
 PEERBERRY_PASSWORD = os.environ.get("PEERBERRY_PASSWORD")
@@ -169,6 +171,12 @@ def login(session: requests.Session) -> str:
     return access_token
 
 
+def _login_for_cache(session: requests.Session) -> tuple:
+    """`login_fn` adapter for get_or_refresh_session(): the bearer token lives on `session.headers`, so no `extra` is needed."""
+    login(session)
+    return None, {}
+
+
 def fetch_available_money(session: requests.Session) -> float:
     """Fetch the "Available for investment" balance (`availableMoney`, EUR -
     see module docstring)."""
@@ -193,8 +201,12 @@ def run() -> None:
 
     session = requests.Session()
     try:
-        login(session)
-        available_money = fetch_available_money(session)
+        available_money, _ = get_or_refresh_session(
+            session, SESSION_STATE_FILE,
+            fetch_fn=lambda extra: fetch_available_money(session),
+            login_fn=lambda: _login_for_cache(session),
+            platform_name="PeerBerry",
+        )
     except Exception:
         log.exception("Failed to log in or fetch the available-for-investment balance.")
         sys.exit(1)
