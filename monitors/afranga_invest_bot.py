@@ -74,7 +74,7 @@ MODE = os.environ.get("AFRANGA_BOT_MODE", "probe").strip().lower()
 MIN_INVESTMENT_AMOUNT = float(os.environ.get("AFRANGA_MIN_INVESTMENT_AMOUNT", "10"))
 PAGE_SIZE = 100
 MAX_PAGES = 10
-# Below this remaining principal the platform only sells a listing in full.
+# Secondary: a partial purchase must be >= this and leave >= this; smaller listings are bought in full only.
 SECONDARY_MIN_LEFT = 100.0
 MAX_DIAGNOSTICS_EMAIL_CHARS = 2_000_000
 
@@ -192,8 +192,9 @@ class Line:
 
 def plan_secondary(rows: list, tracker, budget: float) -> list:
     """Most discounted first (most negative premium), then shortest remaining
-    term. Partial purchases allowed unless `full_exit_only`; a partial one may
-    not leave less than SECONDARY_MIN_LEFT behind."""
+    term. A listing under SECONDARY_MIN_LEFT (or `full_exit_only`) is bought in
+    full only; otherwise the purchase must be >= SECONDARY_MIN_LEFT and may not
+    leave less than SECONDARY_MIN_LEFT behind."""
     config = tracker.config
     candidates = []
     for row in rows:
@@ -223,7 +224,8 @@ def plan_secondary(rows: list, tracker, budget: float) -> list:
             remaining / factor,
         )
         amount = _floor2(ceiling)
-        if row.get("full_exit_only"):
+        min_amount = max(min_principal, loan.min_amount or 0.0)
+        if row.get("full_exit_only") or max_principal < SECONDARY_MIN_LEFT:
             if amount + 0.005 < max_principal:
                 continue
             amount = max_principal
@@ -232,7 +234,7 @@ def plan_secondary(rows: list, tracker, budget: float) -> list:
             if 0 < left < SECONDARY_MIN_LEFT:
                 full_cost_ok = _floor2(min(ceiling, max_principal)) + 0.005 >= max_principal
                 amount = max_principal if full_cost_ok else _floor2(max_principal - SECONDARY_MIN_LEFT)
-        min_amount = max(min_principal, loan.min_amount or 0.0)
+            min_amount = max(min_amount, SECONDARY_MIN_LEFT)
         if amount < min_amount or amount <= 0:
             continue
         cost = round(amount * factor + 1e-9, 2)
