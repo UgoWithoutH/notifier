@@ -518,6 +518,7 @@ def fetch_statement_totals(session: requests.Session, from_date: date, to_date: 
     gross_interest_received_loans = 0.0
     gross_interest_received_obligations = 0.0
     withholding_tax = 0.0
+    withholding_tax_bonus = 0.0
     for type_id, raw_amount in groups.items():
         label = (types.get(type_id) or "").lower()
         try:
@@ -544,6 +545,8 @@ def fetch_statement_totals(session: requests.Session, from_date: date, to_date: 
             or "withholding" in label
         ):
             withholding_tax += abs(amount)
+            if _is_bonus(label):
+                withholding_tax_bonus += abs(amount)
 
     gross_interest_received = gross_interest_received_loans + gross_interest_received_obligations
 
@@ -552,6 +555,8 @@ def fetch_statement_totals(session: requests.Session, from_date: date, to_date: 
         "gross_interest_received_loans": round(gross_interest_received_loans, 2),
         "gross_interest_received_obligations": round(gross_interest_received_obligations, 2),
         "withholding_tax": round(withholding_tax, 2),
+        "withholding_tax_bonus": round(withholding_tax_bonus, 2),
+        "withholding_tax_interest": round(withholding_tax - withholding_tax_bonus, 2),
     }
 
 
@@ -761,6 +766,10 @@ def _outstanding_delta_for_entry(label: str, turnover: float) -> float:
     reconstructed closing balance looks off.
     """
     if _is_deposit(label) or _is_withdrawal(label):
+        return 0.0
+    # Withholding tax debits the wallet but never funds an investment (live audit 2026-10-04: counting it overstated outstanding by ~5.6 EUR).
+    lowered = label.lower()
+    if "withholding" in lowered or "prélèvement" in lowered or "prelevement" in lowered:
         return 0.0
     if turnover < 0:
         return abs(turnover)
@@ -1122,10 +1131,11 @@ def run(session: requests.Session | None = None) -> None:
     for o in originators + bond_issuers:
         combined_originators[o["originator"]] = combined_originators.get(o["originator"], 0) + o["outstanding"]
 
-    net_interest_received = statement_totals["gross_interest_received"] - statement_totals["withholding_tax"]
+    net_interest_received = statement_totals["gross_interest_received"] - statement_totals["withholding_tax_interest"]
     log.info(
-        "This month's interest: gross=%.2f EUR, net=%.2f EUR, withholding_tax=%.2f EUR",
-        statement_totals["gross_interest_received"], net_interest_received, statement_totals["withholding_tax"],
+        "This month's interest: gross=%.2f EUR, net=%.2f EUR, tax on interest=%.2f EUR, tax on bonus=%.2f EUR",
+        statement_totals["gross_interest_received"], net_interest_received,
+        statement_totals["withholding_tax_interest"], statement_totals["withholding_tax_bonus"],
     )
 
     # "invested" (from accounts/978) only reflects the loans portfolio, not
@@ -1394,7 +1404,8 @@ def run(session: requests.Session | None = None) -> None:
     labeled_amounts = {
         "intérêts brut prêts": statement_totals["gross_interest_received_loans"],
         "intérêts brut obligations": statement_totals["gross_interest_received_obligations"],
-        "prélèvements": statement_totals["withholding_tax"],
+        "prélèvements": statement_totals["withholding_tax_interest"],
+        "prélèvements bonus": statement_totals["withholding_tax_bonus"],
     }
     if current_month:
         labeled_amounts["en cours prêts"] = portfolio_split["loans"]
@@ -1433,10 +1444,6 @@ def run(session: requests.Session | None = None) -> None:
     bonus_breakdown = {}
     if xirr_value is not None:
         bonus_breakdown["XIRR"] = xirr_value
-    if cash_drag_brut_value is not None:
-        bonus_breakdown["Cash drag brut"] = cash_drag_brut_value
-    if cash_drag_net_value is not None:
-        bonus_breakdown["Cash drag net"] = cash_drag_net_value
     if rendement_brut_value is not None:
         bonus_breakdown["Rendements % brut"] = rendement_brut_value
     for step_name in ("Intérêts brut %", "Cash drag brut %", "Bonus brut %", "Frais brut %", "Taxes brut %"):

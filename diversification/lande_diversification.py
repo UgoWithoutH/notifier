@@ -391,8 +391,10 @@ def _is_bonus(label: str) -> bool:
     """Real (not hypothetical) transaction types on this account -
     "Bonus d'affiliation" and "Bonus de parrainage" (confirmed live
     2026-08-14, see module docstring) - matched by the generic "bonus"
-    keyword so any future bonus-style label is also caught."""
-    return "bonus" in label.lower()
+    keyword so any future bonus-style label is also caught (plus "cashback",
+    since the overview page advertises cashback campaigns)."""
+    l = label.lower()
+    return "bonus" in l or "cashback" in l
 
 
 def _is_interest(label: str) -> bool:
@@ -888,12 +890,11 @@ def run(session: requests.Session | None = None) -> None:
     # row by label, it doesn't insert new labelled rows into this
     # block.
     bonus_breakdown = {}
+    # Lande's block only has a "cashback" sub-row (no "prime"), and "Bonus" = that row.
+    if all_entries is not None:
+        bonus_breakdown["cashback"] = round(monthly_bonus, 2)
     if xirr_value is not None:
         bonus_breakdown["XIRR"] = xirr_value
-    if cash_drag_brut_value is not None:
-        bonus_breakdown["Cash drag brut"] = cash_drag_brut_value
-    if cash_drag_net_value is not None:
-        bonus_breakdown["Cash drag net"] = cash_drag_net_value
     if rendement_brut_value is not None:
         bonus_breakdown["Rendements % brut"] = rendement_brut_value
     for step_name in ("Intérêts brut %", "Cash drag brut %", "Bonus brut %", "Frais brut %", "Taxes brut %"):

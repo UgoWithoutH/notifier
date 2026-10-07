@@ -177,7 +177,10 @@ from shared.xirr_waterfall import compute_waterfall_xirr_shares
 
 load_dotenv()
 
-from monitors.lendermarket_monitor import login, LENDERMARKET_EMAIL, LENDERMARKET_PASSWORD, _xsrf_headers, fetch_account_balance
+from monitors.lendermarket_monitor import (
+    login, LENDERMARKET_EMAIL, LENDERMARKET_PASSWORD, _xsrf_headers, fetch_account_balance,
+    fetch_account_pending_payments,
+)
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger("lendermarket_diversification")
@@ -455,6 +458,13 @@ def _invested_balance_at_month_end(monthly_summaries: dict, live_total_account_v
     Returns None if `month_key` isn't cached."""
     if month_key not in monthly_summaries:
         return None
+    # Before the first deposit nothing can be invested; the backward walk would otherwise leave a small
+    # residual (pending payments, write-offs...) that blows up any ratio divided by it.
+    net_deposited_through = sum(
+        s["deposits"] - s["withdrawals"] for k, s in monthly_summaries.items() if k <= month_key
+    )
+    if net_deposited_through < 0.005:
+        return 0.0
     value_change_since = sum(
         s["deposits"] - s["withdrawals"] + s["interest_received"] + s["bonuses"] - s["fees"]
         for k, s in monthly_summaries.items() if k > month_key
@@ -533,7 +543,12 @@ def run() -> None:
     # Snapshot of the LIVE (real_today) total account value, captured before `total_invested` is
     # potentially reassigned below for a backfilled month - reused both for that reconstruction and
     # for _invested_balance_at_month_end()'s own backward walk further down.
-    live_total_account_value = total_invested + available_balance if available_balance is not None else None
+    # Pending payments (repaid but not yet credited) are part of the platform's own account value.
+    pending_payments = fetch_account_pending_payments(session, investor_id)
+    log.info("Pending payments (received, not yet credited): %.2f EUR.", pending_payments)
+    live_total_account_value = (
+        total_invested + available_balance + pending_payments if available_balance is not None else None
+    )
 
     # "total" ("en cours") written to the Sheet is invested + uninvested,
     # per user request 2026-08-14 (matching Bienprêter/Iuvo/Bricks/Lande's
@@ -541,7 +556,7 @@ def run() -> None:
     # balance couldn't be fetched. `total_invested` itself stays
     # invested-only, since it feeds the Cash drag/XIRR math below.
     amounts = {
-        "total": total_invested + available_balance if available_balance is not None else total_invested,
+        "total": total_invested + available_balance + pending_payments if available_balance is not None else total_invested,
         "gross_interest_received": statement_totals["interest_received"],
         "net_interest_received": statement_totals["interest_received"],
         "withholding_tax": 0.0,
@@ -579,7 +594,7 @@ def run() -> None:
     bonus_xirr_contribution = None
     if monthly_summaries_as_of and available_balance is not None:
         if current_month:
-            total_account_value = total_invested + available_balance
+            total_account_value = live_total_account_value
         else:
             # Backfilled month: reconstruct today_date's total account
             # value by subtracting today's live total every real net
@@ -798,7 +813,12 @@ def run() -> None:
             cash_drag_lifetime_total = cash_weight_lifetime * lifetime_yield_rate
             missed_earnings = cash_drag_lifetime_total * (avg_idle_cash_lifetime + total_invested)
             lifetime_fees_total = sum(s["fees"] for s in monthly_summaries_as_of.values())
-
+            # Interest inside pending payments is in the account value but not yet in the statement.
+            ledger_value = sum(
+                s["deposits"] - s["withdrawals"] + s["interest_received"] + s["bonuses"] - s["fees"]
+                for s in monthly_summaries_as_of.values()
+            )
+            pending_interest = max(0.0, total_account_value - ledger_value)
             # Waterfall decomposition (switched from Shapley 2026-09-09,
             # see shared/xirr_waterfall.py's module docstring for why) -
             # walks a true 0%-return baseline up to total_account_value in
@@ -808,7 +828,7 @@ def run() -> None:
             # "investorFeeAmount" is a genuine, distinct platform FEE (not
             # a tax) - mapped to "XIRR Frais" here.
             steps = [
-                ("XIRR Intérêts", lifetime_gross_interest_total + missed_earnings),
+                ("XIRR Intérêts", lifetime_gross_interest_total + pending_interest + missed_earnings),
                 ("XIRR Cash drag", -missed_earnings),
                 ("XIRR Bonus", lifetime_bonus_total),
                 ("XIRR Frais", -lifetime_fees_total),
@@ -853,16 +873,12 @@ def run() -> None:
     bonus_breakdown = {"prime": statement_totals["bonuses"]}
     if xirr_value is not None:
         bonus_breakdown["XIRR"] = xirr_value
-    if cash_drag_brut_value is not None:
-        bonus_breakdown["Cash drag brut"] = cash_drag_brut_value
     if rendement_brut_value is not None:
         bonus_breakdown["Rendements % brut"] = rendement_brut_value
     for step_name in ("Intérêts brut %", "Cash drag brut %", "Bonus brut %", "Frais brut %", "Taxes brut %"):
         step_value = monthly_yield_shares.get(step_name)
         if step_value is not None:
             bonus_breakdown[step_name] = step_value
-    if cash_drag_net_value is not None:
-        bonus_breakdown["Cash drag net"] = cash_drag_net_value
     if bonus_xirr_contribution is not None:
         bonus_breakdown["XIRR Bonus"] = bonus_xirr_contribution
     if cash_drag_xirr_contribution is not None:

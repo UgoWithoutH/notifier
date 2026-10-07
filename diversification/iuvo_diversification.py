@@ -542,6 +542,13 @@ def _invested_balance_at_month_end(monthly_summaries: dict, live_total: float, m
     block, added 2026-09-11). Returns None if `month_key` isn't cached."""
     if month_key not in monthly_summaries:
         return None
+    # Before the first deposit nothing can be invested; the backward walk would otherwise leave a small
+    # residual that blows up any ratio divided by it.
+    net_deposited_through = sum(
+        s["deposits"] - s["withdrawals"] for k, s in monthly_summaries.items() if k <= month_key
+    )
+    if net_deposited_through < 0.005:
+        return 0.0
     value_change_since = sum(
         s["deposits"] - s["withdrawals"] + s["gross_interest_received"] + s["bonus_cashback_contest"]
         for k, s in monthly_summaries.items() if k > month_key
@@ -919,10 +926,6 @@ def run() -> None:
     bonus_breakdown = {}
     if xirr_value is not None:
         bonus_breakdown["XIRR"] = xirr_value
-    if cash_drag_brut_value is not None:
-        bonus_breakdown["Cash drag brut"] = cash_drag_brut_value
-    if cash_drag_net_value is not None:
-        bonus_breakdown["Cash drag net"] = cash_drag_net_value
     if rendement_brut_value is not None:
         bonus_breakdown["Rendements % brut"] = rendement_brut_value
     for step_name in ("Intérêts brut %", "Cash drag brut %", "Bonus brut %", "Frais brut %", "Taxes brut %"):

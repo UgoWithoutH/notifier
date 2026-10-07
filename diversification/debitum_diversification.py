@@ -49,10 +49,13 @@ Bearer` auth):
     company).
   - `POST /gtw/loans/api/balances/v3/transactions-summary` body
     `{"transactionTypes": [], "periodFrame": "CUSTOM"|"ALLTIME",
-    "period": {"from": "YYYY-MM-DD", "to": "YYYY-MM-DD"}|null}` -> a
+    "period": {"start": "YYYY-MM-DD", "end": "YYYY-MM-DD"}|null}` -> a
     SERVER-SIDE PRE-AGGREGATED summary for the given range: `interest`
     (gross interest received), `totalTax` (withholding tax), `bonusReferral`
     (referral/loyalty bonus - AFFILIATE-type transactions), `principal`.
+    GOTCHA (found 2026-10-02): the period keys are `start`/`end`; the old
+    `from`/`to` were silently ignored, so every CUSTOM call returned LIFETIME
+    totals (interest, tax and bonus all wrong per month).
     An EMPTY `transactionTypes` array means "every type included" (per
     explicit user request "regarde dans le filtre tout les transactions
     type pour tous les prendre en compte") - confirmed live this is the
@@ -87,9 +90,9 @@ Bearer` auth):
 
 Since-inception XIRR/Cash drag block (mirrors nectaro_diversification.py's
 design exactly - see that module's own docstring for the full
-methodology): gated behind `is_current_month()` (LIVE-only, needs today's
-real total account value) - NOT extended to support a REPORT_DATE-
-backfilled past month (same documented scope limitation as Nectaro).
+methodology): supports a REPORT_DATE-backfilled past month too - the account
+value at that date is the live balances minus every cash/invested movement
+after it (see run()).
   - XIRR cashflows: every DEPOSIT (negative, money invested) and
     WITHDRAWAL (positive, money returned) transaction, since account
     inception, fetched incrementally via `debitum_xirr_cashflows_state.json`
@@ -212,7 +215,11 @@ XIRR_HISTORY_START_DATE = date(2000, 1, 1)
 
 SESSION_STATE_FILE = Path(__file__).parent / "debitum_diversification_session_state.json"
 XIRR_CASHFLOWS_STATE_FILE = Path(__file__).parent / "debitum_xirr_cashflows_state.json"
-XIRR_CASHFLOWS_STATE_DEFAULT = {"transactions": [], "last_fetched_date": None}
+# v2: rows are keyed by (id, transactionType) - an INTEREST_REPAYMENT and its INTEREST_BOOST_REPAYMENT share one `id`.
+XIRR_CACHE_SCHEMA_VERSION = 2
+XIRR_CASHFLOWS_STATE_DEFAULT = {"transactions": [], "last_fetched_date": None, "schema_version": None}
+# Rows can be posted days after their own date, so re-fetch this many days before the cache frontier.
+XIRR_CACHE_OVERLAP_DAYS = 30
 
 
 def login(session: requests.Session) -> str:
@@ -330,7 +337,7 @@ def fetch_transactions_summary(session: requests.Session, headers: dict, start_d
         body = {
             "transactionTypes": [],
             "periodFrame": "CUSTOM",
-            "period": {"from": start_date.strftime("%Y-%m-%d"), "to": end_date.strftime("%Y-%m-%d")},
+            "period": {"start": start_date.strftime("%Y-%m-%d"), "end": end_date.strftime("%Y-%m-%d")},
         }
     r = session.post(TRANSACTIONS_SUMMARY_URL, json=body, headers=headers, timeout=20)
     r.raise_for_status()
@@ -341,7 +348,7 @@ def _fetch_all_transactions_page(session: requests.Session, headers: dict, start
     body = {
         "transactionTypes": [],
         "periodFrame": "CUSTOM",
-        "period": {"from": start_date.strftime("%Y-%m-%d"), "to": end_date.strftime("%Y-%m-%d")},
+        "period": {"start": start_date.strftime("%Y-%m-%d"), "end": end_date.strftime("%Y-%m-%d")},
     }
     r = session.post(
         ALL_TRANSACTIONS_URL,
@@ -376,12 +383,18 @@ def get_cached_all_transactions(session: requests.Session, headers: dict, end_da
     XIRR_CASHFLOWS_STATE_FILE and deduped by Debitum's own transaction
     `id` field (a real, stable, per-row unique string, confirmed live)."""
     state = load_state(XIRR_CASHFLOWS_STATE_FILE, XIRR_CASHFLOWS_STATE_DEFAULT)
-    cached = {t["id"]: t for t in state["transactions"]}
+    if state.get("schema_version") != XIRR_CACHE_SCHEMA_VERSION:
+        log.info("Transactions cache has an outdated shape - discarding it and re-fetching the full history.")
+        state = dict(XIRR_CASHFLOWS_STATE_DEFAULT)
+    cached = {(t["id"], t.get("transactionType")): t for t in state["transactions"]}
 
     last_fetched_date_str = state.get("last_fetched_date")
+    last_fetched_date = (
+        datetime.strptime(last_fetched_date_str, "%Y-%m-%d").date() if last_fetched_date_str else None
+    )
     fetch_start = (
-        datetime.strptime(last_fetched_date_str, "%Y-%m-%d").date()
-        if last_fetched_date_str
+        max(XIRR_HISTORY_START_DATE, last_fetched_date - timedelta(days=XIRR_CACHE_OVERLAP_DAYS))
+        if last_fetched_date
         else XIRR_HISTORY_START_DATE
     )
 
@@ -398,10 +411,11 @@ def get_cached_all_transactions(session: requests.Session, headers: dict, end_da
     log.info("Fetching transactions from %s to %s (incremental cache)...", fetch_start, end_date)
     new_rows = fetch_all_transactions(session, headers, fetch_start, end_date)
     for row in new_rows:
-        cached[row["id"]] = row
+        cached[(row["id"], row.get("transactionType"))] = row
 
     state["transactions"] = list(cached.values())
-    state["last_fetched_date"] = end_date.strftime("%Y-%m-%d")
+    state["schema_version"] = XIRR_CACHE_SCHEMA_VERSION
+    state["last_fetched_date"] = max(end_date, last_fetched_date or end_date).strftime("%Y-%m-%d")
     save_state(XIRR_CASHFLOWS_STATE_FILE, state)
 
     log.info("%d cached transaction(s) in total.", len(cached))
@@ -429,16 +443,17 @@ def _cash_delta_for_transaction(transaction: dict) -> float:
     return transaction.get("amount", 0.0)
 
 
-# Signed delta to the INVESTED (outstanding) balance - only "INVESTMENT"
-# is known to move money INTO investedEur (its own `amount` is negative,
-# mirroring SUBSCRIPTION's real debit for the same loan purchase, see the
-# module docstring's accounting-quirk paragraph) - so the invested balance
-# INCREASES by -amount. No principal-repayment transaction type has been
+# Signed delta to the INVESTED (outstanding) balance - "SUBSCRIPTION" is
+# the real cash debit (see the module docstring's accounting-quirk
+# paragraph), so the invested balance INCREASES by -amount at that date.
+# Using "INVESTMENT" (booked ~12h-1 day later) left that money in neither
+# bucket for a day, understating the day-weighted average total balance
+# (-6.8% in 08/2026) - the neutral INVESTMENT row is ignored here. No principal-repayment transaction type has been
 # observed yet on this (young) account to decrease it - every other type
 # is treated as neutral here, same "don't guess" convention as elsewhere
 # in this repo. If a real principal-repayment type is ever observed, add
 # it here (decrease = -amount) instead of leaving this at 0.0.
-_INVESTED_INCREASE_TRANSACTION_TYPES = {"INVESTMENT"}
+_INVESTED_INCREASE_TRANSACTION_TYPES = {"SUBSCRIPTION"}
 
 
 def _invested_delta_for_transaction(transaction: dict) -> float:
@@ -447,15 +462,34 @@ def _invested_delta_for_transaction(transaction: dict) -> float:
     return 0.0
 
 
+def _bonus_tax_for_period(transactions: list, start_date: date, end_date: date) -> float:
+    """Sum (positive) of TAX rows withheld on bonuses in [start_date, end_date].
+    An AFFILIATE's TAX row shares its id UUID suffix; a CASHBACK's TAX row shares its createdOn second."""
+    affiliate_suffixes = {
+        t["id"].rsplit(":", 1)[-1] for t in transactions if t.get("transactionType") == "AFFILIATE" and t.get("id")
+    }
+    cashback_seconds = {t["createdOn"][:19] for t in transactions if t.get("transactionType") == "CASHBACK" and t.get("createdOn")}
+    total = 0.0
+    for t in transactions:
+        if t.get("transactionType") != "TAX":
+            continue
+        if t.get("id", "").rsplit(":", 1)[-1] not in affiliate_suffixes and t.get("createdOn", "")[:19] not in cashback_seconds:
+            continue
+        try:
+            t_date = _parse_transaction_date(t["createdOn"])
+        except (KeyError, ValueError):
+            continue
+        if start_date <= t_date <= end_date:
+            total -= t.get("amount", 0.0)
+    return total
+
+
 def run() -> None:
     if not DEBITUM_EMAIL or not DEBITUM_PASSWORD:
         log.error("DEBITUM_EMAIL and DEBITUM_PASSWORD environment variables are required.")
         sys.exit(1)
 
-    # XIRR/Cash drag (like "total" elsewhere in this repo) is a LIVE-only
-    # snapshot metric (needs TODAY's real total account value as its final
-    # cashflow) - not yet extended to support a REPORT_DATE-backfilled past
-    # month (see module docstring), so gated behind is_current_month().
+    # Needs the live balances as final cashflow; for a backfilled month they are backed out to the report date.
     current_month = is_current_month()
 
     log.info("Starting Debitum diversification run (pure HTTP, no browser).")
@@ -495,14 +529,14 @@ def run() -> None:
         month_summary = fetch_transactions_summary(session, headers, month_start_date, today_date)
         gross_interest = month_summary.get("interest", 0.0) or 0.0
         withholding_tax = month_summary.get("totalTax", 0.0) or 0.0
-        bonus = month_summary.get("bonusReferral", 0.0) or 0.0
         amounts["gross_interest_received"] = gross_interest
         amounts["net_interest_received"] = gross_interest - withholding_tax
         amounts["withholding_tax"] = withholding_tax
-        amounts["bonus_cashback_contest"] = bonus
+        # bonusReferral covers every bonus type (AFFILIATE + CASHBACK...), unlike summing AFFILIATE rows alone.
+        amounts["bonus_cashback_contest"] = month_summary.get("bonusReferral", 0.0) or 0.0
         log.info(
             "This month's totals: gross_interest=%.2f EUR, withholding_tax=%.2f EUR, bonus=%.2f EUR.",
-            gross_interest, withholding_tax, bonus,
+            gross_interest, withholding_tax, amounts["bonus_cashback_contest"],
         )
     except Exception:
         log.exception("Failed to fetch this month's transactions summary - defaulting interest/tax/bonus to 0.0.")
@@ -523,13 +557,23 @@ def run() -> None:
     avg_non_invested_balance = None
     earliest_transaction_date = None
 
+    # Fetched through the real today (not the report date) so a backfill can back out later events.
+    real_today = date.today()
     all_transactions = None
     try:
-        all_transactions = get_cached_all_transactions(session, headers, today_date)
+        all_transactions = get_cached_all_transactions(session, headers, max(today_date, real_today))
     except Exception:
         log.exception("Failed to fetch the since-inception transaction history - XIRR/Cash drag will not be updated.")
 
     if all_transactions is not None:
+        # The summary's totalTax covers interest AND bonus tax - split them.
+        month_bonus_tax = _bonus_tax_for_period(all_transactions, month_start_date, today_date)
+        month_interest_tax = amounts["withholding_tax"] - month_bonus_tax
+        amounts["withholding_tax_bonus"] = month_bonus_tax
+        amounts["withholding_tax_interest"] = month_interest_tax
+        amounts["net_interest_received"] = amounts["gross_interest_received"] - month_interest_tax
+        log.info("This month's taxes: on interest=%.2f EUR, on bonus=%.2f EUR.", month_interest_tax, month_bonus_tax)
+
         cash_events = []
         invested_events = []
         for t in all_transactions:
@@ -630,12 +674,23 @@ def run() -> None:
                 rendement_brut_value * 100, {k: round(v * 100, 4) for k, v in monthly_yield_shares.items() if v is not None},
             )
 
-        if current_month:
+        if earliest_transaction_date is not None and earliest_transaction_date <= today_date:
             deposit_dates = [
-                _parse_transaction_date(t["createdOn"]) for t in all_transactions if t.get("transactionType") == "DEPOSIT"
+                _parse_transaction_date(t["createdOn"]) for t in all_transactions
+                if t.get("transactionType") == "DEPOSIT" and _parse_transaction_date(t["createdOn"]) <= today_date
             ]
-            total_invested = balances["invested_funds"]
-            total_account_value = total_invested + balances["cash_balance"]
+            if today_date >= real_today:
+                total_invested = balances["invested_funds"]
+                cash_value = balances["cash_balance"]
+            else:
+                # Backfill: back out every cash/invested movement after the report date from the live balances.
+                total_invested = balances["invested_funds"] - sum(v for d, v in invested_events if d > today_date)
+                cash_value = balances["cash_balance"] - sum(v for d, v in cash_events if d > today_date)
+                log.info(
+                    "Backfilled account value as of %s: invested=%.2f EUR, cash=%.2f EUR.",
+                    today_date, total_invested, cash_value,
+                )
+            total_account_value = total_invested + cash_value
 
             signed_cashflows = []
             for t in all_transactions:
@@ -646,8 +701,11 @@ def run() -> None:
                     t_date = _parse_transaction_date(t["createdOn"])
                 except (KeyError, ValueError):
                     continue
+                if t_date > today_date:
+                    continue
                 amount = t.get("amount", 0.0)
-                signed_cashflows.append((t_date, -amount if ttype == "DEPOSIT" else amount))
+                # Debitum's `amount` is wallet-signed (DEPOSIT > 0, WITHDRAWAL < 0), so investor-side flow is -amount for both.
+                signed_cashflows.append((t_date, -amount))
             signed_cashflows.append((today_date, total_account_value))
 
             xirr_value = compute_xirr(signed_cashflows)
@@ -660,7 +718,11 @@ def run() -> None:
                 )
 
                 try:
-                    lifetime_summary = fetch_transactions_summary(session, headers, None, None)
+                    lifetime_summary = (
+                        fetch_transactions_summary(session, headers, None, None)
+                        if today_date >= real_today
+                        else fetch_transactions_summary(session, headers, XIRR_HISTORY_START_DATE, today_date)
+                    )
                 except Exception:
                     log.exception("Failed to fetch lifetime transactions summary - XIRR Bonus/Taxes/Intérêts shares will not be updated.")
                     lifetime_summary = None
@@ -746,16 +808,14 @@ def run() -> None:
     )
 
     bonus_breakdown = {
-        "prélèvements": amounts["withholding_tax"],
+        "prélèvements": amounts.get("withholding_tax_interest", amounts["withholding_tax"]),
     }
+    if "withholding_tax_bonus" in amounts:
+        bonus_breakdown["prélèvements bonus"] = amounts["withholding_tax_bonus"]
     if amounts["bonus_cashback_contest"]:
         bonus_breakdown["prime"] = amounts["bonus_cashback_contest"]
     if xirr_value is not None:
         bonus_breakdown["XIRR"] = xirr_value
-    if cash_drag_brut_value is not None:
-        bonus_breakdown["Cash drag brut"] = cash_drag_brut_value
-    if cash_drag_net_value is not None:
-        bonus_breakdown["Cash drag net"] = cash_drag_net_value
     if rendement_brut_value is not None:
         bonus_breakdown["Rendements % brut"] = rendement_brut_value
     for step_name in ("Intérêts brut %", "Cash drag brut %", "Bonus brut %", "Frais brut %", "Taxes brut %"):

@@ -64,8 +64,9 @@ Data endpoints (all under api.nectaro.eu, `Authorization: Bearer` auth):
     compatible with any new type Nectaro might add later without needing
     a code change. Real types confirmed live on the test account:
     DEPOSIT, WITHDRAWAL (not observed yet, forward-looking), INVESTMENT,
-    PRINCIPAL, INTEREST, TAXATION, REWARD (bonus/cashback, not observed
-    yet - genuinely 0 so far, not a placeholder).
+    PRINCIPAL, INTEREST, TAXATION (tax on interest), REWARD (bonus, gross),
+    REWARD_TAXATION (tax on a REWARD, ~5%; a separate type, confirmed live
+    2026-10-02).
     `direction` is a clean, generic "IN credits the cash wallet, OUT
     debits it" scheme (confirmed against every observed type) - much
     simpler than Afranga's CSS-class-based direction-in/direction-out
@@ -75,12 +76,9 @@ Data endpoints (all under api.nectaro.eu, `Authorization: Bearer` auth):
 Since-inception XIRR/Cash drag block (mirrors afranga_diversification.py's
 ORIGINAL design, i.e. before its 2026-09-07 backward-reconstruction-for-
 backfill enhancement - see that module's docstring/repo memory for the
-full methodology this is based on): gated behind `is_current_month()`
-(LIVE-only, needs today's real total account value) - NOT yet extended to
-support a REPORT_DATE-backfilled past month, even though Nectaro's
-statement endpoint DOES expose a real per-transaction dated ledger (same
-data shape as Afranga's Details rows) that would make this feasible if
-requested later.
+full methodology this is based on): now also supports a REPORT_DATE-
+backfilled past month - the account value at that date is the live
+balances minus every cash/invested movement after it (see run()).
   - XIRR cashflows: every DEPOSIT (negative, money invested) and WITHDRAWAL
     (positive, money returned) transaction, since account inception,
     fetched incrementally via `nectaro_xirr_cashflows_state.json` (deduped
@@ -184,6 +182,8 @@ XIRR_HISTORY_START_DATE = date(2000, 1, 1)
 SESSION_STATE_FILE = Path(__file__).parent / "nectaro_diversification_session_state.json"
 XIRR_CASHFLOWS_STATE_FILE = Path(__file__).parent / "nectaro_xirr_cashflows_state.json"
 XIRR_CASHFLOWS_STATE_DEFAULT = {"transactions": [], "last_fetched_date": None}
+# Rows can be posted days after their own date, so re-fetch this many days before the cache frontier.
+XIRR_CACHE_OVERLAP_DAYS = 30
 
 
 def login(session: requests.Session) -> str:
@@ -276,8 +276,18 @@ def fetch_overview(session: requests.Session, headers: dict) -> dict:
 
     cash_balance = customer.get("cashAccountBalance", 0.0)
     invested_funds = dashboard.get("investedFunds", customer.get("portfolioAmount", 0.0))
-    log.info("Overview: cash_balance=%.2f EUR, invested_funds=%.2f EUR.", cash_balance, invested_funds)
-    return {"cash_balance": cash_balance, "invested_funds": invested_funds}
+    # `pendingPayments`: loan payments already due/received by the lending
+    # company but not yet credited to the wallet (live audit 2026-10: the
+    # platform's own `totalValue` = investedFunds + pendingPayments + cash,
+    # and the statement ledger reconciles to that totalValue exactly, NOT to
+    # investedFunds + cash). Kept separate from `invested_funds` so the
+    # residue-based geographic breakdown still sums to invested_funds.
+    pending_payments = dashboard.get("pendingPayments", 0.0) or 0.0
+    log.info(
+        "Overview: cash_balance=%.2f EUR, invested_funds=%.2f EUR, pending_payments=%.2f EUR.",
+        cash_balance, invested_funds, pending_payments,
+    )
+    return {"cash_balance": cash_balance, "invested_funds": invested_funds, "pending_payments": pending_payments}
 
 
 def fetch_portfolio_by_lending_company(session: requests.Session, headers: dict) -> list:
@@ -357,9 +367,12 @@ def get_cached_statement_transactions(session: requests.Session, headers: dict, 
     cached = {t["id"]: t for t in state["transactions"]}
 
     last_fetched_date_str = state.get("last_fetched_date")
+    last_fetched_date = (
+        datetime.strptime(last_fetched_date_str, "%Y-%m-%d").date() if last_fetched_date_str else None
+    )
     fetch_start = (
-        datetime.strptime(last_fetched_date_str, "%Y-%m-%d").date()
-        if last_fetched_date_str
+        max(XIRR_HISTORY_START_DATE, last_fetched_date - timedelta(days=XIRR_CACHE_OVERLAP_DAYS))
+        if last_fetched_date
         else XIRR_HISTORY_START_DATE
     )
 
@@ -379,7 +392,7 @@ def get_cached_statement_transactions(session: requests.Session, headers: dict, 
         cached[row["id"]] = row
 
     state["transactions"] = list(cached.values())
-    state["last_fetched_date"] = end_date.strftime("%Y-%m-%d")
+    state["last_fetched_date"] = max(end_date, last_fetched_date or end_date).strftime("%Y-%m-%d")
     save_state(XIRR_CASHFLOWS_STATE_FILE, state)
 
     log.info("%d cached statement transaction(s) in total.", len(cached))
@@ -426,10 +439,7 @@ def run() -> None:
         log.error("NECTARO_EMAIL and NECTARO_PASSWORD environment variables are required.")
         sys.exit(1)
 
-    # XIRR/Cash drag (like "total" elsewhere in this repo) is a LIVE-only
-    # snapshot metric (needs TODAY's real total account value as its final
-    # cashflow) - not yet extended to support a REPORT_DATE-backfilled past
-    # month (see module docstring), so gated behind is_current_month().
+    # Needs the live balances as final cashflow; for a backfilled month they are backed out to the report date.
     current_month = is_current_month()
 
     log.info("Starting Nectaro diversification run (pure HTTP, no browser).")
@@ -457,7 +467,7 @@ def run() -> None:
     today_date = get_report_date()
 
     amounts = {
-        "total": overview["invested_funds"] + overview["cash_balance"],
+        "total": overview["invested_funds"] + overview["cash_balance"] + overview.get("pending_payments", 0.0),
         "gross_interest_received": 0.0,
         "net_interest_received": 0.0,
         "withholding_tax": 0.0,
@@ -468,15 +478,19 @@ def run() -> None:
         month_start_date = today_date.replace(day=1)
         this_month_transactions = fetch_all_statement_transactions(session, headers, month_start_date, today_date)
         gross_interest = sum(t["amount"] for t in this_month_transactions if t.get("type") == "INTEREST")
-        withholding_tax = sum(t["amount"] for t in this_month_transactions if t.get("type") == "TAXATION")
+        bonus_tax = sum(t["amount"] for t in this_month_transactions if t.get("type") == "REWARD_TAXATION")
+        interest_tax = sum(t["amount"] for t in this_month_transactions if t.get("type") == "TAXATION")
+        withholding_tax = interest_tax + bonus_tax
         bonus = sum(t["amount"] for t in this_month_transactions if t.get("type") == "REWARD")
         amounts["gross_interest_received"] = gross_interest
-        amounts["net_interest_received"] = gross_interest - withholding_tax
+        amounts["net_interest_received"] = gross_interest - interest_tax
         amounts["withholding_tax"] = withholding_tax
+        amounts["withholding_tax_interest"] = interest_tax
+        amounts["withholding_tax_bonus"] = bonus_tax
         amounts["bonus_cashback_contest"] = bonus
         log.info(
-            "This month's statement totals: gross_interest=%.2f EUR, withholding_tax=%.2f EUR, bonus=%.2f EUR.",
-            gross_interest, withholding_tax, bonus,
+            "This month's statement totals: gross_interest=%.2f EUR, tax on interest=%.2f EUR, tax on bonus=%.2f EUR, bonus=%.2f EUR.",
+            gross_interest, interest_tax, bonus_tax, bonus,
         )
     except Exception:
         log.exception("Failed to fetch this month's statement totals - defaulting interest/tax/bonus to 0.0.")
@@ -497,9 +511,11 @@ def run() -> None:
     avg_invested_balance = None
     avg_non_invested_balance = None
 
+    # Fetched through the real today so a backfill can back out later events.
+    real_today = date.today()
     all_transactions = None
     try:
-        all_transactions = get_cached_statement_transactions(session, headers, today_date)
+        all_transactions = get_cached_statement_transactions(session, headers, max(today_date, real_today))
     except Exception:
         log.exception("Failed to fetch the since-inception statement history - XIRR/Cash drag will not be updated.")
 
@@ -603,15 +619,36 @@ def run() -> None:
                 rendement_brut_value * 100, {k: round(v * 100, 4) for k, v in monthly_yield_shares.items() if v is not None},
             )
 
-        if current_month:
+        transactions_as_of = []
+        for t in all_transactions:
+            try:
+                if _parse_transaction_date(t["date"]) <= today_date:
+                    transactions_as_of.append(t)
+            except (KeyError, ValueError):
+                continue
+
+        if transactions_as_of:
             deposit_dates = [
-                _parse_transaction_date(t["date"]) for t in all_transactions if t.get("type") == "DEPOSIT"
+                _parse_transaction_date(t["date"]) for t in transactions_as_of if t.get("type") == "DEPOSIT"
             ]
-            total_invested = overview["invested_funds"]
-            total_account_value = total_invested + overview["cash_balance"]
+            if today_date >= real_today:
+                total_invested = overview["invested_funds"]
+                cash_value = overview["cash_balance"]
+            else:
+                # Backfill: back out every cash/invested movement after the report date from the live balances.
+                total_invested = overview["invested_funds"] - sum(v for d, v in invested_events if d > today_date)
+                cash_value = overview["cash_balance"] - sum(v for d, v in cash_events if d > today_date)
+                log.info(
+                    "Backfilled account value as of %s: invested=%.2f EUR, cash=%.2f EUR.",
+                    today_date, total_invested, cash_value,
+                )
+            # Pending payments are part of the platform's own totalValue (see
+            # fetch_overview()); for a backfilled date the current amount is
+            # used as an approximation (no historical equivalent exists).
+            total_account_value = total_invested + cash_value + overview.get("pending_payments", 0.0)
 
             signed_cashflows = []
-            for t in all_transactions:
+            for t in transactions_as_of:
                 ttype = t.get("type")
                 if ttype not in ("DEPOSIT", "WITHDRAWAL"):
                     continue
@@ -632,9 +669,11 @@ def run() -> None:
                     xirr_value * 100, total_account_value,
                 )
 
-                lifetime_bonus_total = sum(t["amount"] for t in all_transactions if t.get("type") == "REWARD")
-                lifetime_withholding_tax = sum(t["amount"] for t in all_transactions if t.get("type") == "TAXATION")
-                lifetime_gross_interest = sum(t["amount"] for t in all_transactions if t.get("type") == "INTEREST")
+                lifetime_bonus_total = sum(t["amount"] for t in transactions_as_of if t.get("type") == "REWARD")
+                lifetime_withholding_tax = sum(
+                    t["amount"] for t in transactions_as_of if t.get("type") in ("TAXATION", "REWARD_TAXATION")
+                )
+                lifetime_gross_interest = sum(t["amount"] for t in transactions_as_of if t.get("type") == "INTEREST")
 
                 # Waterfall decomposition (switched from Shapley
                 # 2026-09-09, see shared/xirr_waterfall.py's module
@@ -703,8 +742,10 @@ def run() -> None:
     )
 
     bonus_breakdown = {
-        "prélèvements": amounts["withholding_tax"],
+        "prélèvements": amounts.get("withholding_tax_interest", amounts["withholding_tax"]),
     }
+    if "withholding_tax_bonus" in amounts:
+        bonus_breakdown["prélèvements bonus"] = amounts["withholding_tax_bonus"]
     if amounts["bonus_cashback_contest"]:
         bonus_breakdown["prime"] = amounts["bonus_cashback_contest"]
     if rendement_brut_value is not None:
@@ -715,10 +756,6 @@ def run() -> None:
             bonus_breakdown[step_name] = step_value
     if xirr_value is not None:
         bonus_breakdown["XIRR"] = xirr_value
-    if cash_drag_brut_value is not None:
-        bonus_breakdown["Cash drag brut"] = cash_drag_brut_value
-    if cash_drag_net_value is not None:
-        bonus_breakdown["Cash drag net"] = cash_drag_net_value
     if bonus_xirr_contribution is not None:
         bonus_breakdown["XIRR Bonus"] = bonus_xirr_contribution
     if cash_drag_xirr_contribution is not None:

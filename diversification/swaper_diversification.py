@@ -147,6 +147,8 @@ XIRR_CASHFLOWS_STATE_FILE = Path(__file__).parent / "swaper_xirr_cashflows_state
 # Cash drag reconstruction reuses the SAME incremental fetch instead of
 # re-fetching the whole history every run - see get_cached_account_cashflows().
 XIRR_CASHFLOWS_STATE_DEFAULT = {"cashflows": [], "all_entries": [], "last_fetched_date": None}
+# Rows can be posted days after their own date, so re-fetch this many days before the cache frontier.
+XIRR_CACHE_OVERLAP_DAYS = 30
 # Verified live 2026-08-14 (full-history probe): pageSize=1000 returned this
 # account's entire history (352 records) in one page - a larger pageSize
 # (5000) was REJECTED by the API with HTTP 400 (undocumented server-side
@@ -462,6 +464,8 @@ _CASH_DEBIT_TRANSACTION_TYPES = {"INVESTMENT"}
 _CASH_CREDIT_TRANSACTION_TYPES = {
     "FUNDING", "REPAYMENT_PRINCIPAL", "REPAYMENT_INTEREST",
     "BUYBACK_PRINCIPAL", "BUYBACK_INTEREST", "EXTENSION_INTEREST",
+    # Secondary-market sale of a loan share: cash comes back in (see _OUTSTANDING_DECREASE_TYPES).
+    "INVESTMENT_SELL",
 }
 
 
@@ -536,7 +540,8 @@ def compute_average_idle_cash(entries: list, opening_balance: float, closing_bal
     if day_count == 0:
         return (opening_balance + closing_balance) / 2
 
-    if abs(running_balance - closing_balance) > 0.05:
+    # Per-entry amounts are rounded to cents, so ~0.1 EUR of drift over hundreds of entries is expected.
+    if abs(running_balance - closing_balance) > 0.10:
         log.warning(
             "Reconstructed closing balance (%.2f EUR) from all account-entries types doesn't match the API's own closing_balance (%.2f EUR) - "
             "an unmapped transactionType may exist; the average idle cash below may be slightly off.",
@@ -575,7 +580,11 @@ def get_cached_account_cashflows(page, end_date: str) -> tuple:
     state = load_state(XIRR_CASHFLOWS_STATE_FILE, XIRR_CASHFLOWS_STATE_DEFAULT)
     cached_cashflows = state["cashflows"]
     cached_all_entries = state.get("all_entries", [])
-    start_date = state["last_fetched_date"] or XIRR_HISTORY_START_DATE
+    last_fetched_date = state["last_fetched_date"]
+    start_date = (
+        max(XIRR_HISTORY_START_DATE, (datetime.strptime(last_fetched_date, "%Y-%m-%d") - timedelta(days=XIRR_CACHE_OVERLAP_DAYS)).strftime("%Y-%m-%d"))
+        if last_fetched_date else XIRR_HISTORY_START_DATE
+    )
     if not cached_all_entries and cached_cashflows and start_date != XIRR_HISTORY_START_DATE:
         # Migration from a pre-"all_entries" cache file: last_fetched_date is
         # already advanced but all_entries was never populated - force ONE
@@ -620,7 +629,7 @@ def get_cached_account_cashflows(page, end_date: str) -> tuple:
         seen_entries.add(key)
         merged_all_entries.append(entry)
 
-    save_state(XIRR_CASHFLOWS_STATE_FILE, {"cashflows": merged_cashflows, "all_entries": merged_all_entries, "last_fetched_date": end_date})
+    save_state(XIRR_CASHFLOWS_STATE_FILE, {"cashflows": merged_cashflows, "all_entries": merged_all_entries, "last_fetched_date": max(end_date, last_fetched_date or end_date)})
     log.info(
         "XIRR cashflow cache now holds %d cashflow(s)/%d total entrie(s) (was %d/%d before this run).",
         len(merged_cashflows), len(merged_all_entries), len(cached_cashflows), len(cached_all_entries),
@@ -687,7 +696,8 @@ def fetch_referral_bonus_earned(page) -> float:
 # below to compute this figure for an arbitrary PAST end_date, mirroring
 # afranga_diversification.reconstruct_outstanding()/_outstanding_delta_for_label().
 _OUTSTANDING_INCREASE_TYPES = {"INVESTMENT"}
-_OUTSTANDING_DECREASE_TYPES = {"REPAYMENT_PRINCIPAL", "BUYBACK_PRINCIPAL"}
+# INVESTMENT_SELL = loan share sold on the secondary market; credited at par (verified exact vs the live outstanding, 2026-10).
+_OUTSTANDING_DECREASE_TYPES = {"REPAYMENT_PRINCIPAL", "BUYBACK_PRINCIPAL", "INVESTMENT_SELL"}
 
 
 def _outstanding_delta_for_entry(transaction_type: str, amount: float) -> float:
@@ -836,7 +846,7 @@ def _warn_if_wallet_balance_mismatch(all_entries: list, end_date, closing_balanc
         except (TypeError, ValueError):
             continue
         reconstructed += _cash_delta_for_entry(transaction_type, amount)
-    if abs(reconstructed - closing_balance_as_of) > 0.05:
+    if abs(reconstructed - closing_balance_as_of) > 0.10:
         log.warning(
             "Reconstructed uninvested-cash balance (%.2f EUR) as of %s doesn't match the API's own closing_balance "
             "(%.2f EUR) for the same date - the terminal value used for this XIRR-as-of computation may be wrong.",
@@ -1460,10 +1470,6 @@ def run(headless: bool = True) -> None:
     bonus_breakdown = {"prime": referral_bonus_earned}
     if xirr_value is not None:
         bonus_breakdown["XIRR"] = xirr_value
-    if cash_drag_brut_value is not None:
-        bonus_breakdown["Cash drag brut"] = cash_drag_brut_value
-    if cash_drag_net_value is not None:
-        bonus_breakdown["Cash drag net"] = cash_drag_net_value
     if rendement_brut_value is not None:
         bonus_breakdown["Rendements % brut"] = rendement_brut_value
     for step_name in ("Intérêts brut %", "Cash drag brut %", "Bonus brut %", "Frais brut %", "Taxes brut %"):

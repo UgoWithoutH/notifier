@@ -201,6 +201,8 @@ MAX_LIMIT = 250  # largest value offered by the page's own rows-per-page dropdow
 SESSION_STATE_FILE = Path(__file__).parent / "afranga_diversification_session_state.json"
 XIRR_CASHFLOWS_STATE_FILE = Path(__file__).parent / "afranga_xirr_cashflows_state.json"
 XIRR_CASHFLOWS_STATE_DEFAULT = {"cashflows": [], "all_entries": [], "last_fetched_date": None}
+# Rows can be posted days after their own date, so re-fetch this many days before the cache frontier.
+XIRR_CACHE_OVERLAP_DAYS = 30
 # XIRR is a since-inception money-weighted return (not per-month) - this
 # start date is early enough to cover any real account's full history.
 XIRR_HISTORY_START_DATE = date(2000, 1, 1)
@@ -512,7 +514,9 @@ def fetch_statement_totals(session: requests.Session, start_date: date, end_date
     for row in parsed_rows:
         label = row.get("label") or ""
         if label.startswith("Gross interest received"):
-            gross_interest_received = _parse_amount(row.get("value"))
+            gross_interest_received += _parse_amount(row.get("value"))
+        elif label == "Interest received from early repayment":
+            gross_interest_received += _parse_amount(row.get("value"))
         elif label == "Withholding Tax":
             withholding_tax = _parse_amount(row.get("value"))
         elif label.startswith("Opening balance"):
@@ -809,9 +813,12 @@ def get_cached_account_details(session: requests.Session, end_date: date) -> tup
     state = load_state(XIRR_CASHFLOWS_STATE_FILE, XIRR_CASHFLOWS_STATE_DEFAULT)
     cached_cashflows = state["cashflows"]
     cached_all_rows = state.get("all_entries", [])
+    last_fetched_date = (
+        datetime.strptime(state["last_fetched_date"], "%Y-%m-%d").date() if state["last_fetched_date"] else None
+    )
     start_date = (
-        datetime.strptime(state["last_fetched_date"], "%Y-%m-%d").date()
-        if state["last_fetched_date"] else XIRR_HISTORY_START_DATE
+        max(XIRR_HISTORY_START_DATE, last_fetched_date - timedelta(days=XIRR_CACHE_OVERLAP_DAYS))
+        if last_fetched_date else XIRR_HISTORY_START_DATE
     )
 
     if start_date > end_date:
@@ -858,7 +865,7 @@ def get_cached_account_details(session: requests.Session, end_date: date) -> tup
 
     save_state(XIRR_CASHFLOWS_STATE_FILE, {
         "cashflows": merged_cashflows, "all_entries": merged_all_rows,
-        "last_fetched_date": end_date.strftime("%Y-%m-%d"),
+        "last_fetched_date": max(end_date, last_fetched_date or end_date).strftime("%Y-%m-%d"),
     })
     log.info(
         "XIRR cashflow cache now holds %d cashflow(s)/%d total row(s) (was %d/%d before this run).",
@@ -891,7 +898,7 @@ _OUTSTANDING_INCREASE_LABELS = {"Investments in loans"}
 # are inspected live and this can be classified with confidence.
 _OUTSTANDING_NEUTRAL_LABELS = {
     "Deposited funds", "Withdrawn funds", "Withholding Tax",
-    "Interest received", "Bonus received", "Cashback bonus",
+    "Interest received", "Interest received from early repayment", "Bonus received", "Cashback bonus",
     "Registration Bonus",
 }
 
@@ -925,7 +932,8 @@ def _outstanding_delta_for_label(label: str, net_amount: float) -> float:
     if label in _OUTSTANDING_INCREASE_LABELS:
         return abs(net_amount or 0.0)
     lowered = label.lower()
-    if "principal" in lowered or "savesmart" in lowered:
+    # "<id> Loan <id> [<originator>] Secondary Market Sale": loan sold on the secondary market, principal leaves the invested balance (cash received at par, verified exact vs live outstanding 2026-10).
+    if "principal" in lowered or "savesmart" in lowered or "secondary market sale" in lowered:
         return -abs(net_amount or 0.0)
     if label in _OUTSTANDING_NEUTRAL_LABELS:
         return 0.0
@@ -1688,10 +1696,6 @@ def run() -> None:
     }
     if xirr_value is not None:
         bonus_breakdown["XIRR"] = xirr_value
-    if cash_drag_brut_value is not None:
-        bonus_breakdown["Cash drag brut"] = cash_drag_brut_value
-    if cash_drag_net_value is not None:
-        bonus_breakdown["Cash drag net"] = cash_drag_net_value
     if rendement_brut_value is not None:
         bonus_breakdown["Rendements % brut"] = rendement_brut_value
     for step_name in ("Intérêts brut %", "Cash drag brut %", "Bonus brut %", "Frais brut %", "Taxes brut %"):

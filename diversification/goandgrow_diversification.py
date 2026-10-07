@@ -667,8 +667,6 @@ def run() -> None:
             bonus_breakdown[step_name] = step_value
     if xirr_value is not None:
         bonus_breakdown["XIRR"] = xirr_value
-        bonus_breakdown["Cash drag brut"] = 0.0
-        bonus_breakdown["Cash drag net"] = 0.0
         bonus_breakdown["XIRR Cash drag"] = 0.0
         bonus_breakdown["XIRR Taxes"] = 0.0
     if bonus_xirr_contribution is not None:
