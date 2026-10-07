@@ -138,12 +138,15 @@ computation as Bonus/Cash drag/Taxes, not a derived leftover), so the two
 can be compared/sanity-checked against each other on the sheet/dashboard
 side.
 
-The "Répartition géographique" section also already has a single "Lande"
-aggregate row (under a "Crowdlending agricole" sub-header, verified live
-2026-07-29) with NO per-borrower sub-rows below it (unlike Mintos/Swaper's
-per-issuer breakdown rows) - written via fill_geographic_repartition_amounts()
-with just the account's total balance, same single-row pattern already
-used for Go & Grow's aggregate row.
+The "Répartition géographique" section has a "Lande" row followed by a
+"non investi" row and one row PER ACTIVE LOAN (named by Lande loan id), like
+Bienprêter's per-borrower rows: fill_lande_loan_geo_amounts() puts each
+loan's remaining principal in its country column (ISO code from the
+/fr/investor/investments table), writes a SOMME total per row, rewrites the
+"Lande" row itself as sums of its sub-rows and deletes rows of loans no
+longer active. All non-repaid payment_status filters are read because the
+default view hides "Défaut" loans; the sum is cross-checked against
+"Fonds investis" before anything is written.
 
 Added 2026-09-07: the whole XIRR block (Cash drag, XIRR, XIRR Intérêts,
 XIRR Bonus, XIRR Cash drag, XIRR Taxes/Frais) can now ALSO be computed for a
@@ -198,6 +201,7 @@ import os
 import re
 import sys
 import logging
+from html.parser import HTMLParser
 from datetime import datetime, timedelta
 
 import fitz
@@ -207,8 +211,8 @@ from dotenv import load_dotenv
 from shared.google_sheet import (
     fill_current_month_amounts,
     fill_current_month_bonus_breakdown,
-    fill_geographic_repartition_amounts,
     fill_geographic_repartition_uninvested_amount,
+    fill_lande_loan_geo_amounts,
 )
 from shared.report_date import get_report_date, is_current_month
 from shared.weighted_average import INVESTED_BALANCE_LABEL, NON_INVESTED_BALANCE_LABEL, compute_time_weighted_average
@@ -224,6 +228,8 @@ log = logging.getLogger("lande_diversification")
 TRANSACTIONS_URL = "https://lande.finance/fr/investor/transactions"
 TAX_REPORT_URL = "https://lande.finance/fr/investor/transactions/tax-report"
 OVERVIEW_URL = "https://lande.finance/fr/investor"
+INVESTMENTS_URL = "https://lande.finance/fr/investor/investments"
+LANDE_ACTIVE_PAYMENT_STATUSES = ("current", "5-30", "31-60", "60", "default")
 PLATFORM_LABEL = "Lande"
 MAX_TRANSACTIONS_PAGES = 200  # safety net, see bienpreter_diversification.py's identical pattern
 TRANSACTIONS_PAGE_SIZE = 15  # confirmed via the page's own "Showing X to Y of Z" footer
@@ -235,6 +241,21 @@ SINCE_INCEPTION_START_DATE = "01.01.2015"
 _TRANSACTION_LABEL_RE = re.compile(r'class="capitalize">([^<]+)<')
 _TRANSACTION_DATE_RE = re.compile(r'<p class="mt-1 m-0 text-xs text-neutral-500">([\d.]+)</p>')
 _TRANSACTION_AMOUNT_RE = re.compile(r'<span class="text-(?:brand-green|rose-600)">([+-])€[\s\xa0]*([\d.,\s\xa0]+?)</span>')
+_LOAN_ID_RE = re.compile(r"/fr/investors/loans/(\d+)(?:$|[/?#])")
+_EURO_AMOUNT_RE = re.compile(r"€\s*(-?[\d.,\s\xa0]+)")
+
+LANDE_COUNTRY_CODES = {
+    "ZA": "Afrique du Sud", "DE": "Allemagne", "AR": "Argentine",
+    "AU": "Australie", "BR": "Brésil", "BG": "Bulgarie", "CA": "Canada",
+    "CN": "Chine", "CY": "Chypre", "CO": "Colombie", "KR": "Corée du Sud",
+    "HR": "Croatie", "DK": "Danemark", "ES": "Espagne", "EE": "Estonie",
+    "US": "États-Unis", "FI": "Finlande", "FR": "France", "IN": "Inde",
+    "ID": "Indonésie", "IT": "Italie", "JP": "Japon", "KZ": "Kazakhstan",
+    "LV": "Lettonie", "LT": "Lituanie", "MY": "Malaisie", "MX": "Mexique",
+    "NL": "Pays Bas", "PL": "Pologne", "PE": "Pérou", "CZ": "République tchèque",
+    "RO": "Roumanie", "GB": "Royaume-Uni", "SE": "Suède", "TW": "Taïwan",
+    "TH": "Thaïlande",
+}
 
 LANDE_CF_CLEARANCE = os.environ.get("LANDE_CF_CLEARANCE")
 LANDE_LANDE_SESSION = os.environ.get("LANDE_LANDE_SESSION")
@@ -527,6 +548,19 @@ def compute_average_balances(
     return avg_invested, avg_non_invested
 
 
+def _fetch_overview_fund(session: requests.Session, label: str) -> float:
+    r = session.get(OVERVIEW_URL, timeout=20)
+    _check_authenticated(r)
+    if not r.ok:
+        raise RuntimeError(f"Investor overview page returned status {r.status_code}")
+
+    match = re.search(re.escape(label) + r".*?€[\s\xa0]*([\d.,\s\xa0]+?)\s*</dd>", r.text, re.DOTALL)
+    if not match:
+        raise RuntimeError(f"Could not find {label!r} on the investor overview page.")
+
+    return _parse_amount(match.group(1))
+
+
 def fetch_available_funds(session: requests.Session) -> float:
     """Fetch the uninvested cash balance ("non investi") from the investor
     overview page's "Fonds disponibles" figure (verified live 2026-08-10):
@@ -534,16 +568,129 @@ def fetch_available_funds(session: requests.Session) -> float:
     `id="total_balance"` (always-CURRENT, see module docstring) followed by
     a `<dl>` breaking it down into "Fonds disponibles" (uninvested cash) /
     "Fonds investis" / "Fonds réservés", which sum back to total_balance."""
-    r = session.get(OVERVIEW_URL, timeout=20)
-    _check_authenticated(r)
-    if not r.ok:
-        raise RuntimeError(f"Investor overview page returned status {r.status_code}")
+    return _fetch_overview_fund(session, "Fonds disponibles")
 
-    match = re.search(r"Fonds disponibles.*?€[\s\xa0]*([\d.,\s\xa0]+?)\s*</dd>", r.text, re.DOTALL)
-    if not match:
-        raise RuntimeError("Could not find 'Fonds disponibles' on the investor overview page.")
 
-    return _parse_amount(match.group(1))
+class _InvestmentTableParser(HTMLParser):
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.rows = []
+        self.row = None
+        self.cell = None
+
+    def handle_starttag(self, tag, attrs):
+        attributes = dict(attrs)
+        if tag == "tr":
+            self.row = {"cells": [], "links": []}
+        elif tag in ("td", "th") and self.row is not None:
+            self.cell = []
+            self.row["cells"].append(self.cell)
+        elif tag == "a" and self.row is not None:
+            href = attributes.get("href")
+            if href:
+                self.row["links"].append(href)
+
+    def handle_data(self, data):
+        if self.cell is not None:
+            self.cell.append(data)
+
+    def handle_endtag(self, tag):
+        if tag in ("td", "th"):
+            self.cell = None
+        elif tag == "tr" and self.row is not None:
+            self.row["cells"] = [" ".join("".join(cell).split()) for cell in self.row["cells"]]
+            self.rows.append(self.row)
+            self.row = None
+
+
+def fetch_active_loan_geo_amounts(session: requests.Session) -> tuple:
+    """Fetch current Lande investments as ``(loan_amounts, defaulted_loan_ids)``
+    where ``loan_amounts`` is ``loan id -> country -> remaining principal``.
+    The site's current-investments table contains
+    one parent row per loan followed by one detail row per investment
+    contract; several contracts for the same loan are summed together.
+    """
+    loan_amounts = {}
+    defaulted_loan_ids = set()
+    parent_rows = 0
+    # Le tableau par défaut masque les prêts « Défaut » (vérifié en live) : on parcourt chaque filtre actif.
+    for payment_status in LANDE_ACTIVE_PAYMENT_STATUSES:
+        url = f"{INVESTMENTS_URL}?payment_status={payment_status}"
+        log.info("GET %s (fetching investments for geographic breakdown)...", url)
+        response = session.get(url, timeout=30)
+        log.info("GET investments (%s): status=%s", payment_status, response.status_code)
+        _check_authenticated(response)
+        if not response.ok:
+            raise RuntimeError(f"Lande investments page returned status {response.status_code}")
+        known_before = set(loan_amounts)
+        parent_rows += _parse_investments_page(response.text, loan_amounts)
+        if payment_status == "default":
+            defaulted_loan_ids = set(loan_amounts) - known_before
+
+    invested_funds = _fetch_overview_fund(session, "Fonds investis")
+    parsed_total = sum(amount for countries in loan_amounts.values() for amount in countries.values())
+    if abs(parsed_total - invested_funds) > 0.10:
+        raise RuntimeError(
+            f"Lande loans total {parsed_total:.2f} EUR != 'Fonds investis' {invested_funds:.2f} EUR - "
+            "répartition non mise à jour pour ne supprimer aucune ligne à tort."
+        )
+
+    log.info(
+        "Lande current investments: %d loan row(s), %d loan(s) with remaining principal (%.2f EUR).",
+        parent_rows, len(loan_amounts), parsed_total,
+    )
+    return loan_amounts, defaulted_loan_ids
+
+
+def _parse_investments_page(page_html: str, loan_amounts: dict) -> int:
+    """Ajoute dans `loan_amounts` les prêts non remboursés de la page ; retourne le nombre de lignes prêt."""
+    parser = _InvestmentTableParser()
+    parser.feed(page_html)
+    current_loan = None
+    parent_rows = 0
+
+    def save_current_loan():
+        if current_loan and current_loan["amount"] > 0:
+            loan_amounts[current_loan["id"]] = {
+                current_loan["country"]: current_loan["amount"]
+            }
+
+    for row in parser.rows:
+        loan_id = next(
+            (match.group(1) for link in row["links"] if (match := _LOAN_ID_RE.search(link))),
+            None,
+        )
+        if loan_id:
+            save_current_loan()
+            parent_rows += 1
+            cells = row["cells"]
+            status = cells[3].casefold() if len(cells) > 3 else ""
+            country_code = cells[4].strip().upper() if len(cells) > 4 else ""
+            if "rembours" in status:
+                current_loan = None
+                continue
+            current_loan = {
+                "id": loan_id,
+                "country": LANDE_COUNTRY_CODES.get(country_code, ""),
+                "amount": 0.0,
+            }
+            if country_code and not current_loan["country"]:
+                log.warning("Unknown Lande country code %r for loan %s.", country_code, loan_id)
+            continue
+
+        if current_loan is None or len(row["cells"]) <= 3:
+            continue
+        if not any("contrat" in cell.casefold() for cell in row["cells"]):
+            continue
+        amount_match = _EURO_AMOUNT_RE.search(row["cells"][3])
+        if amount_match:
+            try:
+                current_loan["amount"] += _parse_amount(amount_match.group(1))
+            except ValueError:
+                log.warning("Could not parse remaining principal for Lande loan %s.", current_loan["id"])
+
+    save_current_loan()
+    return parent_rows
 
 
 def run(session: requests.Session | None = None) -> None:
@@ -606,13 +753,17 @@ def run(session: requests.Session | None = None) -> None:
 
     current_month = is_current_month()
 
-    # "Répartition géographique" has a single "Lande" aggregate row (no
-    # per-borrower sub-rows below it, unlike Mintos/Swaper) - same value as
-    # the Crowdlending section's total. "non investi" ("Fonds disponibles")
-    # is a LIVE-only snapshot (no date param) - both stay current-month-only.
+    # "non investi" ("Fonds disponibles") et les prêts actifs sont des relevés LIVE (sans date) : mois courant uniquement.
+    # La ligne "Lande" est une formule de somme de ses sous-lignes, gérée par fill_lande_loan_geo_amounts.
     available_funds = None
     if current_month:
-        fill_geographic_repartition_amounts([{"name": PLATFORM_LABEL, "amount": total}])
+        try:
+            active_loan_amounts, defaulted_loan_ids = fetch_active_loan_geo_amounts(session)
+            geo_issues = fill_lande_loan_geo_amounts(active_loan_amounts, defaulted_loan_ids)
+            for issue in geo_issues:
+                log.warning("Lande geographic breakdown: %s", issue)
+        except Exception:
+            log.exception("Failed to fetch/update Lande's active-loan geographic breakdown.")
 
         try:
             available_funds = fetch_available_funds(session)

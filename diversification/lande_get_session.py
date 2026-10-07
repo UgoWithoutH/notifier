@@ -47,12 +47,8 @@ Usage: `python -m diversification.lande_get_session`
    pressing Enter again.
 4. Once logged in, it captures the 3 needed cookies and immediately calls
    `lande_diversification.run(session=...)` - the account's current data
-   is fetched and written to the Google Sheet right away.
-5. The three cookie values are also printed at the end - copy them into
-   your local .env and the GitHub repository secrets (Settings > Secrets
-   and variables > Actions) of the same names, so the scheduled/
-   cron-job.org-triggered workflow can keep reusing this session
-   headlessly afterward without needing a fresh manual login every time.
+    is fetched and written to the Google Sheet right away. Cookie values
+    remain in memory and are never printed by this helper.
 
 Lande's cf_clearance/session cookie lifetimes are NOT specifically
 characterized yet (unlike Mintos's confirmed self-renewing sliding
@@ -212,11 +208,7 @@ def main() -> None:
         log.info("[%d/%d] Running the Lande diversification fetch for %s...", i, len(report_dates), report_date or "today")
         run_diversification(session=session)
 
-    print("\nDone. To let the scheduled/cron-job.org-triggered workflow reuse this session")
-    print("headlessly afterward, also update these in your local .env AND as GitHub repository secrets:\n")
-    print(f"LANDE_CF_CLEARANCE={wanted['cf_clearance']}")
-    print(f"LANDE_LANDE_SESSION={wanted['lande_session']}")
-    print(f"LANDE_XSRF_TOKEN={wanted['XSRF-TOKEN']}")
+    log.info("Done. The authenticated session was kept in memory; cookie values were not displayed or persisted.")
 
 
 if __name__ == "__main__":

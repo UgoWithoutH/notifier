@@ -1054,6 +1054,159 @@ def _normalize_borrower_name(name: str) -> str:
     return " ".join(name.strip().lower().split())
 
 
+def fill_lande_loan_geo_amounts(loan_amounts: dict, defaulted_loan_ids=()) -> list:
+    """Met à jour les lignes de prêts Lande dans la matrice pays de
+    "Répartition géographique". ``loan_amounts`` est indexé par identifiant
+    de prêt, puis par pays : ``{loan_id: {country: remaining_amount}}``.
+    Les prêts absents du relevé actif sont supprimés; la ligne Lande est
+    réécrite en formules de somme de ses sous-lignes (comme Bienprêter) et la
+    ligne ``non investi`` reste gérée par sa fonction dédiée.
+    Si une ligne ``en défaut`` existe dans le bloc, les prêts ``defaulted_loan_ids``
+    sont placés en dessous et les autres au-dessus.
+    """
+    logger.info("Début mise à jour Répartition géographique / Lande (%d prêt(s))", len(loan_amounts))
+    issues = []
+    worksheet = get_worksheet_by_name("Répartition géographique")
+    grid = _call_with_retry(worksheet.get_all_values)
+
+    geo_pos = find_cell_by_value(grid, "Répartition géographique")
+    if not geo_pos:
+        message = "Section 'Répartition géographique' non trouvée - lignes de prêts Lande non mises à jour."
+        logger.warning(message)
+        return [message]
+    geo_row, geo_col = geo_pos
+
+    platform_row = find_first_cell_containing_below(grid, geo_row, geo_col, "Lande")
+    if not platform_row:
+        message = "Ligne 'Lande' non trouvée sous 'Répartition géographique'."
+        logger.warning(message)
+        return [message]
+
+    end_row = _find_geo_block_end_row(grid, geo_row, geo_col, platform_row, "Lande")
+    header_row = grid[geo_row - 1]
+    country_columns = {
+        header_row[col_idx - 1].strip().casefold(): col_idx
+        for col_idx in range(geo_col + 2, len(header_row) + 1)
+        if header_row[col_idx - 1].strip()
+    }
+    if not country_columns:
+        raise RuntimeError("Aucune colonne pays trouvée pour la répartition géographique Lande.")
+
+    first_country_letter = _col_letter(min(country_columns.values()))
+    target_col = geo_col + 1
+    normalized_amounts = {
+        _normalize_borrower_name(str(loan_id)): countries
+        for loan_id, countries in loan_amounts.items()
+    }
+
+    # Ligne plateforme = sommes de ses sous-lignes (comme Bienprêter) ; la borne basse suit les insertions/suppressions.
+    platform_updates = []
+    for col_idx in [target_col, *country_columns.values()]:
+        letter = _col_letter(col_idx)
+        platform_updates.append({
+            "range": rowcol_to_a1(platform_row, col_idx),
+            "values": [[f"=SOMME({letter}{platform_row + 1}:INDEX({letter}:{letter};ROW({letter}{end_row})-1))"]],
+        })
+    defaulted = {_normalize_borrower_name(str(loan_id)) for loan_id in defaulted_loan_ids}
+    default_row = None
+    for row_idx in range(platform_row + 1, end_row):
+        row = grid[row_idx - 1]
+        if geo_col - 1 < len(row) and row[geo_col - 1].strip().casefold() == "en défaut":
+            default_row = row_idx
+            break
+
+    rows_to_delete = []
+    existing_rows = {}
+    for row_idx in range(platform_row + 1, end_row):
+        row = grid[row_idx - 1]
+        name = row[geo_col - 1].strip() if geo_col - 1 < len(row) else ""
+        if not name or name.casefold() in ("non investi", "en défaut"):
+            continue
+        normalized = _normalize_borrower_name(name)
+        wrong_side = default_row is not None and (normalized in defaulted) != (row_idx > default_row)
+        if normalized not in normalized_amounts or wrong_side:
+            rows_to_delete.append(row_idx)
+            continue
+        existing_rows.setdefault(normalized, row_idx)
+
+    updates = list(platform_updates)
+    rows_to_restyle = []
+    pending_new_loans = []
+    for loan_id, country_amounts in loan_amounts.items():
+        normalized_id = _normalize_borrower_name(str(loan_id))
+        resolved_amounts = {}
+        for country, amount in country_amounts.items():
+            country = (country or "").strip()
+            country_col = country_columns.get(country.casefold()) if country else None
+            if country_col is None:
+                message = f"Pays Lande '{country or 'inconnu'}' introuvable pour le prêt {loan_id}; montant non écrit."
+                logger.warning(message)
+                issues.append(message)
+                continue
+            resolved_amounts[country_col] = resolved_amounts.get(country_col, 0.0) + amount
+
+        row_idx = existing_rows.get(normalized_id)
+        if row_idx is None:
+            pending_new_loans.append((str(loan_id), resolved_amounts, normalized_id in defaulted))
+            continue
+
+        rows_to_restyle.append(rowcol_to_a1(row_idx, geo_col))
+        row = grid[row_idx - 1]
+        filled_country_cols = {
+            col_idx for col_idx in country_columns.values()
+            if col_idx - 1 < len(row) and row[col_idx - 1].strip()
+        }
+        for country_col in filled_country_cols | set(resolved_amounts):
+            address = rowcol_to_a1(row_idx, country_col)
+            updates.append({"range": address, "values": [[resolved_amounts.get(country_col, 0.0)]]})
+        formula = f"=SOMME({first_country_letter}{row_idx}:{row_idx})"
+        updates.append({"range": rowcol_to_a1(row_idx, target_col), "values": [[formula]]})
+
+    if updates:
+        _call_with_retry(worksheet.batch_update, updates, value_input_option="USER_ENTERED")
+
+    name_style = {"horizontalAlignment": "RIGHT", "textFormat": {"fontSize": 9, "bold": False}}
+    if rows_to_restyle:
+        _call_with_retry(worksheet.format, rows_to_restyle, name_style)
+
+    # Suppressions avant insertions : les index des lignes à supprimer sont ceux de la grille lue.
+    for row_idx in sorted(rows_to_delete, reverse=True):
+        logger.info("Suppression de la ligne Lande obsolète %s.", row_idx)
+        _call_with_retry(worksheet.delete_rows, row_idx, row_idx)
+        if default_row is not None and row_idx < default_row:
+            default_row -= 1
+        end_row -= 1
+
+    new_rows_to_restyle = []
+    for loan_id, resolved_amounts, is_defaulted in sorted(pending_new_loans, key=lambda loan: loan[2]):
+        above_default = default_row is not None and not is_defaulted
+        insert_row = default_row if above_default else end_row
+        row_length = max([geo_col, target_col] + list(country_columns.values()))
+        row_values = [""] * row_length
+        row_values[geo_col - 1] = loan_id
+        row_values[target_col - 1] = f"=SOMME({first_country_letter}{insert_row}:{insert_row})"
+        for country_col, amount in resolved_amounts.items():
+            row_values[country_col - 1] = amount
+        # Hérite du format de la ligne au-dessus, jamais de celle de la plateforme suivante (jaune).
+        _call_with_retry(
+            worksheet.insert_rows, [row_values], insert_row,
+            value_input_option="USER_ENTERED", inherit_from_before=True,
+        )
+        new_rows_to_restyle.append(rowcol_to_a1(insert_row, geo_col))
+        if above_default:
+            default_row += 1
+        end_row += 1
+
+    if new_rows_to_restyle:
+        _call_with_retry(worksheet.format, new_rows_to_restyle, name_style)
+
+    logger.info(
+        "Mise à jour géographique Lande terminée (%d existant(s), %d ajouté(s), %d supprimé(s)).",
+        len(existing_rows) - len(rows_to_delete), len(pending_new_loans), len(rows_to_delete),
+    )
+    return issues
+
+
 def fill_bienpreter_borrower_geo_amounts(borrowers: dict):
     """
     borrowers : {nom_emprunteur: {nom_pays: montant}} - les prêts Bienprêter
