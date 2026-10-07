@@ -232,7 +232,8 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-from monitors.peerberry_monitor import login, PEERBERRY_EMAIL, PEERBERRY_PASSWORD, _HEADERS, API_BASE
+from monitors.peerberry_monitor import login, _login_for_cache, PEERBERRY_EMAIL, PEERBERRY_PASSWORD, _HEADERS, API_BASE
+from shared.session_cache import get_or_refresh_session, save_session_state
 from shared.notifier import send_peerberry_invest_bot_summary_email
 from shared.google_sheet import get_geo_platform_snapshot
 from shared.robot_config import Candidate, build_tracker, get_platform_config, plan_allocations
@@ -346,6 +347,7 @@ EXTERNAL_INVESTMENT_CHECK_INTERVAL_SECONDS = float(os.environ.get("EXTERNAL_INVE
 HTTP_REQUEST_TIMEOUT_SECONDS = float(os.environ.get("HTTP_REQUEST_TIMEOUT_SECONDS", "4"))
 
 DIAGNOSTICS_FILE = Path(__file__).parent / "peerberry_invest_bot_diagnostics.log"
+SESSION_STATE_FILE = Path(__file__).parent / "peerberry_invest_session_state.json"
 
 
 def _log_diagnostics(tag: str, **fields) -> None:
@@ -527,6 +529,12 @@ def fetch_loans(session: requests.Session, public_id: str) -> dict:
     return r.json() or {}
 
 
+def _relogin(session: requests.Session) -> None:
+    """Fresh login after a mid-run 401, persisting the new token for the next run."""
+    login(session)
+    save_session_state(session, SESSION_STATE_FILE)
+
+
 def _call_with_reauth(session: requests.Session, func, *args, **kwargs):
     """Call an authenticated API function (fetch_loans/fetch_available_money/
     ...); if it fails with HTTP 401, PeerBerry's access_token (a short-lived
@@ -542,7 +550,7 @@ def _call_with_reauth(session: requests.Session, func, *args, **kwargs):
     except requests.exceptions.HTTPError as exc:
         if exc.response is not None and exc.response.status_code == 401:
             log.warning("Got 401 Unauthorized calling %s - access token likely expired, re-authenticating and retrying once.", getattr(func, "__name__", func))
-            login(session)
+            _relogin(session)
             return func(session, *args, **kwargs)
         raise
 
@@ -653,7 +661,7 @@ def attempt_investment(session: requests.Session, loan: dict, amount: float) -> 
             # handles for the read-only endpoints - re-login once and retry
             # this POST before treating it as a real investment failure.
             log.warning("Investment attempt for loan %s got 401 Unauthorized - re-authenticating and retrying once.", loan_id)
-            login(session)
+            _relogin(session)
             r = session.post(url, json=payload, headers=_HEADERS, timeout=HTTP_REQUEST_TIMEOUT_SECONDS)
     except Exception as exc:
         _log_diagnostics(
@@ -721,9 +729,12 @@ def run() -> None:
 
     session = requests.Session()
     try:
-        login(session)
-        public_id = fetch_public_id(session)
-        available_money = fetch_available_money(session)
+        (public_id, available_money), _ = get_or_refresh_session(
+            session, SESSION_STATE_FILE,
+            fetch_fn=lambda extra: (fetch_public_id(session), fetch_available_money(session)),
+            login_fn=lambda: _login_for_cache(session),
+            platform_name="PeerBerry",
+        )
     except Exception as exc:
         log.exception("Failed to log in or fetch initial account info.")
         _log_diagnostics("startup_error", step="login_or_initial_fetch", error=str(exc), traceback=traceback.format_exc())
