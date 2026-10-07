@@ -14,7 +14,7 @@ Ces scripts demandent une validation (téléphone ou code reçu) : on les lance 
 | Fichier / dossier | Contenu | Protection |
 |---|---|---|
 | `.env` | identifiants TR, Esalia, clé Google | ignoré par Git |
-| `portfolio_imports/` | exports TR, ledger PEE, **métaux précieux**, positions initiales | ignoré par Git |
+| `portfolio_imports/` | exports TR, ledger PEE,  positions initiales | ignoré par Git |
 | `portfolio_imports/physical_metals.json` | achats d'or et d'argent physiques | couvert par `portfolio_imports/` |
 
 
@@ -42,29 +42,8 @@ python -m portfolio.sheet_bourse             # écrire dans « dashboard 2026 »
 - Parts détenues mais absentes de l'historique (transferts) : elles sont inscrites une fois dans `portfolio_imports/trade_republic/initial_positions.json` (mois, nombre, prix). Ce fichier est modifiable : corriger le mois ou le prix réels, relancer `sheet_bourse`.
 - Si une note « colonne absente de l'onglet » apparaît, le mois n'existe pas dans l'onglet.
 
-## 2. Métaux précieux (or / argent physiques)
 
-Logique dans `portfolio/sheet_metals.py` et données dans `portfolio_imports/physical_metals.json` : les deux sont **ignorés par Git** (jamais poussés sur GitHub).
-
-Liste d'achats, une entrée par achat :
-
-```json
-[
-  {"metal": "XAU", "month": "2026-03", "ounces": 0.0, "price": 0.0, "fees": 0.0, "note": ""}
-]
-```
-
-- `metal` : `XAU` (or) ou `XAG` (argent) ; `month` : `AAAA-MM` ;
-- `ounces` : onces de métal fin ; `price` : € par once à l'achat ; `fees` : frais en €.
-
-```bash
-python -m portfolio.sheet_metals --dry-run
-python -m portfolio.sheet_metals
-```
-
-Le cours spot actuel n'est pas écrit par ce script : il vient de l'Apps Script du Sheet.
-
-## 3. PEE (Société Générale / Esalia, fonds CGI)
+## 2. PEE (Société Générale / Esalia, fonds CGI)
 
 À lancer depuis un **réseau personnel** : le proxy d'entreprise a un certificat auto-signé et fait échouer la connexion (la vérification SSL n'est jamais désactivée).
 
@@ -81,7 +60,7 @@ python -m portfolio.sheet_pee
 - Contrôle : le total de parts de `C886` doit être égal au nombre de parts affiché dans l'espace Esalia.
 - Chaque connexion demande un nouveau code unique ; il n'est pas mémorisé.
 
-## 4. Vérifications dans le Sheet
+## 3. Vérifications dans le Sheet
 
 - Lignes « valo totale » et « Rendements % » des blocs mis à jour (Bourse, métaux, PEE CGI).
 - Totaux patrimoine (Bourse, Or, Argent, PEE) cohérents avec les blocs.

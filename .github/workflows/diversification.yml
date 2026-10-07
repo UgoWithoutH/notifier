@@ -14,71 +14,71 @@ on:
       # All default to true so the cron-job.org trigger (which never sets
       # inputs, only relying on defaults) keeps running every platform -
       # decocher one here only affects a manual run.
-      run_swaper:
-        description: "Swaper"
-        type: boolean
-        required: false
-        default: true
-      run_iuvo:
-        description: "Iuvo"
-        type: boolean
-        required: false
-        default: true
-      run_afranga:
-        description: "Afranga"
-        type: boolean
-        required: false
-        default: true
-      run_bienpreter:
-        description: "Bienprêter"
-        type: boolean
-        required: false
-        default: true
+      # run_swaper:
+      #   description: "Swaper"
+      #   type: boolean
+      #   required: false
+      #   default: true
+      # run_iuvo:
+      #   description: "Iuvo"
+      #   type: boolean
+      #   required: false
+      #   default: true
+      # run_afranga:
+      #   description: "Afranga"
+      #   type: boolean
+      #   required: false
+      #   default: true
+      # run_bienpreter:
+      #   description: "Bienprêter"
+      #   type: boolean
+      #   required: false
+      #   default: true
       run_lendermarket:
         description: "Lendermarket"
         type: boolean
         required: false
         default: true
-      run_loanch:
-        description: "Loanch"
-        type: boolean
-        required: false
-        default: true
+      # run_loanch:
+      #   description: "Loanch"
+      #   type: boolean
+      #   required: false
+      #   default: true
       run_monefit:
         description: "Monefit"
         type: boolean
         required: false
         default: true
-      run_peerberry:
-        description: "PeerBerry"
-        type: boolean
-        required: false
-        default: true
-      run_goandgrow:
-        description: "Go & Grow"
-        type: boolean
-        required: false
-        default: true
+      # run_peerberry:
+      #   description: "PeerBerry"
+      #   type: boolean
+      #   required: false
+      #   default: true
+      # run_goandgrow:
+      #   description: "Go & Grow"
+      #   type: boolean
+      #   required: false
+      #   default: true
       run_bricks:
         description: "Bricks"
         type: boolean
         required: false
         default: true
-      run_nectaro:
-        description: "Nectaro"
-        type: boolean
-        required: false
-        default: true
-      run_debitum:
-        description: "Debitum"
-        type: boolean
-        required: false
-        default: true
-      run_income_marketplace:
-        description: "Income Marketplace"
-        type: boolean
-        required: false
-        default: true
+      # run_nectaro:
+      #   description: "Nectaro"
+      #   type: boolean
+      #   required: false
+      #   default: true
+      # run_debitum:
+      #   description: "Debitum"
+      #   type: boolean
+      #   required: false
+      #   default: true
+      # run_income_marketplace:
+      #   description: "Income Marketplace"
+      #   type: boolean
+      #   required: false
+      #   default: true
 
 permissions:
   contents: read
