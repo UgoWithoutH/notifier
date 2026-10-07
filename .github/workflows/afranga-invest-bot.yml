@@ -33,10 +33,12 @@ jobs:
       - name: Install Python dependencies
         run: pip install -r requirements.txt
 
-      - name: Restore persisted session
+      - name: Restore persisted session + cron schedule state
         uses: actions/cache/restore@v4
         with:
-          path: monitors/afranga_invest_session_state.json
+          path: |
+            monitors/afranga_invest_session_state.json
+            monitors/afranga_cron_schedule_state.json
           key: afranga-invest-session-${{ github.run_id }}
           restore-keys: |
             afranga-invest-session-
@@ -47,6 +49,8 @@ jobs:
           AFRANGA_EMAIL: ${{ secrets.AFRANGA_EMAIL }}
           AFRANGA_PASSWORD: ${{ secrets.AFRANGA_PASSWORD }}
           AFRANGA_TOTP_SECRET: ${{ secrets.AFRANGA_TOTP_SECRET }}
+          CRON_JOB_API_KEY: ${{ secrets.CRON_JOB_API_KEY }}
+          AFRANGA_CRON_JOB_ID: ${{ secrets.AFRANGA_CRON_JOB_ID }}
           GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
           GOOGLE_CREDENTIALS: ${{ secrets.GOOGLE_CREDENTIALS }}
           SMTP_HOST: ${{ secrets.SMTP_HOST }}
@@ -57,9 +61,11 @@ jobs:
           EMAIL_TO: ${{ secrets.EMAIL_TO }}
         run: python -m monitors.afranga_invest_bot
 
-      - name: Save persisted session
+      - name: Save persisted session + cron schedule state
         if: always()
         uses: actions/cache/save@v4
         with:
-          path: monitors/afranga_invest_session_state.json
+          path: |
+            monitors/afranga_invest_session_state.json
+            monitors/afranga_cron_schedule_state.json
           key: afranga-invest-session-${{ github.run_id }}
