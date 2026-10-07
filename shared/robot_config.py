@@ -18,6 +18,10 @@ suivante) :
   un prêt.
 - Répartition équivalente entre les prêts si possible : "x" = le budget
   est réparti à parts égales entre les prêts disponibles du run.
+- Actif marché secondaire : "x" = le robot peut acheter ce loan sur le marché
+  secondaire (colonnes optionnelles ci-dessous, ignorées sur le marché primaire).
+- Durée restante min / max : durée restante du prêt, en mois.
+- décote / prime min / max : en % du principal, négatif = décote, positif = prime.
 """
 
 import logging
@@ -36,7 +40,7 @@ CONFIG_SHEET_NAME = "config robots"
 # terminent le bloc de la plateforme courante - un loan ne porte jamais l'un
 # de ces noms.
 _BLOCK_BOUNDARY_NAMES = {
-    "crowdlending", "afranga", "lendivo", "stikcredit", "bienpreter", "debitum",
+    "crowdlending", "afranga", "bienpreter", "debitum",
     "income marketplace", "iuvo", "lendermarket", "loanch", "mintos", "nectaro",
     "peerberry", "swaper", "crowdlending savings", "monefit", "go & grow",
     "crowdlending agricole", "lande", "crowdfunding immobilier", "bricks", "bourse",
@@ -53,6 +57,15 @@ _COLUMN_PREFIXES = {
     "min_amount": "montant min",
     "max_amount": "montant max",
     "equal_split": "repartition equivalente",
+}
+
+# Colonnes facultatives : absentes = fonctionnalité marché secondaire désactivée.
+_OPTIONAL_COLUMN_PREFIXES = {
+    "secondary_active": "actif marche secondaire",
+    "min_months": "duree restante min",
+    "max_months": "duree restante max",
+    "min_premium": "decote / prime min",
+    "max_premium": "decote / prime max",
 }
 
 
@@ -83,6 +96,31 @@ class LoanConfig:
     min_amount: float | None
     max_amount: float | None
     equal_split: bool
+    secondary_active: bool = False
+    min_months: float | None = None
+    max_months: float | None = None
+    min_premium: float | None = None
+    max_premium: float | None = None
+
+    def secondary_rejection_reason(self, rate, premium, months) -> str | None:
+        """None si un prêt du marché secondaire (taux, prime en % -
+        négatif = décote, durée restante en mois) peut être acheté."""
+        if not self.secondary_active:
+            return "loan non actif sur le marché secondaire"
+        for label, value, low, high in (
+            ("taux", rate, self.min_rate, self.max_rate),
+            ("décote/prime", premium, self.min_premium, self.max_premium),
+            ("durée restante", months, self.min_months, self.max_months),
+        ):
+            if low is None and high is None:
+                continue
+            if value is None:
+                return f"{label} inconnu(e)"
+            if low is not None and value < low:
+                return f"{label} {value} < min {low}"
+            if high is not None and value > high:
+                return f"{label} {value} > max {high}"
+        return None
 
     def rejection_reason(self, rate) -> str | None:
         """None si un prêt de taux `rate` peut être pris pour ce loan."""
@@ -122,17 +160,31 @@ class PlatformConfig:
                 return loan
         return None
 
-    def lowest_min_rate(self) -> float | None:
+    def secondary_names(self) -> list:
+        return [name for name, loan in self.loans.items() if loan.secondary_active]
+
+    def lowest_min_rate(self, secondary: bool = False) -> float | None:
         """Plus petit taux min parmi les loans actifs (None si au moins un
         loan actif n'a pas de taux min) - sert de pré-filtre côté API."""
         rates = []
         for loan in self.loans.values():
-            if not loan.active:
+            if not (loan.secondary_active if secondary else loan.active):
                 continue
             if loan.min_rate is None:
                 return None
             rates.append(loan.min_rate)
         return min(rates) if rates else None
+
+    def secondary_bounds(self, low_attr: str, high_attr: str) -> tuple:
+        """(min des bornes basses, max des bornes hautes) sur les loans actifs
+        du marché secondaire ; None si un loan n'a pas cette borne - sert de
+        pré-filtre côté API."""
+        loans = [loan for loan in self.loans.values() if loan.secondary_active]
+        lows = [getattr(loan, low_attr) for loan in loans]
+        highs = [getattr(loan, high_attr) for loan in loans]
+        low = None if not lows or any(v is None for v in lows) else min(lows)
+        high = None if not highs or any(v is None for v in highs) else max(highs)
+        return low, high
 
 
 def get_platform_config(platform: str) -> PlatformConfig:
@@ -144,19 +196,21 @@ def get_platform_config(platform: str) -> PlatformConfig:
     if header_idx is None:
         raise RuntimeError(f"En-tête 'Nom' introuvable dans l'onglet '{CONFIG_SHEET_NAME}'.")
 
+    all_prefixes = {**_COLUMN_PREFIXES, **_OPTIONAL_COLUMN_PREFIXES}
     columns = {}
     for col_idx, header in enumerate(grid[header_idx]):
         normalized = _norm(header)
-        for key, prefix in _COLUMN_PREFIXES.items():
-            if key not in columns and normalized.startswith(prefix):
-                columns[key] = col_idx
+        matches = [(len(prefix), key) for key, prefix in all_prefixes.items() if normalized.startswith(prefix)]
+        if matches:
+            key = max(matches)[1]
+            columns.setdefault(key, col_idx)
     missing = [key for key in _COLUMN_PREFIXES if key not in columns]
     if missing:
         raise RuntimeError(f"Colonnes introuvables dans '{CONFIG_SHEET_NAME}' : {missing}")
 
     def cell(row, key) -> str:
-        idx = columns[key]
-        return row[idx].strip() if idx < len(row) else ""
+        idx = columns.get(key)
+        return row[idx].strip() if idx is not None and idx < len(row) else ""
 
     target = _norm(platform)
     platform_idx = next(
@@ -187,11 +241,16 @@ def get_platform_config(platform: str) -> PlatformConfig:
             min_amount=_parse_number(cell(row, "min_amount")),
             max_amount=_parse_number(cell(row, "max_amount")),
             equal_split=cell(row, "equal_split").lower() == "x",
+            secondary_active=cell(row, "secondary_active").lower() == "x",
+            min_months=_parse_number(cell(row, "min_months")),
+            max_months=_parse_number(cell(row, "max_months")),
+            min_premium=_parse_number(cell(row, "min_premium")),
+            max_premium=_parse_number(cell(row, "max_premium")),
         )
 
     log.info(
-        "Config robot %s : %d loan(s) dont %d actif(s), plafond par pays=%s%%.",
-        platform, len(config.loans), len(config.active_names()), config.country_max_pct,
+        "Config robot %s : %d loan(s) dont %d actif(s) et %d actif(s) marché secondaire, plafond par pays=%s%%.",
+        platform, len(config.loans), len(config.active_names()), len(config.secondary_names()), config.country_max_pct,
     )
     return config
 
