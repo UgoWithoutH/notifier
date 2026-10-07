@@ -183,7 +183,7 @@ MONEFIT_PASSWORD = os.environ.get("MONEFIT_PASSWORD")
 SESSION_STATE_FILE = Path(__file__).parent / "monefit_diversification_session_state.json"
 XIRR_CASHFLOWS_STATE_FILE = Path(__file__).parent / "monefit_xirr_cashflows_state.json"
 XIRR_CASHFLOWS_STATE_DEFAULT = {"monthly_summaries": {}, "last_fetched_month": None}
-XIRR_CACHE_SCHEMA_VERSION = 2
+XIRR_CACHE_SCHEMA_VERSION = 3
 # Conservative floor for the one-time yearly scan used to find the
 # account's real inception year (see _find_first_active_year()) - well
 # before Monefit SmartSaver existed, just a safety bound on the scan length.
@@ -333,6 +333,7 @@ def fetch_statement_summary(session: requests.Session, start_date: date, end_dat
                 daily_returns, ledger_interest, start_date, end_date,
             )
             daily_returns = ledger_interest
+            vault_interest = 0.0  # the ledger figure already includes vault interest
 
     log.info(
         "Parsed statement totals: daily_returns=%.2f, vault_interest=%.2f, rewards_bonuses=%.2f, matured_vaults=%.2f, "
@@ -720,6 +721,29 @@ def run() -> None:
                 "XIRR Waterfall shares (since-inception, avg idle cash %.2f EUR, missed earnings ~%.2f EUR): %r",
                 avg_idle_cash, missed_earnings, {k: round(v * 100, 4) for k, v in waterfall_shares.items() if v is not None},
             )
+
+    if not current_month and closing_balance is not None:
+        # Backfilled month: the whole-account (opening+closing)/2 stands in for the average balance;
+        # idle cash has no history, so Cash drag is left out (its row stays untouched).
+        avg_total_balance_month = (statement_totals["opening_balance"] + closing_balance) / 2
+        monthly_yield_steps = [
+            ("Intérêts brut %", interest_total),
+            ("Bonus brut %", statement_totals["rewards_bonuses"]),
+            ("Frais brut %", -statement_totals["fees"]),
+            ("Taxes brut %", 0.0),
+        ]
+        monthly_yield_shares = compute_monthly_yield_shares(
+            avg_total_balance_month, monthly_yield_steps, log=log, log_context="Monefit (backfilled month)",
+        )
+        if any(v is not None for v in monthly_yield_shares.values()):
+            rendement_brut_value = sum(v for v in monthly_yield_shares.values() if v is not None)
+            log.info(
+                "Monthly gross-yield waterfall shares (backfilled month, avg balance %.2f EUR): Rendements %% brut=%.2f%% %r",
+                avg_total_balance_month, rendement_brut_value * 100,
+                {k: round(v * 100, 4) for k, v in monthly_yield_shares.items() if v is not None},
+            )
+        else:
+            log.warning("Average balance for the backfilled month is not positive - Rendements %% brut not computed.")
 
     # Monefit's "bonus" field ("Rewards & bonuses") is written directly to
     # the "Bonus" row (no more prime/cashback/concours sub-rows). Note:
