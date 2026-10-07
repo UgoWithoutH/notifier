@@ -104,7 +104,7 @@ logging in again if the persisted session stops working.
 import os
 import sys
 import logging
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from html.parser import HTMLParser
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -543,7 +543,12 @@ def run() -> None:
     # "Taxes brut %" stays 0.0 too (no withholding tax on this platform).
     rendement_brut_value = None
     monthly_yield_shares: dict = {}
-    if avg_invested_balance is not None and avg_invested_balance > 0:
+    # Denominator is the PREVIOUS month's average balance (like the other platforms), so an account's first month has no yield.
+    avg_invested_prev_month = None
+    if entries:
+        prev_month_end_date = today_date.replace(day=1) - timedelta(days=1)
+        avg_invested_prev_month = compute_average_balance(entries, prev_month_end_date.replace(day=1), prev_month_end_date)
+    if avg_invested_prev_month is not None and avg_invested_prev_month > 0:
         monthly_yield_steps = [
             ("Intérêts brut %", statement_totals["interest_received"]),
             ("Cash drag brut %", 0.0),
@@ -552,7 +557,7 @@ def run() -> None:
             ("Taxes brut %", 0.0),
         ]
         monthly_yield_shares = compute_monthly_yield_shares(
-            avg_invested_balance, monthly_yield_steps, log=log, log_context="Go & Grow",
+            avg_invested_prev_month, monthly_yield_steps, log=log, log_context="Go & Grow",
         )
         rendement_brut_value = sum(v for v in monthly_yield_shares.values() if v is not None)
         log.info(
