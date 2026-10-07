@@ -3,6 +3,7 @@ venv/
 __pycache__/
 *.pyc
 .env
+portfolio_imports/
 error_screenshot.png
 swaper_storage_state.json
 swaper_state.json
@@ -24,3 +25,7 @@ loanch_diversification_storage_state.json
 monefit_diversification_storage_state.json
 bienpreter_diversification_storage_state.json
 swaper_diversification_storage_state.json
+
+# Trade Republic scraper secrets/exports
+trade_republic_scraper/config.ini
+trade_republic_scraper/out/

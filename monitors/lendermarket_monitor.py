@@ -121,6 +121,10 @@ INVEST_DIAGNOSTICS_FILE = Path(__file__).parent / "lendermarket_invest_diagnosti
 # investment, confirmed by the user 2026-07-24.
 MIN_INVESTMENT_AMOUNT = float(os.environ.get("LENDERMARKET_MIN_INVESTMENT_AMOUNT", "10"))
 
+# Upper bound per loan (explicit user request 2026-10-06): each funded loan gets
+# between MIN_INVESTMENT_AMOUNT and this value; any excess stays uninvested.
+MAX_INVESTMENT_AMOUNT = float(os.environ.get("LENDERMARKET_MAX_INVESTMENT_AMOUNT", "30"))
+
 # Fallback used only if get_lendermarket_min_interest_rate() (reads the
 # cell just left of "Lendermarket" in "Répartition géographique", added
 # 2026-07-31, same convention as PeerBerry's own MIN_INTEREST_RATE) fails
@@ -582,7 +586,12 @@ def _format_amount(amount: float) -> str:
     return f"{rounded:.2f}".rstrip("0").rstrip(".")
 
 
-def _compute_loan_shares(budget: float, loans: list, min_investment: float = MIN_INVESTMENT_AMOUNT) -> dict:
+def _compute_loan_shares(
+    budget: float,
+    loans: list,
+    min_investment: float = MIN_INVESTMENT_AMOUNT,
+    max_investment: float = MAX_INVESTMENT_AMOUNT,
+) -> dict:
     """Split `budget` (one lender's own share of the account balance, see
     `invest_selected_lenders()`) EQUALLY across `loans` (that same lender's
     currently available loans), per explicit user request 2026-07-24: "2
@@ -603,6 +612,10 @@ def _compute_loan_shares(budget: float, loans: list, min_investment: float = MIN
       doesn't sit idle in one loan's slot while another loan could still
       absorb it, again to avoid a leftover.
 
+    Each loan's cap is also bounded by `max_investment` (30 EUR by default):
+    a loan never receives more than that, and whatever the budget has left
+    beyond the sum of the capped shares is simply not invested this run.
+
     Returns `{loan_uuid: amount}` for every loan that ends up funded
     (amount rounded to 2 decimals); loans below `min_investment` after all
     adjustments are simply omitted.
@@ -617,7 +630,7 @@ def _compute_loan_shares(budget: float, loans: list, min_investment: float = MIN
         except (TypeError, ValueError):
             cap = 0.0
         if cap > 0:
-            caps[loan_uuid] = cap
+            caps[loan_uuid] = min(cap, max_investment)
 
     # Keep insertion (listing) order for deterministic drop/keep decisions below.
     active = list(caps.keys())
@@ -904,7 +917,7 @@ def invest_selected_lenders(
             log.info("Lender '%s': no loan currently available, excluded from the balance split this run.", lender_name)
             continue
 
-        shares = _compute_loan_shares(budget_for_lender, loans, MIN_INVESTMENT_AMOUNT)
+        shares = _compute_loan_shares(budget_for_lender, loans, MIN_INVESTMENT_AMOUNT, MAX_INVESTMENT_AMOUNT)
         if not shares:
             log.info("Lender '%s': budget=%.2f EUR, %d loan(s) available - nothing fundable (below the %.2f EUR minimum).", lender_name, budget_for_lender, len(loans), MIN_INVESTMENT_AMOUNT)
             continue
