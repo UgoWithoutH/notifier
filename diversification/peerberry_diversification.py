@@ -871,6 +871,9 @@ def run() -> None:
     # same convention as Afranga/Swaper/Lendermarket.
     current_month = is_current_month()
     today_date = get_report_now(REPORT_TIMEZONE).date()
+    # A backfill simulating the month's last day for the still-running month must compute "as of" the real day.
+    if current_month:
+        today_date = min(today_date, datetime.now(REPORT_TIMEZONE).date())
     # BUGFIX 2026-08-21: is_current_month() only compares the MONTH, not the
     # exact day - a backfill run (scripts/run_diversification_for_month_
     # range.sh) that simulates "now" as some other day within the current
@@ -986,7 +989,8 @@ def run() -> None:
             cache_last_fetched = datetime.strptime(raw_last_fetched, "%Y-%m-%d").date() if raw_last_fetched else None
         except Exception:
             cache_last_fetched = None
-        if all_entries and (cache_last_fetched is None or cache_last_fetched < today_date) and real_today >= today_date:
+        # Empty/missing cache (fresh CI runner) must be populated too, not just a stale one.
+        if (cache_last_fetched is None or cache_last_fetched < today_date) and real_today >= today_date:
             try:
                 log.info("Cached transactions only go up to %s - refreshing up to the real day %s before the backfill.", cache_last_fetched, real_today)
                 all_entries = get_cached_transactions(session, real_today.strftime("%Y-%m-%d"))
