@@ -638,7 +638,8 @@ def find_rows_by_texts_below(grid, start_row, start_col, texts: list, max_rows: 
 
         # Une ligne n'est attribuée qu'à UNE clé : l'égalité exacte d'abord, sinon la clé
         # la plus longue (ex. "cash drag brut %" ne doit pas aussi capter "cash drag brut").
-        candidates = [key for key in remaining if key in value_lower]
+        # "bonus" ne doit jamais capter une ligne comme "intérêts brut avec bonus" (la vraie ligne vient plus bas).
+        candidates = [key for key in remaining if key in value_lower and (key != "bonus" or value_lower == "bonus")]
         if not candidates:
             continue
         key = value_lower if value_lower in candidates else max(candidates, key=len)
