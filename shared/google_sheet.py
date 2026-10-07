@@ -1062,7 +1062,7 @@ LANDE_STATUS_HEADER_LABELS = {
     "default": "en défaut",
 }
 # Style relevé sur les lignes d'en-tête existantes de la feuille (identique à la ligne "non investi").
-LANDE_STATUS_HEADER_STYLE = {
+STATUS_HEADER_STYLE = {
     "horizontalAlignment": "LEFT",
     "textFormat": {"fontFamily": "Arial", "fontSize": 9, "italic": True, "bold": False},
     "backgroundColor": {"red": 0.9372549, "green": 0.9372549, "blue": 0.9372549},
@@ -1083,11 +1083,16 @@ def _lande_status_of_header(name: str):
     return None
 
 
-def fill_lande_loan_geo_amounts(loan_amounts: dict, loan_statuses=None) -> list:
-    """Met à jour les lignes de prêts Lande dans la matrice pays de
-    "Répartition géographique". ``loan_amounts`` est indexé par identifiant
-    de prêt, puis par pays : ``{loan_id: {country: remaining_amount}}``.
-    Les prêts absents du relevé actif sont supprimés; la ligne Lande est
+def fill_platform_loan_geo_amounts(
+    platform: str, loan_amounts: dict, loan_statuses, status_order: tuple,
+    status_header_labels: dict, header_status_of,
+) -> list:
+    """Met à jour les lignes de prêts/projets d'une plateforme (Lande, Bricks...)
+    dans la matrice pays de "Répartition géographique". ``loan_amounts`` est
+    indexé par identifiant de prêt, puis par pays : ``{loan_id: {country: remaining_amount}}``.
+    ``status_order`` (le 1er = statut sain, sans en-tête), ``status_header_labels`` et
+    ``header_status_of(nom_ligne)`` décrivent les lignes d'en-tête de statut propres à la plateforme.
+    Les prêts absents du relevé actif sont supprimés; la ligne plateforme est
     réécrite en formules de somme de ses sous-lignes (comme Bienprêter) et la
     ligne ``non investi`` reste gérée par sa fonction dédiée.
     ``loan_statuses`` (``{loan_id: "current"|"5-30"|"31-60"|"60"|"default"}``)
@@ -1096,25 +1101,25 @@ def fill_lande_loan_geo_amounts(loan_amounts: dict, loan_statuses=None) -> list:
     cet ordre sous "non investi") ; les prêts sains restent au-dessus du premier
     en-tête. Un en-tête est créé s'il a au moins un prêt, supprimé sinon.
     """
-    logger.info("Début mise à jour Répartition géographique / Lande (%d prêt(s))", len(loan_amounts))
+    logger.info("Début mise à jour Répartition géographique / %s (%d prêt(s))", platform, len(loan_amounts))
     issues = []
     worksheet = get_worksheet_by_name("Répartition géographique")
     grid = _call_with_retry(worksheet.get_all_values)
 
     geo_pos = find_cell_by_value(grid, "Répartition géographique")
     if not geo_pos:
-        message = "Section 'Répartition géographique' non trouvée - lignes de prêts Lande non mises à jour."
+        message = f"Section 'Répartition géographique' non trouvée - lignes de prêts {platform} non mises à jour."
         logger.warning(message)
         return [message]
     geo_row, geo_col = geo_pos
 
-    platform_row = find_first_cell_containing_below(grid, geo_row, geo_col, "Lande")
+    platform_row = find_first_cell_containing_below(grid, geo_row, geo_col, platform)
     if not platform_row:
-        message = "Ligne 'Lande' non trouvée sous 'Répartition géographique'."
+        message = f"Ligne '{platform}' non trouvée sous 'Répartition géographique'."
         logger.warning(message)
         return [message]
 
-    end_row = _find_geo_block_end_row(grid, geo_row, geo_col, platform_row, "Lande")
+    end_row = _find_geo_block_end_row(grid, geo_row, geo_col, platform_row, platform)
     header_row = grid[geo_row - 1]
     country_columns = {
         header_row[col_idx - 1].strip().casefold(): col_idx
@@ -1122,7 +1127,7 @@ def fill_lande_loan_geo_amounts(loan_amounts: dict, loan_statuses=None) -> list:
         if header_row[col_idx - 1].strip()
     }
     if not country_columns:
-        raise RuntimeError("Aucune colonne pays trouvée pour la répartition géographique Lande.")
+        raise RuntimeError(f"Aucune colonne pays trouvée pour la répartition géographique {platform}.")
 
     first_country_letter = _col_letter(min(country_columns.values()))
     target_col = geo_col + 1
@@ -1144,7 +1149,7 @@ def fill_lande_loan_geo_amounts(loan_amounts: dict, loan_statuses=None) -> list:
     for row_idx in range(platform_row + 1, end_row):
         row = grid[row_idx - 1]
         name = row[geo_col - 1].strip() if geo_col - 1 < len(row) else ""
-        header_status = _lande_status_of_header(name) if name else None
+        header_status = header_status_of(name) if name else None
         if header_status and header_status not in status_headers:
             status_headers[header_status] = row_idx
     header_status_by_row = {row_idx: status for status, row_idx in status_headers.items()}
@@ -1152,7 +1157,7 @@ def fill_lande_loan_geo_amounts(loan_amounts: dict, loan_statuses=None) -> list:
     def section_of(normalized_id: str):
         """Statut de l'en-tête sous lequel ranger le prêt (None = prêt sain, avant le premier en-tête)."""
         status = statuses.get(normalized_id)
-        return status if status in LANDE_STATUS_HEADER_LABELS else None
+        return status if status in status_header_labels else None
 
     needed_headers = {section_of(normalized) for normalized in normalized_amounts} - {None}
 
@@ -1185,7 +1190,7 @@ def fill_lande_loan_geo_amounts(loan_amounts: dict, loan_statuses=None) -> list:
             country = (country or "").strip()
             country_col = country_columns.get(country.casefold()) if country else None
             if country_col is None:
-                message = f"Pays Lande '{country or 'inconnu'}' introuvable pour le prêt {loan_id}; montant non écrit."
+                message = f"Pays {platform} '{country or 'inconnu'}' introuvable pour le prêt {loan_id}; montant non écrit."
                 logger.warning(message)
                 issues.append(message)
                 continue
@@ -1217,7 +1222,7 @@ def fill_lande_loan_geo_amounts(loan_amounts: dict, loan_statuses=None) -> list:
 
     # Suppressions avant insertions : les index des lignes à supprimer sont ceux de la grille lue.
     for row_idx in sorted(rows_to_delete, reverse=True):
-        logger.info("Suppression de la ligne Lande obsolète %s.", row_idx)
+        logger.info("Suppression de la ligne %s obsolète %s.", platform, row_idx)
         _call_with_retry(worksheet.delete_rows, row_idx, row_idx)
         for status, header_row_idx in list(status_headers.items()):
             if header_row_idx == row_idx:
@@ -1228,29 +1233,29 @@ def fill_lande_loan_geo_amounts(loan_amounts: dict, loan_statuses=None) -> list:
 
     # En-têtes manquants créés dans l'ordre canonique, chacun juste avant l'en-tête suivant existant (ou en fin de bloc).
     created_headers = 0
-    for status in LANDE_STATUS_ORDER[1:]:
+    for status in status_order[1:]:
         if status not in needed_headers or status in status_headers:
             continue
-        rank = LANDE_STATUS_ORDER.index(status)
-        later_headers = [r for s, r in status_headers.items() if LANDE_STATUS_ORDER.index(s) > rank]
+        rank = status_order.index(status)
+        later_headers = [r for s, r in status_headers.items() if status_order.index(s) > rank]
         insert_row = min(later_headers) if later_headers else end_row
         row_values = [""] * geo_col
-        row_values[geo_col - 1] = LANDE_STATUS_HEADER_LABELS[status]
+        row_values[geo_col - 1] = status_header_labels[status]
         _call_with_retry(
             worksheet.insert_rows, [row_values], insert_row,
             value_input_option="USER_ENTERED", inherit_from_before=True,
         )
-        _call_with_retry(worksheet.format, rowcol_to_a1(insert_row, geo_col), LANDE_STATUS_HEADER_STYLE)
+        _call_with_retry(worksheet.format, rowcol_to_a1(insert_row, geo_col), STATUS_HEADER_STYLE)
         for other_status, header_row_idx in status_headers.items():
             if header_row_idx >= insert_row:
                 status_headers[other_status] = header_row_idx + 1
         status_headers[status] = insert_row
         end_row += 1
         created_headers += 1
-        logger.info("Ajout de la ligne Lande '%s' en %s.", LANDE_STATUS_HEADER_LABELS[status], insert_row)
+        logger.info("Ajout de la ligne %s '%s' en %s.", platform, status_header_labels[status], insert_row)
 
     def section_rank(section):
-        return -1 if section is None else LANDE_STATUS_ORDER.index(section)
+        return -1 if section is None else status_order.index(section)
 
     new_rows_to_restyle = []
     for loan_id, resolved_amounts, section in sorted(pending_new_loans, key=lambda loan: section_rank(loan[2])):
@@ -1278,9 +1283,54 @@ def fill_lande_loan_geo_amounts(loan_amounts: dict, loan_statuses=None) -> list:
         _call_with_retry(worksheet.format, new_rows_to_restyle, name_style)
 
     logger.info(
-        "Mise à jour géographique Lande terminée (%d existant(s), %d ajouté(s), %d supprimé(s), %d en-tête(s) créé(s)).",
-        len(existing_rows), len(pending_new_loans), len(rows_to_delete), created_headers,
+        "Mise à jour géographique %s terminée (%d existant(s), %d ajouté(s), %d supprimé(s), %d en-tête(s) créé(s)).",
+        platform, len(existing_rows), len(pending_new_loans), len(rows_to_delete), created_headers,
     )
+    return issues
+
+
+def fill_lande_loan_geo_amounts(loan_amounts: dict, loan_statuses=None) -> list:
+    """Lignes de prêts Lande : voir fill_platform_loan_geo_amounts()."""
+    return fill_platform_loan_geo_amounts(
+        "Lande", loan_amounts, loan_statuses, LANDE_STATUS_ORDER, LANDE_STATUS_HEADER_LABELS, _lande_status_of_header,
+    )
+
+
+BRICKS_STATUS_ORDER = ("current", "delay", "default")
+BRICKS_STATUS_HEADER_LABELS = {"delay": "en retard", "default": "en défaut"}
+
+
+def _bricks_status_of_header(name: str):
+    """Statut Bricks correspondant à une ligne d'en-tête de section, ou None."""
+    n = name.strip().casefold()
+    if "défaut" in n or "defaut" in n:
+        return "default"
+    if "retard" in n:
+        return "delay"
+    return None
+
+
+def fill_bricks_project_geo_amounts(project_amounts: dict, project_statuses=None) -> list:
+    """Lignes de projets Bricks : voir fill_platform_loan_geo_amounts().
+    ``project_amounts`` = ``{nom_projet: {pays: capital restant}}``,
+    ``project_statuses`` = ``{nom_projet: "current"|"delay"|"default"}``.
+    La ligne "Bricks" devient la somme de ses sous-lignes ("non investi" incluse) : l'en-tête de
+    section "Crowdfunding immobilier" est donc réécrit en ``=C<ligne Bricks>`` pour ne rien compter deux fois.
+    """
+    issues = fill_platform_loan_geo_amounts(
+        "Bricks", project_amounts, project_statuses, BRICKS_STATUS_ORDER, BRICKS_STATUS_HEADER_LABELS, _bricks_status_of_header,
+    )
+    worksheet = get_worksheet_by_name("Répartition géographique")
+    grid = _call_with_retry(worksheet.get_all_values)
+    geo_pos = find_cell_by_value(grid, "Répartition géographique")
+    section_row = find_first_cell_containing_below(grid, geo_pos[0], geo_pos[1], "Crowdfunding immobilier") if geo_pos else None
+    platform_row = find_first_cell_containing_below(grid, geo_pos[0], geo_pos[1], "Bricks") if geo_pos else None
+    if section_row and platform_row and section_row < platform_row:
+        letter = _col_letter(geo_pos[1] + 1)
+        _call_with_retry(
+            worksheet.update, rowcol_to_a1(section_row, geo_pos[1] + 1), [[f"={letter}{platform_row}"]],
+            value_input_option="USER_ENTERED",
+        )
     return issues
 
 
