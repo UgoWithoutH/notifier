@@ -51,6 +51,18 @@ button can't be found/clicked, or any other unrecognized UI appears,
 investing still stops immediately rather than guessing, and the modal's
 HTML is included in the summary for manual review.
 
+CURRENT BEHAVIOR (supersedes every sheet/split description below): the robot
+is configured entirely by the "config robots" Google Sheet (see
+shared/robot_config.py: active originators, min/max rate, per-country and
+per-originator caps in % of balance + invested, min/max amount per
+investment, equal split flag), with already-invested amounts read from
+"Répartition géographique" (shared.google_sheet.get_geo_platform_snapshot()).
+The investment amounts of a run come from robot_config.plan_allocations();
+the functions/sheet readers named below that no longer exist
+(get_selected_swaper_loan_originators(), get_swaper_min_interest_rate(),
+get_swaper_country_allocations(), get_swaper_originator_caps(),
+_compute_swaper_loan_shares()) are kept in this text for history only.
+
 Per-originator filtering + budget split (added 2026-07-25, same day, per
 explicit user request - mirrors the PeerBerry/Lendermarket "x" flag
 convention in the Google Sheet): instead of investing into the aggregate/
@@ -240,12 +252,8 @@ from shared.notifier import send_swaper_email, send_swaper_investment_summary_em
 from shared.state import load_state, save_state
 from shared.cron_schedule import ensure_schedule, apply_startup_jitter
 from shared.notification_gate import should_notify
-from shared.google_sheet import (
-    get_selected_swaper_loan_originators,
-    get_swaper_min_interest_rate,
-    get_swaper_country_allocations,
-    get_swaper_originator_caps,
-)
+from shared.google_sheet import get_geo_platform_snapshot
+from shared.robot_config import Candidate, build_tracker, get_platform_config, plan_allocations
 from shared.browser_stealth import get_context_options, apply_stealth, human_pause, human_mouse_wander, human_type
 
 DEFAULT_STATE = {
@@ -271,13 +279,6 @@ SWAPER_CRON_JOB_ID = os.environ.get("SWAPER_CRON_JOB_ID")
 # this, don't even attempt a click (mirrors MIN_INVESTMENT_AMOUNT in
 # monitors/peerberry_invest_bot.py).
 MIN_INVESTMENT_AMOUNT = float(os.environ.get("MIN_INVESTMENT_AMOUNT", "10"))
-
-# Fallback used only if get_swaper_min_interest_rate() (reads the cell just
-# left of "Swaper" in "Répartition géographique", see that function's
-# docstring) fails - default 0 preserves the pre-2026-07-31 behavior (no
-# interest-rate filtering at all) instead of silently excluding every loan
-# on a read error.
-MIN_INTEREST_RATE = float(os.environ.get("SWAPER_MIN_INTEREST_RATE", "0"))
 
 # Loans-listing page navigated to directly (fetch_loans() lets the real
 # Angular app fire the API call itself - see that function's docstring for
@@ -679,52 +680,6 @@ def _redact_sensitive_headers(headers: dict) -> dict:
     return redacted
 
 
-def _compute_swaper_loan_shares(budget: float, loans: list, min_investment: float = MIN_INVESTMENT_AMOUNT) -> dict:
-    """Greedily fill `loans` (that originator's currently available loans,
-    kept in LISTING order) one after another with as much of `budget` as
-    each can actually take, instead of splitting the budget evenly across
-    them - replaces the old equal-split algorithm (removed 2026-09-19,
-    explicit user request: "il met tout le solde qu'il peut sur les prêts
-    qu'il trouve et si plusieurs prêts il met ce qu'il peut sur le premier
-    ensuite le deuxième etc", overriding the 2026-07-25 equal-split
-    decision quoted in the module docstring above). Combined with
-    `_available_originators_in_order()`, one originator's loans are fully
-    funded (in listing order) before any leftover budget moves on to the
-    next originator - see run()'s invest loop.
-
-    For each loan in order: invest `min(remaining_budget, loan's own
-    `amount`)`, but only if that is >= `min_investment` (a loan that can
-    only take less than the minimum is skipped - not funded, not
-    "wasted" - the next loan in the list is tried with the same remaining
-    budget). Stops as soon as remaining budget drops below
-    `min_investment` or the loan list is exhausted.
-
-    Returns `{loan_id: amount}` for every loan that ends up funded (amount
-    rounded to 2 decimals).
-    """
-    shares = {}
-    remaining = budget
-    for loan in loans:
-        if remaining < min_investment:
-            break
-        loan_id = loan.get("id")
-        if loan_id is None:
-            continue
-        try:
-            cap = float(loan.get("amount") or 0)
-        except (TypeError, ValueError):
-            cap = 0.0
-        if cap <= 0:
-            continue
-        amount = min(remaining, cap)
-        if amount < min_investment:
-            continue
-        amount = round(amount, 2)
-        shares[loan_id] = amount
-        remaining -= amount
-    return shares
-
-
 def _record_api_response(captured: list, response) -> None:
     """Passively captures every `/rest/` API call fired by real UI clicks
     (registered on `page.on("response", ...)` only AFTER `login()` has fully
@@ -946,7 +901,7 @@ def run(headless: bool = True) -> None:
     payload = None
     captured_api_calls = []
     investment_attempts = []
-    min_interest_rate = MIN_INTEREST_RATE
+    min_interest_rate = 0
     country_threshold_percentage = None
     country_status = {}
     country_blocked_originators = []
@@ -1032,82 +987,47 @@ def run(headless: bool = True) -> None:
                     balance_now, MIN_INVESTMENT_AMOUNT,
                 )
             else:
+                # The whole robot configuration (active originators, rate bounds,
+                # caps, min/max amounts, equal split) comes from the "config
+                # robots" sheet (shared/robot_config.py); the amounts already
+                # invested (per country / originator) from "Répartition
+                # géographique". The config is required (read failure = no
+                # auto-invest this run); the geographic snapshot is soft-fail:
+                # without it, caps are computed from the balance only.
+                config = None
                 try:
-                    selected_originators = get_selected_swaper_loan_originators()
+                    config = get_platform_config("Swaper")
                 except Exception:
-                    log.exception("Could not read selected Swaper loan originators from the Google Sheet.")
-                    selected_originators = []
+                    log.exception("Could not read the Swaper configuration from the 'config robots' sheet.")
 
-                # minInterestRate + per-country cap, read from the Sheet once per
-                # run (added 2026-07-31, same convention/cell layout as
-                # PeerBerry's/Lendermarket's own MIN_INTEREST_RATE/country
-                # allocations, see get_swaper_min_interest_rate()/
-                # get_swaper_country_allocations()) - both are soft-fail: a read
-                # error just falls back to the module default / disables country
-                # blocking for this run, rather than aborting.
-                min_interest_rate = MIN_INTEREST_RATE
-                try:
-                    min_interest_rate = get_swaper_min_interest_rate()
-                except Exception:
-                    log.exception(
-                        "Could not read the Swaper minInterestRate from the Google Sheet, falling back to the default (%s).",
-                        MIN_INTEREST_RATE,
-                    )
+                selected_originators = config.active_names() if config else []
+                # Lowest "Taux min" among active originators: only a coarse
+                # pre-filter for the fetched loans (0 = none); each loan is
+                # checked against its own originator's min/max rate when the
+                # investment plan is computed.
+                min_interest_rate = (config.lowest_min_rate() or 0) if config else 0
+                country_threshold_percentage = config.country_max_pct if config else None
 
-                country_allocations = {}
-                try:
-                    country_allocations = get_swaper_country_allocations()
-                except Exception:
-                    log.exception("Could not read the Swaper per-country allocations from the Google Sheet, country blocking is disabled this run.")
+                geo_snapshot = None
+                if config:
+                    try:
+                        geo_snapshot = get_geo_platform_snapshot("Swaper", "Crowdlending savings")
+                    except Exception:
+                        log.exception("Could not read the Swaper geographic snapshot from the Google Sheet, country/originator caps are computed from the balance only this run.")
+                tracker = build_tracker(config, balance_now, geo_snapshot) if config else None
 
-                country_threshold_percentage = country_allocations.get("threshold_percentage")
-                country_invested = dict(country_allocations.get("country_amounts") or {})
-                originator_countries = country_allocations.get("originator_countries") or {}
                 country_blocked_originators = []
-                relevant_countries = {
-                    originator_countries[name] for name in selected_originators if name in originator_countries
-                }
-
-                def _is_country_blocked(country, total_budget):
-                    if not country or country_threshold_percentage is None or total_budget <= 0:
-                        return False
-                    return country_invested.get(country, 0.0) >= (country_threshold_percentage / 100.0) * total_budget
-
-                total_budget = balance_now + sum(country_invested.values())
-
-                # Per-loan-originator cap (added 2026-08-05, in ADDITION to
-                # the per-country cap above) - same soft-fail convention: a
-                # read error just disables this cap for the run rather than
-                # aborting it. See shared.google_sheet.get_swaper_originator_caps().
-                originator_cap_data = {}
-                try:
-                    originator_cap_data = get_swaper_originator_caps()
-                except Exception:
-                    log.exception("Could not read the Swaper per-loan-originator caps from the Google Sheet, per-originator cap blocking is disabled this run.")
-
-                originator_invested = {
-                    name: data.get("invested_amount", 0.0) for name, data in originator_cap_data.items()
-                }
-                originator_max_percentages = {
-                    name: data.get("max_percentage")
-                    for name, data in originator_cap_data.items()
-                    if data.get("max_percentage") is not None
-                }
                 originator_cap_blocked = []
-
-                if originator_max_percentages:
+                relevant_countries = (
+                    {tracker.country_of(name) for name in selected_originators} - {None} if tracker else set()
+                )
+                if tracker:
                     log.info(
-                        "Plafonds par loan originator configurés (%% du budget total) : %s (déjà investi : %s)",
-                        originator_max_percentages, originator_invested,
+                        "Caps (%% of total budget %.2f EUR): country=%s%%, originators=%s ; already invested per country: %s",
+                        tracker.total_budget, country_threshold_percentage,
+                        {n: l.max_loan_pct for n, l in config.loans.items() if l.active and l.max_loan_pct is not None},
+                        tracker.country_invested,
                     )
-                else:
-                    log.info("Aucun plafond par loan originator configuré - blocage par originator désactivé pour ce run.")
-
-                def _is_originator_cap_blocked(name, total_budget):
-                    max_percentage = originator_max_percentages.get(name)
-                    if max_percentage is None or total_budget <= 0:
-                        return False
-                    return originator_invested.get(name, 0.0) >= (max_percentage / 100.0) * total_budget
 
                 originator_loans = {}
                 if not selected_originators:
@@ -1184,18 +1104,14 @@ def run(headless: bool = True) -> None:
                                 balance_now, MIN_INVESTMENT_AMOUNT,
                             )
                         else:
-                            # Per-country cap (added 2026-07-31, mirrors
-                            # lendermarket_monitor.py's invest_selected_lenders()) -
-                            # any currently-available originator whose mapped
-                            # country is already at/above
-                            # `country_threshold_percentage`% of the total Swaper
-                            # budget (balance + every country's already-invested
-                            # amount) is excluded from this run's budget split
-                            # (same treatment as "0 loans available").
-                            total_budget = balance_now + sum(country_invested.values())
+                            # Per-country / per-originator caps ("Pourcentage max du
+                            # solde par pays" / "par loan", relative to balance +
+                            # everything already invested): an originator already
+                            # at/above one of them is excluded from this run (same
+                            # treatment as "0 loans available").
                             for name in list(originator_loans.keys()):
-                                country = originator_countries.get(name)
-                                if _is_country_blocked(country, total_budget):
+                                country = tracker.country_of(name)
+                                if tracker.country_room(country) <= 0:
                                     log.info(
                                         "Originator %r (country %r) is blocked this run: already at/above the %s%% country cap.",
                                         name, country, country_threshold_percentage,
@@ -1204,57 +1120,21 @@ def run(headless: bool = True) -> None:
                                         country_blocked_originators.append(name)
                                     del originator_loans[name]
                                     continue
-                                if _is_originator_cap_blocked(name, total_budget):
-                                    log.info(
-                                        "Originator %r is blocked this run: already at/above its own %s%% cap.",
-                                        name, originator_max_percentages.get(name),
-                                    )
+                                if tracker.loan_room(name) <= 0:
+                                    log.info("Originator %r is blocked this run: already at/above its own cap.", name)
                                     if name not in originator_cap_blocked:
                                         originator_cap_blocked.append(name)
                                     del originator_loans[name]
 
-                            # Sequential fill instead of an even split (changed
-                            # 2026-09-19, explicit user request: "il met tout
-                            # le solde qu'il peut sur les prêts qu'il trouve
-                            # et si plusieurs prêts il met ce qu'il peut sur
-                            # le premier ensuite le deuxième etc"; an earlier
-                            # version of this same change also prioritized
-                            # "Wandoo Finance Group" first, reverted minutes
-                            # later per "je ne veux plus le Priorité par
-                            # originator enlève le" - originators are now
-                            # visited in plain discovery order, no special
-                            # casing). `remaining_budget` carries over from
-                            # one originator to the next: the first available
-                            # originator is offered the FULL balance and
-                            # greedily fills as many of its own loans as it
-                            # can (see `_compute_swaper_loan_shares()`'s
-                            # greedy algorithm); whatever is left over only
-                            # then moves on to the next originator, and so on
-                            # - no originator gets a fixed pre-split share
-                            # anymore.
-                            remaining_budget = balance_now
+                            # Re-fetch (not just re-apply the filter) right before
+                            # investing - the discovery-time list can already be
+                            # stale by now since Swaper's manual inventory is
+                            # extremely transient (a loan can be grabbed by someone
+                            # else, or a new one can appear, within seconds).
+                            candidates = []
+                            loans_by_name = {}
                             for name in _available_originators_in_order(originator_loans):
-                                if remaining_budget < MIN_INVESTMENT_AMOUNT:
-                                    log.info(
-                                        "Remaining budget %.2f EUR is below the minimum - stopping the "
-                                        "sequential invest loop before originator %r.",
-                                        remaining_budget, name,
-                                    )
-                                    break
-                                budget = remaining_budget
-                                log.info("Investing up to %.2f EUR into originator %r's loan(s).", budget, name)
-
                                 try:
-                                    # Re-fetch (not just re-apply the filter) right
-                                    # before investing - the discovery-time list can
-                                    # already be stale by now since Swaper's manual
-                                    # inventory is extremely transient (a loan can be
-                                    # grabbed by someone else, or a new one can
-                                    # appear, within seconds). Using the fresh list
-                                    # here (instead of the discovery-time
-                                    # originator_loans[name]) avoids computing shares
-                                    # for/targeting a loan that no longer exists, and
-                                    # correctly picks up any loan that appeared since.
                                     refreshed_payload = _with_relogin_retry(
                                         lambda name=name: fetch_loans(page, captured_api_calls, groups=[name])
                                     )
@@ -1267,33 +1147,47 @@ def run(headless: bool = True) -> None:
                                 if not current_loans:
                                     log.info("Originator %r no longer has any loan available right before investing - skipping.", name)
                                     continue
-                                shares = _compute_swaper_loan_shares(budget, current_loans)
+                                loans_by_name[name] = current_loans
+                                for loan in current_loans:
+                                    loan_id = loan.get("id")
+                                    if loan_id is None:
+                                        continue
+                                    try:
+                                        available = float(loan.get("amount") or 0)
+                                    except (TypeError, ValueError):
+                                        available = 0.0
+                                    try:
+                                        rate = float(loan.get("interestRatePerYear"))
+                                    except (TypeError, ValueError):
+                                        rate = None
+                                    candidates.append(Candidate(loan_id, name, available, rate))
+
+                            # One allocation across ALL candidate loans: per-originator
+                            # rate bounds, min/max amount, caps and the "Répartition
+                            # équivalente" flag (see shared/robot_config.py).
+                            plan = plan_allocations(candidates, tracker, balance_now, MIN_INVESTMENT_AMOUNT)
+                            log.info("Investment plan (loan id -> EUR): %s", plan)
+                            shares_by_name = {}
+                            for candidate in candidates:
+                                if candidate.id in plan:
+                                    shares_by_name.setdefault(candidate.loan_name, {})[candidate.id] = plan[candidate.id]
+
+                            for name, shares in shares_by_name.items():
+                                log.info("Investing %.2f EUR into originator %r's loan(s).", sum(shares.values()), name)
                                 try:
                                     attempts = _with_relogin_retry(
-                                        lambda: _invest_available_loans(page, current_loans, shares, captured_api_calls)
+                                        lambda: _invest_available_loans(page, loans_by_name[name], shares, captured_api_calls)
                                     )
                                 except Exception:
                                     log.exception("Failed to invest into originator %r's loan(s) - skipping it this run.", name)
                                     continue
-                                country = originator_countries.get(name)
                                 for attempt in attempts:
                                     attempt["originator"] = name
-                                    # country_invested is updated after EVERY
-                                    # attempted amount (not just a confirmed
-                                    # status) so multiple originators sharing the
-                                    # same country can't jointly blow past the cap.
-                                    if country and not attempt.get("error"):
-                                        country_invested[country] = country_invested.get(country, 0.0) + (attempt.get("amount") or 0.0)
-                                    # Same idea, per loan originator (added
-                                    # 2026-08-05, per-originator cap).
+                                    # Caps are updated after every attempt that
+                                    # wasn't an outright error, so later investments
+                                    # in the same run see them.
                                     if not attempt.get("error"):
-                                        originator_invested[name] = originator_invested.get(name, 0.0) + (attempt.get("amount") or 0.0)
-                                    # Carry any unspent budget over to the next
-                                    # originator in discovery order (see above) -
-                                    # only amounts that weren't an outright
-                                    # error are treated as actually spent.
-                                    if not attempt.get("error"):
-                                        remaining_budget -= (attempt.get("amount") or 0.0)
+                                        tracker.add(name, attempt.get("amount") or 0.0)
                                 pass_attempts.extend(attempts)
 
                         investment_attempts.extend(pass_attempts)
@@ -1332,33 +1226,8 @@ def run(headless: bool = True) -> None:
                 # 2026-07-31, mirrors send_lendermarket_invest_summary_email()'s
                 # "=== Seuil par pays ===" section) - built AFTER the invest loop
                 # above so it reflects this run's own successful attempts too.
-                country_status = {}
-                for country in relevant_countries:
-                    invested = country_invested.get(country, 0.0)
-                    threshold_amount = (
-                        (country_threshold_percentage / 100.0) * total_budget
-                        if country_threshold_percentage is not None and total_budget > 0
-                        else None
-                    )
-                    country_status[country] = {
-                        "invested": invested,
-                        "threshold_amount": threshold_amount,
-                        "blocked": threshold_amount is not None and invested >= threshold_amount,
-                    }
-
-                # Same snapshot, per loan originator this time (added
-                # 2026-08-05, per-originator cap - mirrors the per-country
-                # one above).
-                originator_cap_status = {}
-                for name, max_percentage in originator_max_percentages.items():
-                    invested = originator_invested.get(name, 0.0)
-                    threshold_amount = (max_percentage / 100.0) * total_budget if total_budget > 0 else None
-                    originator_cap_status[name] = {
-                        "invested": invested,
-                        "max_percentage": max_percentage,
-                        "threshold_amount": threshold_amount,
-                        "blocked": threshold_amount is not None and invested >= threshold_amount,
-                    }
+                country_status = tracker.country_status(relevant_countries) if tracker else {}
+                originator_cap_status = tracker.loan_cap_status() if tracker else {}
         except SwaperMaintenanceMode as exc:
             # Transient external outage (site-wide maintenance), not a bug -
             # explicit user decision (2026-08-03): skip the rest of this run
@@ -1407,7 +1276,7 @@ def run(headless: bool = True) -> None:
         )
         send_swaper_investment_summary_email(
             investment_attempts,
-            min_interest_rate=min_interest_rate,
+            min_interest_rate=min_interest_rate or None,
             country_threshold_percentage=country_threshold_percentage,
             country_status=country_status,
             country_blocked=country_blocked_originators,

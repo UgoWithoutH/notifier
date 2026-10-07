@@ -1,5 +1,10 @@
 """PeerBerry automated investment bot (v1).
 
+CURRENT BEHAVIOR: originators, rates, amounts and caps now come from the
+"config robots" sheet (shared.robot_config); the "R\u00e9partition g\u00e9ographique"
+sheet is only read once for the already-invested amounts. The remainder of
+this docstring is historical (old sheet readers no longer exist).
+
 `workflow_dispatch`-only bot, externally triggered via cron-job.org, that
 repeatedly polls PeerBerry's filtered loan listing (same filters as
 https://peerberry.com/en/client/invest?sort=-loanId&groupGuarantee=1&loanOriginators=4,12,23,30,33,36,39,41,43,45,47,48,49,50,51,52,53,54,55,56,57,58,59,62,63,64,65,66,67,68,69,70,71,72,73,74,75,76,77,78&minInterestRate=8.5&maxRemainingTerm=185&minRemainingTerm=1,
@@ -229,12 +234,8 @@ load_dotenv()
 
 from monitors.peerberry_monitor import login, PEERBERRY_EMAIL, PEERBERRY_PASSWORD, _HEADERS, API_BASE
 from shared.notifier import send_peerberry_invest_bot_summary_email
-from shared.google_sheet import (
-    get_selected_peerberry_loan_originators,
-    get_peerberry_min_interest_rate,
-    get_peerberry_country_allocations,
-    get_peerberry_originator_caps,
-)
+from shared.google_sheet import get_geo_platform_snapshot
+from shared.robot_config import Candidate, build_tracker, get_platform_config, plan_allocations
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger("peerberry_invest_bot")
@@ -261,11 +262,11 @@ LOAN_ORIGINATORS = [
     75, 76, 77, 78,
 ]
 
-# Overridden at startup in run() from the Sheet cell just left of "Peerberry"
-# (shared.google_sheet.get_peerberry_min_interest_rate()) - this literal is
-# only the fallback used if that read fails (soft-fail, not fatal, unlike
-# the loan originator selection).
-MIN_INTEREST_RATE = 8.5
+# Overridden at startup in run() with the lowest "Taux min" of the active
+# loan originators in the "config robots" sheet (0 if none/empty) - only a
+# coarse server-side pre-filter, each loan is then checked against its own
+# originator's min/max rate (shared.robot_config.plan_allocations()).
+MIN_INTEREST_RATE = 0
 
 _DURATION_SHORTHAND_RE = re.compile(r"^(?P<hours>\d+)h(?P<minutes>\d+)$")
 _DURATION_UNITS_RE = re.compile(
@@ -602,49 +603,33 @@ def _group_invested_by_country(raw_amounts: dict, originator_countries: dict) ->
     return totals
 
 
-def _update_blocked_countries(country_invested: dict, threshold_amount, blocked_countries: set) -> list:
-    """Add to `blocked_countries` (in place) any country in
-    `country_invested` whose total has reached/exceeded `threshold_amount`
-    - once a country is blocked it stays blocked for the rest of the run
-    (sticky), matching the user's requirement that a country hitting its
-    cap can no longer be invested in "durant le run" even if a later
-    resync happens to show a lower figure. Returns the list of newly-
-    blocked country names (for logging), or [] if none / no threshold
-    configured (`threshold_amount` is None, i.e. the Sheet's threshold
-    percentage cell was empty - country blocking disabled for this run)."""
-    if threshold_amount is None:
-        return []
-    newly_blocked = []
-    for country, amount in country_invested.items():
-        if country in blocked_countries:
+def _plan_poll(config, tracker, loans: list, budget: float, recently_failed: dict) -> dict:
+    """{loanId: amount} to invest for this listing, in the given order.
+    Only loans of active originators (matched by name) that are not in
+    failure cooldown are considered; the amounts respect each originator's
+    min/max rate and amount, equal-split flag and the country / loan caps
+    left in `tracker` (see shared.robot_config.plan_allocations())."""
+    selected = config.active_names()
+    now = time.monotonic()
+    candidates = []
+    for loan in loans:
+        loan_id = loan.get("loanId")
+        name = _match_selected_originator(loan.get("loanOriginator"), selected)
+        if name is None:
             continue
-        if amount >= threshold_amount:
-            blocked_countries.add(country)
-            newly_blocked.append(country)
-    return newly_blocked
-
-
-def _update_blocked_originators(originator_invested: dict, originator_threshold_amounts: dict, blocked_originators: set) -> list:
-    """Same sticky-blocking logic as `_update_blocked_countries()`, but
-    per loan originator instead of per country - added 2026-08-05,
-    supports the new per-loan-originator cap (`shared.google_sheet.
-    get_peerberry_originator_caps()`, a percentage of the account's total
-    balance a single loan originator should never exceed, in ADDITION to
-    the existing per-country cap). `originator_threshold_amounts` is a
-    dict of {originator_name: threshold_amount} (only originators with a
-    configured percentage are present - an originator absent from this
-    dict has no cap and can never be blocked here)."""
-    newly_blocked = []
-    for name, amount in originator_invested.items():
-        if name in blocked_originators:
+        failed_at = recently_failed.get(loan_id)
+        if failed_at is not None and now - failed_at < FAILED_LOAN_COOLDOWN_SECONDS:
             continue
-        threshold_amount = originator_threshold_amounts.get(name)
-        if threshold_amount is None:
-            continue
-        if amount >= threshold_amount:
-            blocked_originators.add(name)
-            newly_blocked.append(name)
-    return newly_blocked
+        try:
+            available = float(loan.get("availableToInvest"))
+        except (TypeError, ValueError):
+            available = 0.0
+        try:
+            rate = float(loan.get("interestRate"))
+        except (TypeError, ValueError):
+            rate = None
+        candidates.append(Candidate(loan_id, name, available, rate))
+    return plan_allocations(candidates, tracker, budget, MIN_INVESTMENT_AMOUNT)
 
 
 def attempt_investment(session: requests.Session, loan: dict, amount: float) -> bool:
@@ -772,77 +757,49 @@ def run() -> None:
         return
 
     try:
-        selected_originators = get_selected_peerberry_loan_originators()
+        config = get_platform_config("Peerberry")
     except Exception as exc:
-        log.exception("Failed to read selected loan originators from the Google Sheet.")
-        _log_diagnostics("startup_error", step="google_sheet_selection", error=str(exc), traceback=traceback.format_exc())
+        log.exception("Failed to read the PeerBerry configuration from the 'config robots' sheet.")
+        _log_diagnostics("startup_error", step="google_sheet_config", error=str(exc), traceback=traceback.format_exc())
         stats["errors"] += 1
         send_peerberry_invest_bot_summary_email(
             stats,
-            error=f"Échec de lecture des loan originators sélectionnés (Google Sheet) : {exc}",
+            error=f"Échec de lecture de la configuration PeerBerry (onglet 'config robots') : {exc}",
             diagnostics_text=_collect_run_diagnostics(run_started_at),
         )
         sys.exit(1)
 
+    selected_originators = config.active_names()
+
     global MIN_INTEREST_RATE
+    MIN_INTEREST_RATE = config.lowest_min_rate() or 0
+
+    # Amounts already invested per country / loan originator, from the
+    # "Répartition géographique" sheet (soft-fail: without it the caps are
+    # computed from the balance only). Afterwards kept up to date purely from
+    # the live API (own successful investments update it immediately, a
+    # periodic resync folds in anything external) - the sheet is never read
+    # again after this point.
     try:
-        MIN_INTEREST_RATE = get_peerberry_min_interest_rate()
+        geo_snapshot = get_geo_platform_snapshot("Peerberry", "Swaper")
     except Exception as exc:
-        log.warning("Could not read minInterestRate from the Google Sheet, keeping the fallback %.2f: %s", MIN_INTEREST_RATE, exc)
-        _log_diagnostics("min_interest_rate_read_error", error=str(exc), traceback=traceback.format_exc(), fallback=MIN_INTEREST_RATE)
+        log.warning("Could not read the PeerBerry geographic snapshot from the Google Sheet - caps computed from the balance only for this run: %s", exc)
+        _log_diagnostics("geo_snapshot_read_error", error=str(exc), traceback=traceback.format_exc())
+        geo_snapshot = None
 
-    # Per-country investment cap (soft-fail: an error here disables country
-    # blocking for this run rather than aborting it, same reasoning as
-    # MIN_INTEREST_RATE above - see shared.google_sheet.get_peerberry_country_allocations()).
-    try:
-        country_data = get_peerberry_country_allocations()
-    except Exception as exc:
-        log.warning("Could not read PeerBerry country allocations from the Google Sheet - country threshold blocking disabled for this run: %s", exc)
-        _log_diagnostics("country_allocations_read_error", error=str(exc), traceback=traceback.format_exc())
-        country_data = {"threshold_percentage": None, "country_amounts": {}, "originator_countries": {}}
-
-    country_threshold_percentage = country_data.get("threshold_percentage")
-    # Running per-country invested total - starts from the Google Sheet
-    # snapshot (as requested), then kept up to date for the rest of the run
-    # purely from the live API (own successful investments update it
-    # immediately, a periodic resync folds in anything external) - see
-    # EXTERNAL_INVESTMENT_CHECK_INTERVAL_SECONDS below. The Sheet itself is
-    # never read again after this point.
-    country_invested = dict(country_data.get("country_amounts") or {})
-    originator_countries = country_data.get("originator_countries") or {}
-    # Countries that have reached/exceeded the threshold - sticky for the
-    # rest of the run (see _update_blocked_countries()).
-    blocked_countries: set = set()
-
-    # Per-loan-originator investment cap (added 2026-08-05, in ADDITION to
-    # the per-country cap above): a percentage of the TOTAL PeerBerry
-    # budget that a single loan originator should never exceed, read from
-    # shared.google_sheet.get_peerberry_originator_caps() (soft-fail, same
-    # convention as the per-country read above - a read error just
-    # disables this cap for the run rather than aborting it).
-    try:
-        originator_cap_data = get_peerberry_originator_caps()
-    except Exception as exc:
-        log.warning("Could not read PeerBerry per-loan-originator caps from the Google Sheet - per-originator cap blocking disabled for this run: %s", exc)
-        _log_diagnostics("originator_caps_read_error", error=str(exc), traceback=traceback.format_exc())
-        originator_cap_data = {}
-
-    originator_max_percentages = {
-        name: data.get("max_percentage")
-        for name, data in originator_cap_data.items()
-        if data.get("max_percentage") is not None
-    }
-    # Loan originators that have reached/exceeded their own cap - sticky for
-    # the rest of the run (see _update_blocked_originators()).
-    blocked_originators: set = set()
+    tracker = build_tracker(config, available_money, geo_snapshot)
+    country_threshold_percentage = config.country_max_pct
+    country_invested = tracker.country_invested
+    originator_countries = tracker.loan_countries
+    country_invested_initial = dict(country_invested)
 
     if not selected_originators:
-        log.error("No PeerBerry loan originator selected in the Google Sheet (column -1 == 'x'), nothing to invest in.")
+        log.error("No PeerBerry loan originator is active (ACTIF = x) in the 'config robots' sheet, nothing to invest in.")
         _log_diagnostics("startup_error", error="no selected loan originators")
         stats["errors"] += 1
         send_peerberry_invest_bot_summary_email(
             stats,
-            error="Aucun loan originator PeerBerry sélectionné dans le Google Sheet.",
+            error="Aucun loan originator PeerBerry actif dans l'onglet 'config robots'.",
             diagnostics_text=_collect_run_diagnostics(run_started_at),
         )
         sys.exit(1)
@@ -887,18 +844,18 @@ def run() -> None:
     total_peerberry_budget = total_invested_all_originators + available_money
     stats["total_invested_all_originators"] = total_invested_all_originators
     stats["total_peerberry_budget"] = total_peerberry_budget
-    if country_threshold_percentage is not None:
-        country_threshold_amount = total_peerberry_budget * country_threshold_percentage / 100.0
+    if initial_raw_invested:
+        tracker.total_budget = total_peerberry_budget
+    country_threshold_amount = tracker.country_cap_amount()
+    if country_threshold_amount is not None:
         log.info(
             "Seuil par pays PeerBerry : %.2f%% de %.2f EUR (investi %.2f + disponible %.2f) = %.2f EUR max par pays.",
             country_threshold_percentage, total_peerberry_budget, total_invested_all_originators, available_money, country_threshold_amount,
         )
     else:
-        country_threshold_amount = None
         log.info("Aucun pourcentage de seuil par pays PeerBerry configuré - blocage par pays désactivé pour ce run.")
 
-    initially_blocked = _update_blocked_countries(country_invested, country_threshold_amount, blocked_countries)
-    for country in initially_blocked:
+    for country in tracker.blocked_countries():
         log.warning(
             "Pays '%s' déjà au-dessus du seuil dès le démarrage (%.2f EUR >= %.2f EUR) - bloqué pour tout ce run.",
             country, country_invested.get(country, 0.0), country_threshold_amount,
@@ -914,25 +871,29 @@ def run() -> None:
     # didn't return anything for - kept up to date for the rest of the run
     # exactly like country_invested (this bot's own successful investments,
     # plus the same periodic external resync).
+    originator_max_percentages = {
+        name: loan_cfg.max_loan_pct
+        for name, loan_cfg in config.loans.items()
+        if loan_cfg.active and loan_cfg.max_loan_pct is not None
+    }
     originator_threshold_amounts = {
-        name: pct / 100.0 * total_peerberry_budget
-        for name, pct in originator_max_percentages.items()
+        name: tracker.loan_cap_amount(name) for name in originator_max_percentages
     }
-    raw_invested_by_selected_name = {}
+    # Live API snapshot takes precedence over the sheet's "already invested"
+    # figure (tracker.loan_invested, seeded from the geo snapshot).
+    originator_invested = tracker.loan_invested
+    config_names = list(config.loans.keys())
+    raw_invested_by_name = {}
     for raw_name, amount in initial_raw_invested.items():
-        matched_name = _match_selected_originator(raw_name, selected_originators)
+        matched_name = _match_selected_originator(raw_name, config_names)
         if matched_name is not None:
-            raw_invested_by_selected_name[matched_name] = raw_invested_by_selected_name.get(matched_name, 0.0) + amount
-    originator_invested = {
-        name: raw_invested_by_selected_name.get(name, originator_cap_data.get(name, {}).get("invested_amount", 0.0))
-        for name in selected_originators
-    }
+            raw_invested_by_name[matched_name] = raw_invested_by_name.get(matched_name, 0.0) + amount
+    originator_invested.update(raw_invested_by_name)
 
-    initially_blocked_originators = _update_blocked_originators(originator_invested, originator_threshold_amounts, blocked_originators)
-    for name in initially_blocked_originators:
+    for name in tracker.blocked_loans():
         log.warning(
             "Loan originator '%s' déjà au-dessus de son plafond dès le démarrage (%.2f EUR >= %.2f EUR) - bloqué pour tout ce run.",
-            name, originator_invested.get(name, 0.0), originator_threshold_amounts.get(name),
+            name, originator_invested.get(name, 0.0), originator_threshold_amounts.get(name) or 0.0,
         )
 
     log.info(
@@ -978,11 +939,6 @@ def run() -> None:
     # Raw loanOriginator values already console-logged as "unmatched" this
     # run, so the same value isn't logged on every single poll.
     logged_unmatched_originators: set = set()
-    # Country names already console-logged as "blocked" this run, so the
-    # same country isn't logged again on every single poll once blocked.
-    logged_blocked_countries: set = set()
-    # Same, per loan originator (added 2026-08-05, per-originator cap).
-    logged_blocked_originators: set = set()
     # (loan_id, reason) pairs already console-logged as "skipped" this run,
     # so the same loan+reason isn't logged again on every single poll it
     # keeps reappearing in the listing - reasons: "cooldown" (recent failed
@@ -1028,29 +984,16 @@ def run() -> None:
                         fresh_country_totals = _group_invested_by_country(raw_invested, originator_countries)
                         for country, amount in fresh_country_totals.items():
                             country_invested[country] = amount
-                        newly_blocked = _update_blocked_countries(country_invested, country_threshold_amount, blocked_countries)
-                        for country in newly_blocked:
-                            log.warning(
-                                "Pays '%s' vient d'atteindre le seuil (%.2f EUR >= %.2f EUR) - bloqué pour le reste du run.",
-                                country, country_invested.get(country, 0.0), country_threshold_amount,
-                            )
-                    # Same resync, per loan originator this time (added
-                    # 2026-08-05) - folds in anything external for the
-                    # per-originator cap too, not just this bot's own
-                    # successful investments (already updated inline below).
+                    # Same resync, per loan originator this time - folds in
+                    # anything external for the per-originator cap too, not
+                    # just this bot's own successful investments.
                     fresh_originator_totals = {}
                     for raw_name, amount in raw_invested.items():
-                        matched_name = _match_selected_originator(raw_name, selected_originators)
+                        matched_name = _match_selected_originator(raw_name, config_names)
                         if matched_name is not None:
                             fresh_originator_totals[matched_name] = fresh_originator_totals.get(matched_name, 0.0) + amount
                     for name, amount in fresh_originator_totals.items():
                         originator_invested[name] = amount
-                    newly_blocked_originators = _update_blocked_originators(originator_invested, originator_threshold_amounts, blocked_originators)
-                    for name in newly_blocked_originators:
-                        log.warning(
-                            "Loan originator '%s' vient d'atteindre son plafond (%.2f EUR >= %.2f EUR) - bloqué pour le reste du run.",
-                            name, originator_invested.get(name, 0.0), originator_threshold_amounts.get(name),
-                        )
                 except Exception as exc:
                     stats["errors"] += 1
                     _log_diagnostics("external_investment_check_error", error=str(exc), traceback=traceback.format_exc())
@@ -1143,6 +1086,7 @@ def run() -> None:
             # the list are less likely to already be contested by the time
             # we get to them.
             loans_to_try = list(reversed(data))
+            plan = _plan_poll(config, tracker, loans_to_try, available_money, recently_failed)
             while loans_to_try:
                 loan = loans_to_try.pop(0)
                 loan_id = loan.get("loanId")
@@ -1158,25 +1102,6 @@ def run() -> None:
                     continue
 
                 originator_stats[matched_originator]["loans_seen"].add(loan_id)
-
-                loan_country = originator_countries.get(matched_originator)
-                if loan_country and loan_country in blocked_countries:
-                    if loan_country not in logged_blocked_countries:
-                        logged_blocked_countries.add(loan_country)
-                        log.info(
-                            "Pays '%s' (originator '%s', loanId=%s) a atteint/dépassé le seuil - tous les prêts de ce pays sont bloqués pour le reste du run.",
-                            loan_country, matched_originator, loan_id,
-                        )
-                    continue
-
-                if matched_originator in blocked_originators:
-                    if matched_originator not in logged_blocked_originators:
-                        logged_blocked_originators.add(matched_originator)
-                        log.info(
-                            "Loan originator '%s' (loanId=%s) a atteint/dépassé son propre plafond - bloqué pour le reste du run.",
-                            matched_originator, loan_id,
-                        )
-                    continue
 
                 failed_at = recently_failed.get(loan_id)
                 if failed_at is not None and time.monotonic() - failed_at < FAILED_LOAN_COOLDOWN_SECONDS:
@@ -1194,19 +1119,19 @@ def run() -> None:
                         log.info("Remaining balance %.2f EUR is below the minimum (%.2f EUR), skipping loan %s.", available_money, MIN_INVESTMENT_AMOUNT, loan_id)
                     continue
 
+                amount = plan.get(loan_id)
+                if amount is None:
+                    if (loan_id, "not_planned") not in logged_skip_reasons:
+                        logged_skip_reasons.add((loan_id, "not_planned"))
+                        log.info(
+                            "Loan %s (originator '%s') ignoré : taux hors bornes, plafond (pays/loan) atteint ou montant sous le minimum.",
+                            loan_id, matched_originator,
+                        )
+                    continue
                 try:
                     loan_available = float(loan.get("availableToInvest"))
                 except (TypeError, ValueError):
                     loan_available = 0.0
-                amount = min(available_money, loan_available)
-                if amount < MIN_INVESTMENT_AMOUNT:
-                    if (loan_id, "amount_too_low") not in logged_skip_reasons:
-                        logged_skip_reasons.add((loan_id, "amount_too_low"))
-                        log.info(
-                            "Loan %s (originator '%s') availableToInvest=%.2f -> montant investissable %.2f EUR sous le minimum (%.2f EUR) - ignoré.",
-                            loan_id, matched_originator, loan_available, amount, MIN_INVESTMENT_AMOUNT,
-                        )
-                    continue
 
                 log.info("Matching loan found: loanId=%s originator=%s availableToInvest=%.2f -> attempting %.2f EUR.", loan_id, matched_originator, loan_available, amount)
                 stats["invest_attempts"] += 1
@@ -1220,21 +1145,7 @@ def run() -> None:
                     originator_stats[matched_originator]["invested_loans"].append({"loanId": loan_id, "amount": amount})
                     available_money -= amount
                     log.info("Solde disponible actualisé après investissement : %.2f EUR (investi %.2f EUR dans le prêt %s).", available_money, amount, loan_id)
-                    if loan_country:
-                        country_invested[loan_country] = country_invested.get(loan_country, 0.0) + amount
-                        newly_blocked = _update_blocked_countries(country_invested, country_threshold_amount, blocked_countries)
-                        for country in newly_blocked:
-                            log.warning(
-                                "Pays '%s' vient d'atteindre le seuil (%.2f EUR >= %.2f EUR) suite à cet investissement - bloqué pour le reste du run.",
-                                country, country_invested.get(country, 0.0), country_threshold_amount,
-                            )
-                    originator_invested[matched_originator] = originator_invested.get(matched_originator, 0.0) + amount
-                    newly_blocked_originators = _update_blocked_originators(originator_invested, originator_threshold_amounts, blocked_originators)
-                    for name in newly_blocked_originators:
-                        log.warning(
-                            "Loan originator '%s' vient d'atteindre son plafond (%.2f EUR >= %.2f EUR) suite à cet investissement - bloqué pour le reste du run.",
-                            name, originator_invested.get(name, 0.0), originator_threshold_amounts.get(name),
-                        )
+                    tracker.add(matched_originator, amount)
                     continue
 
                 stats["invest_failures"] += 1
@@ -1275,6 +1186,7 @@ def run() -> None:
                             loans=data,
                         )
                     loans_to_try = list(reversed(data))
+                    plan = _plan_poll(config, tracker, loans_to_try, available_money, recently_failed)
                 except Exception as exc:
                     stats["errors"] += 1
                     _log_diagnostics(
@@ -1319,8 +1231,10 @@ def run() -> None:
     stats["min_interest_rate"] = MIN_INTEREST_RATE
     stats["country_threshold_percentage"] = country_threshold_percentage
     stats["country_threshold_amount"] = country_threshold_amount
-    stats["country_invested_initial"] = dict(country_data.get("country_amounts") or {})
+    stats["country_invested_initial"] = country_invested_initial
     stats["country_invested_final"] = dict(country_invested)
+    blocked_countries = set(tracker.blocked_countries())
+    blocked_originators = set(tracker.blocked_loans())
     stats["blocked_countries"] = sorted(blocked_countries)
     # Full per-country debug detail for the summary email: exactly what was
     # read from the Sheet at startup, what it ended at, and how that
@@ -1356,7 +1270,7 @@ def run() -> None:
             "blocked": name in blocked_originators,
         })
     stats["originator_cap_details"] = originator_cap_details
-    stats["blocked_originators_cap"] = sorted(blocked_originators)
+    stats["blocked_originators_cap"] = sorted(n for n in blocked_originators if n in originator_max_percentages)
     for name, s in originator_stats.items():
         s["loans_seen"] = len(s["loans_seen"])
     stats["originator_stats"] = originator_stats
