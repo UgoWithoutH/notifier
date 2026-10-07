@@ -548,6 +548,73 @@ def send_lendermarket_invest_summary_email(stats: dict, error: str | None = None
         log.exception("Failed to send Lendermarket invest bot summary email.")
 
 
+def send_afranga_invest_summary_email(stats: dict, error: str | None = None, diagnostics_text: str | None = None) -> None:
+    """Recap of monitors/afranga_invest_bot.py. `stats["mode"]` is dry/probe/live;
+    in dry/probe nothing is bought, the planned lines are listed and the
+    diagnostics (requests/responses, review page structure) are attached."""
+    if not all([SMTP_HOST, SMTP_USER, SMTP_PASSWORD, EMAIL_TO]):
+        log.error(
+            "SMTP configuration is incomplete; cannot send email. "
+            "Required env vars: SMTP_HOST, SMTP_USER, SMTP_PASSWORD, EMAIL_TO."
+        )
+        return
+
+    mode = stats.get("mode", "?")
+    status = "ÉCHEC" if error else "OK"
+    subject = f"[Afranga Invest Bot] {status} ({mode}) - {stats.get('successes', 0)} investissement(s)"
+
+    body_parts = [f"Statut : {status}" + (f" ({error})" if error else ""), f"Mode : {mode}"]
+    if mode != "live":
+        body_parts.append("Aucun achat réel n'est effectué dans ce mode.")
+    if stats.get("balance_before") is not None:
+        body_parts.append(f"Solde avant : {stats['balance_before']:.2f} €")
+        body_parts.append(f"Solde après : {stats.get('balance_after', stats['balance_before']):.2f} €")
+    body_parts += [
+        f"Tentatives (ajouts au panier) : {stats.get('attempts', 0)}",
+        f"  - réussies : {stats.get('successes', 0)}",
+        f"  - échouées : {stats.get('failures', 0)}",
+        f"Montant total investi : {stats.get('total_invested', 0.0):.2f} €",
+        "",
+        "=== Achats prévus ===",
+    ]
+    for item in stats.get("plan") or []:
+        premium = item.get("premium")
+        extra = f", prime/décote {premium:+.1f}%" if premium is not None else ""
+        months = item.get("remaining_months")
+        extra += f", {months:g} mois" if months is not None else ""
+        rate = item.get("rate")
+        body_parts.append(
+            f"- [{item['market']}] {item['loan']} : {item['amount']:.2f} € (coût {item['cost']:.2f} €)"
+            f" @ {rate if rate is not None else 'n/a'}%{extra}"
+        )
+    if not stats.get("plan"):
+        body_parts.append("Aucun prêt éligible.")
+    if stats.get("invested"):
+        body_parts += ["", "=== Investissements réussis ==="]
+        body_parts += [f"- [{i['market']}] {i['loan']} : {i['amount']:.2f} €" for i in stats["invested"]]
+    if diagnostics_text:
+        body_parts += ["", "Le détail complet (requêtes/réponses, structure des pages de confirmation) est joint."]
+
+    msg = MIMEMultipart()
+    msg["From"] = EMAIL_FROM
+    msg["To"] = EMAIL_TO
+    msg["Subject"] = subject
+    msg.attach(MIMEText("\n".join(body_parts), "plain"))
+    if diagnostics_text:
+        attachment = MIMEText(diagnostics_text, "plain", "utf-8")
+        attachment.add_header("Content-Disposition", "attachment", filename="afranga_invest_bot_diagnostics_this_run.log")
+        msg.attach(attachment)
+
+    try:
+        with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=15) as server:
+            server.starttls()
+            server.login(SMTP_USER, SMTP_PASSWORD)
+            server.sendmail(EMAIL_FROM, [EMAIL_TO], msg.as_string())
+        log.info("Afranga invest bot summary email sent to %s.", EMAIL_TO)
+    except Exception:
+        log.exception("Failed to send Afranga invest bot summary email.")
+
+
 def send_peerberry_email(originators: list) -> None:
     """Send the PeerBerry "distribution by loan originators" recap.
 

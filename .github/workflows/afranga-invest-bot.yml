@@ -1,0 +1,65 @@
+name: Afranga Invest Bot
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "dry = plan only, probe = add one line to the cart and capture the confirm page (no purchase), live = real purchases"
+        required: false
+        default: probe
+        type: choice
+        options: [dry, probe, live]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: afranga-invest-bot
+  cancel-in-progress: false
+
+jobs:
+  afranga-invest-bot:
+    runs-on: ubuntu-22.04
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install Python dependencies
+        run: pip install -r requirements.txt
+
+      - name: Restore persisted session
+        uses: actions/cache/restore@v4
+        with:
+          path: monitors/afranga_invest_session_state.json
+          key: afranga-invest-session-${{ github.run_id }}
+          restore-keys: |
+            afranga-invest-session-
+
+      - name: Run Afranga invest bot
+        env:
+          AFRANGA_BOT_MODE: ${{ github.event.inputs.mode || 'probe' }}
+          AFRANGA_EMAIL: ${{ secrets.AFRANGA_EMAIL }}
+          AFRANGA_PASSWORD: ${{ secrets.AFRANGA_PASSWORD }}
+          AFRANGA_TOTP_SECRET: ${{ secrets.AFRANGA_TOTP_SECRET }}
+          GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
+          GOOGLE_CREDENTIALS: ${{ secrets.GOOGLE_CREDENTIALS }}
+          SMTP_HOST: ${{ secrets.SMTP_HOST }}
+          SMTP_PORT: ${{ secrets.SMTP_PORT }}
+          SMTP_USER: ${{ secrets.SMTP_USER }}
+          SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
+          EMAIL_FROM: ${{ secrets.EMAIL_FROM }}
+          EMAIL_TO: ${{ secrets.EMAIL_TO }}
+        run: python -m monitors.afranga_invest_bot
+
+      - name: Save persisted session
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: monitors/afranga_invest_session_state.json
+          key: afranga-invest-session-${{ github.run_id }}
