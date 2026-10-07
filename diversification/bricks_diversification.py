@@ -202,7 +202,7 @@ try:
     from shared.google_sheet import (
         fill_current_month_amounts,
         fill_current_month_bonus_breakdown,
-        fill_geographic_repartition_amounts,
+        fill_bricks_project_geo_amounts,
         fill_geographic_repartition_uninvested_amount,
     )
     from shared.report_date import get_report_now, is_current_month
@@ -215,7 +215,7 @@ except ModuleNotFoundError:
     from shared.google_sheet import (
         fill_current_month_amounts,
         fill_current_month_bonus_breakdown,
-        fill_geographic_repartition_amounts,
+        fill_bricks_project_geo_amounts,
         fill_geographic_repartition_uninvested_amount,
     )
     from shared.report_date import get_report_now, is_current_month
@@ -234,6 +234,9 @@ SIGNIN_URL = "https://api.bricks.co/api/auth/sign-in/email"
 HOME_METRICS_URL = "https://api.bricks.co/investor/portfolio/wealth/home-metrics"
 REVENUE_API_URL = "https://api.bricks.co/investor/portfolio/revenue"
 WALLET_TRANSACTIONS_URL = "https://api.bricks.co/wallet-transactions"
+PORTFOLIO_PROPERTIES_URL = "https://api.bricks.co/investor/portfolio/properties"
+# financialStatus de l'API -> section de "Répartition géographique" (absent = projet sain, sans en-tête).
+_PROJECT_STATUS_SECTIONS = {"repayment-delay": "delay", "repayment-default": "default"}
 # Server-side cap, confirmed live (requesting take=2000 still only returned 50).
 WALLET_TRANSACTIONS_PAGE_SIZE = 50
 MAX_WALLET_TRANSACTIONS_PAGES = 200
@@ -426,6 +429,64 @@ def fetch_current_month_revenue_totals(session: requests.Session) -> dict:
         "referrals": referrals_total,
         "boosted_balance_gain": boosted_balance_gain_total,
     }
+
+
+def fetch_active_project_geo_amounts(session: requests.Session, all_entries: list = None) -> tuple:
+    """Projets Bricks en cours sous la forme ``(project_amounts, project_statuses)`` :
+    ``{nom: {pays: capital restant}}`` et ``{nom: "current"|"delay"|"default"}``.
+
+    Source : ``GET /investor/portfolio/properties`` (la page "Mes projets"), qui renvoie ``ongoing``/``refunded``
+    et ``total.value`` (centimes = "Investissements en cours"). ``brickPrice`` est arrondi à l'euro près après un
+    remboursement partiel (écart vérifié de 0.22 EUR sur le total) : si le grand livre ``all_entries`` est fourni et
+    que son capital restant par projet colle au centime à ``total.value``, c'est lui qui donne les montants ;
+    sinon repli sur ``brickCount * brickPrice`` (tolérance proportionnelle au nombre de bricks).
+    """
+    log.info("Requesting Bricks portfolio properties...")
+    resp = session.get(PORTFOLIO_PROPERTIES_URL, timeout=15)
+    log.info("Portfolio properties response: status=%s", resp.status_code)
+    if resp.status_code != 200:
+        raise RuntimeError(f"Bricks portfolio properties endpoint returned status {resp.status_code}")
+    resp.encoding = "utf-8"
+    data = resp.json() or {}
+
+    ongoing = data.get("ongoing") or []
+    expected_total = round(float((data.get("total") or {}).get("value") or 0) / 100, 2)
+
+    ledger = {}
+    for entry in all_entries or []:
+        if _is_confirmed(entry) and entry.get("kind") in _OUTSTANDING_KINDS and entry.get("propertyId"):
+            ledger[entry["propertyId"]] = ledger.get(entry["propertyId"], 0.0) - _entry_value(entry)
+    ledger_amounts = {p.get("propertyId"): round(ledger.get(p.get("propertyId"), 0.0), 2) for p in ongoing}
+    use_ledger = bool(ledger) and abs(sum(ledger_amounts.values()) - expected_total) <= 0.02
+    log.info("Per-project amounts from the %s.", "wallet ledger" if use_ledger else "brickCount * brickPrice")
+
+    project_amounts = {}
+    project_statuses = {}
+    for project in ongoing:
+        name = (project.get("propertyName") or "").strip()
+        if use_ledger:
+            amount = ledger_amounts[project.get("propertyId")]
+        else:
+            amount = round(float(project.get("brickCount") or 0) * float(project.get("brickPrice") or 0) / 100, 2)
+        if not name or amount <= 0:
+            continue
+        country = (project.get("country") or "").strip()
+        countries = project_amounts.setdefault(name, {})
+        countries[country] = round(countries.get(country, 0.0) + amount, 2)
+        project_statuses[name] = _PROJECT_STATUS_SECTIONS.get(project.get("financialStatus"), "current")
+
+    parsed_total = round(sum(a for countries in project_amounts.values() for a in countries.values()), 2)
+    total_bricks = sum(float(p.get("brickCount") or 0) for p in ongoing)
+    if abs(parsed_total - expected_total) > (0.02 if use_ledger else 0.10 + 0.005 * total_bricks):
+        raise RuntimeError(
+            f"Bricks projects total {parsed_total:.2f} EUR != portfolio total {expected_total:.2f} EUR - "
+            "répartition non mise à jour pour ne supprimer aucune ligne à tort."
+        )
+    log.info(
+        "Bricks projects: %d en cours (%.2f EUR), statuts: %r",
+        len(project_amounts), parsed_total, {s: list(project_statuses.values()).count(s) for s in set(project_statuses.values())},
+    )
+    return project_amounts, project_statuses
 
 
 def fetch_wallet_transactions_page(session: requests.Session, cursor: int) -> dict:
@@ -1037,17 +1098,19 @@ def run() -> None:
         section="Crowdfunding immobilier",
     )
 
-    # "Répartition géographique" has a single "Bricks" aggregate row (no
-    # per-project/per-country breakdown, unlike Mintos/Swaper) - same value
-    # as the Crowdfunding immobilier section's total, mirroring Lande's
-    # single-row pattern. Also has its own "non investi" row (solde_total
-    # = balanceAvailable + giftBalance, i.e. cash not yet invested).
+    # "Répartition géographique" : une ligne par projet (statut en sections, pays en colonne, comme Lande) ;
+    # la ligne "Bricks" en est la somme. Relevés LIVE (sans date) : mois courant uniquement.
     if current_month:
         try:
-            fill_geographic_repartition_amounts([{"name": "Bricks", "amount": balances["investments_en_cours"]}])
+            project_amounts, project_statuses = fetch_active_project_geo_amounts(session, all_entries)
+            for issue in fill_bricks_project_geo_amounts(project_amounts, project_statuses):
+                log.warning("Bricks geographic breakdown: %s", issue)
+        except Exception:
+            log.exception("Failed to fetch/update Bricks' per-project geographic breakdown.")
+        try:
             fill_geographic_repartition_uninvested_amount("Bricks", balances["solde_total"])
         except Exception:
-            log.exception("Failed to update Bricks' 'Répartition géographique' rows.")
+            log.exception("Failed to update Bricks' 'non investi' row.")
 
 
 if __name__ == "__main__":
