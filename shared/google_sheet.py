@@ -1054,15 +1054,47 @@ def _normalize_borrower_name(name: str) -> str:
     return " ".join(name.strip().lower().split())
 
 
-def fill_lande_loan_geo_amounts(loan_amounts: dict, defaulted_loan_ids=()) -> list:
+LANDE_STATUS_ORDER = ("current", "5-30", "31-60", "60", "default")
+LANDE_STATUS_HEADER_LABELS = {
+    "5-30": "5-30 jours de retard",
+    "31-60": "31-60 jours de retard",
+    "60": "60+ jours de retard",
+    "default": "en défaut",
+}
+# Style relevé sur les lignes d'en-tête existantes de la feuille (identique à la ligne "non investi").
+LANDE_STATUS_HEADER_STYLE = {
+    "horizontalAlignment": "LEFT",
+    "textFormat": {"fontFamily": "Arial", "fontSize": 9, "italic": True, "bold": False},
+    "backgroundColor": {"red": 0.9372549, "green": 0.9372549, "blue": 0.9372549},
+}
+
+
+def _lande_status_of_header(name: str):
+    """Statut Lande correspondant à une ligne d'en-tête de section, ou None."""
+    n = name.strip().casefold()
+    if "défaut" in n or "defaut" in n:
+        return "default"
+    if "60+" in n or "+60" in n:
+        return "60"
+    if "31-60" in n:
+        return "31-60"
+    if "5-30" in n:
+        return "5-30"
+    return None
+
+
+def fill_lande_loan_geo_amounts(loan_amounts: dict, loan_statuses=None) -> list:
     """Met à jour les lignes de prêts Lande dans la matrice pays de
     "Répartition géographique". ``loan_amounts`` est indexé par identifiant
     de prêt, puis par pays : ``{loan_id: {country: remaining_amount}}``.
     Les prêts absents du relevé actif sont supprimés; la ligne Lande est
     réécrite en formules de somme de ses sous-lignes (comme Bienprêter) et la
     ligne ``non investi`` reste gérée par sa fonction dédiée.
-    Si une ligne ``en défaut`` existe dans le bloc, les prêts ``defaulted_loan_ids``
-    sont placés en dessous et les autres au-dessus.
+    ``loan_statuses`` (``{loan_id: "current"|"5-30"|"31-60"|"60"|"default"}``)
+    range chaque prêt sous la ligne d'en-tête de son statut ("5-30 jours de
+    retard", "31-60 jours de retard", "60+ jours de retard", "en défaut", dans
+    cet ordre sous "non investi") ; les prêts sains restent au-dessus du premier
+    en-tête. Un en-tête est créé s'il a au moins un prêt, supprimé sinon.
     """
     logger.info("Début mise à jour Répartition géographique / Lande (%d prêt(s))", len(loan_amounts))
     issues = []
@@ -1107,24 +1139,38 @@ def fill_lande_loan_geo_amounts(loan_amounts: dict, defaulted_loan_ids=()) -> li
             "range": rowcol_to_a1(platform_row, col_idx),
             "values": [[f"=SOMME({letter}{platform_row + 1}:INDEX({letter}:{letter};ROW({letter}{end_row})-1))"]],
         })
-    defaulted = {_normalize_borrower_name(str(loan_id)) for loan_id in defaulted_loan_ids}
-    default_row = None
-    for row_idx in range(platform_row + 1, end_row):
-        row = grid[row_idx - 1]
-        if geo_col - 1 < len(row) and row[geo_col - 1].strip().casefold() == "en défaut":
-            default_row = row_idx
-            break
-
-    rows_to_delete = []
-    existing_rows = {}
+    statuses = {_normalize_borrower_name(str(loan_id)): status for loan_id, status in (loan_statuses or {}).items()}
+    status_headers = {}  # statut -> numéro de ligne de l'en-tête de section
     for row_idx in range(platform_row + 1, end_row):
         row = grid[row_idx - 1]
         name = row[geo_col - 1].strip() if geo_col - 1 < len(row) else ""
-        if not name or name.casefold() in ("non investi", "en défaut"):
+        header_status = _lande_status_of_header(name) if name else None
+        if header_status and header_status not in status_headers:
+            status_headers[header_status] = row_idx
+    header_status_by_row = {row_idx: status for status, row_idx in status_headers.items()}
+
+    def section_of(normalized_id: str):
+        """Statut de l'en-tête sous lequel ranger le prêt (None = prêt sain, avant le premier en-tête)."""
+        status = statuses.get(normalized_id)
+        return status if status in LANDE_STATUS_HEADER_LABELS else None
+
+    needed_headers = {section_of(normalized) for normalized in normalized_amounts} - {None}
+
+    rows_to_delete = []
+    existing_rows = {}
+    current_section = None
+    for row_idx in range(platform_row + 1, end_row):
+        row = grid[row_idx - 1]
+        name = row[geo_col - 1].strip() if geo_col - 1 < len(row) else ""
+        if row_idx in header_status_by_row:
+            current_section = header_status_by_row[row_idx]
+            if current_section not in needed_headers:
+                rows_to_delete.append(row_idx)
+            continue
+        if not name or name.casefold() == "non investi":
             continue
         normalized = _normalize_borrower_name(name)
-        wrong_side = default_row is not None and (normalized in defaulted) != (row_idx > default_row)
-        if normalized not in normalized_amounts or wrong_side:
+        if normalized not in normalized_amounts or section_of(normalized) != current_section:
             rows_to_delete.append(row_idx)
             continue
         existing_rows.setdefault(normalized, row_idx)
@@ -1147,7 +1193,7 @@ def fill_lande_loan_geo_amounts(loan_amounts: dict, defaulted_loan_ids=()) -> li
 
         row_idx = existing_rows.get(normalized_id)
         if row_idx is None:
-            pending_new_loans.append((str(loan_id), resolved_amounts, normalized_id in defaulted))
+            pending_new_loans.append((str(loan_id), resolved_amounts, section_of(normalized_id)))
             continue
 
         rows_to_restyle.append(rowcol_to_a1(row_idx, geo_col))
@@ -1165,7 +1211,7 @@ def fill_lande_loan_geo_amounts(loan_amounts: dict, defaulted_loan_ids=()) -> li
     if updates:
         _call_with_retry(worksheet.batch_update, updates, value_input_option="USER_ENTERED")
 
-    name_style = {"horizontalAlignment": "RIGHT", "textFormat": {"fontSize": 9, "bold": False}}
+    name_style = {"horizontalAlignment": "RIGHT", "textFormat": {"fontSize": 9, "bold": False, "italic": False}}
     if rows_to_restyle:
         _call_with_retry(worksheet.format, rows_to_restyle, name_style)
 
@@ -1173,14 +1219,44 @@ def fill_lande_loan_geo_amounts(loan_amounts: dict, defaulted_loan_ids=()) -> li
     for row_idx in sorted(rows_to_delete, reverse=True):
         logger.info("Suppression de la ligne Lande obsolète %s.", row_idx)
         _call_with_retry(worksheet.delete_rows, row_idx, row_idx)
-        if default_row is not None and row_idx < default_row:
-            default_row -= 1
+        for status, header_row_idx in list(status_headers.items()):
+            if header_row_idx == row_idx:
+                del status_headers[status]
+            elif header_row_idx > row_idx:
+                status_headers[status] = header_row_idx - 1
         end_row -= 1
 
+    # En-têtes manquants créés dans l'ordre canonique, chacun juste avant l'en-tête suivant existant (ou en fin de bloc).
+    created_headers = 0
+    for status in LANDE_STATUS_ORDER[1:]:
+        if status not in needed_headers or status in status_headers:
+            continue
+        rank = LANDE_STATUS_ORDER.index(status)
+        later_headers = [r for s, r in status_headers.items() if LANDE_STATUS_ORDER.index(s) > rank]
+        insert_row = min(later_headers) if later_headers else end_row
+        row_values = [""] * geo_col
+        row_values[geo_col - 1] = LANDE_STATUS_HEADER_LABELS[status]
+        _call_with_retry(
+            worksheet.insert_rows, [row_values], insert_row,
+            value_input_option="USER_ENTERED", inherit_from_before=True,
+        )
+        _call_with_retry(worksheet.format, rowcol_to_a1(insert_row, geo_col), LANDE_STATUS_HEADER_STYLE)
+        for other_status, header_row_idx in status_headers.items():
+            if header_row_idx >= insert_row:
+                status_headers[other_status] = header_row_idx + 1
+        status_headers[status] = insert_row
+        end_row += 1
+        created_headers += 1
+        logger.info("Ajout de la ligne Lande '%s' en %s.", LANDE_STATUS_HEADER_LABELS[status], insert_row)
+
+    def section_rank(section):
+        return -1 if section is None else LANDE_STATUS_ORDER.index(section)
+
     new_rows_to_restyle = []
-    for loan_id, resolved_amounts, is_defaulted in sorted(pending_new_loans, key=lambda loan: loan[2]):
-        above_default = default_row is not None and not is_defaulted
-        insert_row = default_row if above_default else end_row
+    for loan_id, resolved_amounts, section in sorted(pending_new_loans, key=lambda loan: section_rank(loan[2])):
+        section_start = status_headers[section] if section else platform_row
+        later_headers = [r for r in status_headers.values() if r > section_start]
+        insert_row = min(later_headers) if later_headers else end_row
         row_length = max([geo_col, target_col] + list(country_columns.values()))
         row_values = [""] * row_length
         row_values[geo_col - 1] = loan_id
@@ -1193,16 +1269,17 @@ def fill_lande_loan_geo_amounts(loan_amounts: dict, defaulted_loan_ids=()) -> li
             value_input_option="USER_ENTERED", inherit_from_before=True,
         )
         new_rows_to_restyle.append(rowcol_to_a1(insert_row, geo_col))
-        if above_default:
-            default_row += 1
+        for status, header_row_idx in status_headers.items():
+            if header_row_idx >= insert_row:
+                status_headers[status] = header_row_idx + 1
         end_row += 1
 
     if new_rows_to_restyle:
         _call_with_retry(worksheet.format, new_rows_to_restyle, name_style)
 
     logger.info(
-        "Mise à jour géographique Lande terminée (%d existant(s), %d ajouté(s), %d supprimé(s)).",
-        len(existing_rows) - len(rows_to_delete), len(pending_new_loans), len(rows_to_delete),
+        "Mise à jour géographique Lande terminée (%d existant(s), %d ajouté(s), %d supprimé(s), %d en-tête(s) créé(s)).",
+        len(existing_rows), len(pending_new_loans), len(rows_to_delete), created_headers,
     )
     return issues
 
