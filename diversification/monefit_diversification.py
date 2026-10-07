@@ -358,6 +358,15 @@ def _total_interest(summary: dict) -> float:
     return summary["daily_returns"] + summary.get("vault_interest", 0.0)
 
 
+def _prev_month_avg_balance(monthly_summaries: dict | None, month_key: str) -> float | None:
+    """Whole-account (opening+closing)/2 of the month before `month_key`, or None if it isn't cached."""
+    earlier = sorted(k for k in (monthly_summaries or {}) if k < month_key)
+    if not earlier or monthly_summaries[earlier[-1]].get("closing_balance") is None:
+        return None
+    prev = monthly_summaries[earlier[-1]]
+    return (prev["opening_balance"] + prev["closing_balance"]) / 2
+
+
 def fetch_current_month_statement_totals(session: requests.Session) -> dict:
     """Thin wrapper around fetch_statement_summary() for the current
     calendar month (1st of the month through today)."""
@@ -580,6 +589,10 @@ def run() -> None:
         log.exception("Failed to fetch the monthly statement summary history - XIRR will not be updated.")
         monthly_summaries = None
 
+    # Like the other platforms, "Rendements % brut" divides by the PREVIOUS month's average balance
+    # (None for an account's first month, so no yield is reported for it).
+    prev_avg_total_balance = _prev_month_avg_balance(monthly_summaries, f"{end_date.year:04d}-{end_date.month:02d}")
+
     if monthly_summaries:
         # get_cached_monthly_summaries()'s cache accumulates every month
         # ever fetched by ANY past run - for a backfilled month, filter out
@@ -670,23 +683,27 @@ def run() -> None:
         # genuine, real platform fees ("fees" field) but no withholding-
         # tax data at all (Taxes brut % hardcoded 0.0, same reasoning as
         # "XIRR Taxes" above).
-        avg_total_balance_month = total_invested + avg_idle_cash
-        missed_earnings_month = cash_drag_brut_value * avg_total_balance_month
-        monthly_yield_steps = [
-            ("Intérêts brut %", interest_total + missed_earnings_month),
-            ("Cash drag brut %", -missed_earnings_month),
-            ("Bonus brut %", statement_totals["rewards_bonuses"]),
-            ("Frais brut %", -statement_totals["fees"]),
-            ("Taxes brut %", 0.0),
-        ]
-        monthly_yield_shares = compute_monthly_yield_shares(
-            avg_total_balance_month, monthly_yield_steps, log=log, log_context="Monefit",
-        )
-        rendement_brut_value = sum(v for v in monthly_yield_shares.values() if v is not None)
-        log.info(
-            "Monthly gross-yield waterfall shares: Rendements %% brut=%.2f%% %r",
-            rendement_brut_value * 100, {k: round(v * 100, 4) for k, v in monthly_yield_shares.items() if v is not None},
-        )
+        avg_total_balance_month = prev_avg_total_balance
+        if avg_total_balance_month is not None and avg_total_balance_month > 0:
+            missed_earnings_month = cash_drag_brut_value * avg_total_balance_month
+            monthly_yield_steps = [
+                ("Intérêts brut %", interest_total + missed_earnings_month),
+                ("Cash drag brut %", -missed_earnings_month),
+                ("Bonus brut %", statement_totals["rewards_bonuses"]),
+                ("Frais brut %", -statement_totals["fees"]),
+                ("Taxes brut %", 0.0),
+            ]
+            monthly_yield_shares = compute_monthly_yield_shares(
+                avg_total_balance_month, monthly_yield_steps, log=log, log_context="Monefit",
+            )
+            rendement_brut_value = sum(v for v in monthly_yield_shares.values() if v is not None)
+            log.info(
+                "Monthly gross-yield waterfall shares (previous month avg balance %.2f EUR): Rendements %% brut=%.2f%% %r",
+                avg_total_balance_month, rendement_brut_value * 100,
+                {k: round(v * 100, 4) for k, v in monthly_yield_shares.items() if v is not None},
+            )
+        else:
+            log.warning("No positive previous-month average balance - Rendements %% brut not computed.")
 
         if xirr_value is not None and signed_cashflows is not None and monthly_summaries:
             cash_weight_lifetime = cash_weight  # no real historical idle-cash time series - reuse the live snapshot (see comment above).
@@ -723,9 +740,9 @@ def run() -> None:
             )
 
     if not current_month and closing_balance is not None:
-        # Backfilled month: the whole-account (opening+closing)/2 stands in for the average balance;
+        # Backfilled month: previous month's whole-account (opening+closing)/2 is the denominator;
         # idle cash has no history, so Cash drag is left out (its row stays untouched).
-        avg_total_balance_month = (statement_totals["opening_balance"] + closing_balance) / 2
+        avg_total_balance_month = prev_avg_total_balance if prev_avg_total_balance is not None else 0.0
         monthly_yield_steps = [
             ("Intérêts brut %", interest_total),
             ("Bonus brut %", statement_totals["rewards_bonuses"]),
@@ -743,7 +760,7 @@ def run() -> None:
                 {k: round(v * 100, 4) for k, v in monthly_yield_shares.items() if v is not None},
             )
         else:
-            log.warning("Average balance for the backfilled month is not positive - Rendements %% brut not computed.")
+            log.warning("No positive previous-month average balance for the backfilled month - Rendements %% brut not computed.")
 
     # Monefit's "bonus" field ("Rewards & bonuses") is written directly to
     # the "Bonus" row (no more prime/cashback/concours sub-rows). Note:
