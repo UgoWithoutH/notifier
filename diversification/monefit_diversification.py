@@ -721,14 +721,12 @@ def run() -> None:
                 avg_idle_cash, missed_earnings, {k: round(v * 100, 4) for k, v in waterfall_shares.items() if v is not None},
             )
 
-    # Monefit's "bonus" field ("Rewards & bonuses") maps to "prime" (a
-    # referral-style reward) - written to its own dedicated sub-row, never
-    # to the "Bonus" row itself (a SUM formula over prime/cashback/
-    # concours). Note: Monefit also runs a separate weekly investment-draw
-    # ("concours"-style lottery, confirmed via live page text: "5 winners
-    # ... picked at random") but the account/summary API has no distinct
-    # field for draw winnings - only "prime" is written here, "concours"
-    # is left untouched pending a dedicated data source. "XIRR"/"Cash
+    # Monefit's "bonus" field ("Rewards & bonuses") is written directly to
+    # the "Bonus" row (no more prime/cashback/concours sub-rows). Note:
+    # Monefit also runs a separate weekly investment-draw (lottery,
+    # confirmed via live page text: "5 winners ... picked at random") but
+    # the account/summary API has no distinct field for draw winnings.
+    # "XIRR"/"Cash
     # drag" and the XIRR Bonus/Cash drag/Taxes-Frais/Intérêts pie-chart
     # shares (rows already added by the user) are only included when
     # actually computed. "XIRR Intérêts" (added 2026-08-19) sits right
@@ -774,7 +772,7 @@ def run() -> None:
             avg_invested_balance,
         )
 
-    bonus_breakdown = {"prime": statement_totals["rewards_bonuses"]}
+    bonus_breakdown = {"Bonus": statement_totals["rewards_bonuses"]}
     if xirr_value is not None:
         bonus_breakdown["XIRR"] = xirr_value
     if rendement_brut_value is not None:

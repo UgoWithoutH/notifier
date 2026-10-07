@@ -643,7 +643,7 @@ def run() -> None:
 
     # No bonus/cashback/contest statement entry Type has been observed yet
     # on this account (see module docstring) - everything currently
-    # defaults into "prime", same catch-all convention used by
+    # defaults into "Bonus", same catch-all convention used by
     # monefit_diversification.py until a real one shows up and its exact
     # Type label can be mapped to the right sub-row. "frais" is a real,
     # confirmed fee bucket (see module docstring) - written on the
@@ -658,7 +658,7 @@ def run() -> None:
     # Taxes/Frais") for this new value to actually land somewhere - this
     # script fills an existing row by label, it doesn't insert new
     # labelled rows into this block.
-    bonus_breakdown = {"prime": statement_totals["bonus_cashback_contest"], "frais": statement_totals["fees"]}
+    bonus_breakdown = {"Bonus": statement_totals["bonus_cashback_contest"], "frais": statement_totals["fees"]}
     if rendement_brut_value is not None:
         bonus_breakdown["Rendements % brut"] = rendement_brut_value
     for step_name in ("Intérêts brut %", "Cash drag brut %", "Bonus brut %", "Frais brut %", "Taxes brut %"):

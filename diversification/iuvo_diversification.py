@@ -924,7 +924,7 @@ def run() -> None:
     # after "XIRR Taxes/Frais") for this new value to actually land
     # somewhere - this script fills an existing row by label, it doesn't
     # insert new labelled rows into this block.
-    bonus_breakdown = {"prime": interest_totals["bonus_cashback_contest"]}
+    bonus_breakdown = {"Bonus": interest_totals["bonus_cashback_contest"]}
     if xirr_value is not None:
         bonus_breakdown["XIRR"] = xirr_value
     if rendement_brut_value is not None:

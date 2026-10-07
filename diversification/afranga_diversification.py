@@ -1669,9 +1669,8 @@ def run() -> None:
     )
 
     # Afranga's bonus feature is literally called "Bonus Cashback
-    # Campaigns" - a "cashback", not a prime/concours - written to its own
-    # dedicated sub-row, never to the "Bonus" row itself (a SUM formula
-    # over prime/cashback/concours). "prélèvements" gets the real
+    # Campaigns" - written directly to the "Bonus" row (no more
+    # prime/cashback/concours sub-rows). "prélèvements" gets the real
     # withholding tax on gross interest, same as Bienprêter's equivalent row.
     # "XIRR"/"Cash drag" and the XIRR Bonus/Cash drag/Taxes-Frais/Intérêts
     # pie-chart shares sit further down the block - only included when
@@ -1691,7 +1690,7 @@ def run() -> None:
     # 0.0 anyway - no platform-fee concept distinct from withholding tax
     # exists here, so no row is needed for this platform specifically).
     bonus_breakdown = {
-        "cashback": statement_totals["bonus_cashback_contest"],
+        "Bonus": statement_totals["bonus_cashback_contest"],
         "prélèvements": statement_totals["withholding_tax"],
     }
     if xirr_value is not None:
