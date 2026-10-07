@@ -812,7 +812,7 @@ def run() -> None:
     if "withholding_tax_bonus" in amounts:
         bonus_breakdown["prélèvements bonus"] = amounts["withholding_tax_bonus"]
     if amounts["bonus_cashback_contest"]:
-        bonus_breakdown["prime"] = amounts["bonus_cashback_contest"]
+        bonus_breakdown["Bonus"] = amounts["bonus_cashback_contest"]
     if xirr_value is not None:
         bonus_breakdown["XIRR"] = xirr_value
     if rendement_brut_value is not None:

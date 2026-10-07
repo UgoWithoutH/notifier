@@ -520,19 +520,16 @@ def fill_current_month_amounts_with_labels(
 
 
 def fill_current_month_bonus_breakdown(platform: str, breakdown: dict, section: str = "Crowdlending"):
-    """Write this month's bonus/cashback/contest figures to their own
-    dedicated sub-rows under a platform's block, instead of the merged
-    "Bonus" row (which is a SUM formula over those sub-rows in the Sheet
-    itself - deliberately never written to here).
+    """Write this month's bonus/cashback/contest figures (now a single
+    "Bonus" row per platform) and the other labelled sub-rows (XIRR, Cash
+    drag, ...) under a platform's block.
 
     `breakdown` : dict mapping the exact sub-row label (case-insensitive,
     substring-matched, same convention as find_rows_by_texts_below) to the
-    amount to write, e.g. {"prime": 12.3} or {"cashback": 5.0} or, for
-    Bricks' differently-labelled block, {"parrainages": 1.0, "soldes
-    boostés": 2.0}. Only the labels present in `breakdown` are looked up/
-    written - a platform whose bonus feature maps to a single category
-    (the common case) only ever touches that one row, leaving the other
-    sibling rows (and "Bonus" itself) untouched.
+    amount to write, e.g. {"Bonus": 12.3}. The "Bonus" label is only
+    accepted on a row whose text is exactly "Bonus" (never "XIRR Bonus"
+    or similar). Only the labels present in `breakdown` are looked up/
+    written.
 
     No more hardcoded `max_rows`: the search below the platform's own row
     is bounded dynamically via _platform_block_max_rows(), so it stops at
@@ -577,6 +574,12 @@ def fill_current_month_bonus_breakdown(platform: str, breakdown: dict, section: 
     )
 
     missing = [label for label in labels if label not in rows_by_label]
+    for label in list(rows_by_label):
+        cell_text = (grid[rows_by_label[label] - 1][section_col - 1] or "").strip().lower()
+        if label.strip().lower() == "bonus" and cell_text != "bonus":
+            logger.warning("Ligne 'Bonus' exacte non trouvée pour %s (trouvé '%s') - ignorée.", platform, cell_text)
+            del rows_by_label[label]
+            missing.append(label)
     if missing:
         logger.warning(
             "Ligne(s) non trouvée(s) pour %s (ignorée(s), pas de valeur écrite) : %s",
