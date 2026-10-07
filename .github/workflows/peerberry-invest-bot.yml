@@ -60,6 +60,14 @@ jobs:
           restore-keys: |
             peerberry-invest-bot-diagnostics-
 
+      - name: Restore persisted session
+        uses: actions/cache/restore@v4
+        with:
+          path: monitors/peerberry_invest_session_state.json
+          key: peerberry-invest-session-${{ github.run_id }}
+          restore-keys: |
+            peerberry-invest-session-
+
       - name: Run PeerBerry invest bot
         env:
           PEERBERRY_EMAIL: ${{ secrets.PEERBERRY_EMAIL }}
@@ -77,6 +85,13 @@ jobs:
           EMAIL_FROM: ${{ secrets.EMAIL_FROM }}
           EMAIL_TO: ${{ secrets.EMAIL_TO }}
         run: python -m monitors.peerberry_invest_bot
+
+      - name: Save persisted session for the next run
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: monitors/peerberry_invest_session_state.json
+          key: peerberry-invest-session-${{ github.run_id }}
 
       - name: Save diagnostics log for next run (owner-only, not a public artifact)
         if: always()

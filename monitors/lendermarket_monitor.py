@@ -86,6 +86,7 @@ from shared.robot_config import (
     plan_allocations,
 )
 from shared.state import load_state, save_state
+from shared.session_cache import get_or_refresh_session
 from shared.notification_gate import should_notify
 from shared.cron_schedule import ensure_schedule, apply_startup_jitter
 
@@ -111,6 +112,7 @@ BALANCE_API_URL = f"{API_BASE}/ledger/v1/investor/getInvestorAccountSummary"
 INVEST_URL = f"{API_BASE}/claims/v1/investor/createInvestment"
 
 STATE_FILE = Path(__file__).parent / "lendermarket_state.json"
+SESSION_STATE_FILE = Path(__file__).parent / "lendermarket_monitor_session_state.json"
 CRON_SCHEDULE_STATE_FILE = Path(__file__).parent / "lendermarket_cron_schedule_state.json"
 # Diagnostics for the real auto-invest feature (added 2026-07-24) - full
 # request/response detail for every real investment attempt, same idea as
@@ -463,26 +465,33 @@ def login(session: requests.Session) -> str:
     return investor_id
 
 
+def _fetch_balance_payload(session: requests.Session, investor_id: str) -> dict:
+    """Raises on any HTTP error (e.g. 401 on an expired persisted session)."""
+    r = session.get(
+        BALANCE_API_URL,
+        params={"currency": "EUR"},
+        headers=_xsrf_headers(session, investor_id),
+        timeout=20,
+    )
+    r.raise_for_status()
+    return r.json().get("data") or {}
+
+
+def _parse_balance(payload: dict) -> float | None:
+    try:
+        return float(payload.get("investorAvailableBalanceAmount"))
+    except (TypeError, ValueError):
+        return None
+
+
 def fetch_account_balance(session: requests.Session, investor_id: str) -> float | None:
     """Fetch the investor's available balance (EUR)."""
     try:
-        r = session.get(
-            BALANCE_API_URL,
-            params={"currency": "EUR"},
-            headers=_xsrf_headers(session, investor_id),
-            timeout=20,
-        )
-        r.raise_for_status()
+        payload = _fetch_balance_payload(session, investor_id)
     except Exception:
         log.exception("Failed to fetch the Lendermarket account balance.")
         return None
-
-    data = r.json().get("data") or {}
-    balance = data.get("investorAvailableBalanceAmount")
-    try:
-        return float(balance)
-    except (TypeError, ValueError):
-        return None
+    return _parse_balance(payload)
 
 
 def fetch_account_pending_payments(session: requests.Session, investor_id: str) -> float:
@@ -518,13 +527,17 @@ def login_and_fetch_balance() -> tuple:
 
     session = requests.Session()
     try:
-        investor_id = login(session)
+        payload, extra = get_or_refresh_session(
+            session, SESSION_STATE_FILE,
+            fetch_fn=lambda extra: _fetch_balance_payload(session, extra["investor_id"]),
+            login_fn=lambda: (None, {"investor_id": login(session)}),
+            platform_name="Lendermarket",
+        )
     except Exception:
         log.exception("Failed to log into Lendermarket to fetch the account balance.")
         return None, None, None
 
-    balance = fetch_account_balance(session, investor_id)
-    return session, investor_id, balance
+    return session, extra["investor_id"], _parse_balance(payload)
 
 
 def _log_invest_diagnostics(tag: str, **fields) -> None:
