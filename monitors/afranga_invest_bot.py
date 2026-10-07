@@ -30,6 +30,9 @@ MODE (env AFRANGA_BOT_MODE, default "probe"):
 
 Required env vars: AFRANGA_EMAIL, AFRANGA_PASSWORD, AFRANGA_TOTP_SECRET (if 2FA),
 GOOGLE_SHEET_ID, GOOGLE_CREDENTIALS, SMTP_* / EMAIL_TO.
+Optional: CRON_JOB_API_KEY, AFRANGA_CRON_JOB_ID -> cron-job.org schedule every 2 min
+(balance >= minimum) / once a day (below), cached in a local state file so the API
+is only called when the mode changes (see shared/cron_schedule.py).
 """
 
 import json
@@ -49,6 +52,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 from diversification.afranga_diversification import _HEADERS, fetch_uninvested_balance, login
+from shared.cron_schedule import apply_startup_jitter, ensure_schedule
 from shared.google_sheet import get_geo_platform_snapshot
 from shared.notifier import send_afranga_invest_summary_email
 from shared.robot_config import Candidate, build_tracker, get_platform_config, plan_allocations
@@ -63,6 +67,8 @@ PRIMARY_PAGE_URL = f"{BASE}/profile/invest"
 
 SESSION_STATE_FILE = Path(__file__).parent / "afranga_invest_session_state.json"
 DIAGNOSTICS_FILE = Path(__file__).parent / "afranga_invest_diagnostics.log"
+CRON_SCHEDULE_STATE_FILE = Path(__file__).parent / "afranga_cron_schedule_state.json"
+AFRANGA_CRON_JOB_ID = os.environ.get("AFRANGA_CRON_JOB_ID")
 
 MODE = os.environ.get("AFRANGA_BOT_MODE", "probe").strip().lower()
 MIN_INVESTMENT_AMOUNT = float(os.environ.get("AFRANGA_MIN_INVESTMENT_AMOUNT", "10"))
@@ -410,6 +416,7 @@ def execute_market(session: requests.Session, market: MarketRows, lines: list, t
 
 def run() -> None:
     run_started_at = datetime.now(timezone.utc)
+    apply_startup_jitter(CRON_SCHEDULE_STATE_FILE)
     stats = {
         "mode": MODE, "attempts": 0, "successes": 0, "failures": 0, "total_invested": 0.0,
         "invested": [], "plan": [], "probed": False,
@@ -426,6 +433,11 @@ def run() -> None:
         # login() returns None, so the balance is fetched by fetch_fn on the fresh session.
         stats["balance_before"] = stats["balance_after"] = balance
         log.info("Afranga mode=%s, uninvested balance: %.2f EUR", MODE, balance)
+        # Before any early return, so the schedule always follows the balance.
+        ensure_schedule(
+            "24h" if balance < MIN_INVESTMENT_AMOUNT else "2m",
+            cron_job_id=AFRANGA_CRON_JOB_ID, state_file=CRON_SCHEDULE_STATE_FILE,
+        )
         if balance < MIN_INVESTMENT_AMOUNT:
             log.info("Balance below the minimum investment amount - nothing to do.")
             return

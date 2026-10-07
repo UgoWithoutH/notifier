@@ -51,6 +51,12 @@ DEFAULT_STATE = {"cron_schedule_mode": None, "cron_schedule_minutes": None}
 # below for where the randomness moved to).
 BASE_INTERVAL_MINUTES = {"2m": 2, "30m": 30}
 
+# Once-a-day mode: fires at DAILY_HOUR:00 (cron-job.org timezone). Its startup
+# jitter falls in the "else" branch of apply_startup_jitter(), i.e. the 30m range.
+DAILY_MODE = "24h"
+DAILY_HOUR = 8
+SCHEDULE_MODES = (*BASE_INTERVAL_MINUTES, DAILY_MODE)
+
 # Random sleep (whole minutes, INCLUSIVE range), applied ONCE at the start
 # of a monitor's own run() via apply_startup_jitter() - two SEPARATE ranges,
 # one per mode, per explicit user request ("deux random différent... chacun
@@ -66,8 +72,16 @@ def _build_fixed_minutes(mode: str) -> list:
     """Builds a plain, regularly-spaced list of minutes-of-hour (0-59) for
     the given mode, at exactly that mode's own base interval - no jitter
     (see the module docstring for why the randomness moved elsewhere)."""
+    if mode == DAILY_MODE:
+        return [0]
     base = BASE_INTERVAL_MINUTES[mode]
     return list(range(0, 60, base))
+
+
+def _build_hours(mode: str) -> list:
+    """Hours-of-day for `mode` ([-1] = every hour) - always sent so leaving
+    the daily mode restores the hourly pattern."""
+    return [DAILY_HOUR] if mode == DAILY_MODE else [-1]
 
 
 def apply_startup_jitter(state_file: Path) -> None:
@@ -95,13 +109,13 @@ def apply_startup_jitter(state_file: Path) -> None:
 RATE_LIMIT_RETRY_DELAY_SECONDS = 15
 
 
-def _patch_schedule(cron_job_id: str, minutes: list) -> bool:
+def _patch_schedule(cron_job_id: str, minutes: list, hours: list) -> bool:
     if not CRON_JOB_API_KEY or not cron_job_id:
         log.info("CRON_JOB_API_KEY or cron job id missing, skipping cron-job.org update.")
         return False
 
     endpoint = f"https://api.cron-job.org/jobs/{cron_job_id}"
-    payload = {"job": {"schedule": {"timezone": CRON_JOB_TIMEZONE, "minutes": minutes}}}
+    payload = {"job": {"schedule": {"timezone": CRON_JOB_TIMEZONE, "hours": hours, "minutes": minutes}}}
 
     for attempt in range(1, 3):
         req = request.Request(
@@ -148,7 +162,7 @@ def ensure_schedule(mode: str, cron_job_id: str, state_file: Path) -> None:
     cron-job.org's 100-requests/day account cap (re-added 2026-09-10, after
     the brief 2026-09-09 "always rebuild+PATCH" design blew through that
     budget)."""
-    if mode not in BASE_INTERVAL_MINUTES:
+    if mode not in SCHEDULE_MODES:
         raise ValueError(f"Unknown cron schedule mode: {mode!r}")
 
     state = load_state(state_file, DEFAULT_STATE)
@@ -163,7 +177,7 @@ def ensure_schedule(mode: str, cron_job_id: str, state_file: Path) -> None:
 
     new_minutes = _build_fixed_minutes(mode)
     log.info("Cron decision: mode changed %s -> %s, updating cron-job.org (new minutes=%s).", current_mode, mode, new_minutes)
-    if _patch_schedule(cron_job_id, new_minutes):
+    if _patch_schedule(cron_job_id, new_minutes, _build_hours(mode)):
         state["cron_schedule_mode"] = mode
         state["cron_schedule_minutes"] = new_minutes
         save_state(state_file, state)
