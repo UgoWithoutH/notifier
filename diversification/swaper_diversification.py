@@ -1453,9 +1453,8 @@ def run(headless: bool = True) -> None:
         skip_total=not current_month,
     )
 
-    # Swaper's referral bonus is a "prime" (parrainage/reward), not a
-    # cashback or contest - written to its own dedicated sub-row, never to
-    # the "Bonus" row itself (a SUM formula over prime/cashback/concours).
+    # Swaper's referral bonus is written directly to the "Bonus" row (no
+    # more prime/cashback/concours sub-rows).
     # "Cash drag"/"XIRR" are written alongside it, further down the same
     # block - the search below the platform's row is bounded dynamically
     # (stops at the next platform's own row), no more hardcoded `max_rows`
@@ -1467,7 +1466,7 @@ def run(headless: bool = True) -> None:
     # Taxes/Frais") for this new value to actually land somewhere - this
     # script fills an existing row by label, it doesn't insert new
     # labelled rows into this block.
-    bonus_breakdown = {"prime": referral_bonus_earned}
+    bonus_breakdown = {"Bonus": referral_bonus_earned}
     if xirr_value is not None:
         bonus_breakdown["XIRR"] = xirr_value
     if rendement_brut_value is not None:

@@ -1268,10 +1268,9 @@ def run() -> None:
         skip_total=not current_month,
     )
 
-    # PeerBerry's REFERRAL_FEE is treated as a "prime" (referral reward),
-    # same convention as Swaper's referral bonus - written to its own
-    # dedicated sub-row, never to the "Bonus" row itself (a SUM formula
-    # over prime/cashback/concours). "XIRR"/"Cash drag" and the XIRR
+    # PeerBerry's REFERRAL_FEE (referral reward) is written directly to
+    # the "Bonus" row (no more prime/cashback/concours sub-rows).
+    # "XIRR"/"Cash drag" and the XIRR
     # Bonus/Cash drag/Taxes-Frais/Intérêts pie-chart shares (rows already
     # added by the user, mirroring Afranga/Swaper/Lendermarket's own
     # blocks) sit further below - only included when actually computed.
@@ -1282,7 +1281,7 @@ def run() -> None:
     # (right after "XIRR Taxes/Frais") for this new value to actually land
     # somewhere - this script fills an existing row by label, it doesn't
     # insert new labelled rows into this block.
-    bonus_breakdown = {"prime": monthly_referral_bonus}
+    bonus_breakdown = {"Bonus": monthly_referral_bonus}
     if xirr_value is not None:
         bonus_breakdown["XIRR"] = xirr_value
     if rendement_brut_value is not None:

@@ -1301,7 +1301,7 @@ def run() -> None:
         skip_total=not current_month,
     )
 
-    # "prime" now gets the real "Bonus" transaction total (see above -
+    # "Bonus" now gets the real "Bonus" transaction total (see above -
     # replaces the old placeholder). "prélèvements" (withholding tax on
     # interest, real figure - see fetch_current_month_interest_totals())
     # is a separate sub-row in the same block, right before "Rendements %"
@@ -1319,7 +1319,7 @@ def run() -> None:
     # value to actually land somewhere - this script fills an existing
     # row by label, it doesn't insert new labelled rows into this block.
     bonus_breakdown = {
-        "prime": interest_totals["bonus_cashback_contest"],
+        "Bonus": interest_totals["bonus_cashback_contest"],
         "prélèvements": interest_totals["withholding_tax"],
     }
     if rendement_brut_value is not None:

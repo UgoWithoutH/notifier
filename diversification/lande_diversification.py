@@ -890,9 +890,8 @@ def run(session: requests.Session | None = None) -> None:
     # row by label, it doesn't insert new labelled rows into this
     # block.
     bonus_breakdown = {}
-    # Lande's block only has a "cashback" sub-row (no "prime"), and "Bonus" = that row.
     if all_entries is not None:
-        bonus_breakdown["cashback"] = round(monthly_bonus, 2)
+        bonus_breakdown["Bonus"] = round(monthly_bonus, 2)
     if xirr_value is not None:
         bonus_breakdown["XIRR"] = xirr_value
     if rendement_brut_value is not None:

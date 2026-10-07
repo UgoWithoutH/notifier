@@ -1290,9 +1290,8 @@ def run() -> None:
     )
 
     # Loanch's "total_bonus" ("rewards") is a promotional/referral reward -
-    # a "prime", not a cashback/concours - written to its own dedicated
-    # sub-row, never to the "Bonus" row itself (a SUM formula over
-    # prime/cashback/concours). "XIRR"/"Cash drag" and the XIRR
+    # written directly to the "Bonus" row (no more prime/cashback/concours
+    # sub-rows). "XIRR"/"Cash drag" and the XIRR
     # Bonus/Cash drag/Taxes-Frais/Intérêts pie-chart shares (rows already
     # added by the user, mirroring Afranga/Swaper/Lendermarket/PeerBerry's
     # own blocks) sit further below - only included when actually computed.
@@ -1303,7 +1302,7 @@ def run() -> None:
     # Taxes/Frais") for this new value to actually land somewhere - this
     # script fills an existing row by label, it doesn't insert new
     # labelled rows into this block.
-    bonus_breakdown = {"prime": statement_totals["rewards"]}
+    bonus_breakdown = {"Bonus": statement_totals["rewards"]}
     if xirr_value is not None:
         bonus_breakdown["XIRR"] = xirr_value
     if rendement_brut_value is not None:
