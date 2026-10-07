@@ -604,14 +604,15 @@ class _InvestmentTableParser(HTMLParser):
 
 
 def fetch_active_loan_geo_amounts(session: requests.Session) -> tuple:
-    """Fetch current Lande investments as ``(loan_amounts, defaulted_loan_ids)``
-    where ``loan_amounts`` is ``loan id -> country -> remaining principal``.
+    """Fetch current Lande investments as ``(loan_amounts, loan_statuses)``
+    where ``loan_amounts`` is ``loan id -> country -> remaining principal``
+    and ``loan_statuses`` is ``loan id -> payment_status filter``.
     The site's current-investments table contains
     one parent row per loan followed by one detail row per investment
     contract; several contracts for the same loan are summed together.
     """
     loan_amounts = {}
-    defaulted_loan_ids = set()
+    loan_statuses = {}
     parent_rows = 0
     # Le tableau par défaut masque les prêts « Défaut » (vérifié en live) : on parcourt chaque filtre actif.
     for payment_status in LANDE_ACTIVE_PAYMENT_STATUSES:
@@ -622,10 +623,12 @@ def fetch_active_loan_geo_amounts(session: requests.Session) -> tuple:
         _check_authenticated(response)
         if not response.ok:
             raise RuntimeError(f"Lande investments page returned status {response.status_code}")
-        known_before = set(loan_amounts)
-        parent_rows += _parse_investments_page(response.text, loan_amounts)
-        if payment_status == "default":
-            defaulted_loan_ids = set(loan_amounts) - known_before
+        page_amounts = {}
+        parent_rows += _parse_investments_page(response.text, page_amounts)
+        loan_amounts.update(page_amounts)
+        # Le filtre « current » liste aussi les prêts en retard : les filtres suivants, plus précis, écrasent son statut.
+        for loan_id in page_amounts:
+            loan_statuses[loan_id] = payment_status
 
     invested_funds = _fetch_overview_fund(session, "Fonds investis")
     parsed_total = sum(amount for countries in loan_amounts.values() for amount in countries.values())
@@ -639,7 +642,7 @@ def fetch_active_loan_geo_amounts(session: requests.Session) -> tuple:
         "Lande current investments: %d loan row(s), %d loan(s) with remaining principal (%.2f EUR).",
         parent_rows, len(loan_amounts), parsed_total,
     )
-    return loan_amounts, defaulted_loan_ids
+    return loan_amounts, loan_statuses
 
 
 def _parse_investments_page(page_html: str, loan_amounts: dict) -> int:
@@ -758,8 +761,8 @@ def run(session: requests.Session | None = None) -> None:
     available_funds = None
     if current_month:
         try:
-            active_loan_amounts, defaulted_loan_ids = fetch_active_loan_geo_amounts(session)
-            geo_issues = fill_lande_loan_geo_amounts(active_loan_amounts, defaulted_loan_ids)
+            active_loan_amounts, loan_statuses = fetch_active_loan_geo_amounts(session)
+            geo_issues = fill_lande_loan_geo_amounts(active_loan_amounts, loan_statuses)
             for issue in geo_issues:
                 log.warning("Lande geographic breakdown: %s", issue)
         except Exception:
