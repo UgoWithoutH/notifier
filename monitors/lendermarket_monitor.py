@@ -901,6 +901,7 @@ def run() -> None:
                     invest_stats,
                     error=invest_error,
                     diagnostics_text=_collect_run_invest_diagnostics(run_started_at),
+                    robot_config=config,
                 )
             else:
                 log.info("Auto-invest: no fundable loan found this run for the selected lenders.")
