@@ -18,8 +18,12 @@ Endpoints (found 2026-10-07 by reading the pages' own JS, all JSON):
          the market page's `investMarket(JSON.parse(...))` config)
     POST /profile/cart/<id>/destroy    removes a cart line
 Review page (`order.review_url`) is only rendered with a non-empty cart; its
-confirm endpoint (`urls.buySm`, secondary) / `pmForm` form (primary) are read
-from that page at run time - see MODE "probe".
+confirm endpoint is read from that page at run time. Secondary (verified from the
+page's JS + a live probe, 2026-10-08): POST /profile/cart/api/buy-sm (`urls.buySm`),
+JSON {"risk_confirmed": bool}, headers Accept: application/json, X-Requested-With:
+XMLHttpRequest, X-CSRF-TOKEN (token from the page's `investConfirm` config); answers
+{"status": "ok"|"redirect", "redirect": url} or {"status": "risk"} (resend with
+risk_confirmed=true). Primary: legacy `pmForm` form POST (not verified).
 
 MODE (env AFRANGA_BOT_MODE, default "probe"):
     dry   - plan only, no HTTP call that changes anything.
@@ -84,6 +88,7 @@ _SECRET_RES = [
     re.compile(r"(\\u0022csrf\\u0022:\\u0022)[^\\]+"),
     re.compile(r'(name="_token"\s+value=")[^"]+'),
     re.compile(r'("_token"\s*:\s*")[^"]+'),
+    re.compile(r'(name="csrf-token"\s+content=")[^"]+'),
 ]
 
 
@@ -320,6 +325,13 @@ def _confirm(session: requests.Session, review_html: str, market: str, csrf: str
                 body = {}
             _log_diagnostics("confirm_secondary", risk_confirmed=risk, status=r.status_code, response=_redact(r.text[:5000]))
             if body.get("status") in ("ok", "redirect"):
+                if body.get("redirect"):
+                    try:
+                        done = session.get(body["redirect"], headers=_HEADERS, timeout=20)
+                        _log_diagnostics("confirm_done_page", status=done.status_code, final_url=done.url,
+                                         html=_redact(done.text[:3000]))
+                    except requests.RequestException:
+                        log.exception("Could not fetch the post-purchase page.")
                 return True
             if body.get("status") != "risk":
                 return False
@@ -373,6 +385,14 @@ def execute_market(session: requests.Session, market: MarketRows, lines: list, t
     if not lines or MODE == "dry":
         return
     csrf, urls = market.config["csrf"], market.config["urls"]
+    # A confirm buys the WHOLE cart: lines left by a crashed run / manual use must never be bought blindly.
+    order = market.config.get("order") or {}
+    stale_ids = [_find_key(line, "cart_loan_id") for line in order.get("lines") or []]
+    if order.get("count") and (len(stale_ids) < order["count"] or not all(stale_ids)):
+        raise RuntimeError("The Afranga cart is not empty and its lines can't be identified - empty it manually.")
+    for cart_loan_id in stale_ids:
+        log.warning("Removing stale cart line %s before planning purchases.", cart_loan_id)
+        _remove_from_cart(session, csrf, urls, cart_loan_id)
     to_add = lines[:1] if MODE == "probe" else lines
     added = []
     review_url = market.config.get("order", {}).get("review_url")
@@ -482,8 +502,12 @@ def run() -> None:
         log.exception("Afranga invest bot failed.")
     finally:
         _log_diagnostics("run_summary", stats=stats, error=error)
-        if stats["plan"] or stats["attempts"] or error:
-            send_afranga_invest_summary_email(stats, error=error, diagnostics_text=_collect_run_diagnostics(run_started_at))
+        had_problem = bool(error or stats["failures"])
+        # dry/probe runs only email on error; diagnostics are attached only when something went wrong.
+        if error or (MODE == "live" and (stats["plan"] or stats["attempts"])):
+            send_afranga_invest_summary_email(
+                stats, error=error, diagnostics_text=_collect_run_diagnostics(run_started_at) if had_problem else None
+            )
     if error:
         sys.exit(1)
 
