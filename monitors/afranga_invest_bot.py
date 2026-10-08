@@ -444,6 +444,7 @@ def run() -> None:
         "invested": [], "plan": [], "probed": False,
     }
     error = None
+    config = None
     try:
         session = requests.Session()
         balance, _extra = get_or_refresh_session(
@@ -506,7 +507,8 @@ def run() -> None:
         # dry/probe runs only email on error; diagnostics are attached only when something went wrong.
         if error or (MODE == "live" and (stats["plan"] or stats["attempts"])):
             send_afranga_invest_summary_email(
-                stats, error=error, diagnostics_text=_collect_run_diagnostics(run_started_at) if had_problem else None
+                stats, error=error, diagnostics_text=_collect_run_diagnostics(run_started_at) if had_problem else None,
+                robot_config=config,
             )
     if error:
         sys.exit(1)

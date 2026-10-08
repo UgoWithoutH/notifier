@@ -908,6 +908,7 @@ def run(headless: bool = True) -> None:
     originator_cap_status = {}
     originator_cap_blocked = []
     originator_loans = {}
+    robot_config = None
 
     with sync_playwright() as p:
         browser = p.chromium.launch(
@@ -1000,6 +1001,7 @@ def run(headless: bool = True) -> None:
                 except Exception:
                     log.exception("Could not read the Swaper configuration from the 'config robots' sheet.")
 
+                robot_config = config
                 selected_originators = config.active_names() if config else []
                 # Lowest "Taux min" among active originators: only a coarse
                 # pre-filter for the fetched loans (0 = none); each loan is
@@ -1283,6 +1285,7 @@ def run(headless: bool = True) -> None:
             originator_cap_status=originator_cap_status,
             originator_blocked=originator_cap_blocked,
             error=run_error,
+            robot_config=robot_config,
         )
     elif captured_api_calls and originator_loans and balance >= MIN_INVESTMENT_AMOUNT:
         # Diagnostics email (added 2026-07-26, explicit user request: get
