@@ -1030,3 +1030,42 @@ def send_diversification_recap_email(amounts: dict, missing_platforms: list | No
         log.info("Diversification recap email sent to %s.", EMAIL_TO)
     except Exception:
         log.exception("Failed to send diversification recap email.")
+
+
+def send_new_bilans_email(new_bilans: list) -> None:
+    """Sent by scripts/sync_bilans_financiers.py when new bilan rows were added
+    to the "notes bilans" sheet. Each item: dict with owner, exercice, audit,
+    devise, ca_eur, resultat_net, note."""
+    if not all([SMTP_HOST, SMTP_USER, SMTP_PASSWORD, EMAIL_TO]):
+        log.error(
+            "SMTP configuration is incomplete; cannot send email. "
+            "Required env vars: SMTP_HOST, SMTP_USER, SMTP_PASSWORD, EMAIL_TO."
+        )
+        return
+
+    subject = f"[Bilans] {len(new_bilans)} nouveau(x) bilan(s) financier(s) ajouté(s)"
+    body_lines = ["Nouveaux bilans ajoutés dans l'onglet \"notes bilans\" :", ""]
+    for b in new_bilans:
+        note = f"{b['note']}/5" if b.get("note") != "" else "n/a"
+        ca = f"{b['ca_eur']} €" if b.get("ca_eur") != "" else "n/a"
+        result = f"{b['resultat_net']} {b['devise']}".strip() if b.get("resultat_net") != "" else "n/a"
+        body_lines.append(
+            f"- {b['owner']} - exercice {b['exercice']} ({b['audit']}) : "
+            f"CA {ca} | résultat net {result} | note {note}"
+        )
+    body = "\n".join(body_lines)
+
+    msg = MIMEMultipart()
+    msg["From"] = EMAIL_FROM
+    msg["To"] = EMAIL_TO
+    msg["Subject"] = subject
+    msg.attach(MIMEText(body, "plain"))
+
+    try:
+        with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=15) as server:
+            server.starttls()
+            server.login(SMTP_USER, SMTP_PASSWORD)
+            server.sendmail(EMAIL_FROM, [EMAIL_TO], msg.as_string())
+        log.info("New bilans email sent to %s.", EMAIL_TO)
+    except Exception:
+        log.exception("Failed to send new bilans email.")
