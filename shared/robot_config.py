@@ -8,7 +8,7 @@ suivante) :
 
 - Nom : nom de la plateforme (ligne de bloc) ou du loan.
 - Pays : pays du loan (peut être vide).
-- Actif : "x" = le robot peut investir sur ce loan.
+- Actif marché primaire : "x" = le robot peut investir sur ce loan.
 - Taux min / Taux max : bornes du taux d'intérêt des prêts acceptés
   (vide = pas de borne).
 - Pourcentage max du solde par pays : sur la ligne de la plateforme,
