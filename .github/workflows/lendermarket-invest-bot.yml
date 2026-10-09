@@ -1,4 +1,4 @@
-name: Lendermarket Monitor
+name: Lendermarket Invest Bot
 
 on:
   workflow_dispatch: {}
@@ -7,7 +7,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: lendermarket-monitor
+  group: lendermarket-invest-bot
   cancel-in-progress: false
 
 jobs:
