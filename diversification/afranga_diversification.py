@@ -1,4 +1,4 @@
-"""Afranga portfolio diversification (by loan originator) fetcher.
+﻿"""Afranga portfolio diversification (by loan originator) fetcher.
 
 Logs into afranga.com via pure HTTP (email/password + a single-field Google
 Authenticator TOTP code, form-urlencoded POSTs against a Laravel CSRF `_token`
@@ -27,35 +27,13 @@ Auth flow verified 2026-07-18 via a real browser network capture:
      for every subsequent authenticated GET - no bearer token, no extra
      headers needed.
 
-Unlike PeerBerry/Lendermarket, Afranga has no JSON API for this - "My
-investments" is an old-school server-rendered (Laravel + jQuery) page: the
-table is populated by
-`GET https://afranga.com/profile/my-investments/refresh?<filters>&limit=N`
-which returns an HTML fragment (a `<table id="myInvestmentsTable">`), not
-JSON. Verified against the real account on 2026-07-09 (and re-verified via
-pure HTTP on 2026-07-18):
-- Requires a `_token` CSRF query param, read from `input[name='_token']` on
-  the my-investments page itself (a hidden field of the filter form).
-- `limit` must be one of the dropdown's allowed values (25/50/100/250) -
-  250 is used here to fetch everything in one call; larger values return
-  HTTP 400. No offset/page param was found, so accounts with more than 250
-  active investments would be truncated (logged as a warning if the exact
-  cap is hit - fine for now, revisit if/when the portfolio grows that big).
-- Each `<tr>` has the loan originator as an `<img alt="X logo">` (never as
-  plain text) in the 6th `<td>`, and the outstanding amount as
-  "€ 1 234.56"-formatted text in the 12th `<td>` ("Outstanding Investment"
-  column - the remaining/still-invested capital, as opposed to "Invested
-  Amount" which is the original amount before any repayments). The last row
-  is always a "Total:" summary row, not a real investment (its first `<td>`
-  has no Loan ID link), and is skipped. NOTE: a leading `<td>` (a "Sell on
-  Secondary market" checkbox, added by Afranga at some point after this was
-  first verified) shifts every column index by +1 versus earlier versions
-  of this comment - re-verify live (e.g. via a throwaway probe script) if
-  investments start silently disappearing again (0 parsed rows despite a
-  non-zero "Invested Funds" on the overview page is the telltale symptom).
-- Parsed via regex only (no HTML parser dependency), same approach as
-  bienpreter_diversification.py: split the fragment into `<tr>...</tr>`
-  blocks, then each block into `<td>...</td>` cells.
+Investments come from the redesigned "My investments" page's JSON API
+(verified live 2026-10-12; the old HTML `/refresh` fragment now 404s):
+`GET https://afranga.com/profile/my-investments/api/rows?limit=<10|25|50>&page=N`
+returns `{cards: [...], last_page}` - each card has `originator.name` and
+`invested.value` (the outstanding/still-invested capital, cross-checked
+against the overview's "Invested Funds"). Any other `limit` value returns
+HTTP 400, so pages are walked until `last_page`. No CSRF token needed.
 
 Also fetches this calendar month's "Gross interest received" and
 "Withholding Tax" from the Account Statement page
@@ -189,7 +167,8 @@ LOGIN_URL = "https://afranga.com/login"
 TWO_FA_URL = "https://afranga.com/2fa/verify"
 PROFILE_OVERVIEW_URL = "https://afranga.com/profile/overview"
 MY_INVESTMENTS_URL = "https://afranga.com/profile/my-investments"
-REFRESH_URL = "https://afranga.com/profile/my-investments/refresh"
+ROWS_API_URL = "https://afranga.com/profile/my-investments/api/rows"
+ROWS_API_LIMIT = 50  # largest accepted value (10/25/50); others return 400
 STATEMENT_PAGE_URL = "https://afranga.com/profile/account-statement"
 STATEMENT_REFRESH_URL = "https://afranga.com/profile/account-statement/refresh"
 BONUS_CASHBACK_HISTORY_URL = "https://afranga.com/profile/bonus-cashback/history"
@@ -321,68 +300,38 @@ def login(session: requests.Session) -> None:
 
 
 def fetch_investments(session: requests.Session) -> list:
-    """Fetch every active investment by calling the same HTML-fragment
-    endpoint the "My investments" page itself uses (see module docstring
-    for the verified shape/quirks). Parses the response via regex and
-    returns a list of {"originator", "outstanding"} dicts (amounts as
-    floats), skipping the trailing "Total:" summary row.
+    """Fetch every active investment from the "My investments" JSON API
+    (redesign verified live 2026-10-12: the old HTML `/refresh` fragment
+    now 404s). Returns a list of {"originator", "outstanding"} dicts.
     """
-    r = session.get(MY_INVESTMENTS_URL, headers=_HEADERS, timeout=20)
-    r.raise_for_status()
-    token = _extract_csrf_token(r.text)
-
-    log.info("Requesting My investments refresh endpoint (limit=%d)...", MAX_LIMIT)
-    r = session.get(
-        REFRESH_URL,
-        params={
-            "_token": token,
-            "interest_rate_percent[from]": "", "interest_rate_percent[to]": "",
-            "period[from]": "", "period[to]": "",
-            "created_at[from]": "", "created_at[to]": "",
-            "invested_amount[from]": "", "invested_amount[to]": "",
-            "loan[type]": "", "loan[early_repayment_possible]": "",
-            "limit": str(MAX_LIMIT),
-        },
-        headers={**_HEADERS, "X-Requested-With": "XMLHttpRequest"},
-        timeout=20,
-    )
-    log.info("My investments refresh endpoint response: status=%s", r.status_code)
-    if not r.ok:
-        raise RuntimeError(f"My investments refresh endpoint returned status {r.status_code}")
-
-    tbody_m = re.search(r"<tbody[^>]*>(.*?)</tbody>", r.text, re.DOTALL)
-    tbody_html = tbody_m.group(1) if tbody_m else ""
-    raw_rows = re.findall(r"<tr[^>]*>(.*?)</tr>", tbody_html, re.DOTALL)
-    log.info("Parsed %d raw row(s) from the My investments table (before filtering the Total row).", len(raw_rows))
-
     investments = []
-    for row_html in raw_rows:
-        cells = re.findall(r"<td[^>]*>(.*?)</td>", row_html, re.DOTALL)
-        if len(cells) < 12:
-            continue
-        # Indices are +1 vs. an older verification of this page - Afranga
-        # added a leading checkbox `<td>` ("Sell on Secondary market") since.
-        loan_id_m = re.search(r">\s*(\d+)\s*<", cells[2])
-        originator_m = re.search(r'alt="([^"]+)"', cells[5])
-        if not loan_id_m or not originator_m:
-            continue  # the trailing "Total:" row has no loan ID / originator
-        outstanding_m = re.search(r"€\s*([\d\s.,]+)", cells[11])
-        investments.append(
-            {
-                "originator": originator_m.group(1),
-                "outstanding": _parse_amount(outstanding_m.group(1) if outstanding_m else None),
-            }
+    page = 1
+    while True:
+        log.info("Requesting My investments rows API (page %d)...", page)
+        r = session.get(
+            ROWS_API_URL,
+            params={"limit": str(ROWS_API_LIMIT), "page": str(page)},
+            headers={**_HEADERS, "Accept": "application/json", "X-Requested-With": "XMLHttpRequest"},
+            timeout=20,
         )
+        log.info("My investments rows API response: status=%s", r.status_code)
+        if not r.ok:
+            raise RuntimeError(f"My investments rows API returned status {r.status_code}")
 
-    log.info("%d row(s) remain after filtering out the trailing Total row.", len(investments))
+        payload = r.json()
+        for card in payload.get("cards") or []:
+            investments.append(
+                {
+                    "originator": (card.get("originator") or {}).get("name") or "Unknown",
+                    "outstanding": float((card.get("invested") or {}).get("value") or 0.0),
+                }
+            )
 
-    if len(investments) >= MAX_LIMIT:
-        log.warning(
-            "Fetched exactly the max page size (%d) - the portfolio may have more investments than "
-            "this endpoint can return in one call (no pagination param is known to work here).",
-            MAX_LIMIT,
-        )
+        if page >= int(payload.get("last_page") or 1):
+            break
+        page += 1
 
+    log.info("Fetched %d active investment(s) from the My investments rows API.", len(investments))
     return investments
 
 
