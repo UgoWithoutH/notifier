@@ -473,6 +473,24 @@ def _invested_balance_at_month_end(monthly_summaries: dict, live_total_account_v
     return total_account_value - monthly_summaries[month_key]["closing_balance"]
 
 
+def compute_average_invested(monthly_summaries_as_of: dict, monthly_summaries: dict, live_total: float):
+    """Invested counterpart of compute_average_idle_cash(): day-weighted average of each month's
+    (opening+closing)/2 invested balance, rebuilt backward from the live total. None if unavailable."""
+    total_weighted = 0.0
+    total_days = 0
+    opening = 0.0
+    for month_key in sorted(monthly_summaries_as_of):
+        closing = _invested_balance_at_month_end(monthly_summaries, live_total, month_key)
+        if closing is None:
+            return None
+        days = monthly_summaries_as_of[month_key].get("days_covered") or 0
+        if days > 0:
+            total_weighted += (opening + closing) / 2 * days
+            total_days += days
+        opening = closing
+    return total_weighted / total_days if total_days else None
+
+
 def run() -> None:
     if not LENDERMARKET_EMAIL or not LENDERMARKET_PASSWORD:
         log.error("LENDERMARKET_EMAIL and LENDERMARKET_PASSWORD environment variables are required.")
@@ -822,11 +840,15 @@ def run() -> None:
     # Lifetime shares don't need the previous month's balances (first month of the account).
     if xirr_value is not None and signed_cashflows is not None and monthly_summaries_as_of and total_invested > 0:
         avg_idle_cash_lifetime = compute_average_idle_cash(monthly_summaries_as_of)
-        cash_weight_lifetime = avg_idle_cash_lifetime / (avg_idle_cash_lifetime + total_invested)
+        # Time-weighted like the idle cash: end-of-period total_invested understates the yield on a fast-growing account.
+        avg_invested_lifetime = compute_average_invested(monthly_summaries_as_of, monthly_summaries, live_total_account_value)
+        if avg_invested_lifetime is None or avg_invested_lifetime <= 0:
+            avg_invested_lifetime = total_invested
+        cash_weight_lifetime = avg_idle_cash_lifetime / (avg_idle_cash_lifetime + avg_invested_lifetime)
         lifetime_gross_interest_total = sum(s["interest_received"] for s in monthly_summaries_as_of.values())
-        lifetime_yield_rate = lifetime_gross_interest_total / total_invested
+        lifetime_yield_rate = lifetime_gross_interest_total / avg_invested_lifetime
         cash_drag_lifetime_total = cash_weight_lifetime * lifetime_yield_rate
-        missed_earnings = cash_drag_lifetime_total * (avg_idle_cash_lifetime + total_invested)
+        missed_earnings = cash_drag_lifetime_total * (avg_idle_cash_lifetime + avg_invested_lifetime)
         lifetime_fees_total = sum(s["fees"] for s in monthly_summaries_as_of.values())
         # Interest inside pending payments is in the account value but not yet in the statement.
         ledger_value = sum(

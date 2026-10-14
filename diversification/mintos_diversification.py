@@ -1047,10 +1047,14 @@ def compute_xirr_block_as_of(session: requests.Session, all_entries: list, end_d
         return result
 
     avg_idle_cash_lifetime = compute_average_idle_cash(all_entries, since_inception_date.strftime("%Y-%m-%d"), end_date.strftime("%Y-%m-%d"))
-    cash_weight_lifetime = avg_idle_cash_lifetime / (avg_idle_cash_lifetime + outstanding_as_of)
-    lifetime_yield_rate = lifetime_statement_totals["gross_interest_received"] / outstanding_as_of
+    # Time-weighted like the idle cash: end-of-period balance understates the yield on a fast-growing account.
+    avg_invested_lifetime = compute_average_balances(all_entries, since_inception_date, end_date)[0]
+    if avg_invested_lifetime is None or avg_invested_lifetime <= 0:
+        avg_invested_lifetime = outstanding_as_of
+    cash_weight_lifetime = avg_idle_cash_lifetime / (avg_idle_cash_lifetime + avg_invested_lifetime)
+    lifetime_yield_rate = lifetime_statement_totals["gross_interest_received"] / avg_invested_lifetime
     cash_drag_lifetime_total = cash_weight_lifetime * lifetime_yield_rate
-    missed_earnings = cash_drag_lifetime_total * (avg_idle_cash_lifetime + outstanding_as_of)
+    missed_earnings = cash_drag_lifetime_total * (avg_idle_cash_lifetime + avg_invested_lifetime)
 
     lifetime_withholding_tax = lifetime_statement_totals["withholding_tax"]
     lifetime_gross_interest = lifetime_statement_totals["gross_interest_received"]
@@ -1334,7 +1338,11 @@ def run(session: requests.Session | None = None) -> None:
 
         if xirr_value is not None and signed_cashflows is not None and since_inception_date is not None and total_outstanding > 0:
             avg_idle_cash_lifetime = compute_average_idle_cash(all_entries, since_inception_date.strftime("%Y-%m-%d"), today_str)
-            cash_weight_lifetime = avg_idle_cash_lifetime / (avg_idle_cash_lifetime + total_outstanding)
+            # Time-weighted like the idle cash: end-of-period balance understates the yield on a fast-growing account.
+            avg_invested_lifetime = compute_average_balances(all_entries, since_inception_date, today_date)[0]
+            if avg_invested_lifetime is None or avg_invested_lifetime <= 0:
+                avg_invested_lifetime = total_outstanding
+            cash_weight_lifetime = avg_idle_cash_lifetime / (avg_idle_cash_lifetime + avg_invested_lifetime)
             try:
                 lifetime_statement_totals = fetch_statement_totals(session, since_inception_date, today_date)
             except Exception:
@@ -1342,9 +1350,9 @@ def run(session: requests.Session | None = None) -> None:
                 lifetime_statement_totals = None
 
             if lifetime_statement_totals is not None:
-                lifetime_yield_rate = lifetime_statement_totals["gross_interest_received"] / total_outstanding
+                lifetime_yield_rate = lifetime_statement_totals["gross_interest_received"] / avg_invested_lifetime
                 cash_drag_lifetime_total = cash_weight_lifetime * lifetime_yield_rate
-                missed_earnings = cash_drag_lifetime_total * (avg_idle_cash_lifetime + total_outstanding)
+                missed_earnings = cash_drag_lifetime_total * (avg_idle_cash_lifetime + avg_invested_lifetime)
                 lifetime_withholding_tax = lifetime_statement_totals["withholding_tax"]
                 lifetime_gross_interest = lifetime_statement_totals["gross_interest_received"]
 

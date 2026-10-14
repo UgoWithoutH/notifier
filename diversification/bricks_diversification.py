@@ -839,10 +839,14 @@ def compute_xirr_block_as_of(
     avg_idle_cash_lifetime = compute_average_idle_cash(all_entries, since_inception_str, end_date_str)
     lifetime_gross_interest = _lifetime_sum_as_of(all_entries, {_INTEREST_KIND}, end_date)
     if outstanding_as_of > 0:
-        cash_weight_lifetime = avg_idle_cash_lifetime / (avg_idle_cash_lifetime + outstanding_as_of)
-        lifetime_yield_rate = lifetime_gross_interest / outstanding_as_of
+        # Time-weighted like the idle cash: end-of-period balance understates the yield on a fast-growing account.
+        avg_invested_lifetime = compute_average_balances(all_entries, since_inception_date, end_date)[0]
+        if avg_invested_lifetime is None or avg_invested_lifetime <= 0:
+            avg_invested_lifetime = outstanding_as_of
+        cash_weight_lifetime = avg_idle_cash_lifetime / (avg_idle_cash_lifetime + avg_invested_lifetime)
+        lifetime_yield_rate = lifetime_gross_interest / avg_invested_lifetime
         cash_drag_lifetime_total = cash_weight_lifetime * lifetime_yield_rate
-        missed_earnings = cash_drag_lifetime_total * (avg_idle_cash_lifetime + outstanding_as_of)
+        missed_earnings = cash_drag_lifetime_total * (avg_idle_cash_lifetime + avg_invested_lifetime)
     else:
         # Nothing invested at end_date: no yield rate to extrapolate idle cash from.
         missed_earnings = 0.0
