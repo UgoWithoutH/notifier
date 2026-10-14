@@ -831,6 +831,11 @@ def run() -> None:
                 today_month_key,
             )
 
+    # First month of the account: no invested capital the month before, so use this month's averages instead.
+    if (avg_invested_prev_month is None or avg_invested_prev_month <= 0) and avg_invested_balance is not None:
+        avg_invested_prev_month = avg_invested_balance
+        avg_non_invested_prev_month = avg_non_invested_balance
+
     if avg_invested_prev_month is not None and (avg_invested_prev_month + avg_non_invested_prev_month) > 0:
         # Both averages are 0 for any backfilled month before the account's real inception (nothing invested/held yet) - guard against ZeroDivisionError there.
         cash_weight = avg_non_invested_prev_month / (avg_non_invested_prev_month + avg_invested_prev_month)

@@ -775,10 +775,20 @@ def run() -> None:
                 )
         else:
             log.warning(
-                "No previous month cached before %s - Cash drag/'Rendements %% brut' will not be updated "
-                "(they now divide by the PREVIOUS month's average balances, see comment above).",
+                "No previous month cached before %s - falling back to this month's average balances "
+                "for Cash drag/'Rendements %% brut'.",
                 today_month_key,
             )
+
+    # First month of the account: no invested capital the month before, so use this month's averages instead.
+    if (avg_invested_prev_month is None or avg_invested_prev_month <= 0) and avg_invested_balance is not None:
+        log.info(
+            "No invested balance in the previous month - using this month's average balances as the yield denominator "
+            "(investi %.2f EUR, non investi %.2f EUR).",
+            avg_invested_balance, avg_non_invested_balance,
+        )
+        avg_invested_prev_month = avg_invested_balance
+        avg_non_invested_prev_month = avg_non_invested_balance
 
     if avg_invested_prev_month is not None and avg_invested_prev_month > 0:
         cash_weight = avg_non_invested_prev_month / (avg_non_invested_prev_month + avg_invested_prev_month)

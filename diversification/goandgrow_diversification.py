@@ -548,6 +548,9 @@ def run() -> None:
     if entries:
         prev_month_end_date = today_date.replace(day=1) - timedelta(days=1)
         avg_invested_prev_month = compute_average_balance(entries, prev_month_end_date.replace(day=1), prev_month_end_date)
+    # First month of the account: no invested capital the month before, so use this month's average instead.
+    if (avg_invested_prev_month is None or avg_invested_prev_month <= 0) and avg_invested_balance is not None:
+        avg_invested_prev_month = avg_invested_balance
     if avg_invested_prev_month is not None and avg_invested_prev_month > 0:
         monthly_yield_steps = [
             ("Intérêts brut %", statement_totals["interest_received"]),
