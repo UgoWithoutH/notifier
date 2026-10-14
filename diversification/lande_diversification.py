@@ -990,10 +990,14 @@ def run(session: requests.Session | None = None) -> None:
         if (xirr_value is not None and signed_cashflows is not None and since_inception_date is not None
                 and lifetime_interest is not None and total_invested is not None and total_invested > 0):
             avg_idle_cash_lifetime = compute_average_idle_cash(all_entries, since_inception_date, today_date)
-            cash_weight_lifetime = avg_idle_cash_lifetime / (avg_idle_cash_lifetime + total_invested)
-            lifetime_yield_rate = lifetime_interest / total_invested
+            # Time-weighted like the idle cash: end-of-period balance understates the yield on a fast-growing account.
+            avg_invested_lifetime = compute_average_balances(all_entries, since_inception_date, today_date)[0]
+            if avg_invested_lifetime is None or avg_invested_lifetime <= 0:
+                avg_invested_lifetime = total_invested
+            cash_weight_lifetime = avg_idle_cash_lifetime / (avg_idle_cash_lifetime + avg_invested_lifetime)
+            lifetime_yield_rate = lifetime_interest / avg_invested_lifetime
             cash_drag_lifetime_total = cash_weight_lifetime * lifetime_yield_rate
-            missed_earnings = cash_drag_lifetime_total * (avg_idle_cash_lifetime + total_invested)
+            missed_earnings = cash_drag_lifetime_total * (avg_idle_cash_lifetime + avg_invested_lifetime)
 
             def _is_classified(label: str) -> bool:
                 return _is_interest(label) or _is_deposit(label) or _is_withdrawal(label) or _is_bonus(label) or _is_known_internal_movement(label)

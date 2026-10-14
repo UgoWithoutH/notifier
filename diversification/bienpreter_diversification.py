@@ -1250,10 +1250,14 @@ def run() -> None:
                 avg_idle_cash_lifetime = compute_average_idle_cash(
                     operations_as_of, since_inception_date.strftime("%Y-%m-%d"), today_str
                 )
-                cash_weight_lifetime = avg_idle_cash_lifetime / (avg_idle_cash_lifetime + total_invested)
-                lifetime_yield_rate = lifetime_gross_interest / total_invested
+                # Time-weighted like the idle cash: end-of-period total_invested understates the yield on a fast-growing account.
+                avg_invested_lifetime = compute_average_balances(operations_as_of, since_inception_date, today_date)[0]
+                if avg_invested_lifetime is None or avg_invested_lifetime <= 0:
+                    avg_invested_lifetime = total_invested
+                cash_weight_lifetime = avg_idle_cash_lifetime / (avg_idle_cash_lifetime + avg_invested_lifetime)
+                lifetime_yield_rate = lifetime_gross_interest / avg_invested_lifetime
                 cash_drag_lifetime_total = cash_weight_lifetime * lifetime_yield_rate
-                missed_earnings = cash_drag_lifetime_total * (avg_idle_cash_lifetime + total_invested)
+                missed_earnings = cash_drag_lifetime_total * (avg_idle_cash_lifetime + avg_invested_lifetime)
 
                 # Waterfall decomposition (switched from Shapley
                 # 2026-09-09, see shared/xirr_waterfall.py's module
