@@ -636,11 +636,6 @@ def run() -> None:
             avg_invested_prev_month, avg_non_invested_prev_month, prev_month_start_date, prev_month_end_date,
         )
 
-        # First month of the account: no invested capital the month before, so use this month's averages instead.
-        if (avg_invested_prev_month is None or avg_invested_prev_month <= 0) and avg_invested_balance is not None:
-            avg_invested_prev_month = avg_invested_balance
-            avg_non_invested_prev_month = avg_non_invested_balance
-
         if avg_invested_prev_month is not None and avg_invested_prev_month > 0:
             cash_weight = avg_non_invested_prev_month / (avg_non_invested_prev_month + avg_invested_prev_month)
             monthly_yield_rate_brut = amounts["gross_interest_received"] / avg_invested_prev_month
