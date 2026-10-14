@@ -745,10 +745,11 @@ def run() -> None:
 
     if not current_month and closing_balance is not None:
         # Backfilled month: previous month's whole-account (opening+closing)/2 is the denominator;
-        # idle cash has no history, so Cash drag is left out (its row stays untouched).
+        # Cash drag is 0.0, same as the live path (the main account earns daily returns, so it is not idle cash).
         avg_total_balance_month = prev_avg_total_balance if prev_avg_total_balance is not None else 0.0
         monthly_yield_steps = [
             ("Intérêts brut %", interest_total),
+            ("Cash drag brut %", 0.0),
             ("Bonus brut %", statement_totals["rewards_bonuses"]),
             ("Frais brut %", -statement_totals["fees"]),
             ("Taxes brut %", 0.0),
