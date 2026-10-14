@@ -926,10 +926,14 @@ def compute_xirr_block_as_of(all_entries: list, end_date, statement_totals: dict
     lifetime_interest_paid = _lifetime_sum_as_of(all_entries, INTEREST_TYPE, end_date)
 
     avg_idle_cash_lifetime = compute_average_idle_cash(all_entries, since_inception_str, end_date_str)
-    cash_weight_lifetime = avg_idle_cash_lifetime / (avg_idle_cash_lifetime + outstanding_as_of)
-    lifetime_yield_rate = lifetime_interest_paid / outstanding_as_of
+    # Time-weighted like the idle cash: end-of-period balance understates the yield on a fast-growing account.
+    avg_invested_lifetime = compute_average_balances(all_entries, since_inception_date, end_date)[0]
+    if avg_invested_lifetime is None or avg_invested_lifetime <= 0:
+        avg_invested_lifetime = outstanding_as_of
+    cash_weight_lifetime = avg_idle_cash_lifetime / (avg_idle_cash_lifetime + avg_invested_lifetime)
+    lifetime_yield_rate = lifetime_interest_paid / avg_invested_lifetime
     cash_drag_lifetime_total = cash_weight_lifetime * lifetime_yield_rate
-    missed_earnings = cash_drag_lifetime_total * (avg_idle_cash_lifetime + outstanding_as_of)
+    missed_earnings = cash_drag_lifetime_total * (avg_idle_cash_lifetime + avg_invested_lifetime)
 
     # transaction_type not in the confirmed set (see module docstring -
     # 4/5/7/8/9 were never observed on this account) is tracked here as
@@ -1215,11 +1219,15 @@ def run() -> None:
 
         if xirr_value is not None and signed_cashflows is not None and since_inception_date is not None and total_invested > 0:
             avg_idle_cash_lifetime = compute_average_idle_cash(all_entries, since_inception_date.strftime("%Y-%m-%d"), today_str)
-            cash_weight_lifetime = avg_idle_cash_lifetime / (avg_idle_cash_lifetime + total_invested)
+            # Time-weighted like the idle cash: end-of-period balance understates the yield on a fast-growing account.
+            avg_invested_lifetime = compute_average_balances(all_entries, since_inception_date, today_date)[0]
+            if avg_invested_lifetime is None or avg_invested_lifetime <= 0:
+                avg_invested_lifetime = total_invested
+            cash_weight_lifetime = avg_idle_cash_lifetime / (avg_idle_cash_lifetime + avg_invested_lifetime)
             lifetime_interest_paid = sum(_entry_amount(e) for e in all_entries if e.get("transaction_type") == INTEREST_TYPE)
-            lifetime_yield_rate = lifetime_interest_paid / total_invested
+            lifetime_yield_rate = lifetime_interest_paid / avg_invested_lifetime
             cash_drag_lifetime_total = cash_weight_lifetime * lifetime_yield_rate
-            missed_earnings = cash_drag_lifetime_total * (avg_idle_cash_lifetime + total_invested)
+            missed_earnings = cash_drag_lifetime_total * (avg_idle_cash_lifetime + avg_invested_lifetime)
 
             # transaction_type not in the confirmed set (see module
             # docstring - 4/5/7/8/9 were never observed on this account) is

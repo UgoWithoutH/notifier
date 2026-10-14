@@ -814,10 +814,14 @@ def compute_xirr_block_as_of(session: requests.Session, all_entries: list, end_d
     lifetime_statement = fetch_statement_summary(session, since_inception_str, end_date_str)
 
     avg_idle_cash_lifetime = compute_average_idle_cash(all_entries, lifetime_statement["opening_balance"], since_inception_str, end_date_str)
-    cash_weight_lifetime = avg_idle_cash_lifetime / (avg_idle_cash_lifetime + outstanding_as_of)
-    lifetime_yield_rate = lifetime_statement["interest_income"] / outstanding_as_of
+    # Time-weighted like the idle cash: end-of-period balance understates the yield on a fast-growing account.
+    avg_invested_lifetime = compute_average_balances(all_entries, since_inception_date, end_date)[0]
+    if avg_invested_lifetime is None or avg_invested_lifetime <= 0:
+        avg_invested_lifetime = outstanding_as_of
+    cash_weight_lifetime = avg_idle_cash_lifetime / (avg_idle_cash_lifetime + avg_invested_lifetime)
+    lifetime_yield_rate = lifetime_statement["interest_income"] / avg_invested_lifetime
     cash_drag_lifetime_total = cash_weight_lifetime * lifetime_yield_rate
-    missed_earnings = cash_drag_lifetime_total * (avg_idle_cash_lifetime + outstanding_as_of)
+    missed_earnings = cash_drag_lifetime_total * (avg_idle_cash_lifetime + avg_invested_lifetime)
 
     lifetime_sale_fees = sum(
         _entry_amount(e) for e in all_entries
@@ -1188,10 +1192,14 @@ def run() -> None:
                 avg_idle_cash_lifetime = compute_average_idle_cash(
                     all_entries, lifetime_statement["opening_balance"], since_inception_date.strftime("%Y-%m-%d"), today_str,
                 )
-                cash_weight_lifetime = avg_idle_cash_lifetime / (avg_idle_cash_lifetime + total_invested)
-                lifetime_yield_rate = lifetime_statement["interest_income"] / total_invested
+                # Time-weighted like the idle cash: end-of-period balance understates the yield on a fast-growing account.
+                avg_invested_lifetime = compute_average_balances(all_entries, since_inception_date, today_date)[0]
+                if avg_invested_lifetime is None or avg_invested_lifetime <= 0:
+                    avg_invested_lifetime = total_invested
+                cash_weight_lifetime = avg_idle_cash_lifetime / (avg_idle_cash_lifetime + avg_invested_lifetime)
+                lifetime_yield_rate = lifetime_statement["interest_income"] / avg_invested_lifetime
                 cash_drag_lifetime_total = cash_weight_lifetime * lifetime_yield_rate
-                missed_earnings = cash_drag_lifetime_total * (avg_idle_cash_lifetime + total_invested)
+                missed_earnings = cash_drag_lifetime_total * (avg_idle_cash_lifetime + avg_invested_lifetime)
 
                 lifetime_sale_fees = sum(_entry_amount(e) for e in all_entries if e.get("details") == "INVESTMENT_SALE_FEE")
                 lifetime_gross_interest = lifetime_statement["interest_income"]

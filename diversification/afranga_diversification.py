@@ -1230,10 +1230,14 @@ def compute_xirr_block_as_of(session: requests.Session, all_detail_rows: list, x
         all_detail_rows, lifetime_statement_totals_as_of["opening_balance"], lifetime_statement_totals_as_of["closing_balance"],
         since_inception_date.strftime("%Y-%m-%d"), end_date.strftime("%Y-%m-%d"),
     )
-    cash_weight_lifetime = avg_idle_cash_lifetime / (avg_idle_cash_lifetime + outstanding_as_of)
-    lifetime_yield_rate = lifetime_statement_totals_as_of["gross_interest_received"] / outstanding_as_of
+    # Time-weighted like the idle cash: end-of-period balance understates the yield on a fast-growing account.
+    avg_invested_lifetime = compute_average_balances(all_detail_rows, since_inception_date, end_date)[0]
+    if avg_invested_lifetime is None or avg_invested_lifetime <= 0:
+        avg_invested_lifetime = outstanding_as_of
+    cash_weight_lifetime = avg_idle_cash_lifetime / (avg_idle_cash_lifetime + avg_invested_lifetime)
+    lifetime_yield_rate = lifetime_statement_totals_as_of["gross_interest_received"] / avg_invested_lifetime
     cash_drag_lifetime_total = cash_weight_lifetime * lifetime_yield_rate
-    missed_earnings = cash_drag_lifetime_total * (avg_idle_cash_lifetime + outstanding_as_of)
+    missed_earnings = cash_drag_lifetime_total * (avg_idle_cash_lifetime + avg_invested_lifetime)
 
     lifetime_withholding_tax = lifetime_statement_totals_as_of["withholding_tax"]
     lifetime_gross_interest = lifetime_statement_totals_as_of["gross_interest_received"]
@@ -1551,18 +1555,20 @@ def run() -> None:
             if deposit_dates:
                 since_inception_date = datetime.strptime(min(deposit_dates), "%Y-%m-%d").date()
                 years_elapsed = max((today_date - since_inception_date).days / 365.25, 1 / 365.25)
-                # Lifetime shares still use total_invested (today's live
-                # snapshot), not avg_invested_balance - no lifetime-average
-                # equivalent is computed anywhere, and these shares operate
-                # over the since-inception period, not this month's.
+                # Lifetime shares use their own since-inception averages
+                # (avg_invested_lifetime below), not this month's avg_invested_balance.
                 avg_idle_cash_lifetime = compute_average_idle_cash(
                     all_detail_rows or [], lifetime_statement_totals["opening_balance"], lifetime_statement_totals["closing_balance"],
                     since_inception_date.strftime("%Y-%m-%d"), today_date_str,
                 )
-                cash_weight_lifetime = avg_idle_cash_lifetime / (avg_idle_cash_lifetime + total_invested)
-                lifetime_yield_rate = lifetime_statement_totals["gross_interest_received"] / total_invested
+                # Time-weighted like the idle cash: end-of-period balance understates the yield on a fast-growing account.
+                avg_invested_lifetime = compute_average_balances(all_detail_rows or [], since_inception_date, today_date)[0]
+                if avg_invested_lifetime is None or avg_invested_lifetime <= 0:
+                    avg_invested_lifetime = total_invested
+                cash_weight_lifetime = avg_idle_cash_lifetime / (avg_idle_cash_lifetime + avg_invested_lifetime)
+                lifetime_yield_rate = lifetime_statement_totals["gross_interest_received"] / avg_invested_lifetime
                 cash_drag_lifetime_total = cash_weight_lifetime * lifetime_yield_rate
-                missed_earnings = cash_drag_lifetime_total * (avg_idle_cash_lifetime + total_invested)
+                missed_earnings = cash_drag_lifetime_total * (avg_idle_cash_lifetime + avg_invested_lifetime)
 
                 lifetime_bonus_total = lifetime_statement_totals["bonus_total"]
                 lifetime_withholding_tax = lifetime_statement_totals["withholding_tax"]

@@ -1006,10 +1006,14 @@ def compute_xirr_block_as_of(page, all_entries: list, xirr_cashflow_entries: lis
         all_entries, lifetime_statement_totals_as_of["opening_balance"], lifetime_statement_totals_as_of["closing_balance"],
         since_inception_date.strftime("%Y-%m-%d"), end_date_str,
     )
-    cash_weight_lifetime = avg_idle_cash_lifetime / (avg_idle_cash_lifetime + outstanding_as_of)
-    lifetime_yield_rate = lifetime_statement_totals_as_of["earned_interest"] / outstanding_as_of
+    # Time-weighted like the idle cash: end-of-period balance understates the yield on a fast-growing account.
+    avg_invested_lifetime = compute_average_balances(all_entries, since_inception_date, end_date)[0]
+    if avg_invested_lifetime is None or avg_invested_lifetime <= 0:
+        avg_invested_lifetime = outstanding_as_of
+    cash_weight_lifetime = avg_idle_cash_lifetime / (avg_idle_cash_lifetime + avg_invested_lifetime)
+    lifetime_yield_rate = lifetime_statement_totals_as_of["earned_interest"] / avg_invested_lifetime
     cash_drag_lifetime_total = cash_weight_lifetime * lifetime_yield_rate
-    missed_earnings = cash_drag_lifetime_total * (avg_idle_cash_lifetime + outstanding_as_of)
+    missed_earnings = cash_drag_lifetime_total * (avg_idle_cash_lifetime + avg_invested_lifetime)
     lifetime_gross_interest = lifetime_statement_totals_as_of["earned_interest"]
 
     # Waterfall decomposition (switched from Shapley 2026-09-09, see
@@ -1400,8 +1404,12 @@ def run(headless: bool = True) -> None:
                     all_account_entries or [], lifetime_statement_totals["opening_balance"], lifetime_statement_totals["closing_balance"],
                     since_inception_date.strftime("%Y-%m-%d"), get_report_now(REPORT_TIMEZONE).strftime("%Y-%m-%d"),
                 )
-                cash_weight_lifetime = avg_idle_cash_lifetime / (avg_idle_cash_lifetime + breakdown["total_invested"])
-                lifetime_yield_rate = lifetime_statement_totals["earned_interest"] / breakdown["total_invested"]
+                # Time-weighted like the idle cash: end-of-period balance understates the yield on a fast-growing account.
+                avg_invested_lifetime = compute_average_balances(all_account_entries or [], since_inception_date, get_report_now(REPORT_TIMEZONE).date())[0]
+                if avg_invested_lifetime is None or avg_invested_lifetime <= 0:
+                    avg_invested_lifetime = breakdown["total_invested"]
+                cash_weight_lifetime = avg_idle_cash_lifetime / (avg_idle_cash_lifetime + avg_invested_lifetime)
+                lifetime_yield_rate = lifetime_statement_totals["earned_interest"] / avg_invested_lifetime
                 cash_drag_lifetime_total = cash_weight_lifetime * lifetime_yield_rate
                 # Same counterfactual-XIRR technique as bonus_xirr_contribution
                 # above, instead of linearly dividing cash_drag_lifetime_total by
@@ -1414,7 +1422,7 @@ def run(headless: bool = True) -> None:
                 # counterfactual value, and diff vs. the real XIRR - same scale/
                 # methodology as xirr_value itself.
                 if xirr_value is not None:
-                    missed_earnings = cash_drag_lifetime_total * (avg_idle_cash_lifetime + breakdown["total_invested"])
+                    missed_earnings = cash_drag_lifetime_total * (avg_idle_cash_lifetime + avg_invested_lifetime)
                     lifetime_gross_interest = lifetime_statement_totals["earned_interest"]
 
                     # Waterfall decomposition (switched from Shapley
