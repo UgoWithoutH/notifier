@@ -998,6 +998,10 @@ def run() -> None:
             "Solde moyen pondéré (mois N-1, dénominateur du rendement) - investi: %.2f EUR, non investi: %.2f EUR (%s to %s).",
             avg_invested_prev_month, avg_non_invested_prev_month, prev_month_start_date, prev_month_end_date,
         )
+        # First month of the account: no invested capital the month before, so use this month's averages instead.
+        if avg_invested_prev_month <= 0 and avg_invested_balance is not None:
+            avg_invested_prev_month = avg_invested_balance
+            avg_non_invested_prev_month = avg_non_invested_balance
 
     xirr_block = {}
     if all_entries is not None:
