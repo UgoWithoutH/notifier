@@ -592,9 +592,6 @@ def run() -> None:
     # Like the other platforms, "Rendements % brut" divides by the PREVIOUS month's average balance
     # (None for an account's first month, so no yield is reported for it).
     prev_avg_total_balance = _prev_month_avg_balance(monthly_summaries, f"{end_date.year:04d}-{end_date.month:02d}")
-    # First month of the account: nothing the month before, so use this month's own (opening+closing)/2 instead.
-    if (prev_avg_total_balance is None or prev_avg_total_balance <= 0) and closing_balance is not None:
-        prev_avg_total_balance = (statement_totals["opening_balance"] + closing_balance) / 2
 
     if monthly_summaries:
         # get_cached_monthly_summaries()'s cache accumulates every month
@@ -745,11 +742,10 @@ def run() -> None:
 
     if not current_month and closing_balance is not None:
         # Backfilled month: previous month's whole-account (opening+closing)/2 is the denominator;
-        # Cash drag is 0.0, same as the live path (the main account earns daily returns, so it is not idle cash).
+        # idle cash has no history, so Cash drag is left out (its row stays untouched).
         avg_total_balance_month = prev_avg_total_balance if prev_avg_total_balance is not None else 0.0
         monthly_yield_steps = [
             ("Intérêts brut %", interest_total),
-            ("Cash drag brut %", 0.0),
             ("Bonus brut %", statement_totals["rewards_bonuses"]),
             ("Frais brut %", -statement_totals["fees"]),
             ("Taxes brut %", 0.0),
