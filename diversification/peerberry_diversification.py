@@ -743,6 +743,12 @@ def compute_xirr_block_as_of(session: requests.Session, all_entries: list, end_d
         all_entries, prev_month_start_date, prev_month_end_date,
         non_invested_opening_anchor=prev_month_statement["opening_balance"],
     )
+    # First month of the account: no invested capital the month before, so use this month's averages instead.
+    if avg_invested_month <= 0:
+        avg_invested_month, avg_non_invested_month = compute_average_balances(
+            all_entries, month_start_date, end_date,
+            non_invested_opening_anchor=month_statement["opening_balance"],
+        )
     if avg_invested_month > 0:
         cash_weight = avg_non_invested_month / (avg_non_invested_month + avg_invested_month)
         monthly_yield_rate = month_statement["interest_income"] / avg_invested_month

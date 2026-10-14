@@ -874,6 +874,11 @@ def compute_xirr_block_as_of(all_entries: list, end_date, statement_totals: dict
     avg_invested_month, avg_non_invested_month = compute_average_balances(
         all_entries, prev_month_end_date.replace(day=1), prev_month_end_date,
     )
+    # First month of the account: no invested capital the month before, so use this month's averages instead.
+    if avg_invested_month <= 0:
+        avg_invested_month, avg_non_invested_month = compute_average_balances(
+            all_entries, end_date.replace(day=1), end_date,
+        )
     if avg_invested_month > 0:
         cash_weight = avg_non_invested_month / (avg_non_invested_month + avg_invested_month)
         monthly_yield_rate = statement_totals["interest_paid"] / avg_invested_month
