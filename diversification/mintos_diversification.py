@@ -985,6 +985,9 @@ def compute_xirr_block_as_of(session: requests.Session, all_entries: list, end_d
         avg_invested_month, avg_non_invested_month = compute_average_balances(
             all_entries, prev_month_end_date.replace(day=1), prev_month_end_date,
         )
+        # First month of the account: no invested capital the month before, so use this month's averages instead.
+        if avg_invested_month <= 0:
+            avg_invested_month, avg_non_invested_month = compute_average_balances(all_entries, month_start_date, end_date)
         if avg_invested_month > 0:
             cash_weight = avg_non_invested_month / (avg_non_invested_month + avg_invested_month)
             month_net_interest = month_statement_totals["gross_interest_received"] - month_statement_totals["withholding_tax"]
