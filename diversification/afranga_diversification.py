@@ -1308,12 +1308,6 @@ def run() -> None:
         }
 
     try:
-        bonus_cashback = fetch_current_month_bonus_cashback(session)
-    except Exception:
-        log.exception("Failed to fetch this month's Bonus Cashback total - defaulting to 0.0.")
-        bonus_cashback = 0.0
-
-    try:
         uninvested_balance = fetch_uninvested_balance(session)
     except Exception:
         log.exception("Failed to fetch the uninvested wallet balance - 'non investi' will not be updated.")
@@ -1334,7 +1328,8 @@ def run() -> None:
     statement_totals["net_interest_received"] = (
         statement_totals["gross_interest_received"] - statement_totals["withholding_tax"]
     )
-    statement_totals["bonus_cashback_contest"] = bonus_cashback
+    # Ledger total (Bonus received/Cashback bonus/Registration Bonus) is a superset of the Bonus Cashback campaign page's payouts.
+    statement_totals["bonus_cashback_contest"] = statement_totals["bonus_total"]
     log.info(
         "This month's statement totals: total=%.2f EUR, gross_interest_received=%.2f EUR, "
         "net_interest_received=%.2f EUR, withholding_tax=%.2f EUR",
