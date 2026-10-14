@@ -592,6 +592,9 @@ def run() -> None:
     # Like the other platforms, "Rendements % brut" divides by the PREVIOUS month's average balance
     # (None for an account's first month, so no yield is reported for it).
     prev_avg_total_balance = _prev_month_avg_balance(monthly_summaries, f"{end_date.year:04d}-{end_date.month:02d}")
+    # First month of the account: nothing the month before, so use this month's own (opening+closing)/2 instead.
+    if (prev_avg_total_balance is None or prev_avg_total_balance <= 0) and closing_balance is not None:
+        prev_avg_total_balance = (statement_totals["opening_balance"] + closing_balance) / 2
 
     if monthly_summaries:
         # get_cached_monthly_summaries()'s cache accumulates every month

@@ -1509,6 +1509,11 @@ def run() -> None:
             non_invested_opening_anchor=prev_month_statement_totals["opening_balance"],
         )
 
+    # First month of the account: no invested capital the month before, so use this month's averages instead.
+    if (avg_invested_prev_month is None or avg_invested_prev_month <= 0) and avg_invested_balance is not None:
+        avg_invested_prev_month = avg_invested_balance
+        avg_non_invested_prev_month = avg_non_invested_balance
+
     if current_month and avg_invested_prev_month is not None and avg_invested_prev_month > 0:
         today_date_str = today_date.strftime("%Y-%m-%d")
         cash_weight = avg_non_invested_prev_month / (avg_non_invested_prev_month + avg_invested_prev_month)
