@@ -204,7 +204,7 @@ import os
 import sys
 import time
 import logging
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -220,7 +220,9 @@ from shared.google_sheet import (
     fill_current_month_bonus_breakdown,
     fill_geographic_repartition_amounts,
     fill_geographic_repartition_uninvested_amount,
+    fill_remaining_duration_amounts,
 )
+from shared.remaining_duration import overdue_months_and_days, remaining_months_and_days
 from shared.report_date import get_report_now, is_current_month
 from shared.session_cache import get_or_refresh_session
 from shared.state import load_state, save_state
@@ -242,7 +244,10 @@ STATEMENT_API_URL = "https://api.loanch.com/api/v1/statement-report"
 DASHBOARD_API_URL = "https://api.loanch.com/api/v1/dashboard"
 TRANSACTIONS_API_URL = "https://api.loanch.com/api/v1/transaction"
 PAGE_SIZE = 100
-# Every valid `transaction_type` choice as of 2026-08-14 (probed live by
+# Loanch exposes no default status: a loan late by more than this many days
+# is treated as in default in the "durée" tab (inferred, 60 days = common
+# industry threshold).
+LOANCH_DEFAULT_DAYS = 60# Every valid `transaction_type` choice as of 2026-08-14 (probed live by
 # requesting each value individually - 11+ all returned 400
 # "invalid_choice") - see module docstring for what each observed value means.
 TRANSACTION_TYPES = list(range(0, 11))
@@ -413,7 +418,11 @@ def fetch_investments(session: requests.Session) -> list:
         r = session.get(f"{INVESTMENTS_API_URL}/{inv['id']}", headers=_HEADERS, timeout=20)
         if not r.ok:
             raise RuntimeError(f"Investment detail API returned status {r.status_code} for {inv['id']}")
-        inv["principal_left"] = (r.json() or {}).get("principal_left")
+        detail = r.json() or {}
+        inv["principal_left"] = detail.get("principal_left")
+        inv["maturity_date"] = (detail.get("loan") or {}).get("maturity_date")
+        unpaid_dues = sorted(s["date"] for s in detail.get("schedules") or [] if not s.get("is_paid") and s.get("date"))
+        inv["oldest_unpaid_date"] = unpaid_dues[0] if unpaid_dues else None
         if i % 20 == 0 or i == len(investments):
             log.info("Fetched detail for %d/%d investment(s) so far.", i, len(investments))
 
@@ -436,6 +445,58 @@ def aggregate_by_originator(investments: list) -> list:
     originators = [{"originator": name, "amount": amount} for name, amount in totals.items()]
     originators.sort(key=lambda o: o["amount"], reverse=True)
     return originators
+
+
+def aggregate_remaining_durations(investments: list, today: date) -> dict:
+    """Group active investments by loan originator (same key as
+    aggregate_by_originator), then by remaining term as of `today` (months,
+    days): {originator: {(months, days): principal_left}}. The maturity date
+    is the loan's `maturity_date` (detail endpoint, verified live 2026-10-16
+    to equal the last installment date and today + the list's
+    `loan_remaining_days`), falling back to the latter. Investments without
+    any usable maturity are skipped (with a warning).
+
+    Late loans (list field `days_delayed` > 0, verified live 2026-10-16: 59
+    of 106 active investments, none with a `secondary_status`) are grouped by
+    overdue_months_and_days() since their oldest unpaid installment date (=
+    today - days_delayed, verified), falling back to today - days_delayed.
+    Loanch exposes no default status (no defaulted investment on the account
+    to verify; `secondary_status`/`closed_reason` were always empty), so a
+    loan more than LOANCH_DEFAULT_DAYS late is INFERRED to be in default
+    ("de défaut" instead of "de retard")."""
+    result = {}
+    for inv in investments:
+        originator = inv.get("originator_name") or "Unknown"
+        try:
+            amount = float(inv.get("principal_left"))
+        except (TypeError, ValueError):
+            amount = 0.0
+        try:
+            delayed_days = int(inv.get("days_delayed") or 0)
+        except (TypeError, ValueError):
+            delayed_days = 0
+        term = None
+        if delayed_days > 0:
+            try:
+                due = date.fromisoformat(inv["oldest_unpaid_date"][:10])
+            except (KeyError, TypeError, ValueError):
+                due = today - timedelta(days=delayed_days)
+            if due >= today:
+                due = today - timedelta(days=delayed_days)
+            term = overdue_months_and_days(today, due, default=delayed_days > LOANCH_DEFAULT_DAYS)
+        if term is None:
+            try:
+                maturity = date.fromisoformat(inv["maturity_date"][:10])
+            except (KeyError, TypeError, ValueError):
+                try:
+                    maturity = today + timedelta(days=int(inv["loan_remaining_days"]))
+                except (KeyError, TypeError, ValueError):
+                    log.warning("No maturity date found for an investment of %s (%.2f EUR) - skipped.", originator, amount)
+                    continue
+            term = remaining_months_and_days(today, maturity)
+        durations = result.setdefault(originator, {})
+        durations[term] = durations.get(term, 0.0) + amount
+    return result
 
 
 def fetch_current_month_statement_totals(session: requests.Session) -> dict:
@@ -1348,6 +1409,13 @@ def run() -> None:
 
         if uninvested_balance is not None:
             fill_geographic_repartition_uninvested_amount("Loanch", uninvested_balance)
+
+        # Own try/except: the "durée" tab is a secondary view, its failure
+        # must not fail the whole run.
+        try:
+            fill_remaining_duration_amounts("Loanch", aggregate_remaining_durations(investments, today_date))
+        except Exception:
+            log.exception("Failed to update the 'durée' sheet for Loanch.")
 
 
 if __name__ == "__main__":
