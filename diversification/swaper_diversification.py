@@ -123,7 +123,7 @@ load_dotenv()
 from playwright.sync_api import sync_playwright
 
 from shared.browser_stealth import get_context_options, apply_stealth
-from monitors.swaper_monitor import login, SWAPER_EMAIL, SWAPER_PASSWORD, fetch_loans, extract_balance
+from monitors.swaper_invest_bot import login, SWAPER_EMAIL, SWAPER_PASSWORD, fetch_loans, extract_balance
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger("swaper_diversification")
