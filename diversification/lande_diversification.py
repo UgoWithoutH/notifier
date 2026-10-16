@@ -827,7 +827,8 @@ def run(session: requests.Session | None = None) -> None:
         active_loan_amounts = None
         try:
             active_loan_amounts, loan_statuses, loan_due_dates = fetch_active_loan_geo_amounts(session)
-            geo_issues = fill_lande_loan_geo_amounts(active_loan_amounts, loan_statuses)
+            # Pas de statuts : retards/défauts ne sont plus rangés en sections ici, ils sont dans l'onglet "durée".
+            geo_issues = fill_lande_loan_geo_amounts(active_loan_amounts)
             for issue in geo_issues:
                 log.warning("Lande geographic breakdown: %s", issue)
         except Exception:
