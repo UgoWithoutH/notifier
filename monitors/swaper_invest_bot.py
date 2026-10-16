@@ -1,4 +1,4 @@
-"""Swaper loan monitor.
+"""Swaper investment bot.
 
 Logs into swaper.com with Playwright, fetches the available loans and the
 uninvested account balance via the site's own API (using the authenticated
