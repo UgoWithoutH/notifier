@@ -172,7 +172,9 @@ from shared.google_sheet import (
     fill_current_month_bonus_breakdown,
     fill_geographic_repartition_amounts,
     fill_geographic_repartition_uninvested_amount,
+    fill_remaining_duration_amounts,
 )
+from shared.remaining_duration import overdue_months_and_days, remaining_months_and_days
 from shared.report_date import get_report_date, is_current_month
 from shared.session_cache import get_or_refresh_session
 from shared.state import load_state, save_state
@@ -191,6 +193,9 @@ BALANCES_URL = f"{API_BASE}/loans/api/balances"
 INVESTMENTS_CHARTS_URL = f"{API_BASE}/loans/api/investments/charts"
 TRANSACTIONS_SUMMARY_URL = f"{API_BASE}/loans/api/balances/v3/transactions-summary"
 ALL_TRANSACTIONS_URL = f"{API_BASE}/loans/api/balances/v3/all-transactions"
+INVESTMENT_ENTRIES_URL = f"{API_BASE}/loans/api/investments/entries/v3"
+INVESTMENT_ENTRIES_PAGE_SIZE = 500
+MAX_INVESTMENT_ENTRIES_PAGES = 50
 
 DEBITUM_EMAIL = os.environ.get("DEBITUM_EMAIL")
 DEBITUM_PASSWORD = os.environ.get("DEBITUM_PASSWORD")
@@ -324,6 +329,116 @@ def fetch_portfolio_by_lending_company(session: requests.Session, headers: dict)
     companies = [{"name": e["originatorName"], "amount": e.get("amount", 0.0)} for e in entries]
     companies.sort(key=lambda c: c["amount"], reverse=True)
     return companies
+
+
+def _fetch_investment_entries(session: requests.Session, headers: dict, body: dict) -> list:
+    """All pages of `POST /gtw/loans/api/investments/entries/v3` for `body`."""
+    entries = []
+    page = 0
+    while page < MAX_INVESTMENT_ENTRIES_PAGES:
+        r = session.post(
+            INVESTMENT_ENTRIES_URL, params={"page": page, "size": INVESTMENT_ENTRIES_PAGE_SIZE},
+            json=body, headers=headers, timeout=20,
+        )
+        r.raise_for_status()
+        page_data = r.json().get("page") or {}
+        entries.extend(page_data.get("content") or [])
+        page += 1
+        if page >= (page_data.get("page") or {}).get("totalPages", 0):
+            break
+    return entries
+
+
+def _parse_entry_date(raw) -> date | None:
+    try:
+        return date.fromisoformat(raw[:10])
+    except (TypeError, ValueError):
+        return None
+
+
+def fetch_loan_investments(session: requests.Session, headers: dict, today: date) -> list:
+    """Every active loan investment: `POST /gtw/loans/api/investments/entries/v3`
+    (empty body = active investments, verified live 2026-10-16): each entry
+    has `originator`, `remainingAmount` and `term`, the exact maturity date
+    (ISO timestamp). A second call with the UI's own late filters
+    (`gracePeriod` / `lateAfterGracePeriod`, verified live 2026-10-16: they
+    filter, 0 hits on a healthy account) is merged by entry `id`, so late
+    loans can't be missed whatever the default listing hides.
+
+    Late/default signals per entry (the live account had no late loan on
+    2026-10-16, every entry was `status` INVESTED, `termStatus` CURRENT,
+    `lateDays` 0, `daysInGracePeriod` 0; the other values below come from
+    Debitum's own frontend bundle, not from a live late entry):
+    `termStatus` CURRENT / GRACE_PERIOD / LATE, `status` INVESTED / LATE /
+    DEFAULTED / ..., `lateDays` (days late after the grace period) and
+    `daysInGracePeriod` (of `gracePeriod` days). Late = `termStatus` in
+    (GRACE_PERIOD, LATE), `status` in (LATE, DEFAULTED) or `lateDays` > 0;
+    default = `status` DEFAULTED. The missed payment date is `term` when it
+    is in the past, else (inferred) today - (`lateDays` + `daysInGracePeriod`).
+    Returns [{"originator", "amount", "maturity", "late", "default",
+    "overdue_since"}]; entries without a usable `term` keep maturity None."""
+    entries = {}
+    for body in ({}, {"gracePeriod": True, "lateAfterGracePeriod": True}):
+        for entry in _fetch_investment_entries(session, headers, body):
+            entries.setdefault(entry.get("id") or id(entry), entry)
+
+    investments = []
+    for entry in entries.values():
+        default = entry.get("status") == "DEFAULTED"
+        late_days = int(entry.get("lateDays") or 0)
+        grace_days = int(entry.get("daysInGracePeriod") or 0)
+        late = (
+            default
+            or entry.get("status") == "LATE"
+            or entry.get("termStatus") in ("GRACE_PERIOD", "LATE")
+            or late_days > 0
+        )
+        maturity = _parse_entry_date(entry.get("term"))
+        overdue_since = None
+        if late:
+            overdue_since = maturity if maturity is not None and maturity < today else None
+            if overdue_since is None and late_days + grace_days > 0:
+                overdue_since = today - timedelta(days=late_days + grace_days)
+        investments.append(
+            {
+                "originator": entry.get("originator") or "Unknown",
+                "amount": float(entry.get("remainingAmount") or 0.0),
+                "maturity": maturity,
+                "late": late,
+                "default": default,
+                "overdue_since": overdue_since,
+            }
+        )
+    return investments
+
+
+def aggregate_remaining_durations(investments: list, today: date) -> dict:
+    """Group investments by lending company, then by remaining term as of
+    `today` (months, days): {originator: {(months, days): remaining amount}}.
+    Late loans are grouped by how long ago the missed payment was due
+    (overdue_months_and_days, negated; defaulted ones get the "default"
+    marker) when that date is in the past, otherwise they keep their
+    remaining term. Entries with neither a maturity nor an overdue date are
+    skipped (warning)."""
+    result = {}
+    for inv in investments:
+        term = None
+        if inv.get("late") and inv.get("overdue_since"):
+            term = overdue_months_and_days(today, inv["overdue_since"], default=bool(inv.get("default")))
+        if term is None:
+            if inv.get("maturity") is None:
+                log.warning("No maturity date found for an investment of %s (%.2f EUR) - skipped.", inv["originator"], inv["amount"])
+                continue
+            term = remaining_months_and_days(today, inv["maturity"])
+        durations = result.setdefault(inv["originator"], {})
+        durations[term] = durations.get(term, 0.0) + inv["amount"]
+    return result
+
+
+def fetch_remaining_durations(session: requests.Session, headers: dict, today: date) -> dict:
+    """{originator: {term: remaining amount}} for the "durée" sheet, see
+    fetch_loan_investments() and aggregate_remaining_durations()."""
+    return aggregate_remaining_durations(fetch_loan_investments(session, headers, today), today)
 
 
 def fetch_transactions_summary(session: requests.Session, headers: dict, start_date: date | None, end_date: date | None) -> dict:
@@ -847,6 +962,15 @@ def run() -> None:
     if current_month:
         fill_geographic_repartition_amounts(companies, platform="Debitum")
         fill_geographic_repartition_uninvested_amount("Debitum", balances["cash_balance"])
+
+        # Own try/except: the "durée" tab is a secondary view, its failure
+        # must not fail the whole run.
+        try:
+            fill_remaining_duration_amounts(
+                "Debitum", fetch_remaining_durations(session, headers, today_date)
+            )
+        except Exception:
+            log.exception("Failed to update the 'durée' sheet for Debitum.")
 
 
 if __name__ == "__main__":

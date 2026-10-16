@@ -136,7 +136,8 @@ from zoneinfo import ZoneInfo
 import requests
 from dotenv import load_dotenv
 
-from shared.google_sheet import fill_current_month_amounts, fill_current_month_bonus_breakdown, fill_geographic_repartition_amounts
+from shared.google_sheet import fill_current_month_amounts, fill_current_month_bonus_breakdown, fill_geographic_repartition_amounts, fill_remaining_duration_amounts
+from shared.remaining_duration import remaining_months_and_days
 from shared.report_date import get_report_now, is_current_month
 from shared.session_cache import get_or_refresh_session
 from shared.state import load_state, save_state
@@ -257,6 +258,41 @@ def fetch_vaults_breakdown(session: requests.Session) -> dict:
         raise RuntimeError(f"Could not parse vaults response: {result!r}")
 
     return {"total_wealth": total_wealth, "invested": invested, "main_account": main_account}
+
+
+def fetch_remaining_durations(session: requests.Session, today: date) -> dict:
+    """Amount per remaining term as of `today`, in the shape expected by
+    fill_remaining_duration_amounts(): {LOAN_ORIGINATOR_LABEL: {(months,
+    days): amount}}. A vault's term runs until its `expiresAt` date (verified
+    live 2026-10-16); cash in the main account has no term, i.e. 0 days.
+
+    No late/default terms: SmartSaver exposes no loan-level data (verified
+    live 2026-10-16: /v1/vaults and /v1/vaults/<id> carry no overdue, delay,
+    recovery, default or next-payment-due field, other /v1/loans-style routes
+    are 404, and all 50 vaults have status "active" - the only value ever
+    seen, so no "late"/"default" status is known). Only a vault whose
+    `expiresAt` is already past would show as late (negated term, same key
+    as overdue_months_and_days(default=False)); a non-"active" status is
+    logged but not treated as default."""
+    r = session.get(VAULTS_URL, timeout=30)
+    r.raise_for_status()
+    data = (r.json() or {}).get("data") or {}
+
+    durations = {}
+    for vault in data.get("result") or []:
+        if vault.get("status") != "active":
+            log.warning("Vault %s has unexpected status %r.", vault.get("id"), vault.get("status"))
+        expires_at = vault.get("expiresAt")
+        if not expires_at:
+            log.warning("Vault %s has no expiresAt - skipped.", vault.get("id"))
+            continue
+        term = remaining_months_and_days(today, date.fromisoformat(expires_at))
+        durations[term] = durations.get(term, 0.0) + float(vault.get("balance") or 0.0)
+
+    main_account = float(data.get("mainAccount") or 0.0)
+    if round(main_account, 2) > 0:
+        durations[(0, 0)] = durations.get((0, 0), 0.0) + main_account
+    return {LOAN_ORIGINATOR_LABEL: {term: round(amount, 2) for term, amount in durations.items()}} if durations else {}
 
 
 def fetch_statement_summary(session: requests.Session, start_date: date, end_date: date) -> dict:
@@ -847,6 +883,13 @@ def run() -> None:
 
     if current_month:
         fill_geographic_repartition_amounts(loan_originators)
+
+        # Own try/except: the "durée" tab is a secondary view, its failure
+        # must not fail the whole run.
+        try:
+            fill_remaining_duration_amounts("Monefit", fetch_remaining_durations(session, today_date))
+        except Exception:
+            log.exception("Failed to update the 'durée' sheet for Monefit.")
 
 
 if __name__ == "__main__":

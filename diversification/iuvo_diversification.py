@@ -155,7 +155,7 @@ import os
 import random
 import re
 import sys
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -166,8 +166,9 @@ load_dotenv()
 import requests
 
 try:
-    from shared.google_sheet import fill_current_month_amounts, fill_current_month_bonus_breakdown, fill_geographic_repartition_amounts, fill_geographic_repartition_uninvested_amount
+    from shared.google_sheet import fill_current_month_amounts, fill_current_month_bonus_breakdown, fill_geographic_repartition_amounts, fill_geographic_repartition_uninvested_amount, fill_remaining_duration_amounts
     from shared.monthly_yield_waterfall import compute_monthly_yield_shares
+    from shared.remaining_duration import overdue_months_and_days, remaining_months_and_days
     from shared.report_date import get_report_now, is_current_month
     from shared.session_cache import get_or_refresh_session
     from shared.state import load_state, save_state
@@ -180,8 +181,9 @@ except ModuleNotFoundError:
     project_root = Path(__file__).resolve().parents[1]
     if str(project_root) not in sys.path:
         sys.path.insert(0, str(project_root))
-    from shared.google_sheet import fill_current_month_amounts, fill_current_month_bonus_breakdown, fill_geographic_repartition_amounts, fill_geographic_repartition_uninvested_amount
+    from shared.google_sheet import fill_current_month_amounts, fill_current_month_bonus_breakdown, fill_geographic_repartition_amounts, fill_geographic_repartition_uninvested_amount, fill_remaining_duration_amounts
     from shared.monthly_yield_waterfall import compute_monthly_yield_shares
+    from shared.remaining_duration import overdue_months_and_days, remaining_months_and_days
     from shared.report_date import get_report_now, is_current_month
     from shared.session_cache import get_or_refresh_session
     from shared.state import load_state, save_state
@@ -336,6 +338,134 @@ def fetch_balance_and_originators(session: requests.Session, session_token: str)
         "available_funds": available_funds if available_funds is not None else 0.0,
         "originators": originators,
     }
+
+
+def fetch_investment_statuses(session: requests.Session, session_token: str) -> dict:
+    """{loan_id: status} for every loan held, read from the "My investments"
+    table (paged by 100). The status cell reads "Current", or "<N> Days
+    delay" with N = days since the oldest unpaid instalment fell due
+    (verified live 2026-10-16: matches the payment schedule on all 5 late
+    loans held); the filter's other status, "In recovery" (the default
+    state), is not currently held so its cell text is inferred."""
+    statuses = {}
+    total_pages = 1
+    page_num = 0
+    while page_num < total_pages:
+        resp = session.get(
+            f"{API_BASE}/p2p-ui/v2/app",
+            params={
+                "p0": "my_investments_page", "p2": session_token, "lang": "en_US",
+                "page_loans_count": 100, "page_num": page_num,
+                "screen_width": 1280, "screen_height": 720,
+            },
+            headers={"Referer": "https://iuvo-group.com/en/dashboard/"},
+            timeout=30,
+        )
+        resp.raise_for_status()
+        total_pages_match = re.search(r"var totalPages = Number\('(\d+)'\)", resp.text)
+        total_pages = int(total_pages_match.group(1)) if total_pages_match else 1
+        for loan_id in dict.fromkeys(re.findall(r'id="p2p_btn_loan_information_(\d+)"', resp.text)):
+            status = re.search(rf'id="p2p_loan_type_{loan_id}"[^>]*>[^<]*</td>\s*<td[^>]*>([^<]*)</td>', resp.text)
+            statuses.setdefault(loan_id, status.group(1).strip() if status else "")
+        page_num += 1
+    return statuses
+
+
+def fetch_investment_loan_ids(session: requests.Session, session_token: str) -> list:
+    """IDs of every loan held, read from the "My investments" table."""
+    return list(fetch_investment_statuses(session, session_token))
+
+
+def _first_unpaid_due_date(html: str, today: date):
+    """Due date of the oldest instalment not (fully) covered by the payments
+    received, from the "Payment Schedule" table, or None if none is past
+    due. Instalments are settled oldest first (verified live 2026-10-16:
+    catch-up payments, e.g. 64.82 = 3 instalments, pay the oldest ones), so
+    cumulative principal expected is compared with cumulative principal
+    received; late-fee rows are ignored."""
+    schedule = html[html.find("Payment Schedule"):]
+    expected_rows = []
+    received = 0.0
+    for year, month, day, cells in re.findall(r"<tr>\s*<td>(\d{4})-(\d{2})-(\d{2})</td>(.*?)</tr>", schedule, flags=re.S):
+        cols = [_parse_amount(c) for c in re.findall(r"<td[^>]*>([^<]*)</td>", cells)]
+        cols += [None] * (4 - len(cols))
+        expected_rows.append((date(int(year), int(month), int(day)), cols[0] or 0.0))
+        received += cols[2] or 0.0
+    expected = 0.0
+    for due, principal in expected_rows:
+        expected += principal
+        if due < today and expected - received > 0.005:
+            return due
+    return None
+
+
+def fetch_loan_details(session: requests.Session, session_token: str, loan_id: str, today: date = None) -> dict:
+    """Originator, closing (= last scheduled payment, i.e. maturity) date, our
+    share, status and (when late) the due date of the oldest unpaid
+    instalment of one loan, read from its "Receivable Details" panel
+    (verified live 2026-10-16; only served by /p2p-ui/app, not /v2/app).
+    "Your share" equals the per-originator `value`s of the overview page
+    (e.g. 405.14 = 32.99 + 85.90 + ...), unlike the table's rounded-down
+    "Outstanding Principal" column. Status is "Current" or a delay bucket
+    ("3-15"/"16-30"/"31-60"/"60+ days delay", the first three seen live
+    2026-10-16) or "In recovery" (not seen, inferred from the table's
+    filter)."""
+    resp = session.get(
+        f"{API_BASE}/p2p-ui/app",
+        params={"p0": "loan_information", "p2": session_token, "lang": "en_US", "loan_id": loan_id},
+        headers={"Referer": "https://iuvo-group.com/en/dashboard/", "X-Requested-With": "XMLHttpRequest"},
+        timeout=30,
+    )
+    resp.raise_for_status()
+    text = re.sub(r"<script.*?</script>|<style.*?</style>", " ", resp.text, flags=re.S)
+    text = re.sub(r"\s+", " ", re.sub(r"<[^>]+>", " ", text).replace("&nbsp;", " "))
+    originator = re.search(r"Loan originator (.+?) Loan score", text)
+    closing = re.search(r"Closing date (\d{4})-(\d{2})-(\d{2})", text)
+    share = re.search(r"Your share ([\d,]+\.\d+)", text)
+    status = re.search(r"Status (.+?) Loan purpose", text)
+    return {
+        "originator": originator.group(1).strip() if originator else "Unknown",
+        "maturity": date(*(int(g) for g in closing.groups())) if closing else None,
+        "amount": _parse_amount(share.group(1)) if share else None,
+        "status": status.group(1).strip() if status else "",
+        "unpaid_since": _first_unpaid_due_date(resp.text, today or date.today()),
+    }
+
+
+def aggregate_remaining_durations(session: requests.Session, session_token: str, today: date) -> dict:
+    """Group the loans held by loan originator, then by remaining term as of
+    `today` (months, days): {originator: {(months, days): amount}}. Loans
+    whose maturity or amount can't be determined are skipped (with a
+    warning).
+
+    A loan whose status isn't "Current" is late, or in default if "In
+    recovery" (inferred: not seen live); it is grouped by how long ago its
+    oldest unpaid instalment fell due (payment schedule; falling back to the
+    table's "<N> Days delay"), otherwise it keeps its remaining term."""
+    result = {}
+    for loan_id, table_status in fetch_investment_statuses(session, session_token).items():
+        try:
+            details = fetch_loan_details(session, session_token, loan_id, today)
+        except Exception:
+            log.exception("Failed to fetch the details of loan %s.", loan_id)
+            continue
+        if details["maturity"] is None or details["amount"] is None:
+            log.warning("No maturity date/amount found for loan %s (%s) - skipped.", loan_id, details["originator"])
+            continue
+        term = None
+        status = details["status"] or table_status
+        if status and status.lower() != "current":
+            late_since = details["unpaid_since"]
+            days_late = re.match(r"(\d+) Days? delay", table_status)
+            if late_since is None and days_late:
+                late_since = today - timedelta(days=int(days_late.group(1)))
+            if late_since is not None:
+                term = overdue_months_and_days(today, late_since, default="recovery" in f"{status} {table_status}".lower())
+        if term is None:
+            term = remaining_months_and_days(today, details["maturity"])
+        durations = result.setdefault(details["originator"], {})
+        durations[term] = durations.get(term, 0.0) + details["amount"]
+    return result
 
 
 def _find_investor_account_id(html: str) -> str:
@@ -975,6 +1105,15 @@ def run() -> None:
     if current_month:
         fill_geographic_repartition_amounts(balance_data["originators"], platform="Iuvo")
         fill_geographic_repartition_uninvested_amount("Iuvo", balance_data["available_funds"])
+
+        # Own try/except: the "durée" tab is a secondary view, its failure
+        # must not fail the whole run.
+        try:
+            fill_remaining_duration_amounts(
+                "Iuvo", aggregate_remaining_durations(session, session_token, today_date)
+            )
+        except Exception:
+            log.exception("Failed to update the 'durée' sheet for Iuvo.")
 
 
 if __name__ == "__main__":
