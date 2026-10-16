@@ -1,4 +1,4 @@
-"""Lendermarket loan availability monitor.
+"""Lendermarket investment bot.
 
 Mirrors swaper_monitor.py's notification-gate logic exactly, with the
 account balance as the same outer gate:
