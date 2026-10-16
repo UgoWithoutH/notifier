@@ -154,7 +154,7 @@ Optional:
 import calendar
 import logging
 import sys
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -166,7 +166,9 @@ from shared.google_sheet import (
     fill_current_month_bonus_breakdown,
     fill_geographic_repartition_amounts,
     fill_geographic_repartition_uninvested_amount,
+    fill_remaining_duration_amounts,
 )
+from shared.remaining_duration import overdue_months_and_days, remaining_months_and_days
 from shared.report_date import get_report_now, is_current_month
 from shared.session_cache import get_or_refresh_session
 from shared.state import load_state, save_state
@@ -260,6 +262,61 @@ def aggregate_by_lender(investments: list) -> list:
     lenders = [{"lender": lender, "remaining_principal": amount} for lender, amount in totals.items()]
     lenders.sort(key=lambda l: l["remaining_principal"], reverse=True)
     return lenders
+
+
+def aggregate_remaining_durations(investments: list, today: date) -> dict:
+    """Group investments by loan originator (same key as aggregate_by_lender),
+    then by remaining term as of `today` (months, days):
+    {originator: {(months, days): remaining principal}}. The maturity date is
+    the loan's `finalPaymentDate` (already in the investments API response,
+    verified live 2026-10-16). Investments without it are skipped (with a
+    warning).
+
+    Late loans (`loan.loanOverdueDays` > 0, verified live 2026-10-16: 21 of
+    128 active investments, all with `loan.status` still "ACTIVE" and
+    `nextPaymentDate` = the missed due date = today - loanOverdueDays) are
+    grouped by overdue_months_and_days() since that missed payment date
+    instead, falling back to today - loanOverdueDays. Defaulted loans
+    (`loan.status` "DEFAULT"/"DEFAULTED" - INFERRED, no defaulted loan on the
+    account to verify; active/finished investments only ever showed ACTIVE/
+    FINISHED) get the "default" key variant. Otherwise the remaining term
+    above applies."""
+    result = {}
+    for inv in investments:
+        loan = inv.get("loan") or {}
+        lender_name = (
+            (inv.get("lender") or {}).get("displayName")
+            or (loan.get("lender") or {}).get("displayName")
+            or "Fournisseur inconnu"
+        )
+        try:
+            remaining = float(inv.get("remainingPrincipal"))
+        except (TypeError, ValueError):
+            remaining = 0.0
+        try:
+            maturity = date.fromisoformat(loan["finalPaymentDate"][:10])
+        except (KeyError, TypeError, ValueError):
+            log.warning("No maturity date found for an investment of %s (%.2f EUR) - skipped.", lender_name, remaining)
+            continue
+        try:
+            overdue_days = int(loan.get("loanOverdueDays") or 0)
+        except (TypeError, ValueError):
+            overdue_days = 0
+        is_default = str(loan.get("status") or "").upper() in ("DEFAULT", "DEFAULTED")
+        term = None
+        if overdue_days > 0 or is_default:
+            try:
+                missed_due_date = date.fromisoformat(inv["nextPaymentDate"][:10])
+            except (KeyError, TypeError, ValueError):
+                missed_due_date = None
+            term = missed_due_date and overdue_months_and_days(today, missed_due_date, default=is_default)
+            if term is None and overdue_days > 0:
+                term = overdue_months_and_days(today, today - timedelta(days=overdue_days), default=is_default)
+        if term is None:
+            term = remaining_months_and_days(today, maturity)
+        durations = result.setdefault(lender_name, {})
+        durations[term] = durations.get(term, 0.0) + remaining
+    return result
 
 
 def fetch_statement_summary(session: requests.Session, investor_id: str, start_date: date, end_date: date) -> dict:
@@ -947,6 +1004,15 @@ def run() -> None:
         # already relied on elsewhere in this repo to gate the invest bot.
         if available_balance is not None:
             fill_geographic_repartition_uninvested_amount("Lendermarket", available_balance)
+
+        # Own try/except: the "durée" tab is a secondary view, its failure
+        # must not fail the whole run.
+        try:
+            fill_remaining_duration_amounts(
+                "Lendermarket", aggregate_remaining_durations(investments, today_date)
+            )
+        except Exception:
+            log.exception("Failed to update the 'durée' sheet for Lendermarket.")
 
 
 if __name__ == "__main__":

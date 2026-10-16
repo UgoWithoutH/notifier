@@ -149,7 +149,9 @@ from shared.google_sheet import (
     fill_current_month_bonus_breakdown,
     fill_geographic_repartition_amounts,
     fill_geographic_repartition_uninvested_amount,
+    fill_remaining_duration_amounts,
 )
+from shared.remaining_duration import overdue_months_and_days, remaining_months_and_days
 from shared.report_date import get_report_date, is_current_month
 from shared.state import load_state, save_state
 from shared.weighted_average import INVESTED_BALANCE_LABEL, NON_INVESTED_BALANCE_LABEL, compute_time_weighted_average
@@ -164,6 +166,7 @@ LOGIN_PAGE_URL = "https://getincome.com/login"
 API_BASE = "https://api.getincome.com/api"
 INVESTOR_DETAILS_URL = f"{API_BASE}/investor-details"
 ACCOUNT_STATEMENT_URL_TEMPLATE = API_BASE + "/account-statement/{start}/{end}/{page}"
+INVESTMENTS_URL = API_BASE + "/investments/?page_size=1000"
 
 INCOME_MARKETPLACE_EMAIL = os.environ.get("INCOME_MARKETPLACE_EMAIL")
 INCOME_MARKETPLACE_PASSWORD = os.environ.get("INCOME_MARKETPLACE_PASSWORD")
@@ -349,6 +352,98 @@ def fetch_investor_details(page, token: str) -> dict:
     return {"cash_balance": cash_balance, "invested_total": invested_total, "companies": companies}
 
 
+def fetch_investments(page, token: str) -> list:
+    """Every investment of the "My investments" page (GET /api/investments/
+    ?page_size=1000, `{"items": [...], "total": N}`, verified live
+    2026-10-16). The `page` query parameter is ignored by the API (page=1 and
+    page=2 return the same 20 rows), so everything is fetched in a single
+    large page; a warning is logged if fewer than `total` rows come back.
+    Returns [{"originator", "outstanding", "maturity", "status",
+    "overdue_since"}] where `maturity` is the loan's `loan_due_date` (the
+    platform itself shows the remaining term as that date minus today), or
+    None if missing/unparseable; `status` is the raw `loan_status` and
+    `overdue_since` the loan's `overdue_base_date` (None if missing).
+    Verified live 2026-10-16: `loan_status` is "Current" or a lateness
+    bucket "1-15d"/"16-30d"/"31-60d", and `overdue_base_date` is the next
+    scheduled payment date for current loans but the missed payment date for
+    late ones (days since it always fall in the loan's bucket). The platform's
+    i18n also defines "60+d"/"buybackInitiated" ("Buyback initiated": more
+    than 60 days late, buyback obligation triggered), "forcedBuyback" and
+    "paidBack" - never observed on the account, so only inferred."""
+    data = _fetch_json(page, INVESTMENTS_URL, token)
+    items = data.get("items") or []
+    if len(items) < data.get("total", len(items)):
+        log.warning("Only %d of %s investments returned - remaining-duration amounts are incomplete.", len(items), data.get("total"))
+    investments = []
+    for item in items:
+        try:
+            maturity = date.fromisoformat(str(item.get("loan_due_date"))[:10])
+        except ValueError:
+            maturity = None
+        try:
+            overdue_since = date.fromisoformat(str(item.get("overdue_base_date"))[:10])
+        except ValueError:
+            overdue_since = None
+        investments.append(
+            {
+                "originator": (item.get("loan_originator_name") or "Unknown").strip(),
+                "outstanding": float(item.get("investment_outstanding_principal") or 0.0),
+                "maturity": maturity,
+                "status": str(item.get("loan_status") or "").strip(),
+                "overdue_since": overdue_since,
+            }
+        )
+    return investments
+
+
+# Lateness bucket -> minimum days late, only used when overdue_base_date is unusable.
+LATE_BUCKET_MIN_DAYS = {"1-15d": 1, "16-30d": 16, "31-60d": 31}
+# More than 60 days late, buyback obligation triggered - treated as "default" (inferred, never observed live).
+DEFAULT_STATUSES = {"60+d", "buyback initiated", "buybackinitiated"}
+NON_LATE_STATUSES = {"", "current", "paid back", "paidback", "forced buyback", "forcedbuyback"}
+
+
+def _overdue_term(inv: dict, today: date):
+    """Late/default duration key of an investment (see shared.remaining_duration.
+    overdue_months_and_days), or None if it isn't late. Measured from the missed
+    payment date (`overdue_since`); if that isn't in the past, from today minus
+    the minimum days of the loan's lateness bucket."""
+    status = inv.get("status", "").lower()
+    if status in NON_LATE_STATUSES:
+        return None
+    is_default = status in DEFAULT_STATUSES
+    min_days = 61 if is_default else LATE_BUCKET_MIN_DAYS.get(status)
+    if min_days is None:
+        return None
+    return (
+        overdue_months_and_days(today, inv.get("overdue_since") or today, default=is_default)
+        or overdue_months_and_days(today, today - timedelta(days=min_days), default=is_default)
+    )
+
+
+def aggregate_remaining_durations(investments: list, today: date) -> dict:
+    """Group investments by loan originator (same key as the geographic
+    repartition), then by remaining term as of `today` (months, days):
+    {originator: {(months, days): outstanding}}. Late loans (status "1-15d"/
+    "16-30d"/"31-60d", verified live) use the negated lateness since the missed
+    payment date, "Buyback initiated" (60+ days, inferred) ones the same with a
+    "default" marker (see _overdue_term). Fully repaid investments are ignored;
+    non-late ones without a maturity date are skipped (with a warning)."""
+    result = {}
+    for inv in investments:
+        if inv["outstanding"] <= 0:
+            continue
+        term = _overdue_term(inv, today)
+        if term is None and inv["maturity"] is None:
+            log.warning("No maturity date for an investment of %s (%.2f EUR) - skipped.", inv["originator"], inv["outstanding"])
+            continue
+        if term is None:
+            term = remaining_months_and_days(today, inv["maturity"])
+        durations = result.setdefault(inv["originator"], {})
+        durations[term] = durations.get(term, 0.0) + inv["outstanding"]
+    return result
+
+
 def fetch_account_statement(page, token: str, start_date: date, end_date: date, page_num: int = 0) -> dict:
     url = ACCOUNT_STATEMENT_URL_TEMPLATE.format(
         start=start_date.strftime("%Y-%m-%d"), end=end_date.strftime("%Y-%m-%d"), page=page_num
@@ -496,6 +591,21 @@ def run() -> None:
             overview = fetch_investor_details(page, token)
 
             today_date = get_report_date()
+
+            remaining_durations = None
+            if current_month:
+                # Own try/except: the "durée" tab is a secondary view, its failure must not fail the whole run.
+                try:
+                    remaining_durations = aggregate_remaining_durations(fetch_investments(page, token), today_date)
+                    durations_total = sum(a for terms in remaining_durations.values() for a in terms.values())
+                    if abs(durations_total - overview["invested_total"]) > 0.01:
+                        log.warning(
+                            "Remaining-duration total %.2f EUR differs from the invested total %.2f EUR.",
+                            durations_total, overview["invested_total"],
+                        )
+                except Exception:
+                    log.exception("Failed to fetch the investments' maturity dates for the 'durée' sheet.")
+
             amounts = {
                 "total": overview["invested_total"] + overview["cash_balance"],
                 "gross_interest_received": 0.0,
@@ -799,6 +909,12 @@ def run() -> None:
     if current_month:
         fill_geographic_repartition_amounts(overview["companies"], platform="Income Marketplace")
         fill_geographic_repartition_uninvested_amount("Income Marketplace", overview["cash_balance"])
+
+        if remaining_durations is not None:
+            try:
+                fill_remaining_duration_amounts("Income Marketplace", remaining_durations)
+            except Exception:
+                log.exception("Failed to update the 'durée' sheet for Income Marketplace.")
 
 
 if __name__ == "__main__":

@@ -1045,6 +1045,233 @@ def fill_geographic_repartition_amounts(loan_originators: list, platform: str | 
     )
 
 
+DURATION_SHEET_NAME = "durée"
+_DURATION_LABEL_RE = re.compile(r"^(?:(\d+)\s*mois)?\s*(?:(\d+)\s*jours?)?\s*(de\s+retard|de\s+d[ée]faut)?$", re.IGNORECASE)
+
+
+def _duration_label(term: tuple) -> str:
+    """(mois, jours) -> "32 mois 29 jours" / "32 mois" / "5 jours" / "0 jour".
+    Un terme négatif (prêt en retard) donne "2 mois 5 jours de retard" ;
+    (mois, jours, "default") (prêt en défaut) donne "2 mois 5 jours de défaut"."""
+    months, days = term[0], term[1]
+    in_default = len(term) > 2
+    late = months < 0 or days < 0
+    months, days = abs(months), abs(days)
+    parts = []
+    if months:
+        parts.append(f"{months} mois")
+    if days or not months:
+        parts.append(f"{days} jour" + ("s" if days > 1 else ""))
+    if in_default:
+        parts.append("de défaut")
+    elif late:
+        parts.append("de retard")
+    return " ".join(parts)
+
+
+def _parse_duration_label(label: str):
+    """Inverse of _duration_label(); None if `label` isn't a duration."""
+    match = _DURATION_LABEL_RE.match(label.strip())
+    if not label.strip() or not match or (match.group(1) is None and match.group(2) is None):
+        return None
+    suffix = (match.group(3) or "").casefold()
+    months, days = int(match.group(1) or 0), int(match.group(2) or 0)
+    if "faut" in suffix:
+        return (months, days, "default")
+    sign = -1 if suffix else 1
+    return (sign * months, sign * days)
+
+
+def _duration_sort_key(term: tuple):
+    """Défauts d'abord (le plus ancien en premier), puis retards, puis durées restantes croissantes."""
+    if len(term) > 2:
+        return (0, -term[0], -term[1])
+    return (1, term[0], term[1])
+
+
+def _problem_priority(durations: dict):
+    """Clé de tri d'une société ayant au moins un prêt en défaut ou en retard (None sinon) : défauts
+    avant retards, la plus grosse durée de défaut/retard en premier."""
+    keys = [_duration_sort_key(term) for term in durations if len(term) > 2 or term[0] < 0 or term[1] < 0]
+    return min(keys) if keys else None
+
+
+_DURATION_ORIGINATOR_FORMAT = {
+    "backgroundColor": {"red": 1, "green": 1, "blue": 1},
+    "horizontalAlignment": "RIGHT",
+    "textFormat": {"fontSize": 9, "bold": False, "italic": False},
+    "borders": {"top": {"style": "NONE"}, "bottom": {"style": "NONE"}},
+}
+_DURATION_ROW_FORMAT = {**_DURATION_ORIGINATOR_FORMAT, "textFormat": {"fontSize": 9, "bold": False, "italic": True}}
+_DURATION_AMOUNT_FORMAT = {
+    "backgroundColor": {"red": 1, "green": 1, "blue": 1},
+    "numberFormat": {"type": "CURRENCY", "pattern": "#,##0.00\\ [$€-1]"},
+    "borders": {"top": {"style": "NONE"}, "bottom": {"style": "NONE"}},
+}
+
+
+def fill_remaining_duration_amounts(platform: str, durations_by_originator: dict):
+    """Synchronise le bloc de la plateforme `platform` (ligne dont la
+    colonne A vaut exactement son nom) dans l'onglet "durée" :
+
+    - une ligne par société de prêt (nom en colonne A, montant vide), créée
+      si absente et supprimée si elle n'est plus dans les données ;
+    - sous chacune, une ligne de durée restante ("32 mois 29 jours", "5
+      jours"...) par durée (triées par durée croissante, créée/supprimée de
+      la même façon) avec le montant correspondant dans la colonne B (juste
+      à droite).
+
+    `durations_by_originator` : {société de prêt: {(mois, jours): montant}},
+    ex. {"Société A": {(24, 0): 1000.0, (5, 12): 500.0}}. Un terme négatif
+    (mois, jours) = prêt en retard, libellé "2 mois 5 jours de retard" ; un terme
+    (mois, jours, "default") = prêt en défaut, libellé "2 mois 5 jours de défaut". Les lignes déjà présentes et
+    toujours valides sont conservées (leur ordre aussi), seules les lignes
+    manquantes/périmées sont insérées/supprimées. Le bloc s'arrête à la
+    prochaine plateforme/section ou à la première cellule vide en colonne A.
+    """
+    worksheet = get_worksheet_by_name(DURATION_SHEET_NAME)
+    grid = _call_with_retry(worksheet.get_all_values)
+
+    def cell(row_idx: int) -> str:
+        row = grid[row_idx - 1]
+        return row[0].strip() if row else ""
+
+    platform_row = next(
+        (i for i in range(1, len(grid) + 1) if cell(i).casefold() == platform.casefold()), None
+    )
+    if platform_row is None:
+        logger.warning("Plateforme '%s' non trouvée dans l'onglet '%s' - rien écrit.", platform, DURATION_SHEET_NAME)
+        return
+
+    boundaries = {label.casefold() for label in GEO_SECTION_BOUNDARY_LABELS} | {"crowdlending"}
+    boundaries.discard(platform.casefold())
+    end_row = platform_row + 1
+    while end_row <= len(grid) and cell(end_row) and cell(end_row).casefold() not in boundaries:
+        end_row += 1
+
+    def originator_key(name: str) -> str:
+        return name.strip().casefold()
+
+    # Chaque ligne du bloc = (type, clé société, libellé) ; "dur" porte le nombre de mois dans le libellé.
+    existing = []
+    current_originator = None
+    for row_idx in range(platform_row + 1, end_row):
+        label = cell(row_idx)
+        term = _parse_duration_label(label)
+        if term is not None:
+            existing.append(("dur", current_originator, _duration_label(term), label))
+        else:
+            current_originator = originator_key(label)
+            existing.append(("orig", current_originator, current_originator, label))
+
+    new_data = {originator_key(name): (name.strip(), durations) for name, durations in durations_by_originator.items() if durations}
+    amounts_by_label = {
+        (key, _duration_label(term)): amount
+        for key, (_, durations) in new_data.items()
+        for term, amount in durations.items()
+    }
+    existing_order = [key for kind, key, _, _ in existing if kind == "orig" and key in new_data]
+    existing_order = list(dict.fromkeys(existing_order))
+    new_keys = sorted(
+        (key for key in new_data if key not in existing_order),
+        key=lambda key: -sum(new_data[key][1].values()),
+    )
+    # Sociétés en défaut puis en retard d'abord (la plus grosse durée en premier), les autres gardent leur ordre.
+    problem_keys = sorted(
+        (key for key in new_data if _problem_priority(new_data[key][1]) is not None),
+        key=lambda key: _problem_priority(new_data[key][1]),
+    )
+    ordered_keys = problem_keys + [key for key in existing_order + new_keys if key not in problem_keys]
+
+    desired = []
+    desired_texts = {}
+    for key in ordered_keys:
+        name, durations = new_data[key]
+        desired.append(("orig", key, key))
+        desired_texts[("orig", key, key)] = name
+        for term in sorted(durations, key=_duration_sort_key):
+            label = _duration_label(term)
+            desired.append(("dur", key, label))
+            desired_texts[("dur", key, label)] = label
+    desired_keys = set(desired)
+
+    # 1) Suppression (de bas en haut, par plages contiguës) des lignes périmées.
+    stale_rows = [
+        platform_row + 1 + i
+        for i, (kind, key, label, _) in enumerate(existing)
+        if (kind, key, label) not in desired_keys
+    ]
+    deleted_ranges = []
+    for row_idx in reversed(stale_rows):
+        if deleted_ranges and deleted_ranges[-1][0] == row_idx + 1:
+            deleted_ranges[-1][0] = row_idx
+        else:
+            deleted_ranges.append([row_idx, row_idx])
+    for start, stop in deleted_ranges:
+        logger.info("Suppression des lignes périmées %s-%s de '%s' (plateforme '%s').", start, stop, DURATION_SHEET_NAME, platform)
+        _call_with_retry(worksheet.delete_rows, start, stop)
+    kept = [(kind, key, label) for kind, key, label, _ in existing if (kind, key, label) in desired_keys]
+
+    # 2) Insertion des lignes manquantes, par plages contiguës.
+    inserted_rows = {}
+    pending = []
+    pointer = 0
+
+    def flush(first_index: int):
+        if not pending:
+            return
+        rows = []
+        for item in pending:
+            rows.append([desired_texts[item], ""])
+        insert_at = platform_row + 1 + first_index
+        logger.info("Insertion de %s ligne(s) à la ligne %s de '%s' (plateforme '%s').", len(rows), insert_at, DURATION_SHEET_NAME, platform)
+        _call_with_retry(worksheet.insert_rows, rows, insert_at, value_input_option="USER_ENTERED")
+        for offset, item in enumerate(pending):
+            inserted_rows[insert_at + offset] = item[0]
+        pending.clear()
+
+    first_pending_index = 0
+    for index, item in enumerate(desired):
+        if pointer < len(kept) and kept[pointer] == item:
+            flush(first_pending_index)
+            pointer += 1
+        else:
+            if not pending:
+                first_pending_index = index
+            pending.append(item)
+    flush(first_pending_index)
+
+    # Lignes restantes en trop (ordre incohérent avec l'ordre voulu), repoussées sous le bloc par les insertions.
+    leftover = len(kept) - pointer
+    if leftover:
+        first_leftover = platform_row + 1 + len(desired)
+        _call_with_retry(worksheet.delete_rows, first_leftover, first_leftover + leftover - 1)
+
+    # 3) Mise en forme des nouvelles lignes + écriture des montants.
+    formats = []
+    for row_idx, kind in inserted_rows.items():
+        formats.append({"range": rowcol_to_a1(row_idx, 1), "format": _DURATION_ORIGINATOR_FORMAT if kind == "orig" else _DURATION_ROW_FORMAT})
+        formats.append({"range": rowcol_to_a1(row_idx, 2), "format": _DURATION_AMOUNT_FORMAT})
+    if formats:
+        _call_with_retry(worksheet.batch_format, formats)
+
+    updates = []
+    for i, (kind, key, label) in enumerate(desired):
+        row_idx = platform_row + 1 + i
+        if kind == "orig":
+            value = ""
+        else:
+            value = amounts_by_label[(key, label)]
+        updates.append({"range": rowcol_to_a1(row_idx, 2), "values": [[value]]})
+    if updates:
+        _call_with_retry(worksheet.batch_update, updates, value_input_option="USER_ENTERED")
+
+    logger.info(
+        "Mise à jour de '%s' terminée pour %s : %s société(s) de prêt, %s ligne(s) de durée.",
+        DURATION_SHEET_NAME, platform, len(new_data), sum(1 for kind, _, _ in desired if kind == "dur"),
+    )
+
+
 def _col_letter(col_idx: int) -> str:
     """Retourne juste la partie lettre(s) d'une colonne 1-based (ex. 5 -> 'E')."""
     return re.sub(r"\d+", "", rowcol_to_a1(1, col_idx))

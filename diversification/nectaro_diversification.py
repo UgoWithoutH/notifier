@@ -44,10 +44,15 @@ Data endpoints (all under api.nectaro.eu, `Authorization: Bearer` auth):
     the portfolio listing below exactly.
   - `POST /api/investment/portfolio` body `{"meta": [{"limit": N, "page":
     P}], "filters": []}` -> paginated list of individual loans (ID, ISIN,
-    amount, interestRate, lendingCompany, borrowerCountry, status, ...) -
-    NOT used for the geographic breakdown itself (the grouping endpoint
-    above is simpler/already residue-based), kept available for reference
-    only.
+    amount (ORIGINAL), interestRate, lendingCompany, borrowerCountry, status,
+    maturityDate, ...) - NOT used for the geographic breakdown itself (the
+    grouping endpoint above is simpler/already residue-based), used for the
+    "durée" tab (exact maturityDate per loan).
+  - `GET /api/investment/show/{isin}` -> `data.noteSetList`: the ~15
+    underlying loans of a note, each with `loanStatus` (SCHEDULED/DELAYED/
+    BUYBACK/PAID OFF), `dpd` (days past due) and principal - the only
+    per-loan lateness data (verified live 2026-10-16), see
+    fetch_late_shares().
   - `POST /api/statement/list` body `{"meta": [{"limit": N, "page": P}],
     "filters": [{"name": "type", "values": [], "type": "multiselect"},
     {"name": "dateFrom", "value": "YYYY-MM-DD", "type": "datepicker"},
@@ -133,7 +138,9 @@ from shared.google_sheet import (
     fill_current_month_bonus_breakdown,
     fill_geographic_repartition_amounts,
     fill_geographic_repartition_uninvested_amount,
+    fill_remaining_duration_amounts,
 )
+from shared.remaining_duration import overdue_months_and_days, remaining_months_and_days
 from shared.report_date import get_report_date, is_current_month
 from shared.session_cache import get_or_refresh_session
 from shared.state import load_state, save_state
@@ -156,6 +163,7 @@ CUSTOMER_ME_URL = f"{API_BASE}/customer/me"
 INVESTMENT_OVERVIEW_URL = f"{API_BASE}/investment/dashboard"
 DASHBOARD_INVESTMENT_URL = f"{API_BASE}/dashboard/investment"
 PRODUCTS_URL = f"{API_BASE}/products"
+PORTFOLIO_URL = f"{API_BASE}/investment/portfolio"
 STATEMENT_LIST_URL = f"{API_BASE}/statement/list"
 
 NECTARO_EMAIL = os.environ.get("NECTARO_EMAIL")
@@ -184,6 +192,8 @@ XIRR_CASHFLOWS_STATE_FILE = Path(__file__).parent / "nectaro_xirr_cashflows_stat
 XIRR_CASHFLOWS_STATE_DEFAULT = {"transactions": [], "last_fetched_date": None}
 # Rows can be posted days after their own date, so re-fetch this many days before the cache frontier.
 XIRR_CACHE_OVERLAP_DAYS = 30
+# Days of lateness after which the lending company must buy a loan back.
+BUYBACK_DAYS = 60
 
 
 def login(session: requests.Session) -> str:
@@ -322,6 +332,166 @@ def fetch_portfolio_by_lending_company(session: requests.Session, headers: dict)
     companies = [{"name": name, "amount": amount} for name, amount in totals.items()]
     companies.sort(key=lambda c: c["amount"], reverse=True)
     return companies
+
+
+def fetch_late_shares(session: requests.Session, headers: dict, isin: str) -> list:
+    """Late part of one note (a portfolio "loan" is a note series backed by
+    ~15 underlying loans). GET /api/investment/show/{isin} lists them in
+    `data.noteSetList`: [{"LoanID", "principal" (ORIGINAL amount, they sum
+    to the note's total), "loanStatus" (SCHEDULED | DELAYED | BUYBACK |
+    PAID OFF), "dpd" (days past due), "updatedAt"}]. Verified live
+    2026-10-16: DELAYED loans have dpd 4-47 and are refreshed daily; a loan
+    still late after 60 days shows BUYBACK (lending company repurchase
+    obligation, not a late loan anymore); SCHEDULED rows may carry a
+    leftover dpd, so dpd only counts when DELAYED. PAID OFF/BUYBACK loans
+    carry no outstanding amount, so the weights only use the other loans.
+    Returns [(share of the note's outstanding, due date of the missed
+    payment = updatedAt - dpd)] for the DELAYED underlying loans."""
+    r = session.get(f"{API_BASE}/investment/show/{isin}", headers=headers, timeout=20)
+    r.raise_for_status()
+    live = [
+        loan for loan in r.json()["data"].get("noteSetList") or []
+        if loan.get("loanStatus") not in ("PAID OFF", "BUYBACK")
+    ]
+    total = sum(float(loan["principal"]) for loan in live)
+    shares = []
+    for loan in live:
+        dpd = loan.get("dpd") or 0
+        if loan.get("loanStatus") != "DELAYED" or dpd <= 0 or total <= 0:
+            continue
+        updated = date.fromisoformat(loan["updatedAt"]) if loan.get("updatedAt") else date.today()
+        shares.append((float(loan["principal"]) / total, updated - timedelta(days=dpd)))
+    return shares
+
+
+def fetch_current_loans(session: requests.Session, headers: dict) -> list:
+    """Current loans from /api/investment/portfolio (exact `maturityDate`
+    per loan, verified live 2026-10-16). Its `amount` is the ORIGINAL
+    amount, not the outstanding one, and its `status` (SETTLED) says
+    nothing about repayment lateness, see fetch_late_shares(). Returns
+    [{"originator", "amount", "maturity", "late": [(share, due date)]}]."""
+    loans = []
+    for page in range(1, MAX_STATEMENT_PAGES + 1):
+        r = session.post(
+            PORTFOLIO_URL,
+            json={
+                "meta": [{"limit": STATEMENT_PAGE_SIZE, "page": page}],
+                "filters": [{"name": "portfolioType", "value": "Current", "type": "single"}],
+            },
+            headers=headers,
+            timeout=20,
+        )
+        r.raise_for_status()
+        data = r.json()["data"]
+        payload = data.get("payload", [])
+        for loan in payload:
+            loans.append({
+                "originator": loan["lendingCompany"],
+                "amount": float(loan["amount"]),
+                "maturity": date.fromisoformat(loan["maturityDate"]),
+                "late": fetch_late_shares(session, headers, loan["ISIN"]),
+            })
+        if not payload or len(loans) >= data.get("meta", {}).get("total", 0):
+            break
+    return loans
+
+
+def _assign_to_groups(amounts_cents: list, group_totals_cents: list):
+    """Assign each loan to a group whose total equals the sum of its loans
+    (exact, in cents). Returns a list of group indexes or None."""
+    remaining = list(group_totals_cents)
+    order = sorted(range(len(amounts_cents)), key=lambda i: -amounts_cents[i])
+    assignment = [None] * len(amounts_cents)
+
+    def solve(k: int) -> bool:
+        if k == len(order):
+            return all(r == 0 for r in remaining)
+        i = order[k]
+        for g in range(len(remaining)):
+            if remaining[g] >= amounts_cents[i]:
+                remaining[g] -= amounts_cents[i]
+                assignment[i] = g
+                if solve(k + 1):
+                    return True
+                remaining[g] += amounts_cents[i]
+        return False
+
+    return assignment if solve(0) else None
+
+
+def fetch_outstanding_by_loan(session: requests.Session, headers: dict, loans: list, today: date) -> list:
+    """Outstanding (residue) amount of each loan of `loans`, in the same
+    order. Nectaro only exposes residues per group of loans (grouping=
+    maturity-date: `totalAmount`/`totalResidueAmount` per (maturityInMonths,
+    remainingTerm), where remainingTerm is the calendar month difference
+    between today and the maturity), never per loan. Each loan is matched to
+    its group by remainingTerm + exact sum of original amounts, and gets
+    amount * group residue/total ratio (loans of a group amortize
+    identically). Unmatchable loans fall back to their remainingTerm bucket's
+    average ratio."""
+    r = session.get(
+        DASHBOARD_INVESTMENT_URL,
+        params={"isHistorical": "false", "grouping": "maturity-date"},
+        headers=headers,
+        timeout=20,
+    )
+    r.raise_for_status()
+    groups_by_term = {}
+    for g in r.json().get("data", []):
+        groups_by_term.setdefault(g["remainingTerm"], []).append(g)
+
+    loans_by_term = {}
+    for index, loan in enumerate(loans):
+        term = (loan["maturity"].year - today.year) * 12 + loan["maturity"].month - today.month
+        loans_by_term.setdefault(term, []).append(index)
+
+    outstanding = [0.0] * len(loans)
+    for term, indexes in loans_by_term.items():
+        groups = groups_by_term.get(term, [])
+        amounts_cents = [round(loans[i]["amount"] * 100) for i in indexes]
+        assignment = _assign_to_groups(amounts_cents, [round(g["totalAmount"] * 100) for g in groups]) if groups else None
+        if assignment is not None:
+            for i, g in zip(indexes, assignment):
+                ratio = groups[g]["totalResidueAmount"] / groups[g]["totalAmount"]
+                outstanding[i] = loans[i]["amount"] * ratio
+            continue
+        log.warning("Could not match the loans with %d month(s) left to Nectaro's maturity groups exactly - using the average ratio.", term)
+        total = sum(g["totalAmount"] for g in groups)
+        ratio = sum(g["totalResidueAmount"] for g in groups) / total if total else 1.0
+        for i in indexes:
+            outstanding[i] = loans[i]["amount"] * ratio
+    return outstanding
+
+
+def aggregate_remaining_durations(session: requests.Session, headers: dict, today: date) -> dict:
+    """Group the outstanding amounts by lending company (same key as the
+    geographic breakdown), then by remaining term as of `today` (months,
+    days) to each loan's exact maturity date:
+    {originator: {(months, days): outstanding}}.
+    The share of a note held by DELAYED underlying loans is grouped by
+    overdue_months_and_days() since the missed payment instead (negated =
+    late; (months, days, "default") if still late beyond the 60-day buyback
+    obligation, which is inferred and never observed: such loans turn
+    BUYBACK). Totals per originator are unchanged. Verified live 2026-10-16
+    on late loans (dpd 4-47 days); the default case is untested."""
+    loans = fetch_current_loans(session, headers)
+    outstanding = fetch_outstanding_by_loan(session, headers, loans, today)
+    result = {}
+    for loan, amount in zip(loans, outstanding):
+        durations = result.setdefault(loan["originator"], {})
+        normal_share = 1.0
+        for share, due in loan["late"]:
+            overdue_days = (today - due).days
+            term = overdue_months_and_days(today, due, default=overdue_days > BUYBACK_DAYS)
+            if term is None:
+                continue
+            durations[term] = durations.get(term, 0.0) + amount * share
+            normal_share -= share
+        if normal_share > 1e-9:
+            term = remaining_months_and_days(today, loan["maturity"])
+            normal_amount = amount if normal_share == 1.0 else amount * normal_share
+            durations[term] = durations.get(term, 0.0) + normal_amount
+    return result
 
 
 def _fetch_statement_page(session: requests.Session, headers: dict, start_date: date, end_date: date, page: int) -> list:
@@ -781,6 +951,15 @@ def run() -> None:
     if current_month:
         fill_geographic_repartition_amounts(companies, platform="Nectaro")
         fill_geographic_repartition_uninvested_amount("Nectaro", overview["cash_balance"])
+
+        # Own try/except: the "durée" tab is a secondary view, its failure
+        # must not fail the whole run.
+        try:
+            fill_remaining_duration_amounts(
+                "Nectaro", aggregate_remaining_durations(session, headers, today_date)
+            )
+        except Exception:
+            log.exception("Failed to update the 'durée' sheet for Nectaro.")
 
 
 if __name__ == "__main__":
