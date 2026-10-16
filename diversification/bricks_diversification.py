@@ -238,7 +238,7 @@ HOME_METRICS_URL = "https://api.bricks.co/investor/portfolio/wealth/home-metrics
 REVENUE_API_URL = "https://api.bricks.co/investor/portfolio/revenue"
 WALLET_TRANSACTIONS_URL = "https://api.bricks.co/wallet-transactions"
 PORTFOLIO_PROPERTIES_URL = "https://api.bricks.co/investor/portfolio/properties"
-# financialStatus de l'API -> section de "Répartition géographique" (absent = projet sain, sans en-tête).
+# financialStatus de l'API -> statut (absent = projet sain), utilisé pour regrouper retards/défauts dans l'onglet "durée".
 _PROJECT_STATUS_SECTIONS = {"repayment-delay": "delay", "repayment-default": "default"}
 # Server-side cap, confirmed live (requesting take=2000 still only returned 50).
 WALLET_TRANSACTIONS_PAGE_SIZE = 50
@@ -1193,13 +1193,14 @@ def run() -> None:
         section="Crowdfunding immobilier",
     )
 
-    # "Répartition géographique" : une ligne par projet (statut en sections, pays en colonne, comme Lande) ;
-    # la ligne "Bricks" en est la somme. Relevés LIVE (sans date) : mois courant uniquement.
+    # "Répartition géographique" : une ligne par projet (pays en colonne, comme Lande) ; la ligne "Bricks" en est
+    # la somme. Retards/défauts ne sont plus rangés en sections ici, ils sont dans l'onglet "durée".
+    # Relevés LIVE (sans date) : mois courant uniquement.
     if current_month:
         project_amounts = None
         try:
             project_amounts, project_statuses = fetch_active_project_geo_amounts(session, all_entries)
-            for issue in fill_bricks_project_geo_amounts(project_amounts, project_statuses):
+            for issue in fill_bricks_project_geo_amounts(project_amounts):
                 log.warning("Bricks geographic breakdown: %s", issue)
         except Exception:
             log.exception("Failed to fetch/update Bricks' per-project geographic breakdown.")
