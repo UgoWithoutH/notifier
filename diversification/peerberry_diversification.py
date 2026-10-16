@@ -184,7 +184,9 @@ from shared.google_sheet import (
     fill_current_month_bonus_breakdown,
     fill_geographic_repartition_amounts,
     fill_geographic_repartition_uninvested_amount,
+    fill_remaining_duration_amounts,
 )
+from shared.remaining_duration import overdue_months_and_days, remaining_months_and_days
 from shared.report_date import get_report_now, is_current_month
 from shared.session_cache import get_or_refresh_session
 from shared.state import load_state, save_state
@@ -200,6 +202,13 @@ log = logging.getLogger("peerberry_diversification")
 ORIGINATORS_API_URL = "https://api.peerberry.com/v1/investor/overview/originators"
 ACCOUNT_SUMMARY_API_URL = "https://api.peerberry.com/v2/investor/account-summary"
 TRANSACTIONS_API_URL = "https://api.peerberry.com/v2/investor/transactions"
+INVESTMENTS_API_URL = "https://api.peerberry.com/v1/investor/investments"
+# Server caps pageSize at 40 (verified live 2026-10-16: 100 -> 422 "Page Size must be no greater than 40").
+INVESTMENTS_PAGE_SIZE = 40
+MAX_INVESTMENTS_PAGES = 50
+# PeerBerry only exposes CURRENT/LATE statuses (no default status): a loan late by more than this many days is
+# treated as in default in the "durée" tab (inferred, 60 days = common industry threshold).
+PEERBERRY_DEFAULT_DAYS = 60
 # The Account Summary page's default "This month" period (verified 2026-07-10
 # by capturing its own request) = 1st of the current month through TODAY, not
 # the full calendar month - same semantics as Swaper/Afranga/Lendermarket's
@@ -268,6 +277,82 @@ def normalize_originators(payload: list) -> list:
         )
     originators.sort(key=lambda o: o["amount"], reverse=True)
     return originators
+
+
+def fetch_current_investments(session: requests.Session) -> list:
+    """Fetch every current investment (the "My investments" list, `type=CURRENT`, late ones included).
+
+    Verified live 2026-10-16: `GET /v1/investor/investments?type=CURRENT&offset=N&pageSize=40` ->
+    `{"data": [...], "total": 99, ...}`, one entry per loan:
+    `{"originatorTitle": "Smart credito ES", "remainingPrincipal": 100, "status": "CURRENT"|"LATE",
+    "nextPaymentDate": "2026-10-16", "finalPaymentDate": "2026-10-12", ...}`. `type` only accepts CURRENT/FINISHED."""
+    investments = []
+    offset = 0
+    for page_number in range(1, MAX_INVESTMENTS_PAGES + 1):
+        r = session.get(
+            INVESTMENTS_API_URL,
+            params={"type": "CURRENT", "offset": offset, "pageSize": INVESTMENTS_PAGE_SIZE},
+            headers=_HEADERS,
+            timeout=20,
+        )
+        if not r.ok:
+            raise RuntimeError(f"Investments API returned status {r.status_code} (offset={offset})")
+        page = (r.json() or {}).get("data") or []
+        log.info("Investments API page %d: %d investment(s) found.", page_number, len(page))
+        investments.extend(page)
+        if len(page) < INVESTMENTS_PAGE_SIZE:
+            break
+        offset += INVESTMENTS_PAGE_SIZE
+    else:
+        log.warning("Hit MAX_INVESTMENTS_PAGES (%d) without exhausting the investments - the list may be incomplete.", MAX_INVESTMENTS_PAGES)
+    return investments
+
+
+def _parse_iso_date(value):
+    try:
+        return date.fromisoformat(str(value)[:10])
+    except (TypeError, ValueError):
+        return None
+
+
+def aggregate_remaining_durations(investments: list, today: date) -> dict:
+    """Group current investments by loan originator (`originatorTitle`, same
+    key as the originators distribution), then by remaining term as of
+    `today` (months, days): {originator: {(months, days): remainingPrincipal}}.
+    The maturity date is `finalPaymentDate`; investments without a usable
+    one are skipped (with a warning).
+
+    Late loans (`status` "LATE", verified live 2026-10-16: 26 of 99, all
+    short loans whose `finalPaymentDate` was already past while
+    `nextPaymentDate` just rolled over to today) are grouped by
+    overdue_months_and_days() since their missed due date (the earliest of
+    `finalPaymentDate`/`nextPaymentDate` that is in the past). PeerBerry has
+    no default status, so a loan more than PEERBERRY_DEFAULT_DAYS late is
+    INFERRED to be in default ("de défaut" instead of "de retard")."""
+    result = {}
+    for inv in investments:
+        originator = inv.get("originatorTitle") or "Unknown"
+        try:
+            amount = float(inv.get("remainingPrincipal"))
+        except (TypeError, ValueError):
+            amount = 0.0
+        maturity = _parse_iso_date(inv.get("finalPaymentDate"))
+        term = None
+        if str(inv.get("status") or "").upper() == "LATE":
+            due_dates = [d for d in (maturity, _parse_iso_date(inv.get("nextPaymentDate"))) if d and d < today]
+            if due_dates:
+                due = min(due_dates)
+                term = overdue_months_and_days(today, due, default=(today - due).days > PEERBERRY_DEFAULT_DAYS)
+            else:
+                log.warning("Late investment of %s (%.2f EUR) has no past due date - using its remaining term.", originator, amount)
+        if term is None:
+            if maturity is None:
+                log.warning("No maturity date found for an investment of %s (%.2f EUR) - skipped.", originator, amount)
+                continue
+            term = remaining_months_and_days(today, maturity)
+        durations = result.setdefault(originator, {})
+        durations[term] = durations.get(term, 0.0) + amount
+    return result
 
 
 def fetch_statement_summary(session: requests.Session, start_date: str, end_date: str) -> dict:
@@ -1327,6 +1412,15 @@ def run() -> None:
 
         if available_money is not None:
             fill_geographic_repartition_uninvested_amount("Peerberry", available_money)
+
+        # Own try/except: the "durée" tab is a secondary view, its failure
+        # must not fail the whole run.
+        try:
+            fill_remaining_duration_amounts(
+                "Peerberry", aggregate_remaining_durations(fetch_current_investments(session), today_date)
+            )
+        except Exception:
+            log.exception("Failed to update the 'durée' sheet for Peerberry.")
 
 
 if __name__ == "__main__":
