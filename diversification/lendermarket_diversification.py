@@ -177,7 +177,7 @@ from shared.xirr_waterfall import compute_waterfall_xirr_shares
 
 load_dotenv()
 
-from monitors.lendermarket_monitor import (
+from monitors.lendermarket_invest_bot import (
     login, LENDERMARKET_EMAIL, LENDERMARKET_PASSWORD, _xsrf_headers, fetch_account_balance,
     fetch_account_pending_payments,
 )
