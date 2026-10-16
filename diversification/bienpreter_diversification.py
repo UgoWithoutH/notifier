@@ -226,7 +226,9 @@ from shared.google_sheet import (
     fill_current_month_bonus_breakdown,
     fill_bienpreter_borrower_geo_amounts,
     fill_geographic_repartition_uninvested_amount,
+    fill_remaining_duration_amounts,
 )
+from shared.remaining_duration import overdue_months_and_days, remaining_months_and_days
 from shared.report_date import get_report_now, is_current_month
 from shared.session_cache import get_or_refresh_session
 from shared.notifier import send_bienpreter_geo_issues_email
@@ -411,6 +413,7 @@ LOAN_ROW_REGEX = re.compile(r'<tr[^>]*class="bp-tr-main"[^>]*>(.*?)</tr>', re.DO
 LOAN_PROJECT_BORROWER_REGEX = re.compile(
     r'<a\s+href="/projets/(\d+)"[^>]*>.*?</a>\s*<br>\s*([^<]+?)\s*</p>', re.DOTALL
 )
+LOAN_CONTRACT_ID_REGEX = re.compile(r'<tr[^>]*class="bp-tr-main"[^>]*data-id="(\d+)"', re.DOTALL)
 LOAN_AMOUNT_REGEX = re.compile(r'contract__amount[^"]*">\s*([^<]+?)\s*</td>', re.DOTALL)
 PROJECT_LOCATION_REGEX = re.compile(r"<dt>\s*Localisation\s*</dt>\s*<dd[^>]*>(.*?)</dd>", re.DOTALL)
 # "<p class=\"text-center\">\n    24\n    r\u00e9sultats au total\n  </p>" - used to bound
@@ -420,16 +423,26 @@ PROJECT_LOCATION_REGEX = re.compile(r"<dt>\s*Localisation\s*</dt>\s*<dd[^>]*>(.*
 # module docstring/repo memory - out-of-range pages can echo stray rows
 # instead of a clean empty result set).
 TOTAL_RESULTS_REGEX = re.compile(r"(\d+)\s*r\u00e9sultats au total", re.IGNORECASE)
+# "<td class=\"contract__next-payment\">... (06/11/2026) ... 1 sur 16</td>"
+LOAN_NEXT_PAYMENT_DATE_REGEX = re.compile(r"contract__next-payment.*?\((\d{2}/\d{2}/\d{4})\)", re.DOTALL)
+# `litigation` filter of /u/mes-prets (verified live 2026-10-16 from the page's
+# own "Retards / Défauts" <select>): 11 = "Prêts en retard (retard < 6 mois)",
+# 12 = "Prêts en défaut (retard > 6 mois)" (1 = either of them).
+LITIGATION_LATE = "11"
+LITIGATION_DEFAULT = "12"
 
 
 def _parse_active_loans_rows(page_html: str) -> list:
     """Parses one page of https://www.bienpreter.com/u/mes-prets into a
-    list of {"project_id", "borrower", "amount"} dicts - see module
-    docstring section on active-loans fetching for the verified row
-    markup (`<tr class="bp-tr-main">`, project link + borrower name in
-    `.contract__project__name`, amount in `.contract__amount`)."""
+    list of {"project_id", "borrower", "amount", "contract_id",
+    "next_payment_date"} dicts - see module docstring section on
+    active-loans fetching for the verified row markup (`<tr
+    class="bp-tr-main" data-id="...">`, project link + borrower name in
+    `.contract__project__name`, amount in `.contract__amount`, next payment
+    date as "(dd/mm/yyyy)" in `.contract__next-payment`, None if absent)."""
     rows = []
-    for row_html in LOAN_ROW_REGEX.findall(page_html):
+    for row_match in LOAN_ROW_REGEX.finditer(page_html):
+        row_html = row_match.group(1)
         project_match = LOAN_PROJECT_BORROWER_REGEX.search(row_html)
         amount_match = LOAN_AMOUNT_REGEX.search(row_html)
         if not project_match or not amount_match:
@@ -440,18 +453,32 @@ def _parse_active_loans_rows(page_html: str) -> list:
         if not borrower or amount is None:
             continue
 
-        rows.append({"project_id": project_match.group(1), "borrower": borrower, "amount": amount})
+        contract_id_match = LOAN_CONTRACT_ID_REGEX.search(row_match.group(0))
+        next_payment_match = LOAN_NEXT_PAYMENT_DATE_REGEX.search(row_html)
+        rows.append(
+            {
+                "project_id": project_match.group(1),
+                "borrower": borrower,
+                "amount": amount,
+                "contract_id": contract_id_match.group(1) if contract_id_match else None,
+                "next_payment_date": (
+                    datetime.strptime(next_payment_match.group(1), "%d/%m/%Y").date() if next_payment_match else None
+                ),
+            }
+        )
     return rows
 
 
-def fetch_active_loans(session: requests.Session):
+def fetch_active_loans(session: requests.Session, litigation: str = ""):
     """Fetches every currently active ("en cours") Bienprêter loan from
     https://www.bienpreter.com/u/mes-prets, paginating via the `page`
     query param until a page returns no loan rows (bounded by
-    MAX_ACTIVE_LOANS_PAGES as a safety net). Returns (loans, issues):
-    - loans : flat list of {"project_id", "borrower", "amount"} dicts, one
-      per loan/contract (a single borrower can appear multiple times, once
-      per contract).
+    MAX_ACTIVE_LOANS_PAGES as a safety net). `litigation` optionally
+    restricts it to late (LITIGATION_LATE) or defaulted (LITIGATION_DEFAULT)
+    loans. Returns (loans, issues):
+    - loans : flat list of {"project_id", "borrower", "amount",
+      "contract_id", "next_payment_date"} dicts, one per loan/contract (a
+      single borrower can appear multiple times, once per contract).
     - issues : list of short strings describing a pagination problem (hit
       the page safety net, or collected more/fewer rows than the site's
       own "X résultats au total" - both signal the result may be
@@ -460,7 +487,7 @@ def fetch_active_loans(session: requests.Session):
     issues = []
     expected_total = None
     for page_number in range(1, MAX_ACTIVE_LOANS_PAGES + 1):
-        params = dict(ACTIVE_LOANS_BASE_PARAMS, page=str(page_number))
+        params = dict(ACTIVE_LOANS_BASE_PARAMS, page=str(page_number), litigation=litigation)
         log.info("GET active loans page %d...", page_number)
         r = session.get(ACTIVE_LOANS_URL, params=params, timeout=30)
         log.info("GET active loans page %d: status=%s", page_number, r.status_code)
@@ -620,6 +647,90 @@ def fetch_active_loans_by_borrower(session: requests.Session):
 
     log.info("Active loans grouped by borrower: %d borrower(s) found.", len(borrowers))
     return borrowers, issues
+
+
+def fetch_contract_dates(session: requests.Session, contract_id: str) -> tuple:
+    """(maturity, next_due) dates of a loan contract from the JSON API
+    behind the "Gérer mon prêt" page, /api/v1/contracts/{id} (verified live
+    2026-10-16): maturity = "refundDateEstimation" (YYYY-MM-DD; 1st due +
+    duesLeft - 1 months), next_due = "nextDue.dueDate" (the next instalment
+    to be received). Either is None if absent."""
+    r = session.get(
+        f"https://www.bienpreter.com/api/v1/contracts/{contract_id}",
+        headers={"Accept": "application/ld+json"},
+        timeout=30,
+    )
+    r.raise_for_status()
+    data = r.json()
+    estimate = data.get("refundDateEstimation")
+    next_due = (data.get("nextDue") or {}).get("dueDate")
+    return (
+        date.fromisoformat(estimate[:10]) if estimate else None,
+        date.fromisoformat(next_due[:10]) if next_due else None,
+    )
+
+
+def fetch_litigation_loans(session: requests.Session) -> dict:
+    """Late / defaulted active loans: {contract_id: {"default": bool,
+    "next_payment_date": date | None}}, from the /u/mes-prets "Retards /
+    Défauts" filter - "late" = retard < 6 mois, "default" = retard > 6 mois
+    (the platform's own definition; verified live 2026-10-16 that the
+    filter exists and that the account then had no such loan, so the row
+    content of a late loan is NOT verified)."""
+    result = {}
+    for litigation, is_default in ((LITIGATION_LATE, False), (LITIGATION_DEFAULT, True)):
+        loans, _ = fetch_active_loans(session, litigation=litigation)
+        for loan in loans:
+            if loan.get("contract_id"):
+                result[loan["contract_id"]] = {"default": is_default, "next_payment_date": loan["next_payment_date"]}
+    return result
+
+
+def aggregate_remaining_durations(session: requests.Session, loans: list, today: date) -> dict:
+    """Group the active loans (fetch_active_loans()) by borrower - same key
+    as the geographic breakdown - then by remaining term as of `today`
+    (months, days): {borrower: {(months, days): amount}}. Loans whose
+    maturity can't be determined are skipped (with a warning).
+
+    Late / defaulted loans (fetch_litigation_loans(): the platform's own
+    "retard < 6 mois" / "retard > 6 mois" filters) are instead grouped by how
+    long ago their missed instalment was due, via overdue_months_and_days():
+    the earliest past date among the contract's `nextDue.dueDate` and the
+    loan row's next payment date (INFERRED, not verified: no late loan existed
+    to observe whether these still point at the missed instalment). If none
+    is in the past, they keep their remaining term."""
+    try:
+        litigation_loans = fetch_litigation_loans(session)
+    except Exception:
+        log.exception("Failed to fetch the late/defaulted loans - using remaining terms only.")
+        litigation_loans = {}
+
+    result = {}
+    for loan in loans:
+        name = loan["borrower"]
+        contract_id = loan.get("contract_id")
+        try:
+            maturity, next_due = fetch_contract_dates(session, contract_id) if contract_id else (None, None)
+        except Exception:
+            log.exception("Failed to fetch the dates of contract %s.", contract_id)
+            maturity, next_due = None, None
+
+        term = None
+        litigation = litigation_loans.get(contract_id)
+        if litigation:
+            past_dues = [d for d in (next_due, litigation["next_payment_date"]) if d and d < today]
+            if past_dues:
+                term = overdue_months_and_days(today, min(past_dues), default=litigation["default"])
+            else:
+                log.warning("Late loan of %s (%.2f EUR) has no past due date - using its remaining term.", name, loan["amount"])
+        if term is None:
+            if maturity is None:
+                log.warning("No maturity date found for a loan of %s (%.2f EUR) - skipped.", name, loan["amount"])
+                continue
+            term = remaining_months_and_days(today, maturity)
+        durations = result.setdefault(name, {})
+        durations[term] = durations.get(term, 0.0) + loan["amount"]
+    return result
 
 
 def _fetch_operations_page(session: requests.Session, start_date: str, end_date: str, page_number: int) -> list:
@@ -1379,6 +1490,16 @@ def run() -> None:
         except Exception as exc:
             log.exception("Failed to update Bienprêter's 'non investi' row.")
             geo_error = geo_error or str(exc)
+
+        # Own try/except: the "durée" tab is a secondary view, its failure
+        # must not fail the whole run.
+        try:
+            active_loans, _ = fetch_active_loans(session)
+            fill_remaining_duration_amounts(
+                "Bienprêter", aggregate_remaining_durations(session, active_loans, today_date)
+            )
+        except Exception:
+            log.exception("Failed to update the 'durée' sheet for Bienprêter.")
 
     if geo_issues or geo_error:
         send_bienpreter_geo_issues_email(geo_issues, error=geo_error)

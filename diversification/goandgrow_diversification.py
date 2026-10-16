@@ -114,7 +114,7 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-from shared.google_sheet import fill_current_month_amounts, fill_current_month_bonus_breakdown, fill_geographic_repartition_amounts
+from shared.google_sheet import fill_current_month_amounts, fill_current_month_bonus_breakdown, fill_geographic_repartition_amounts, fill_remaining_duration_amounts
 from shared.report_date import get_report_now, is_current_month
 from shared.session_cache import get_or_refresh_session
 from shared.weighted_average import INVESTED_BALANCE_LABEL, NON_INVESTED_BALANCE_LABEL, compute_time_weighted_average
@@ -692,6 +692,15 @@ def run() -> None:
 
     if current_month:
         fill_geographic_repartition_amounts([{"name": PLATFORM_LABEL, "amount": balance}])
+
+        # Go & Grow has no vaults/terms - the whole balance is withdrawable
+        # at any time, i.e. a remaining term of 0 days. Own try/except: the
+        # "durée" tab is a secondary view, its failure must not fail the run.
+        try:
+            durations = {PLATFORM_LABEL: {(0, 0): round(balance, 2)}} if round(balance, 2) > 0 else {}
+            fill_remaining_duration_amounts(PLATFORM_LABEL, durations)
+        except Exception:
+            log.exception("Failed to update the 'durée' sheet for Go & Grow.")
 
 
 if __name__ == "__main__":

@@ -202,7 +202,7 @@ import re
 import sys
 import logging
 from html.parser import HTMLParser
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 
 import fitz
 import requests
@@ -213,7 +213,9 @@ from shared.google_sheet import (
     fill_current_month_bonus_breakdown,
     fill_geographic_repartition_uninvested_amount,
     fill_lande_loan_geo_amounts,
+    fill_remaining_duration_amounts,
 )
+from shared.remaining_duration import overdue_months_and_days, remaining_months_and_days
 from shared.report_date import get_report_date, is_current_month
 from shared.weighted_average import INVESTED_BALANCE_LABEL, NON_INVESTED_BALANCE_LABEL, compute_time_weighted_average
 from shared.monthly_yield_waterfall import compute_monthly_yield_shares
@@ -243,6 +245,7 @@ _TRANSACTION_DATE_RE = re.compile(r'<p class="mt-1 m-0 text-xs text-neutral-500"
 _TRANSACTION_AMOUNT_RE = re.compile(r'<span class="text-(?:brand-green|rose-600)">([+-])€[\s\xa0]*([\d.,\s\xa0]+?)</span>')
 _LOAN_ID_RE = re.compile(r"/fr/investors/loans/(\d+)(?:$|[/?#])")
 _EURO_AMOUNT_RE = re.compile(r"€\s*(-?[\d.,\s\xa0]+)")
+_TABLE_DATE_RE = re.compile(r"^\d{2}\.\d{2}\.\d{4}$")
 
 LANDE_COUNTRY_CODES = {
     "ZA": "Afrique du Sud", "DE": "Allemagne", "AR": "Argentine",
@@ -604,15 +607,18 @@ class _InvestmentTableParser(HTMLParser):
 
 
 def fetch_active_loan_geo_amounts(session: requests.Session) -> tuple:
-    """Fetch current Lande investments as ``(loan_amounts, loan_statuses)``
-    where ``loan_amounts`` is ``loan id -> country -> remaining principal``
-    and ``loan_statuses`` is ``loan id -> payment_status filter``.
+    """Fetch current Lande investments as ``(loan_amounts, loan_statuses, due_dates)``
+    where ``loan_amounts`` is ``loan id -> country -> remaining principal``,
+    ``loan_statuses`` is ``loan id -> payment_status filter`` and ``due_dates``
+    is ``loan id -> "Paiement à venir" date`` (the missed payment's date for a
+    late/defaulted loan).
     The site's current-investments table contains
     one parent row per loan followed by one detail row per investment
     contract; several contracts for the same loan are summed together.
     """
     loan_amounts = {}
     loan_statuses = {}
+    due_dates = {}
     parent_rows = 0
     # Le tableau par défaut masque les prêts « Défaut » (vérifié en live) : on parcourt chaque filtre actif.
     for payment_status in LANDE_ACTIVE_PAYMENT_STATUSES:
@@ -624,7 +630,7 @@ def fetch_active_loan_geo_amounts(session: requests.Session) -> tuple:
         if not response.ok:
             raise RuntimeError(f"Lande investments page returned status {response.status_code}")
         page_amounts = {}
-        parent_rows += _parse_investments_page(response.text, page_amounts)
+        parent_rows += _parse_investments_page(response.text, page_amounts, due_dates)
         loan_amounts.update(page_amounts)
         # Le filtre « current » liste aussi les prêts en retard : les filtres suivants, plus précis, écrasent son statut.
         for loan_id in page_amounts:
@@ -642,11 +648,65 @@ def fetch_active_loan_geo_amounts(session: requests.Session) -> tuple:
         "Lande current investments: %d loan row(s), %d loan(s) with remaining principal (%.2f EUR).",
         parent_rows, len(loan_amounts), parsed_total,
     )
-    return loan_amounts, loan_statuses
+    return loan_amounts, loan_statuses, due_dates
+
+def fetch_loan_maturity_date(session: requests.Session, loan_id: str) -> date | None:
+    """Maturity date of a loan: the last date of the payment schedule
+    ("Calendrier" table: # | Date | Principal | ...) on its project page
+    /fr/investors/loans/<id> (verified live 2026-10-16; the investments
+    table itself only shows the next payment). None if no schedule found."""
+    url = f"https://lande.finance/fr/investors/loans/{loan_id}"
+    response = session.get(url, timeout=30)
+    _check_authenticated(response)
+    response.raise_for_status()
+    parser = _InvestmentTableParser()
+    parser.feed(response.text)
+    dates = [
+        datetime.strptime(row["cells"][1], "%d.%m.%Y").date()
+        for row in parser.rows
+        if len(row["cells"]) >= 5 and row["cells"][0].isdigit() and _TABLE_DATE_RE.match(row["cells"][1])
+    ]
+    return max(dates) if dates else None
 
 
-def _parse_investments_page(page_html: str, loan_amounts: dict) -> int:
-    """Ajoute dans `loan_amounts` les prêts non remboursés de la page ; retourne le nombre de lignes prêt."""
+def aggregate_remaining_durations(
+    session: requests.Session, loan_amounts: dict, today: date, loan_statuses: dict | None = None, due_dates: dict | None = None
+) -> dict:
+    """Group loans by loan id (same key as the geographic breakdown rows),
+    then by remaining term as of `today` (months, days):
+    {loan_id: {(months, days): remaining principal}}. A loan that is late
+    (any payment_status other than "current") or in default ("default") is
+    grouped by how long ago its missed payment was due (the "Paiement à
+    venir" date Lande shows) instead - see overdue_months_and_days().
+    Loans whose maturity can't be determined are skipped (with a warning)."""
+    loan_statuses = loan_statuses or {}
+    due_dates = due_dates or {}
+    result = {}
+    for loan_id, countries in loan_amounts.items():
+        amount = sum(countries.values())
+        status = loan_statuses.get(loan_id, "current")
+        term = None
+        if status != "current" and loan_id in due_dates:
+            term = overdue_months_and_days(today, due_dates[loan_id], default=status == "default")
+        if term is None:
+            try:
+                maturity = fetch_loan_maturity_date(session, loan_id)
+            except Exception:
+                log.exception("Failed to fetch the maturity date of Lande loan %s.", loan_id)
+                maturity = None
+            if maturity is None:
+                log.warning("No maturity date found for Lande loan %s (%.2f EUR) - skipped.", loan_id, amount)
+                continue
+            term = remaining_months_and_days(today, maturity)
+        durations = result.setdefault(loan_id, {})
+        durations[term] = durations.get(term, 0.0) + amount
+    return result
+
+
+def _parse_investments_page(page_html: str, loan_amounts: dict, due_dates: dict | None = None) -> int:
+    """Ajoute dans `loan_amounts` les prêts non remboursés de la page ; retourne le nombre de lignes prêt.
+    Si `due_dates` est fourni, y consigne la date « Paiement à venir » de chaque prêt (pour un prêt en
+    retard ou en défaut, c'est la date du paiement manqué)."""
     parser = _InvestmentTableParser()
     parser.feed(page_html)
     current_loan = None
@@ -657,6 +717,8 @@ def _parse_investments_page(page_html: str, loan_amounts: dict) -> int:
             loan_amounts[current_loan["id"]] = {
                 current_loan["country"]: current_loan["amount"]
             }
+            if due_dates is not None and current_loan["due"]:
+                due_dates[current_loan["id"]] = current_loan["due"]
 
     for row in parser.rows:
         loan_id = next(
@@ -672,10 +734,12 @@ def _parse_investments_page(page_html: str, loan_amounts: dict) -> int:
             if "rembours" in status:
                 current_loan = None
                 continue
+            due_text = cells[5].strip() if len(cells) > 5 else ""
             current_loan = {
                 "id": loan_id,
                 "country": LANDE_COUNTRY_CODES.get(country_code, ""),
                 "amount": 0.0,
+                "due": datetime.strptime(due_text, "%d.%m.%Y").date() if _TABLE_DATE_RE.match(due_text) else None,
             }
             if country_code and not current_loan["country"]:
                 log.warning("Unknown Lande country code %r for loan %s.", country_code, loan_id)
@@ -760,13 +824,25 @@ def run(session: requests.Session | None = None) -> None:
     # La ligne "Lande" est une formule de somme de ses sous-lignes, gérée par fill_lande_loan_geo_amounts.
     available_funds = None
     if current_month:
+        active_loan_amounts = None
         try:
-            active_loan_amounts, loan_statuses = fetch_active_loan_geo_amounts(session)
+            active_loan_amounts, loan_statuses, loan_due_dates = fetch_active_loan_geo_amounts(session)
             geo_issues = fill_lande_loan_geo_amounts(active_loan_amounts, loan_statuses)
             for issue in geo_issues:
                 log.warning("Lande geographic breakdown: %s", issue)
         except Exception:
             log.exception("Failed to fetch/update Lande's active-loan geographic breakdown.")
+
+        # Own try/except: the "durée" tab is a secondary view, its failure
+        # must not fail the whole run.
+        if active_loan_amounts is not None:
+            try:
+                fill_remaining_duration_amounts(
+                    PLATFORM_LABEL,
+                    aggregate_remaining_durations(session, active_loan_amounts, report_date, loan_statuses, loan_due_dates),
+                )
+            except Exception:
+                log.exception("Failed to update the 'durée' sheet for Lande.")
 
         try:
             available_funds = fetch_available_funds(session)
