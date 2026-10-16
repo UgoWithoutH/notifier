@@ -52,7 +52,7 @@ jobs:
           SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
           EMAIL_FROM: ${{ secrets.EMAIL_FROM }}
           EMAIL_TO: ${{ secrets.EMAIL_TO }}
-        run: python -m monitors.lendermarket_monitor
+        run: python -m monitors.lendermarket_invest_bot
 
       - name: Save persisted state (already-notified loan IDs + cron schedule + session) for the next run
         if: always()
