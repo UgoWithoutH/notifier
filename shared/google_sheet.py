@@ -874,6 +874,35 @@ def get_geographic_repartition_uninvested_amounts(platforms: list) -> dict:
     return amounts
 
 
+# Code ISO2 -> nom de pays tel qu'écrit dans les en-têtes de colonnes pays de
+# "Répartition géographique".
+ISO2_TO_FRENCH_COUNTRY = {
+    "ZA": "Afrique du Sud", "DE": "Allemagne", "AR": "Argentine",
+    "AU": "Australie", "BR": "Brésil", "BG": "Bulgarie", "CA": "Canada",
+    "CN": "Chine", "CY": "Chypre", "CO": "Colombie", "KR": "Corée du Sud",
+    "HR": "Croatie", "DK": "Danemark", "ES": "Espagne", "EE": "Estonie",
+    "US": "États-Unis", "FI": "Finlande", "FR": "France", "IN": "Inde",
+    "ID": "Indonésie", "IT": "Italie", "JP": "Japon", "KZ": "Kazakhstan",
+    "LV": "Lettonie", "LT": "Lituanie", "MY": "Malaisie", "MX": "Mexique",
+    "NL": "Pays Bas", "PL": "Pologne", "PE": "Pérou", "CZ": "République tchèque",
+    "RO": "Roumanie", "GB": "Royaume-Uni", "SE": "Suède", "TW": "Taïwan",
+    "TH": "Thaïlande",
+}
+
+
+def _geo_country_column_of(grid, geo_row: int, geo_col: int, country):
+    """Colonne (1-based) du pays `country` dans la ligne d'en-tête de
+    'Répartition géographique' (colonnes après la colonne total), ou None."""
+    country = (country or "").strip().casefold()
+    if not country:
+        return None
+    header_row = grid[geo_row - 1]
+    for col_idx in range(geo_col + 2, len(header_row) + 1):
+        if header_row[col_idx - 1].strip().casefold() == country:
+            return col_idx
+    return None
+
+
 def _insert_missing_geo_rows(worksheet, grid, geo_row, geo_col, target_col, platform: str, missing_loan_originators: list) -> int:
     """Pour le bloc de sociétés de prêt du `platform` donné sous
     'Répartition géographique', INSÈRE une nouvelle ligne (nom + montant, à
@@ -916,10 +945,15 @@ def _insert_missing_geo_rows(worksheet, grid, geo_row, geo_col, target_col, plat
     for lo in missing_loan_originators:
         name = lo["name"]
         amount = lo.get("amount", 0)
-        row_length = max(geo_col, target_col)
+        country_col = _geo_country_column_of(grid, geo_row, geo_col, lo.get("country"))
+        row_length = max(geo_col, target_col, country_col or 0)
         row_values = [""] * row_length
         row_values[geo_col - 1] = name
         row_values[target_col - 1] = amount
+        if country_col:
+            row_values[country_col - 1] = f"=${_col_letter(target_col)}{insert_row}"
+        elif lo.get("country"):
+            logger.warning("Pays '%s' de '%s' introuvable dans les colonnes pays - montant non reporté par pays.", lo["country"], name)
 
         logger.info(
             "Insertion d'une nouvelle ligne '%s' (plateforme '%s') à la ligne %s, montant=%s",
@@ -1015,6 +1049,20 @@ def fill_geographic_repartition_amounts(loan_originators: list, platform: str | 
             amount,
             address
         )
+
+        # Ligne existante sans aucun montant par pays (ex. société ajoutée
+        # automatiquement avant que le pays soit géré) : on le renseigne.
+        country_col = _geo_country_column_of(grid, geo_row, geo_col, lo.get("country"))
+        if country_col:
+            current_row = grid[row - 1]
+            has_country_amount = any(
+                cell.strip() for cell in current_row[geo_col + 1:]
+            )
+            if not has_country_amount:
+                updates.append({
+                    "range": rowcol_to_a1(row, country_col),
+                    "values": [[f"=${_col_letter(target_col)}{row}"]],
+                })
 
     zero_fill_count = 0
     if platform:
