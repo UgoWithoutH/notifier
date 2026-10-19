@@ -180,6 +180,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 from shared.google_sheet import (
+    ISO2_TO_FRENCH_COUNTRY,
     fill_current_month_amounts,
     fill_current_month_bonus_breakdown,
     fill_geographic_repartition_amounts,
@@ -1403,7 +1404,11 @@ def run() -> None:
     )
 
     loan_originators = [
-        {"name": o["originator"], "amount": o["amount"]}
+        {
+            "name": o["originator"],
+            "amount": o["amount"],
+            "country": ISO2_TO_FRENCH_COUNTRY.get((o.get("iso2") or "").upper()),
+        }
         for o in originators
     ]
 
