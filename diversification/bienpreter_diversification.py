@@ -1496,7 +1496,7 @@ def run() -> None:
         try:
             active_loans, _ = fetch_active_loans(session)
             fill_remaining_duration_amounts(
-                "Bienprêter", aggregate_remaining_durations(session, active_loans, today_date)
+                "Bienprêter", aggregate_remaining_durations(session, active_loans, today_date), platform_level=True
             )
         except Exception:
             log.exception("Failed to update the 'durée' sheet for Bienprêter.")

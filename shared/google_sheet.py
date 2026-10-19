@@ -10,6 +10,7 @@ from dotenv import load_dotenv
 from google.oauth2.service_account import Credentials
 from gspread.utils import rowcol_to_a1
 
+from shared import duration_status_history as status_history
 from shared.report_date import get_report_date
 
 
@@ -1158,13 +1159,207 @@ _DURATION_AMOUNT_FORMAT = {
 }
 
 
-def fill_remaining_duration_amounts(platform: str, durations_by_originator: dict):
+_DURATION_STATUS_LABELS = ("normaux", "retards", "défauts")  # même ordre que les parts (normal, retard, défaut)
+_DURATION_STATUS_DISPLAY_ORDER = ("défauts", "retards", "normaux")
+_DURATION_STATUS_BY_CLASS = {"default": "défauts", "late": "retards", "normal": "normaux"}
+_DURATION_SECTION_LABELS = ("crowdlending", "crowdlending savings", "crowdlending agricole", "crowdfunding immobilier")
+_DURATION_FIRST_MONTH_COL = 2  # colonne C (index 0-based) : mois courant, les mois passés sont à droite
+_DURATION_PERCENT_FORMAT = {"numberFormat": {"type": "PERCENT", "pattern": "0.0%"}}
+_DURATION_HEADER_FORMAT = {
+    "horizontalAlignment": "RIGHT",
+    "textFormat": {"fontSize": 9, "bold": True},
+}
+
+
+def _duration_sections(grid: list) -> list:
+    """Secteurs de l'onglet (lignes "Crowdlending", "Crowdlending savings", "Crowdlending agricole",
+    "Crowdfunding immobilier") : [(ligne 1-based, texte de l'horizon en colonne B, horizon en mois ou None)]."""
+    sections = []
+    for row_idx, row in enumerate(grid, 1):
+        if row and row[0].strip().casefold() in _DURATION_SECTION_LABELS:
+            text = row[1].strip() if len(row) > 1 else ""
+            sections.append((row_idx, text, status_history.parse_horizon_months(text)))
+    return sections
+
+
+def _duration_month_columns(grid: list, sections: list) -> list:
+    """Mois (année, mois) des colonnes existantes à partir de la colonne C, lus dans les lignes de secteur
+    (mois courant à gauche) ; s'arrête à la première colonne sans en-tête de mois."""
+    months = []
+    col = _DURATION_FIRST_MONTH_COL
+    while True:
+        month = next((
+            parsed for row_idx, _, _ in sections
+            if col < len(grid[row_idx - 1]) and (parsed := status_history.parse_month_label(grid[row_idx - 1][col]))
+        ), None)
+        if month is None:
+            return months
+        months.append(month)
+        col += 1
+
+
+def _duration_own_section(sections: list, platform_row: int):
+    """Secteur (ligne, texte, horizon) auquel appartient la ligne de plateforme : le dernier au-dessus d'elle."""
+    return next((section for section in reversed(sections) if section[0] < platform_row), None)
+
+
+def _duration_horizon_months(sections: list, platform_row: int, log_problem: bool = False) -> int:
+    """Horizon (en mois) du secteur de la plateforme, lu en colonne B de la ligne du secteur ("1 an",
+    "1 an 6 mois", "18 mois"...) ; 12 mois par défaut quand il est vide ou illisible."""
+    section = _duration_own_section(sections, platform_row)
+    if section and section[2]:
+        return section[2]
+    if log_problem and section and section[1]:
+        logger.warning(
+            "Horizon illisible dans '%s'!B%s (%r) - %s mois utilisés. Attendu : '1 an', '1 an 6 mois', '18 mois'...",
+            DURATION_SHEET_NAME, section[0], section[1], status_history.DEFAULT_HORIZON_MONTHS,
+        )
+    return status_history.DEFAULT_HORIZON_MONTHS
+
+
+def _duration_status_requests(worksheet, grid, platform, platform_row, end_row, desired, new_data, platform_level, row_range) -> list:
+    """Requêtes batchUpdate gérant les colonnes de mois (partagées par tous les secteurs, mois courant à gauche)
+    et, sur les lignes "normaux"/"retards"/"défauts" de `desired`, la moyenne mensuelle des parts (%)
+    enregistrées dans le cache d'historique de la plateforme, sur l'horizon de SON secteur.
+
+    - une colonne n'est créée que si la plateforme a des données pour ce mois ;
+    - une colonne n'est supprimée que si son mois est hors de l'horizon de tous les secteurs ;
+    - les valeurs de la plateforme hors de l'horizon de son secteur sont effacées ;
+    - les en-têtes de mois sont écrits sur la ligne de chaque secteur.
+    Enregistre aussi les parts du jour dans le cache."""
+    today = get_report_date()
+    sections = _duration_sections(grid)
+    own_section = _duration_own_section(sections, platform_row)
+    horizon_months = _duration_horizon_months(sections, platform_row, log_problem=True)
+
+    if platform_level:
+        merged = status_history.merge_durations({key: durations for key, (_, durations) in new_data.items()})
+        shares_by_key = {status_history.PLATFORM_KEY: status_history.status_shares(merged)}
+    else:
+        shares_by_key = {key: status_history.status_shares(durations) for key, (_, durations) in new_data.items()}
+    shares_by_key = {key: shares for key, shares in shares_by_key.items() if shares}
+
+    def display(history_key: str) -> str:
+        return "ensemble de la plateforme" if history_key == status_history.PLATFORM_KEY else names.get(history_key, history_key)
+
+    def percents(shares) -> str:
+        return "défauts %.2f%% | retards %.2f%% | normaux %.2f%%" % (shares[2] * 100, shares[1] * 100, shares[0] * 100)
+
+    path = status_history.state_path(platform)
+    days, names = status_history.load_history(path)
+    names_by_key = {status_history.PLATFORM_KEY if key is None else key: name for key, (name, _) in new_data.items()}
+    status_history.record_day(days, names, today, shares_by_key, names_by_key, today, horizon_months)
+    status_history.save_history(path, days, names)
+    for history_key, shares in shares_by_key.items():
+        logger.info("[%s] %s - parts du jour %s enregistrées dans %s : %s", platform, display(history_key), today, path.name, percents(shares))
+    if not shares_by_key:
+        logger.info("[%s] aucun prêt en cours le %s : rien d'enregistré pour ce jour dans %s.", platform, today, path.name)
+
+    own_window = status_history.window_months(today, horizon_months)
+    history_keys = {status_history.PLATFORM_KEY if key is None else key for kind, key, _ in desired if kind == "status"}
+    averages = {
+        (history_key, month): status_history.monthly_average(days, history_key, *month)
+        for history_key in history_keys for month in own_window
+    }
+    for (history_key, month), average in sorted(averages.items(), key=lambda item: (display(item[0][0]), item[0][1])):
+        if average is None:
+            continue
+        samples = status_history.monthly_samples(days, history_key, *month)
+        logger.info(
+            "[%s] %s - moyenne de %s sur %s jour(s) : %s. Jours utilisés : %s",
+            platform, display(history_key), status_history.month_label(*month), len(samples), percents(average),
+            "; ".join(f"{day} ({percents(shares)})" for day, shares in samples),
+        )
+    needed = {month for (_, month), average in averages.items() if average is not None}
+
+    in_any_window = set(own_window)
+    for _, _, section_months in sections:
+        in_any_window.update(status_history.window_months(
+            today, section_months or status_history.DEFAULT_HORIZON_MONTHS,
+        ))
+    existing_months = _duration_month_columns(grid, sections)
+    final_months = sorted({month for month in existing_months if month in in_any_window} | needed, reverse=True)
+
+    requests = []
+    grid_columns = worksheet.col_count
+    for index in range(len(existing_months) - 1, -1, -1):
+        if existing_months[index] not in final_months:
+            col = _DURATION_FIRST_MONTH_COL + index
+            logger.info("Suppression de la colonne %s de '%s' (mois hors de l'horizon de tous les secteurs).", _col_letter(col + 1), DURATION_SHEET_NAME)
+            requests.append({"deleteDimension": {"range": {
+                "sheetId": worksheet.id, "dimension": "COLUMNS", "startIndex": col, "endIndex": col + 1,
+            }}})
+            grid_columns -= 1
+    kept_months = set(existing_months) & set(final_months)
+    for index, month in enumerate(final_months):
+        if month not in kept_months:
+            col = _DURATION_FIRST_MONTH_COL + index
+            logger.info("Création de la colonne %s ('%s') dans '%s'.", _col_letter(col + 1), status_history.month_label(*month), DURATION_SHEET_NAME)
+            requests.append({"insertDimension": {
+                "range": {"sheetId": worksheet.id, "dimension": "COLUMNS", "startIndex": col, "endIndex": col + 1},
+                "inheritFromBefore": col >= grid_columns,  # Google exige l'héritage pour une insertion après la dernière colonne
+            }})
+            grid_columns += 1
+
+    end_column = _DURATION_FIRST_MONTH_COL + len(final_months)
+    row_shift = len(desired) - (end_row - platform_row - 1)  # décalage des lignes situées sous le bloc
+    for row_idx, text, _ in sections:
+        final_row = row_idx + row_shift if row_idx > platform_row else row_idx
+        if own_section and row_idx == own_section[0] and not text:
+            logger.info("Horizon absent de '%s'!B%s - '1 an' par défaut écrit.", DURATION_SHEET_NAME, row_idx)
+            requests.append({"updateCells": {
+                "range": row_range(final_row, final_row, 1, 2),
+                "rows": [{"values": [{"userEnteredValue": {"stringValue": "1 an"}}]}],
+                "fields": "userEnteredValue",
+            }})
+        if final_months:
+            header_cells = [
+                {"userEnteredValue": {"stringValue": status_history.month_label(*month)}, "userEnteredFormat": _DURATION_HEADER_FORMAT}
+                for month in final_months
+            ]
+            requests.append({"updateCells": {
+                "range": row_range(final_row, final_row, _DURATION_FIRST_MONTH_COL, end_column),
+                "rows": [{"values": header_cells}],
+                "fields": "userEnteredValue,userEnteredFormat(horizontalAlignment,textFormat)",
+            }})
+
+    status_index = {label: index for index, label in enumerate(_DURATION_STATUS_LABELS)}
+    rows = []
+    for kind, key, label in desired:
+        if kind != "status":
+            rows.append({"values": [{}] * len(final_months)})
+            continue
+        history_key = status_history.PLATFORM_KEY if key is None else key
+        cells = []
+        for month in final_months:
+            average = averages.get((history_key, month))
+            cell_value = {"userEnteredFormat": _DURATION_PERCENT_FORMAT}
+            if average is not None:
+                cell_value["userEnteredValue"] = {"numberValue": round(average[status_index[label]], 6)}
+            cells.append(cell_value)
+        rows.append({"values": cells})
+    if rows and final_months:
+        requests.append({"updateCells": {
+            "range": row_range(platform_row + 1, platform_row + len(desired), _DURATION_FIRST_MONTH_COL, end_column),
+            "rows": rows,
+            "fields": "userEnteredValue,userEnteredFormat(numberFormat)",
+        }})
+    return requests
+
+
+def fill_remaining_duration_amounts(platform: str, durations_by_originator: dict, platform_level: bool = False):
     """Synchronise le bloc de la plateforme `platform` (ligne dont la
     colonne A vaut exactement son nom) dans l'onglet "durée" :
 
     - une ligne par société de prêt (nom en colonne A, montant vide), créée
-      si absente et supprimée si elle n'est plus dans les données ;
-    - sous chacune, une ligne de durée restante ("32 mois 29 jours", "5
+      si absente et supprimée seulement quand elle n'a plus de prêt ET plus aucune donnée
+      dans l'historique de l'horizon (une société sans prêt en cours garde sa ligne et ses lignes de statut) ;
+    - sous chacune, trois lignes "défauts", "retards", "normaux" (dans cet ordre) portant, à
+      partir de la colonne C, la moyenne mensuelle (un mois par colonne, le mois
+      courant à gauche, sur l'horizon du secteur de la plateforme lu en colonne B de la ligne du
+      secteur, voir shared.duration_status_history) de la part de chaque statut dans
+      l'encours de la société ;
+    - sous chacune de ces trois lignes, ses lignes de durée restante ("32 mois 29 jours", "5
       jours"...) par durée (triées par durée croissante, créée/supprimée de
       la même façon) avec le montant correspondant dans la colonne B (juste
       à droite).
@@ -1175,6 +1370,9 @@ def fill_remaining_duration_amounts(platform: str, durations_by_originator: dict
     (mois, jours, "default") = prêt en défaut, libellé "2 mois 5 jours de défaut". Les lignes déjà présentes et
     toujours valides sont conservées (leur ordre aussi), seules les lignes
     manquantes/périmées (y compris les lignes à nom vide) sont insérées/supprimées.
+    `platform_level` : plateforme sans société de prêt (projets, compte unique...) ; il n'y a alors pas de
+    ligne de société : les trois lignes de statut (avec leurs durées, toutes sociétés/projets confondus)
+    sont posées directement sous la ligne de la plateforme, avec la part calculée sur tout son encours.
         Le bloc s'arrête à la prochaine plateforme/section ou à la fin de la feuille.
     """
     worksheet = get_worksheet_by_name(DURATION_SHEET_NAME)
@@ -1190,6 +1388,9 @@ def fill_remaining_duration_amounts(platform: str, durations_by_originator: dict
     if platform_row is None:
         logger.warning("Plateforme '%s' non trouvée dans l'onglet '%s' - rien écrit.", platform, DURATION_SHEET_NAME)
         return
+
+    total_cell = _call_with_retry(worksheet.get, f"B{platform_row}", value_render_option="FORMULA")
+    has_total_formula = bool(total_cell and total_cell[0] and f"INDEX('{DURATION_SHEET_NAME}'!B:B" in str(total_cell[0][0]))
 
     boundaries = {label.casefold() for label in GEO_SECTION_BOUNDARY_LABELS} | {"crowdlending"}
     boundaries.discard(platform.casefold())
@@ -1209,13 +1410,33 @@ def fill_remaining_duration_amounts(platform: str, durations_by_originator: dict
     for row_idx in range(platform_row + 1, end_row):
         label = cell(row_idx)
         term = _parse_duration_label(label)
-        if term is not None:
+        if label.casefold() in _DURATION_STATUS_LABELS:
+            existing.append(("status", current_originator, label.casefold(), label))
+        elif term is not None:
             existing.append(("dur", current_originator, _duration_label(term), label))
         else:
             current_originator = originator_key(label)
             existing.append(("orig", current_originator, current_originator, label))
 
-    new_data = {originator_key(name): (name.strip(), durations) for name, durations in durations_by_originator.items() if durations}
+    if platform_level:
+        # Plateforme sans société de prêt : un seul bloc (clé None) regroupant toutes les durées, sans ligne de société.
+        merged = {}
+        for durations in durations_by_originator.values():
+            for term, amount in durations.items():
+                merged[term] = round(merged.get(term, 0.0) + float(amount), 2)
+        new_data = {None: (platform, merged)}
+    else:
+        # Une société sans prêt en cours garde sa ligne (et ses lignes de statut) tant que l'historique
+        # de l'horizon contient des données pour elle.
+        horizon_months = _duration_horizon_months(_duration_sections(grid), platform_row)
+        tracked = status_history.tracked_originators(status_history.state_path(platform), get_report_date(), horizon_months)
+        new_data = {}
+        for name, durations in durations_by_originator.items():
+            key = originator_key(name)
+            if durations or key in tracked:
+                new_data[key] = (name.strip(), durations or {})
+        for key, name in tracked.items():
+            new_data.setdefault(key, (name, {}))
     amounts_by_label = {
         (key, _duration_label(term)): amount
         for key, (_, durations) in new_data.items()
@@ -1238,12 +1459,19 @@ def fill_remaining_duration_amounts(platform: str, durations_by_originator: dict
     desired_texts = {}
     for key in ordered_keys:
         name, durations = new_data[key]
-        desired.append(("orig", key, key))
-        desired_texts[("orig", key, key)] = name
-        for term in sorted(durations, key=_duration_sort_key):
-            label = _duration_label(term)
-            desired.append(("dur", key, label))
-            desired_texts[("dur", key, label)] = label
+        if not platform_level:
+            desired.append(("orig", key, key))
+            desired_texts[("orig", key, key)] = name
+        # Pour chaque statut (défauts, retards, normaux) : sa ligne de part (%) puis ses lignes de durée.
+        for status_label in _DURATION_STATUS_DISPLAY_ORDER:
+            desired.append(("status", key, status_label))
+            desired_texts[("status", key, status_label)] = status_label
+            for term in sorted(durations, key=_duration_sort_key):
+                if _DURATION_STATUS_BY_CLASS[status_history.classify_term(term)] != status_label:
+                    continue
+                label = _duration_label(term)
+                desired.append(("dur", key, label))
+                desired_texts[("dur", key, label)] = label
     desired_keys = set(desired)
 
     # 1) Suppression (de bas en haut, par plages contiguës) des lignes périmées.
@@ -1334,16 +1562,31 @@ def fill_remaining_duration_amounts(platform: str, durations_by_originator: dict
 
     amount_rows = []
     for kind, key, label in desired:
-        if kind == "orig":
-            amount_rows.append({"values": [{}]})
-        else:
+        if kind == "dur":
             amount_rows.append({"values": [{"userEnteredValue": {"numberValue": float(amounts_by_label[(key, label)])}}]})
+        else:
+            amount_rows.append({"values": [{}]})
     if amount_rows:
         requests.append({"updateCells": {
             "range": row_range(platform_row + 1, platform_row + len(desired), 1, 2),
             "rows": amount_rows,
             "fields": "userEnteredValue",
         }})
+
+    # La cellule B de la ligne plateforme porte la somme du bloc (=SUM(B<1re ligne>:INDEX(B:B;ROW(<ligne suivante>)-1))) :
+    # supprimer la 1re ligne du bloc (ordre changé) la casse en #REF!, on la réécrit donc avec les lignes finales.
+    if desired and has_total_formula:
+        requests.append({"updateCells": {
+            "range": row_range(platform_row, platform_row, 1, 2),
+            "rows": [{"values": [{"userEnteredValue": {"formulaValue": (
+                f"=SUM(B{platform_row + 1}:INDEX('{DURATION_SHEET_NAME}'!B:B;ROW(B{platform_row + len(desired) + 1})-1))"
+            )}}]}],
+            "fields": "userEnteredValue",
+        }})
+
+    requests.extend(_duration_status_requests(
+        worksheet, grid, platform, platform_row, end_row, desired, new_data, platform_level, row_range,
+    ))
 
     if requests:
         _call_with_retry(worksheet.client.batch_update, worksheet.spreadsheet_id, {"requests": requests})
