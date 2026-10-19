@@ -1126,8 +1126,8 @@ def fill_remaining_duration_amounts(platform: str, durations_by_originator: dict
     (mois, jours) = prêt en retard, libellé "2 mois 5 jours de retard" ; un terme
     (mois, jours, "default") = prêt en défaut, libellé "2 mois 5 jours de défaut". Les lignes déjà présentes et
     toujours valides sont conservées (leur ordre aussi), seules les lignes
-    manquantes/périmées sont insérées/supprimées. Le bloc s'arrête à la
-    prochaine plateforme/section ou à la première cellule vide en colonne A.
+    manquantes/périmées (y compris les lignes à nom vide) sont insérées/supprimées.
+        Le bloc s'arrête à la prochaine plateforme/section ou à la fin de la feuille.
     """
     worksheet = get_worksheet_by_name(DURATION_SHEET_NAME)
     grid = _call_with_retry(worksheet.get_all_values)
@@ -1145,8 +1145,11 @@ def fill_remaining_duration_amounts(platform: str, durations_by_originator: dict
 
     boundaries = {label.casefold() for label in GEO_SECTION_BOUNDARY_LABELS} | {"crowdlending"}
     boundaries.discard(platform.casefold())
+    # Le bloc va jusqu'à la prochaine plateforme/section (ou la fin de la feuille), SANS s'arrêter aux
+    # cellules vides : des lignes orphelines (nom vide, durées d'anciens runs) y traînaient sinon
+    # indéfiniment, hors du bloc, et n'étaient jamais supprimées (montants en double).
     end_row = platform_row + 1
-    while end_row <= len(grid) and cell(end_row) and cell(end_row).casefold() not in boundaries:
+    while end_row <= len(grid) and cell(end_row).casefold() not in boundaries:
         end_row += 1
 
     def originator_key(name: str) -> str:
