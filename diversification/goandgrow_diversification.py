@@ -698,7 +698,7 @@ def run() -> None:
         # "durée" tab is a secondary view, its failure must not fail the run.
         try:
             durations = {PLATFORM_LABEL: {(0, 0): round(balance, 2)}} if round(balance, 2) > 0 else {}
-            fill_remaining_duration_amounts(PLATFORM_LABEL, durations)
+            fill_remaining_duration_amounts(PLATFORM_LABEL, durations, platform_level=True)
         except Exception:
             log.exception("Failed to update the 'durée' sheet for Go & Grow.")
 
