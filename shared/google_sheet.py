@@ -1210,9 +1210,29 @@ def fill_remaining_duration_amounts(platform: str, durations_by_originator: dict
             deleted_ranges[-1][0] = row_idx
         else:
             deleted_ranges.append([row_idx, row_idx])
+    # Toutes les modifications sont regroupées dans UN SEUL appel batchUpdate (exécuté séquentiellement,
+    # de façon atomique) : un appel par suppression/insertion épuisait le quota "Write requests per minute".
+    requests = []
+
+    def row_range(first_row: int, last_row: int, first_col: int = 0, last_col: int = None) -> dict:
+        grid_range = {
+            "sheetId": worksheet.id,
+            "startRowIndex": first_row - 1,
+            "endRowIndex": last_row,
+            "startColumnIndex": first_col,
+        }
+        if last_col is not None:
+            grid_range["endColumnIndex"] = last_col
+        return grid_range
+
+    def delete_rows_request(first_row: int, last_row: int) -> dict:
+        return {"deleteDimension": {"range": {
+            "sheetId": worksheet.id, "dimension": "ROWS", "startIndex": first_row - 1, "endIndex": last_row,
+        }}}
+
     for start, stop in deleted_ranges:
         logger.info("Suppression des lignes périmées %s-%s de '%s' (plateforme '%s').", start, stop, DURATION_SHEET_NAME, platform)
-        _call_with_retry(worksheet.delete_rows, start, stop)
+        requests.append(delete_rows_request(start, stop))
     kept = [(kind, key, label) for kind, key, label, _ in existing if (kind, key, label) in desired_keys]
 
     # 2) Insertion des lignes manquantes, par plages contiguës.
@@ -1223,12 +1243,17 @@ def fill_remaining_duration_amounts(platform: str, durations_by_originator: dict
     def flush(first_index: int):
         if not pending:
             return
-        rows = []
-        for item in pending:
-            rows.append([desired_texts[item], ""])
         insert_at = platform_row + 1 + first_index
-        logger.info("Insertion de %s ligne(s) à la ligne %s de '%s' (plateforme '%s').", len(rows), insert_at, DURATION_SHEET_NAME, platform)
-        _call_with_retry(worksheet.insert_rows, rows, insert_at, value_input_option="USER_ENTERED")
+        logger.info("Insertion de %s ligne(s) à la ligne %s de '%s' (plateforme '%s').", len(pending), insert_at, DURATION_SHEET_NAME, platform)
+        requests.append({"insertDimension": {
+            "range": {"sheetId": worksheet.id, "dimension": "ROWS", "startIndex": insert_at - 1, "endIndex": insert_at - 1 + len(pending)},
+            "inheritFromBefore": False,
+        }})
+        requests.append({"updateCells": {
+            "range": row_range(insert_at, insert_at + len(pending) - 1, 0, 1),
+            "rows": [{"values": [{"userEnteredValue": {"stringValue": desired_texts[item]}}]} for item in pending],
+            "fields": "userEnteredValue",
+        }})
         for offset, item in enumerate(pending):
             inserted_rows[insert_at + offset] = item[0]
         pending.clear()
@@ -1248,26 +1273,32 @@ def fill_remaining_duration_amounts(platform: str, durations_by_originator: dict
     leftover = len(kept) - pointer
     if leftover:
         first_leftover = platform_row + 1 + len(desired)
-        _call_with_retry(worksheet.delete_rows, first_leftover, first_leftover + leftover - 1)
+        requests.append(delete_rows_request(first_leftover, first_leftover + leftover - 1))
 
     # 3) Mise en forme des nouvelles lignes + écriture des montants.
-    formats = []
     for row_idx, kind in inserted_rows.items():
-        formats.append({"range": rowcol_to_a1(row_idx, 1), "format": _DURATION_ORIGINATOR_FORMAT if kind == "orig" else _DURATION_ROW_FORMAT})
-        formats.append({"range": rowcol_to_a1(row_idx, 2), "format": _DURATION_AMOUNT_FORMAT})
-    if formats:
-        _call_with_retry(worksheet.batch_format, formats)
+        for col, cell_format in ((0, _DURATION_ORIGINATOR_FORMAT if kind == "orig" else _DURATION_ROW_FORMAT), (1, _DURATION_AMOUNT_FORMAT)):
+            requests.append({"repeatCell": {
+                "range": row_range(row_idx, row_idx, col, col + 1),
+                "cell": {"userEnteredFormat": cell_format},
+                "fields": "userEnteredFormat(%s)" % ",".join(cell_format.keys()),
+            }})
 
-    updates = []
-    for i, (kind, key, label) in enumerate(desired):
-        row_idx = platform_row + 1 + i
+    amount_rows = []
+    for kind, key, label in desired:
         if kind == "orig":
-            value = ""
+            amount_rows.append({"values": [{}]})
         else:
-            value = amounts_by_label[(key, label)]
-        updates.append({"range": rowcol_to_a1(row_idx, 2), "values": [[value]]})
-    if updates:
-        _call_with_retry(worksheet.batch_update, updates, value_input_option="USER_ENTERED")
+            amount_rows.append({"values": [{"userEnteredValue": {"numberValue": float(amounts_by_label[(key, label)])}}]})
+    if amount_rows:
+        requests.append({"updateCells": {
+            "range": row_range(platform_row + 1, platform_row + len(desired), 1, 2),
+            "rows": amount_rows,
+            "fields": "userEnteredValue",
+        }})
+
+    if requests:
+        _call_with_retry(worksheet.client.batch_update, worksheet.spreadsheet_id, {"requests": requests})
 
     logger.info(
         "Mise à jour de '%s' terminée pour %s : %s société(s) de prêt, %s ligne(s) de durée.",
