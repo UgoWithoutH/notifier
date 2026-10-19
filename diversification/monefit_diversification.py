@@ -887,7 +887,7 @@ def run() -> None:
         # Own try/except: the "durée" tab is a secondary view, its failure
         # must not fail the whole run.
         try:
-            fill_remaining_duration_amounts("Monefit", fetch_remaining_durations(session, today_date))
+            fill_remaining_duration_amounts("Monefit", fetch_remaining_durations(session, today_date), platform_level=True)
         except Exception:
             log.exception("Failed to update the 'durée' sheet for Monefit.")
 
