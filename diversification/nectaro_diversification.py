@@ -368,9 +368,11 @@ def fetch_current_loans(session: requests.Session, headers: dict) -> list:
     """Current loans from /api/investment/portfolio (exact `maturityDate`
     per loan, verified live 2026-10-16). Its `amount` is the ORIGINAL
     amount, not the outstanding one, and its `status` (SETTLED) says
-    nothing about repayment lateness, see fetch_late_shares(). Returns
+    nothing about repayment lateness, see fetch_late_shares(). Only SETTLED
+    loans are returned (FULFILLED ones aren't in Nectaro's outstanding yet). Returns
     [{"originator", "amount", "maturity", "late": [(share, due date)]}]."""
     loans = []
+    seen = 0
     for page in range(1, MAX_STATEMENT_PAGES + 1):
         r = session.post(
             PORTFOLIO_URL,
@@ -384,14 +386,22 @@ def fetch_current_loans(session: requests.Session, headers: dict) -> list:
         r.raise_for_status()
         data = r.json()["data"]
         payload = data.get("payload", [])
+        seen += len(payload)
         for loan in payload:
+            # A FULFILLED loan is funded but not settled yet: Nectaro's own
+            # invested funds/residue groupings don't include it (live
+            # 2026-10-20: a 250 EUR ECOFINANCE loan made the durée tab 91.91
+            # EUR higher than the geographic one), so skip it until SETTLED.
+            if loan.get("status") != "SETTLED":
+                log.info("Skipping loan %s (status %s, not settled yet, not in Nectaro's outstanding).", loan.get("ID"), loan.get("status"))
+                continue
             loans.append({
                 "originator": loan["lendingCompany"],
                 "amount": float(loan["amount"]),
                 "maturity": date.fromisoformat(loan["maturityDate"]),
                 "late": fetch_late_shares(session, headers, loan["ISIN"]),
             })
-        if not payload or len(loans) >= data.get("meta", {}).get("total", 0):
+        if not payload or seen >= data.get("meta", {}).get("total", 0):
             break
     return loans
 
