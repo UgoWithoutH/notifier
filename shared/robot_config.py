@@ -74,6 +74,26 @@ def _norm(text) -> str:
     return re.sub(r"\s+", " ", ascii_text).strip().casefold()
 
 
+def match_name(raw_name, names, partial: bool = True) -> str | None:
+    """Retourne l'élément de `names` correspondant à `raw_name` : égalité
+    exacte puis (si `partial`) sous-chaîne, insensible à la casse/aux accents.
+    Sert à relier un nom saisi dans la sheet "config robots" au nom réel
+    d'une société/originator sur la plateforme."""
+    value = _norm(raw_name)
+    if not value:
+        return None
+    names = list(names)
+    for name in names:
+        if _norm(name) == value:
+            return name
+    if partial:
+        for name in names:
+            normalized = _norm(name)
+            if normalized and (normalized in value or value in normalized):
+                return name
+    return None
+
+
 def _parse_number(raw):
     """'8,00%' / '10,00 €' / '1 234,5' -> float ; vide/non numérique -> None."""
     cleaned = re.sub(r"[\s\u202f\u00a0€%]", "", str(raw or "")).replace(",", ".")
@@ -148,17 +168,8 @@ class PlatformConfig:
     def find_loan(self, raw_name) -> LoanConfig | None:
         """Retrouve le loan dont le nom correspond à `raw_name` (exact puis
         sous-chaîne, insensible à la casse/aux accents)."""
-        value = _norm(raw_name)
-        if not value:
-            return None
-        for name, loan in self.loans.items():
-            if _norm(name) == value:
-                return loan
-        for name, loan in self.loans.items():
-            normalized = _norm(name)
-            if normalized in value or value in normalized:
-                return loan
-        return None
+        name = match_name(raw_name, self.loans)
+        return self.loans[name] if name is not None else None
 
     def secondary_names(self) -> list:
         return [name for name, loan in self.loans.items() if loan.secondary_active]
