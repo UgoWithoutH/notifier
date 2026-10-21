@@ -15,13 +15,6 @@ SMTP_PASSWORD = os.environ.get("SMTP_PASSWORD")
 EMAIL_FROM = os.environ.get("EMAIL_FROM", SMTP_USER)
 EMAIL_TO = os.environ.get("EMAIL_TO")
 
-# Same unconfirmed candidate field names as
-# monitors/swaper_monitor.py's _ORIGINATOR_FIELD_CANDIDATES - the real
-# field holding the loan originator's name on a raw loan dict from
-# /rest/public/loans has never been confirmed against live data, so the
-# first one present on the loan is used rather than assuming a single name.
-_ORIGINATOR_FIELD_CANDIDATES = ("company", "loanOriginator", "originator", "originatorName", "group")
-
 
 def _fmt_bounds(low, high, unit: str) -> str:
     if low is None and high is None:
@@ -61,33 +54,22 @@ def _robot_config_lines(config) -> list:
     return lines
 
 
-def _format_loan(loan: dict) -> str:
-    """Format a single loan as one line: identifier, originator, available
-    amount, and yield (interest rate)."""
-    number = loan.get("number") or loan.get("id")
+def _send_invest_summary_email(
+    platform: str,
+    invested: list,
+    failures: int = 0,
+    error: str | None = None,
+    robot_config=None,
+    attachment: tuple | None = None,
+) -> None:
+    """Common recap email of the Swaper/Lendermarket/Afranga invest bots
+    (same format on purpose, explicit user request 2026-10-21): what was
+    invested (originator/loan, amount, interest rate), any error/failure,
+    then the "config robot" reminder at the bottom.
 
-    originator = next(
-        (loan[field] for field in _ORIGINATOR_FIELD_CANDIDATES if loan.get(field)),
-        None,
-    )
-    originator_str = f" ({originator})" if originator else ""
-
-    amount = loan.get("amount")
-    try:
-        amount_str = f"{float(amount):.2f} €"
-    except (TypeError, ValueError):
-        amount_str = "montant n/a"
-
-    interest = loan.get("interestRatePerYear")
-    try:
-        interest_str = f"{float(interest):.2f}%"
-    except (TypeError, ValueError):
-        interest_str = "n/a"
-
-    return f"Prêt {number}{originator_str} : {amount_str} | rendement {interest_str}"
-
-
-def send_swaper_email(balance: float, loans: list) -> None:
+    `invested`: list of `{"label": str, "amount": float, "rates": [float]}`.
+    `attachment`: optional `(filename, text)` with the technical detail of a
+    failure, only attached when something went wrong."""
     if not all([SMTP_HOST, SMTP_USER, SMTP_PASSWORD, EMAIL_TO]):
         log.error(
             "SMTP configuration is incomplete; cannot send email. "
@@ -95,362 +77,89 @@ def send_swaper_email(balance: float, loans: list) -> None:
         )
         return
 
-    total_amount = 0.0
-    for loan in loans:
-        try:
-            total_amount += float(loan.get("amount"))
-        except (TypeError, ValueError):
-            pass
+    total = sum(item["amount"] for item in invested)
+    if invested:
+        subject = f"[{platform} Invest Bot] {len(invested)} investissement(s) - {total:.2f} €"
+    else:
+        subject = f"[{platform} Invest Bot] Aucun investissement réussi"
+    if error or failures:
+        subject += " - ERREUR"
 
-    subject = f"[Swaper] {balance:.2f}€ dispo + {len(loans)} prêt(s) manuel(s) disponible(s)"
-    body_parts = [
-        f"Solde non investi : {balance:.2f} €",
-        f"Montant total disponible : {total_amount:.2f} €",
-        "",
-    ]
-    body_parts.extend(_format_loan(loan) for loan in loans)
-    body = "\n".join(body_parts)
+    body_parts = []
+    if error:
+        body_parts += [f"⚠ ERREUR : {error}", ""]
+    if failures:
+        body_parts += [f"⚠ {failures} tentative(s) d'investissement échouée(s).", ""]
+
+    if invested:
+        body_parts.append("=== Investissements ===")
+        for item in invested:
+            rates = ", ".join(f"{rate:.2f}%" for rate in item.get("rates") or [])
+            body_parts.append(f"- {item['label']} : {item['amount']:.2f} € @ {rates or 'n/a'}")
+        body_parts.append(f"Total investi : {total:.2f} €")
+
+    body_parts.extend(_robot_config_lines(robot_config))
+    if attachment:
+        body_parts += ["", "Le détail technique (requêtes/réponses) est joint à cet email."]
 
     msg = MIMEMultipart()
     msg["From"] = EMAIL_FROM
     msg["To"] = EMAIL_TO
     msg["Subject"] = subject
-    msg.attach(MIMEText(body, "plain"))
+    msg.attach(MIMEText("\n".join(body_parts), "plain"))
+    if attachment:
+        filename, text = attachment
+        part = MIMEText(text, "plain", "utf-8")
+        part.add_header("Content-Disposition", "attachment", filename=filename)
+        msg.attach(part)
 
     try:
         with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=15) as server:
             server.starttls()
             server.login(SMTP_USER, SMTP_PASSWORD)
             server.sendmail(EMAIL_FROM, [EMAIL_TO], msg.as_string())
-        log.info("Notification email sent to %s.", EMAIL_TO)
+        log.info("%s invest summary email sent to %s.", platform, EMAIL_TO)
     except Exception:
-        log.exception("Failed to send notification email.")
+        log.exception("Failed to send %s invest summary email.", platform)
 
 
-def send_swaper_investment_summary_email(
-    attempts: list,
-    min_interest_rate: float | None = None,
-    country_threshold_percentage: float | None = None,
-    country_status: dict | None = None,
-    country_blocked: list | None = None,
-    originator_cap_status: dict | None = None,
-    originator_blocked: list | None = None,
-    error: str | None = None,
-    robot_config=None,
-) -> None:
-    """Send a summary of REAL Swaper investments made this run via the
-    manual "+" button (see monitors.swaper_monitor._invest_available_loans()
-    - explicit user decision 2026-07-25 to make this the actual production
-    invest bot: real money, no click-and-abort safety net anymore).
-
-    Sent EVERY time at least one investment was attempted this run (not
-    one-time - real money moves every time, so it should always be
-    visible).
-
-    BODY kept as a short summary (changed 2026-09-19, explicit user
-    request: "je veux que le mail soit plus épuré, un résumé"): one line
-    per attempt (loan/originator/amount/outcome) - no raw request/response
-    detail inline anymore (previously each attempt's `confirm_api_calls`
-    were also dumped into the body, method/url/status/truncated body; that
-    detail moved to the attachment below instead, so the body stays
-    scannable at a glance), plus the existing short interest-rate/
-    per-country/per-originator cap sections.
-
-    ATTACHMENT changed the same day, same request ("la requête envoyée et
-    la réponse pour investir je veux bien ça en pièce jointe... ça
-    remplacera ce qui était envoyé en pièce jointe"): now contains ONLY
-    the real investment calls - each attempt's `confirm_api_calls` (the
-    `GET is-manual-investment-approved` + `POST .../buy` pair fired by
-    clicking the modal's "Confirm" button, see
-    monitors/swaper_monitor.py's `_invest_available_loans()`), one entry
-    per call with method/url/status/headers(redacted)/request body/
-    response body, tagged with which loan/originator/amount it belongs
-    to. This REPLACES the previous attachment, which used to dump every
-    `/rest/` call observed during the whole run (loans-listing/filter
-    calls included, via the now-removed `captured_api_calls` parameter) -
-    that full-run capture is no longer attached here; it still exists
-    separately for `send_swaper_api_structure_email()`'s own diagnostics
-    email (unaffected by this change).
-
-    `min_interest_rate`/`country_threshold_percentage`/`country_status`/
-    `country_blocked` (added 2026-07-31, mirrors
-    `send_lendermarket_invest_summary_email()`'s equivalent sections): the
-    minimum interest rate actually used this run (from
-    `shared.google_sheet.get_swaper_min_interest_rate()`), the configured
-    per-country cap percentage (from `get_swaper_country_allocations()`,
-    None if no threshold cell is set), a per-country
-    `{invested, threshold_amount, blocked}` breakdown, and the list of loan
-    originators excluded this run because their country already hit the
-    cap.
-
-    `originator_cap_status`/`originator_blocked` (added 2026-08-05): the
-    SAME kind of cap, but per loan originator instead of per country - a
-    percentage of the total budget a single loan originator should never
-    exceed, from `shared.google_sheet.get_swaper_originator_caps()`.
-
-    `error` (added 2026-08-01, explicit user request: "si y'a une erreur ou
-    autre il faut arrêter le bot et à la fin du run quoi qu'il arrive
-    envoyer le mail") - when set, this email is sent EVEN IF `attempts` is
-    empty (monitors/swaper_monitor.py's `run()` calls this whenever
-    `attempts or error`), with the error message shown prominently at the
-    top of the body and in the subject, so a failed run is never silent.
-    """
-    if not all([SMTP_HOST, SMTP_USER, SMTP_PASSWORD, EMAIL_TO]):
-        log.error(
-            "SMTP configuration is incomplete; cannot send email. "
-            "Required env vars: SMTP_HOST, SMTP_USER, SMTP_PASSWORD, EMAIL_TO."
-        )
-        return
-
-    subject = f"[Swaper] {len(attempts)} investissement(s) r\u00e9el(s) tent\u00e9(s)"
-    if error:
-        subject += " - ERREUR"
-    body_lines = []
-    if error:
-        body_lines.append(f"\u26a0 ERREUR pendant ce run - le bot s'est arr\u00eat\u00e9 : {error}")
-        body_lines.append("")
-    body_lines += [
-        f"{len(attempts)} investissement(s) r\u00e9el(s) tent\u00e9(s) automatiquement sur Swaper "
-        "(bouton '+' manuel, argent r\u00e9el) :",
-        "",
-    ]
-    for attempt in attempts:
-        label = attempt.get("loan_number") or attempt.get("loan_id")
-        originator = attempt.get("originator")
-        prefix = f"[{originator}] " if originator else ""
-        line = f"- {prefix}Pr\u00eat {label} : {attempt.get('amount'):.2f} \u20ac"
-        if attempt.get("error"):
-            line += " -- ERREUR pendant la requ\u00eate HTTP, voir la pi\u00e8ce jointe"
-        elif attempt.get("not_approved"):
-            line += " -- Swaper indique que l'investissement manuel n'est pas approuv\u00e9 pour ce pr\u00eat, investissement stopp\u00e9"
-        elif attempt.get("confirmed"):
-            line += " -- investissement confirm\u00e9 (requ\u00eate d'achat r\u00e9ussie)"
-        else:
-            line += " -- non confirm\u00e9, voir la pi\u00e8ce jointe"
-        body_lines.append(line)
-    body_lines.append("")
-
-    if min_interest_rate is not None:
-        body_lines.append(f"Taux d'int\u00e9r\u00eat minimum utilis\u00e9 : {min_interest_rate}%")
-
-    if country_status:
-        if country_threshold_percentage is not None:
-            body_lines.append(f"=== Seuil par pays ({country_threshold_percentage}% du budget total) ===")
-        else:
-            body_lines.append("=== Seuil par pays (aucun seuil configur\u00e9) ===")
-        for country, s in sorted(country_status.items()):
-            threshold_amount = s.get("threshold_amount")
-            line = f"- {country} : investi {s.get('invested', 0.0):.2f} \u20ac"
-            if threshold_amount is not None:
-                line += f" / plafond {threshold_amount:.2f} \u20ac"
-            if s.get("blocked"):
-                line += " (BLOQU\u00c9)"
-            body_lines.append(line)
-        body_lines.append("")
-
-    if country_blocked:
-        body_lines.append(
-            "Loan originators bloqu\u00e9s ce run (seuil d'investissement par pays atteint) : "
-            + ", ".join(country_blocked)
-        )
-        body_lines.append("")
-    if originator_cap_status:
-        body_lines.append("=== Plafond par loan originator (% du budget total) ===")
-        for name, s in sorted(originator_cap_status.items()):
-            threshold_amount = s.get("threshold_amount")
-            line = f"- {name} : investi {s.get('invested', 0.0):.2f} \u20ac / plafond {s.get('max_percentage', 0.0):.2f}%"
-            if threshold_amount is not None:
-                line += f" ({threshold_amount:.2f} \u20ac)"
-            if s.get("blocked"):
-                line += " (BLOQU\u00c9)"
-            body_lines.append(line)
-        body_lines.append("")
-
-    if originator_blocked:
-        body_lines.append(
-            "Loan originators bloqués ce run (plafond par loan originator atteint) : "
-            + ", ".join(originator_blocked)
-        )
-        body_lines.append("")
-    body_lines.extend(_robot_config_lines(robot_config))
-    body_lines.append("")
-    body_lines.append(
-        "La pi\u00e8ce jointe contient la requ\u00eate d'investissement r\u00e9elle envoy\u00e9e \u00e0 Swaper "
-        "et sa r\u00e9ponse pour chaque pr\u00eat (v\u00e9rification d'approbation + achat) - m\u00e9thode/URL/"
-        "en-t\u00eates (valeurs sensibles redacted)/corps/statut."
-    )
-    body = "\n".join(body_lines)
-
-    msg = MIMEMultipart()
-    msg["From"] = EMAIL_FROM
-    msg["To"] = EMAIL_TO
-    msg["Subject"] = subject
-    msg.attach(MIMEText(body, "plain"))
-
-    # Attachment now holds ONLY the real investment request/response pairs
-    # (each attempt's own `confirm_api_calls`), not every `/rest/` call
-    # observed during the whole run - see this function's docstring for
-    # what this replaces.
+def send_swaper_investment_summary_email(attempts: list, error: str | None = None, robot_config=None) -> None:
+    """Swaper recap, built from the attempts of monitors/swaper_invest_bot.py
+    (`_invest_available_loans()`): only confirmed attempts count as
+    investments, the others as failures. The attachment (the real
+    investment requests/responses) is only joined when something failed."""
+    invested = {}
+    failures = 0
     investment_calls = []
     for attempt in attempts:
-        label = attempt.get("loan_number") or attempt.get("loan_id")
+        if attempt.get("confirmed") and not attempt.get("error") and not attempt.get("not_approved"):
+            name = attempt.get("originator") or f"Prêt {attempt.get('loan_number') or attempt.get('loan_id')}"
+            entry = invested.setdefault(name, {"label": name, "amount": 0.0, "rates": []})
+            entry["amount"] += attempt.get("amount") or 0.0
+            try:
+                entry["rates"].append(float(attempt.get("rate")))
+            except (TypeError, ValueError):
+                pass
+        else:
+            failures += 1
         for call in attempt.get("confirm_api_calls") or []:
             investment_calls.append({
-                "loan_number": label,
-                "loan_id": attempt.get("loan_id"),
+                "loan_number": attempt.get("loan_number") or attempt.get("loan_id"),
                 "originator": attempt.get("originator"),
                 "amount": attempt.get("amount"),
                 **call,
             })
-    attachment_text = json.dumps(investment_calls, indent=2, ensure_ascii=False, default=str)
-    attachment = MIMEText(attachment_text, "plain", "utf-8")
-    attachment.add_header(
-        "Content-Disposition", "attachment", filename="swaper_investment_requests.json"
-    )
-    msg.attach(attachment)
 
-    try:
-        with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=15) as server:
-            server.starttls()
-            server.login(SMTP_USER, SMTP_PASSWORD)
-            server.sendmail(EMAIL_FROM, [EMAIL_TO], msg.as_string())
-        log.info("Swaper investment summary email sent to %s.", EMAIL_TO)
-    except Exception:
-        log.exception("Failed to send Swaper investment summary email.")
-
-
-def send_swaper_api_structure_email(captured_api_calls: list) -> None:
-    """One-time-ever diagnostics email (added 2026-07-26, explicit user
-    request: "j'ai pas besoin d'attendre d'avoir des sous sur mon compte
-    pour te donner tout ce dont tu auras besoin") - sends the loans-
-    listing/per-originator-filter `/rest/` API call structure captured by
-    monitors/swaper_monitor.py's `_record_api_response()` EVEN WHEN the
-    account balance is below MIN_INVESTMENT_AMOUNT and no real investment
-    was attempted this run, so the pure-HTTP-migration groundwork doesn't
-    have to wait for money to be on the account. Same redaction rules as
-    `send_swaper_investment_summary_email()` (see `_redact_sensitive_
-    headers()`): header NAMES are kept, sensitive values (cookies/auth/csrf)
-    are not. Does NOT include the real invest-call structure - that one
-    genuinely requires a real investment to happen (real money moving) to
-    ever be observed, per the 2026-07-25 decision to drop click-and-abort
-    captures; once that happens, `send_swaper_investment_summary_email()`
-    takes over (see monitors/swaper_monitor.py's DEFAULT_STATE comment -
-    this email is only ever sent once, and skipped entirely if a real
-    investment summary email has already been sent instead).
-    """
-    if not all([SMTP_HOST, SMTP_USER, SMTP_PASSWORD, EMAIL_TO]):
-        log.error(
-            "SMTP configuration is incomplete; cannot send email. "
-            "Required env vars: SMTP_HOST, SMTP_USER, SMTP_PASSWORD, EMAIL_TO."
+    attachment = None
+    if (failures or error) and investment_calls:
+        attachment = (
+            "swaper_investment_requests.json",
+            json.dumps(investment_calls, indent=2, ensure_ascii=False, default=str),
         )
-        return
-
-    subject = "[Swaper] Structure des appels API (listing/filtre pr\u00eats) - aucun argent engag\u00e9"
-    body = (
-        "Aucun investissement r\u00e9el n'a encore \u00e9t\u00e9 tent\u00e9 (solde probablement < "
-        "10 \u20ac, ou aucun pr\u00eat disponible pour l'instant) - voici quand m\u00eame, sans "
-        "attendre, la structure des appels API observ\u00e9s pour lister/filtrer les pr\u00eats "
-        "par lender (m\u00e9thode/URL/toutes les en-t\u00eates - valeurs sensibles redacted - "
-        "corps/statut), en pi\u00e8ce jointe JSON.\n\n"
-        "La structure de l'appel d'investissement r\u00e9el (clic sur le '+') n'y est pas "
-        "encore - elle ne peut \u00eatre observ\u00e9e que lors d'un vrai investissement (argent "
-        "r\u00e9el). Un mail de r\u00e9sum\u00e9 d'investissement plus complet sera envoy\u00e9 "
-        "automatiquement d\u00e8s que \u00e7a arrivera, et remplacera celui-ci.\n\n"
-        "Objectif : accumuler de quoi tenter, plus tard, de reproduire ces appels en pur "
-        "HTTP (sans navigateur) - la connexion/2FA reste elle bas\u00e9e sur le navigateur "
-        "(voir monitors/swaper_monitor.py) et n'est jamais captur\u00e9e ici."
+    _send_invest_summary_email(
+        "Swaper", list(invested.values()), failures=failures, error=error,
+        robot_config=robot_config, attachment=attachment,
     )
-
-    msg = MIMEMultipart()
-    msg["From"] = EMAIL_FROM
-    msg["To"] = EMAIL_TO
-    msg["Subject"] = subject
-    msg.attach(MIMEText(body, "plain"))
-
-    attachment_text = json.dumps(captured_api_calls, indent=2, ensure_ascii=False, default=str)
-    attachment = MIMEText(attachment_text, "plain", "utf-8")
-    attachment.add_header(
-        "Content-Disposition", "attachment", filename="swaper_api_structure.json"
-    )
-    msg.attach(attachment)
-
-    try:
-        with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=15) as server:
-            server.starttls()
-            server.login(SMTP_USER, SMTP_PASSWORD)
-            server.sendmail(EMAIL_FROM, [EMAIL_TO], msg.as_string())
-        log.info("Swaper API-structure diagnostics email sent to %s.", EMAIL_TO)
-    except Exception:
-        log.exception("Failed to send Swaper API-structure diagnostics email.")
-
-
-def _format_lendermarket_lender(lender_stats: dict) -> str:
-    """Format one lender's aggregate: loan count, total investable amount,
-    and yield (min-max interest rate range) - no extra fields and no URL."""
-    lender = lender_stats["lender"]
-    count = lender_stats["count"]
-    total_amount = lender_stats["total_amount"]
-    min_rate = lender_stats["min_rate"]
-    max_rate = lender_stats["max_rate"]
-
-    if min_rate is None:
-        rate_str = "n/a"
-    elif min_rate == max_rate:
-        rate_str = f"{min_rate:.2f}%"
-    else:
-        rate_str = f"{min_rate:.2f}%–{max_rate:.2f}%"
-
-    return f"{lender} : {count} prêt(s), montant total {total_amount:.2f} € | rendement {rate_str}"
-
-
-def send_lendermarket_email(balance: float | None, segments: dict) -> None:
-    """Notify about newly available Lendermarket loans.
-
-    `segments` maps a segment key to {"label", "lenders"}, where "lenders"
-    is the per-lender aggregate list built by
-    lendermarket_monitor.aggregate_by_lender() (loan count, total
-    investable amount, min/max interest rate) for every loan currently
-    active in that segment - not just the new one(s) that triggered the
-    notification.
-    """
-    if not all([SMTP_HOST, SMTP_USER, SMTP_PASSWORD, EMAIL_TO]):
-        log.error(
-            "SMTP configuration is incomplete; cannot send email. "
-            "Required env vars: SMTP_HOST, SMTP_USER, SMTP_PASSWORD, EMAIL_TO."
-        )
-        return
-
-    total_loans = sum(sum(l["count"] for l in s["lenders"]) for s in segments.values())
-    labels = ", ".join(s["label"] for s in segments.values())
-    subject = f"[Lendermarket] {total_loans} prêt(s) disponible(s) ({labels})"
-
-    body_parts = []
-    balance_str = f"{balance:.2f} €" if balance is not None else "indisponible"
-    body_parts.append(f"Solde disponible : {balance_str}")
-    body_parts.append("")
-
-    for segment in segments.values():
-        segment_count = sum(l["count"] for l in segment["lenders"])
-        body_parts.append(f"{segment['label']} ({segment_count} prêt(s))")
-        body_parts.extend(f"  - {_format_lendermarket_lender(lender)}" for lender in segment["lenders"])
-        body_parts.append("")
-    body = "\n".join(body_parts)
-
-    msg = MIMEMultipart()
-    msg["From"] = EMAIL_FROM
-    msg["To"] = EMAIL_TO
-    msg["Subject"] = subject
-    msg.attach(MIMEText(body, "plain"))
-
-    try:
-        with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=15) as server:
-            server.starttls()
-            server.login(SMTP_USER, SMTP_PASSWORD)
-            server.sendmail(EMAIL_FROM, [EMAIL_TO], msg.as_string())
-        log.info("Lendermarket notification email sent to %s.", EMAIL_TO)
-    except Exception:
-        log.exception("Failed to send Lendermarket notification email.")
-
 
 
 def send_lendermarket_invest_summary_email(stats: dict, error: str | None = None, diagnostics_text: str | None = None, robot_config=None) -> None:
@@ -491,172 +200,50 @@ def send_lendermarket_invest_summary_email(stats: dict, error: str | None = None
     (including every failed attempt's real request/response) is directly
     available by email.
     """
-    if not all([SMTP_HOST, SMTP_USER, SMTP_PASSWORD, EMAIL_TO]):
-        log.error(
-            "SMTP configuration is incomplete; cannot send email. "
-            "Required env vars: SMTP_HOST, SMTP_USER, SMTP_PASSWORD, EMAIL_TO."
-        )
-        return
+    invested = []
+    for name, s in sorted((stats.get("lender_stats") or {}).items()):
+        if s.get("successes", 0) <= 0:
+            continue
+        country = s.get("country")
+        rates = [
+            lo.get("interestRate")
+            for lo in (s.get("invested_loans") or [])
+            if lo.get("interestRate") is not None
+        ]
+        invested.append({
+            "label": f"{name} ({country})" if country else name,
+            "amount": s.get("invested_amount", 0.0),
+            "rates": rates,
+        })
 
-    status = "ÉCHEC" if error else "OK"
-    subject = f"[Lendermarket Invest Bot] {status} - {stats.get('invest_successes', 0)} investissement(s) réussi(s)"
-
-    balance_before = stats.get("balance_before")
-    balance_after = stats.get("balance_after")
-    body_parts = [f"Statut : {status}" + (f" ({error})" if error else "")]
-    if balance_before is not None:
-        body_parts.append(f"Solde avant : {balance_before:.2f} €")
-    if balance_after is not None:
-        body_parts.append(f"Solde après : {balance_after:.2f} €")
-    body_parts += [
-        f"Tentatives d'investissement : {stats.get('invest_attempts', 0)}",
-        f"  - réussies : {stats.get('invest_successes', 0)}",
-        f"  - échouées : {stats.get('invest_failures', 0)}",
-        f"Montant total investi : {stats.get('total_invested', 0.0):.2f} €",
-    ]
-
-    min_interest_rate = stats.get("min_interest_rate")
-    if min_interest_rate is not None:
-        body_parts.append(f"Taux d'intérêt minimum utilisé : {min_interest_rate}%")
-
-    lender_stats = stats.get("lender_stats") or {}
-    invested_lenders = {
-        name: s for name, s in lender_stats.items() if s.get("successes", 0) > 0
-    }
-    body_parts.append("")
-    body_parts.append("=== Investissements (taux et lender) ===")
-    if invested_lenders:
-        for name, s in sorted(invested_lenders.items()):
-            country = s.get("country")
-            label = f"{name} ({country})" if country else name
-            rates = [
-                lo.get("interestRate")
-                for lo in (s.get("invested_loans") or [])
-                if lo.get("interestRate") is not None
-            ]
-            rate_str = ", ".join(f"{rate:.2f}%" for rate in rates) if rates else "n/a"
-            body_parts.append(
-                f"- {label} : {s.get('invested_amount', 0.0):.2f} € @ {rate_str}"
-            )
-    else:
-        body_parts.append("Aucun investissement réussi ce run.")
-
-    country_blocked = stats.get("country_blocked") or []
-    if country_blocked:
-        body_parts.append("")
-        body_parts.append(
-            "Lenders bloqués ce run (seuil d'investissement par pays atteint) : "
-            + ", ".join(country_blocked)
-        )
-
-    originator_blocked = stats.get("originator_blocked") or []
-    if originator_blocked:
-        body_parts.append("")
-        body_parts.append(
-            "Lenders bloqués ce run (plafond par lender atteint) : "
-            + ", ".join(originator_blocked)
-        )
-
-    body_parts.extend(_robot_config_lines(robot_config))
-
-    if stats.get("invest_failures", 0) > 0 or error:
-        body_parts.append("")
-        body_parts.append(
-            "Le détail complet (requête/réponse) de chaque échec, et de toute "
-            "erreur inattendue, est joint à cet email."
-        )
-
-    body = "\n".join(body_parts)
-
-    msg = MIMEMultipart()
-    msg["From"] = EMAIL_FROM
-    msg["To"] = EMAIL_TO
-    msg["Subject"] = subject
-    msg.attach(MIMEText(body, "plain"))
-
-    if diagnostics_text:
-        attachment = MIMEText(diagnostics_text, "plain", "utf-8")
-        attachment.add_header(
-            "Content-Disposition", "attachment", filename="lendermarket_invest_bot_diagnostics_this_run.log"
-        )
-        msg.attach(attachment)
-
-    try:
-        with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=15) as server:
-            server.starttls()
-            server.login(SMTP_USER, SMTP_PASSWORD)
-            server.sendmail(EMAIL_FROM, [EMAIL_TO], msg.as_string())
-        log.info("Lendermarket invest bot summary email sent to %s.", EMAIL_TO)
-    except Exception:
-        log.exception("Failed to send Lendermarket invest bot summary email.")
+    attachment = None
+    if diagnostics_text and (stats.get("invest_failures", 0) > 0 or error):
+        attachment = ("lendermarket_invest_bot_diagnostics_this_run.log", diagnostics_text)
+    _send_invest_summary_email(
+        "Lendermarket", invested, failures=stats.get("invest_failures", 0), error=error,
+        robot_config=robot_config, attachment=attachment,
+    )
 
 
 def send_afranga_invest_summary_email(stats: dict, error: str | None = None, diagnostics_text: str | None = None, robot_config=None) -> None:
-    """Recap of monitors/afranga_invest_bot.py. `stats["mode"]` is dry/probe/live;
-    in dry/probe nothing is bought, the planned lines are listed and the
-    diagnostics (requests/responses, review page structure) are attached."""
-    if not all([SMTP_HOST, SMTP_USER, SMTP_PASSWORD, EMAIL_TO]):
-        log.error(
-            "SMTP configuration is incomplete; cannot send email. "
-            "Required env vars: SMTP_HOST, SMTP_USER, SMTP_PASSWORD, EMAIL_TO."
-        )
-        return
-
-    mode = stats.get("mode", "?")
-    status = "ÉCHEC" if error else "OK"
-    subject = f"[Afranga Invest Bot] {status} ({mode}) - {stats.get('successes', 0)} investissement(s)"
-
-    body_parts = [f"Statut : {status}" + (f" ({error})" if error else ""), f"Mode : {mode}"]
-    if mode != "live":
-        body_parts.append("Aucun achat réel n'est effectué dans ce mode.")
-    if stats.get("balance_before") is not None:
-        body_parts.append(f"Solde avant : {stats['balance_before']:.2f} €")
-        body_parts.append(f"Solde après : {stats.get('balance_after', stats['balance_before']):.2f} €")
-    body_parts += [
-        f"Tentatives (ajouts au panier) : {stats.get('attempts', 0)}",
-        f"  - réussies : {stats.get('successes', 0)}",
-        f"  - échouées : {stats.get('failures', 0)}",
-        f"Montant total investi : {stats.get('total_invested', 0.0):.2f} €",
-        "",
-        "=== Achats prévus ===",
+    """Recap of monitors/afranga_invest_bot.py (same email format as the
+    Swaper/Lendermarket ones). Only real purchases (`stats["invested"]`) are
+    listed; dry/probe runs never buy anything, so they only get here on error."""
+    invested = [
+        {
+            "label": f"[{item['market']}] {item['loan']}",
+            "amount": item["amount"],
+            "rates": [item["rate"]] if item.get("rate") is not None else [],
+        }
+        for item in stats.get("invested") or []
     ]
-    for item in stats.get("plan") or []:
-        premium = item.get("premium")
-        extra = f", prime/décote {premium:+.1f}%" if premium is not None else ""
-        months = item.get("remaining_months")
-        extra += f", {months:g} mois" if months is not None else ""
-        rate = item.get("rate")
-        body_parts.append(
-            f"- [{item['market']}] {item['loan']} : {item['amount']:.2f} € (coût {item['cost']:.2f} €)"
-            f" @ {rate if rate is not None else 'n/a'}%{extra}"
-        )
-    if not stats.get("plan"):
-        body_parts.append("Aucun prêt éligible.")
-    if stats.get("invested"):
-        body_parts += ["", "=== Investissements réussis ==="]
-        body_parts += [f"- [{i['market']}] {i['loan']} : {i['amount']:.2f} €" for i in stats["invested"]]
-    body_parts.extend(_robot_config_lines(robot_config))
-    if diagnostics_text:
-        body_parts += ["", "Le détail complet (requêtes/réponses, structure des pages de confirmation) est joint."]
-
-    msg = MIMEMultipart()
-    msg["From"] = EMAIL_FROM
-    msg["To"] = EMAIL_TO
-    msg["Subject"] = subject
-    msg.attach(MIMEText("\n".join(body_parts), "plain"))
-    if diagnostics_text:
-        attachment = MIMEText(diagnostics_text, "plain", "utf-8")
-        attachment.add_header("Content-Disposition", "attachment", filename="afranga_invest_bot_diagnostics_this_run.log")
-        msg.attach(attachment)
-
-    try:
-        with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=15) as server:
-            server.starttls()
-            server.login(SMTP_USER, SMTP_PASSWORD)
-            server.sendmail(EMAIL_FROM, [EMAIL_TO], msg.as_string())
-        log.info("Afranga invest bot summary email sent to %s.", EMAIL_TO)
-    except Exception:
-        log.exception("Failed to send Afranga invest bot summary email.")
+    attachment = None
+    if diagnostics_text and (stats.get("failures", 0) > 0 or error):
+        attachment = ("afranga_invest_bot_diagnostics_this_run.log", diagnostics_text)
+    _send_invest_summary_email(
+        "Afranga", invested, failures=stats.get("failures", 0), error=error,
+        robot_config=robot_config, attachment=attachment,
+    )
 
 
 def send_peerberry_email(originators: list) -> None:
