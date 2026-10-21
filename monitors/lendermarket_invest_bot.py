@@ -76,6 +76,7 @@ import pyotp
 import requests
 from dotenv import load_dotenv
 
+from shared.missing_loans import report_missing_loans
 from shared.notifier import send_lendermarket_email, send_lendermarket_invest_summary_email
 from shared.google_sheet import get_geo_platform_snapshot
 from shared.robot_config import (
@@ -83,6 +84,7 @@ from shared.robot_config import (
     PlatformConfig,
     build_tracker,
     get_platform_config,
+    match_name,
     plan_allocations,
 )
 from shared.state import load_state, save_state
@@ -173,78 +175,29 @@ LOAN_SEGMENTS = [
 # it drops back to 0 (fluctuations while staying above 0 don't re-open it).
 DEFAULT_STATE = {
     "gates": {},
+    "lender_search": {},
 }
 
-# Per-lender filter configs for the invest-structure exploration (added
-# 2026-07-23) - one entry per lender the user actually watches for a future
-# auto-invest bot, selected via the Google Sheet (see
-# Per-lender API filter configs - one entry per lender the auto-invest bot can
-# handle, selected via the "config robots" sheet (ACTIF = x, see
-# shared/robot_config.py). Verified 2026-07-23 against the
-# user's own filtered listing URLs - the `lender_id`s reuse the same UUIDs
-# already in LOAN_SEGMENTS above, but each has its own (stricter)
-# minInterestRate cutoff the aggregate segments above don't apply.
-LENDER_INVEST_FILTERS = {
-    "Dineo": {
-        "lender_id": "9d501521-54f8-4aa2-b975-6b34f8aac5a0",
-        "regulation_status": "REGULATED",
-        "min_interest_rate": 8,
-        "min_remaining_term_in_days": 1,
-        "max_remaining_term_in_days": 360,
-        "page_url": (
-            "https://app.lendermarket.com/fr/listes-des-prets/reglemente"
-            "?minInterestRate=8&minRemainingTermInDays=1&maxRemainingTermInDays=360"
-            "&lenders=9d501521-54f8-4aa2-b975-6b34f8aac5a0"
-        ),
-    },
-    "Creditstar Spain": {
-        "lender_id": "9babf437-637c-47b4-b0e7-937c30fa587c",
-        "regulation_status": "UNREGULATED",
-        "min_interest_rate": 10,
-        "min_remaining_term_in_days": 1,
-        "max_remaining_term_in_days": 360,
-        "page_url": (
-            "https://app.lendermarket.com/fr/listes-des-prets/non-reglemente"
-            "?minInterestRate=10&minRemainingTermInDays=1&maxRemainingTermInDays=360"
-            "&lenders=9babf437-637c-47b4-b0e7-937c30fa587c"
-        ),
-    },
-    "Creditstar Sweden": {
-        "lender_id": "9babf437-6ccb-4ae2-a22f-c887e9e3696c",
-        "regulation_status": "UNREGULATED",
-        "min_interest_rate": 9,
-        "min_remaining_term_in_days": 1,
-        "max_remaining_term_in_days": 360,
-        "page_url": (
-            "https://app.lendermarket.com/fr/listes-des-prets/non-reglemente"
-            "?minInterestRate=9&minRemainingTermInDays=1&maxRemainingTermInDays=360"
-            "&lenders=9babf437-6ccb-4ae2-a22f-c887e9e3696c"
-        ),
-    },
-    "Creditstar Denmark": {
-        "lender_id": "9babf437-6970-48e6-8175-62ef53465eba",
-        "regulation_status": "UNREGULATED",
-        "min_interest_rate": 9,
-        "min_remaining_term_in_days": 1,
-        "max_remaining_term_in_days": 360,
-        "page_url": (
-            "https://app.lendermarket.com/fr/listes-des-prets/non-reglemente"
-            "?minInterestRate=9&minRemainingTermInDays=1&maxRemainingTermInDays=360"
-            "&lenders=9babf437-6970-48e6-8175-62ef53465eba"
-        ),
-    },
-    "Creditstar Czech": {
-        "lender_id": "9babf437-5bf8-41fb-840d-6edf7012e408",
-        "regulation_status": "UNREGULATED",
-        "min_interest_rate": 9,
-        "min_remaining_term_in_days": 1,
-        "max_remaining_term_in_days": 360,
-        "page_url": (
-            "https://app.lendermarket.com/fr/listes-des-prets/non-reglemente"
-            "?minInterestRate=9&minRemainingTermInDays=1&maxRemainingTermInDays=360"
-            "&lenders=9babf437-5bf8-41fb-840d-6edf7012e408"
-        ),
-    },
+# Auto-invest search window (days), same bounds as the user's own filtered
+# listing pages. The lenders themselves are NOT hardcoded for the invest bot:
+# they are found at run time from the "config robots" sheet names, whatever
+# their regulation status (see search_lender_loans()).
+INVEST_MIN_REMAINING_TERM_IN_DAYS = 1
+INVEST_MAX_REMAINING_TERM_IN_DAYS = 360
+INVEST_REGULATION_STATUSES = ("REGULATED", "UNREGULATED")
+MAX_LOANS_PAGES = 100
+# Whole-marketplace scan (many pages) at most this often, only triggered by a
+# sheet name matching no known lender.
+LENDER_SCAN_INTERVAL_SECONDS = 30 * 60
+# Lenders already used by the bot, so they stay "known" while they have no loan
+# (a lender with no loan can't be seen on the marketplace). Everything else is
+# learned from the marketplace and persisted in the state file.
+KNOWN_LENDERS = {
+    "9d501521-54f8-4aa2-b975-6b34f8aac5a0": {"displayName": "Dineo", "statuses": ["REGULATED"]},
+    "9babf437-637c-47b4-b0e7-937c30fa587c": {"displayName": "Creditstar Spain", "statuses": ["UNREGULATED"]},
+    "9babf437-6ccb-4ae2-a22f-c887e9e3696c": {"displayName": "Creditstar Sweden", "statuses": ["UNREGULATED"]},
+    "9babf437-6970-48e6-8175-62ef53465eba": {"displayName": "Creditstar Denmark", "statuses": ["UNREGULATED"]},
+    "9babf437-5bf8-41fb-840d-6edf7012e408": {"displayName": "Creditstar Czech", "statuses": ["UNREGULATED"]},
 }
 
 def fetch_active_loans(segment: dict) -> list:
@@ -304,57 +257,149 @@ def aggregate_by_lender(loans: list) -> list:
     return sorted(buckets.values(), key=lambda b: b["lender"])
 
 
-def fetch_active_loans_for_lender(config: dict, min_interest_rate: float | None = None) -> list:
-    """Same public API as fetch_active_loans(), but for a single lender
-    with its own minRemainingTermInDays/maxRemainingTermInDays cutoffs (one
-    entry of LENDER_INVEST_FILTERS) - used by invest_selected_lenders() (the
-    real auto-invest step) to check each selected lender's own availability
-    exactly like the user's own filtered listing URLs.
+def fetch_marketplace_loans(
+    regulation_status: str, lender_ids: list | None = None, min_interest_rate: float | None = None,
+) -> list | None:
+    """Active loans of one regulation status (all pages, same public API and
+    term window as the user's own listing pages), optionally restricted to
+    `lender_ids` and to a minimum interest rate (pre-filter only, the exact
+    rate bounds are checked per lender by plan_allocations()). Returns None
+    if the API could not be read completely."""
+    loans, seen = [], set()
+    for page in range(1, MAX_LOANS_PAGES + 1):
+        params = [
+            ("minRemainingTermInDays", str(INVEST_MIN_REMAINING_TERM_IN_DAYS)),
+            ("maxRemainingTermInDays", str(INVEST_MAX_REMAINING_TERM_IN_DAYS)),
+            ("regulationStatus", regulation_status),
+            ("page", str(page)),
+        ]
+        if min_interest_rate:
+            params.append(("minInterestRate", f"{min_interest_rate:g}"))
+        params += [("lenders[]", lender_id) for lender_id in lender_ids or []]
+        req = request.Request(f"{LOANS_API_URL}?{parse.urlencode(params)}", headers={"User-Agent": "Mozilla/5.0"})
+        try:
+            with request.urlopen(req, timeout=20) as resp:
+                payload = json.loads(resp.read())
+        except error.HTTPError as exc:
+            log.error("Lendermarket API returned HTTP %s while listing %s loans (page %d).", exc.code, regulation_status, page)
+            return None
+        except Exception:
+            log.exception("Failed to list %s Lendermarket loans (page %d).", regulation_status, page)
+            return None
 
-    `min_interest_rate`, if given, OVERRIDES config["min_interest_rate"] -
-    the "Taux min" of the lender in the "config robots" sheet is passed here
-    by invest_selected_lenders() (the hardcoded value is only a fallback)."""
-    rate = min_interest_rate if min_interest_rate is not None else config["min_interest_rate"]
-    params = [
-        ("minInterestRate", str(rate)),
-        ("minRemainingTermInDays", str(config["min_remaining_term_in_days"])),
-        ("maxRemainingTermInDays", str(config["max_remaining_term_in_days"])),
-        ("regulationStatus", config["regulation_status"]),
-        ("lenders[]", config["lender_id"]),
-    ]
-    url = f"{LOANS_API_URL}?{parse.urlencode(params)}"
-
-    req = request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-    try:
-        with request.urlopen(req, timeout=20) as resp:
-            payload = json.loads(resp.read())
-    except error.HTTPError as exc:
-        log.error("Lendermarket API returned HTTP %s while checking lender availability.", exc.code)
-        return []
-    except Exception:
-        log.exception("Failed to fetch active loans for a specific lender.")
-        return []
-
-    return payload.get("data") or []
+        for loan in payload.get("data") or []:
+            if loan.get("uuid") not in seen:
+                seen.add(loan.get("uuid"))
+                loans.append(loan)
+        if page >= int((payload.get("meta") or {}).get("last_page") or 1):
+            return loans
+    log.warning("Hit MAX_LOANS_PAGES (%d) listing %s loans - listing truncated.", MAX_LOANS_PAGES, regulation_status)
+    return loans
 
 
-def _match_lender_filter(sheet_name: str, filters: dict) -> str | None:
-    """Match a lender name as written in the Google Sheet against
-    LENDER_INVEST_FILTERS' keys - same exact/substring, case-insensitive
-    matching idea as peerberry_invest_bot._match_selected_originator(), in
-    case spelling isn't 100% identical between the sheet and this file.
-    Returns the matching filter key, or None if none matched."""
-    value = sheet_name.strip().lower()
-    if not value:
-        return None
-    for key in filters:
-        if key.strip().lower() == value:
-            return key
-    for key in filters:
-        key_lower = key.strip().lower()
-        if key_lower in value or value in key_lower:
-            return key
-    return None
+def _sheet_name_for_lender(lender: dict, sheet_names: list) -> str | None:
+    """Sheet name (from "config robots") designating this API lender: strictly
+    the same name as the lender's display name (the one shown in the account's
+    investments, e.g. "Creditstar Spain"), ignoring case/accents only - no
+    partial match, so "Creditstar Spain" never matches "Creditstar Sweden" or
+    a bare "Creditstar"."""
+    return match_name(lender.get("displayName"), sheet_names, partial=False)
+
+
+def _scan_lenders() -> tuple | None:
+    """Lists the whole marketplace (both regulation statuses) and returns
+    (catalog, loans), `catalog` being {lender uuid: lender fields + the
+    regulation statuses it was seen with}. None if a listing failed."""
+    catalog, all_loans = {}, []
+    for regulation_status in INVEST_REGULATION_STATUSES:
+        loans = fetch_marketplace_loans(regulation_status)
+        if loans is None:
+            return None
+        all_loans.extend(loans)
+        for loan in loans:
+            lender = loan.get("lender") or {}
+            if not lender.get("uuid"):
+                continue
+            entry = catalog.setdefault(lender["uuid"], {
+                **{key: lender.get(key) for key in ("displayName", "identifier", "legalName")}, "statuses": [],
+            })
+            if regulation_status not in entry["statuses"]:
+                entry["statuses"].append(regulation_status)
+    return catalog, all_loans
+
+
+def search_lender_loans(sheet_names: list, search_state: dict, min_rates: dict | None = None) -> tuple:
+    """Finds the loans of the lenders named in the "config robots" sheet,
+    whatever their regulation status. Returns (loans_by_name, found, complete):
+    `loans_by_name` {sheet name: [loans]} (`min_rates` {sheet name: "Taux min"}
+    only pre-filters what is fetched), `found` {sheet name: bool} for the
+    names whose existence was settled this run (True = the lender is known,
+    False = not found on a fresh marketplace scan - typo or unknown lender;
+    a known lender with no loan right now is NOT "not found"), `complete`
+    False if a listing failed (loans may be missing).
+
+    The lenders seen so far are kept in `search_state["catalog"]` (persisted
+    between runs) so a run only fetches the lenders' own loans; the whole
+    marketplace is only scanned when a sheet name matches no known lender, at
+    most every LENDER_SCAN_INTERVAL_SECONDS."""
+    catalog = search_state.setdefault("catalog", {})
+    for lender_id, seed in KNOWN_LENDERS.items():
+        catalog.setdefault(lender_id, dict(seed))
+
+    def resolve() -> dict:
+        resolved = {}
+        for lender_id, lender in catalog.items():
+            name = _sheet_name_for_lender(lender, sheet_names)
+            if name is not None:
+                resolved[lender_id] = name
+        return resolved
+
+    resolved = resolve()
+    scanned_loans = None
+    unknown = [name for name in sheet_names if name not in resolved.values()]
+    scan_due = time.time() - search_state.get("scanned_at", 0) >= LENDER_SCAN_INTERVAL_SECONDS
+    scan_failed = False
+    if unknown and scan_due:
+        log.info("Lender(s) %s unknown yet - scanning the whole Lendermarket marketplace.", unknown)
+        scan = _scan_lenders()
+        if scan is None:
+            scan_failed = True
+        else:
+            search_state["scanned_at"] = time.time()
+            for lender_id, lender in scan[0].items():
+                catalog[lender_id] = lender
+            scanned_loans = scan[1]
+            resolved = resolve()
+            unknown = [name for name in sheet_names if name not in resolved.values()]
+
+    if scanned_loans is not None:
+        loans = [loan for loan in scanned_loans if (loan.get("lender") or {}).get("uuid") in resolved]
+        complete = True
+    else:
+        loans, complete = [], not scan_failed
+        groups = {}
+        for lender_id, name in resolved.items():
+            rate = (min_rates or {}).get(name)
+            for regulation_status in catalog[lender_id].get("statuses") or INVEST_REGULATION_STATUSES:
+                groups.setdefault((regulation_status, rate), []).append(lender_id)
+        for (regulation_status, rate), ids in groups.items():
+            fetched = fetch_marketplace_loans(regulation_status, ids, rate)
+            if fetched is None:
+                complete = False
+            else:
+                loans.extend(fetched)
+
+    loans_by_name = {name: [] for name in sheet_names}
+    for loan in loans:
+        name = resolved.get((loan.get("lender") or {}).get("uuid"))
+        if name is not None:
+            loans_by_name[name].append(loan)
+
+    # Only a fresh scan can settle that a name is unknown.
+    settled = {name: True for name in sheet_names if name not in unknown}
+    if scanned_loans is not None:
+        settled.update({name: False for name in unknown})
+    return loans_by_name, settled, complete
 
 
 def _redact_sensitive_headers(headers: dict) -> dict:
@@ -665,15 +710,18 @@ def invest_selected_lenders(
     balance: float,
     config: PlatformConfig,
     geo_snapshot: dict | None = None,
+    search_state: dict | None = None,
 ) -> dict:
     """Real auto-invest step, driven by the "config robots" Google Sheet
     (`config` = get_platform_config("Lendermarket"), see
     shared/robot_config.py for the meaning of each column).
 
-    Only lenders flagged ACTIF and matching a LENDER_INVEST_FILTERS entry
-    (`_match_lender_filter()`) are considered. Each one's available loans
-    are fetched with the lender's own "Taux min" as the API minInterestRate
-    (0 if empty), then every loan is checked against the lender's
+    Every lender flagged ACTIF is searched BY ITS SHEET NAME
+    (`search_lender_loans()`): a lender can be in either regulation status, so
+    adding a row to the sheet is enough. A flagged lender that doesn't exist
+    on the marketplace is reported by mail (once, see shared/missing_loans.py).
+    `search_state` is a dict persisted between runs (known lenders, last scan,
+    mail gates). Each loan is then checked against its lender's
     min/max rate, and the whole `balance` is allocated across all the
     candidate loans by `plan_allocations()`: per-lender min/max amount per
     investment, "Pourcentage max du solde par loan" and "Pourcentage max du
@@ -711,13 +759,19 @@ def invest_selected_lenders(
 
     tracker = build_tracker(config, balance, geo_snapshot)
 
+    active_names = config.active_names()
+    search_state = search_state if search_state is not None else {}
+    loans_by_name, found, listing_complete = search_lender_loans(
+        active_names, search_state, {name: config.loans[name].min_rate for name in active_names},
+    )
+    # An incomplete listing must not flag lenders as unknown.
+    if listing_complete and found:
+        report_missing_loans(
+            "Lendermarket", found, search_state.setdefault("missing_gates", {}), all_names=active_names,
+        )
     matched = []
     relevant_countries = set()
-    for sheet_name in config.active_names():
-        filter_key = _match_lender_filter(sheet_name, LENDER_INVEST_FILTERS)
-        if filter_key is None:
-            log.warning("Active Lendermarket lender '%s' from the config sheet doesn't match any known filter config, skipping it.", sheet_name)
-            continue
+    for sheet_name in active_names:
         country = tracker.country_of(sheet_name)
         if country:
             relevant_countries.add(country)
@@ -729,18 +783,15 @@ def invest_selected_lenders(
             log.info("Lender '%s' (country '%s') is blocked this run: already at/above the country cap.", sheet_name, country)
             stats["country_blocked"].append(sheet_name)
             continue
-        matched.append((sheet_name, filter_key, country))
+        matched.append((sheet_name, country))
 
     stats["country_status"] = tracker.country_status(relevant_countries)
     stats["originator_cap_status"] = tracker.loan_cap_status()
 
     candidates = []
     loan_lookup = {}
-    for sheet_name, filter_key, country in matched:
-        lender_cfg = config.loans[sheet_name]
-        loans = fetch_active_loans_for_lender(
-            LENDER_INVEST_FILTERS[filter_key], min_interest_rate=lender_cfg.min_rate or 0,
-        )
+    for sheet_name, country in matched:
+        loans = loans_by_name[sheet_name]
         stats["lender_stats"][sheet_name] = {
             "budget": 0.0,
             "country": country,
@@ -867,7 +918,9 @@ def run() -> None:
 
             invest_error = None
             try:
-                invest_stats = invest_selected_lenders(session, balance, config, geo_snapshot)
+                invest_stats = invest_selected_lenders(
+                    session, balance, config, geo_snapshot, search_state=state.setdefault("lender_search", {}),
+                )
             except Exception as exc:
                 invest_error = str(exc)
                 invest_stats = {"balance_before": balance, "balance_after": balance, "invest_attempts": 0}

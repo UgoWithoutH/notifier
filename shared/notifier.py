@@ -1034,8 +1034,8 @@ def send_diversification_recap_email(amounts: dict, missing_platforms: list | No
 
 def send_new_bilans_email(new_bilans: list) -> None:
     """Sent by scripts/sync_bilans_financiers.py when new bilan rows were added
-    to the "notes bilans" sheet. Each item: dict with owner, exercice, audit,
-    devise, ca_eur, resultat_net, note."""
+    to the "notes bilans" sheet. Each item: dict with platform, owner (lending
+    company, or the platform itself), exercice, note. Grouped by platform."""
     if not all([SMTP_HOST, SMTP_USER, SMTP_PASSWORD, EMAIL_TO]):
         log.error(
             "SMTP configuration is incomplete; cannot send email. "
@@ -1045,14 +1045,15 @@ def send_new_bilans_email(new_bilans: list) -> None:
 
     subject = f"[Bilans] {len(new_bilans)} nouveau(x) bilan(s) financier(s) ajouté(s)"
     body_lines = ["Nouveaux bilans ajoutés dans l'onglet \"notes bilans\" :", ""]
+    by_platform: dict[str, list] = {}
     for b in new_bilans:
-        note = f"{b['note']}/5" if b.get("note") != "" else "n/a"
-        ca = f"{b['ca_eur']} €" if b.get("ca_eur") != "" else "n/a"
-        result = f"{b['resultat_net']} {b['devise']}".strip() if b.get("resultat_net") != "" else "n/a"
-        body_lines.append(
-            f"- {b['owner']} - exercice {b['exercice']} ({b['audit']}) : "
-            f"CA {ca} | résultat net {result} | note {note}"
-        )
+        by_platform.setdefault(b.get("platform") or "Autre", []).append(b)
+    for platform, items in by_platform.items():
+        body_lines.append(f"{platform} ({len(items)}) :")
+        for b in items:
+            note = f"{b['note']}/5" if b.get("note") not in ("", None) else "n/a"
+            body_lines.append(f"  - {b['owner']} - exercice {b['exercice']} : note {note}")
+        body_lines.append("")
     body = "\n".join(body_lines)
 
     msg = MIMEMultipart()
@@ -1069,3 +1070,79 @@ def send_new_bilans_email(new_bilans: list) -> None:
         log.info("New bilans email sent to %s.", EMAIL_TO)
     except Exception:
         log.exception("Failed to send new bilans email.")
+
+
+def send_bilans_sync_issues_email(issues: list, error: str | None = None) -> None:
+    """Sent by scripts/sync_bilans_financiers.py when a platform/company of the
+    "notes bilans" sheet cannot be found on the site, or when the sync crashes."""
+    if not all([SMTP_HOST, SMTP_USER, SMTP_PASSWORD, EMAIL_TO]):
+        log.error(
+            "SMTP configuration is incomplete; cannot send email. "
+            "Required env vars: SMTP_HOST, SMTP_USER, SMTP_PASSWORD, EMAIL_TO."
+        )
+        return
+
+    if error:
+        subject = "[Bilans][ERREUR] Échec de la synchronisation des bilans financiers"
+    else:
+        subject = f"[Bilans][ALERTE] {len(issues)} élément(s) introuvable(s) sur le site"
+    body_lines = []
+    if error:
+        body_lines += ["La synchronisation a échoué :", error, ""]
+    if issues:
+        body_lines.append("Éléments de l'onglet \"notes bilans\" introuvables sur liberte-financiere.net :")
+        body_lines += [f"- {i}" for i in issues]
+    body = "\n".join(body_lines)
+
+    msg = MIMEMultipart()
+    msg["From"] = EMAIL_FROM
+    msg["To"] = EMAIL_TO
+    msg["Subject"] = subject
+    msg.attach(MIMEText(body, "plain"))
+
+    try:
+        with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=15) as server:
+            server.starttls()
+            server.login(SMTP_USER, SMTP_PASSWORD)
+            server.sendmail(EMAIL_FROM, [EMAIL_TO], msg.as_string())
+        log.info("Bilans sync issues email sent to %s.", EMAIL_TO)
+    except Exception:
+        log.exception("Failed to send bilans sync issues email.")
+
+
+def send_missing_loans_email(platform: str, names: list, detail: str | None = None) -> None:
+    """Sent by the invest bots (Lendermarket, Swaper, Afranga) when a company
+    flagged active in the "config robots" sheet is never found on the platform
+    (unknown/misspelled name). Once per company (see shared/missing_loans.py)."""
+    if not all([SMTP_HOST, SMTP_USER, SMTP_PASSWORD, EMAIL_TO]):
+        log.error(
+            "SMTP configuration is incomplete; cannot send email. "
+            "Required env vars: SMTP_HOST, SMTP_USER, SMTP_PASSWORD, EMAIL_TO."
+        )
+        return
+
+    subject = f"[{platform}] ATTENTION - société introuvable : {', '.join(names)}"
+    body_lines = [
+        f"Aucun prêt n'a jamais été trouvé sur {platform} pour {len(names)} société(s) active(s) dans l'onglet \"config robots\" :",
+        *(f"  - {name}" for name in names),
+        "",
+        "Vérifier que le nom saisi dans la sheet correspond bien au nom de la société affiché sur la plateforme.",
+        "Ce mail n'est envoyé qu'une fois par société ; elle est ensuite suivie normalement dès qu'elle est trouvée.",
+    ]
+    if detail:
+        body_lines += ["", detail]
+
+    msg = MIMEMultipart()
+    msg["From"] = EMAIL_FROM
+    msg["To"] = EMAIL_TO
+    msg["Subject"] = subject
+    msg.attach(MIMEText("\n".join(body_lines), "plain"))
+
+    try:
+        with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=15) as server:
+            server.starttls()
+            server.login(SMTP_USER, SMTP_PASSWORD)
+            server.sendmail(EMAIL_FROM, [EMAIL_TO], msg.as_string())
+        log.info("Missing loans email sent to %s for %s.", EMAIL_TO, platform)
+    except Exception:
+        log.exception("Failed to send the missing loans email.")

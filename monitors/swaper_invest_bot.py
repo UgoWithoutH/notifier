@@ -253,11 +253,13 @@ from shared.state import load_state, save_state
 from shared.cron_schedule import ensure_schedule, apply_startup_jitter
 from shared.notification_gate import should_notify
 from shared.google_sheet import get_geo_platform_snapshot
-from shared.robot_config import Candidate, build_tracker, get_platform_config, plan_allocations
+from shared.missing_loans import TRANSIENT_GRACE_SECONDS, report_missing_loans
+from shared.robot_config import Candidate, build_tracker, get_platform_config, match_name, plan_allocations
 from shared.browser_stealth import get_context_options, apply_stealth, human_pause, human_mouse_wander, human_type
 
 DEFAULT_STATE = {
     "gates": {},
+    "missing_loans": {},
 }
 
 load_dotenv()
@@ -593,6 +595,24 @@ def _filter_loans_by_min_interest_rate(loans: list, min_interest_rate: float) ->
 # field name is unconfirmed (no live loan data available to inspect at the
 # time this was written, see repo memory).
 _ORIGINATOR_FIELD_CANDIDATES = ("company", "loanOriginator", "originator", "originatorName", "group")
+
+
+def _resolve_group_names(sheet_names: list, loans: list) -> dict:
+    """{sheet name: Swaper group name to send as `groups`}. The `groups` filter
+    needs the exact originator name: when a sheet name doesn't match exactly
+    but (case/accents/partial) matches a group seen on the unfiltered `loans`,
+    that group's real name is used instead. Anything unresolved keeps the sheet
+    name as typed."""
+    resolved = {name: name for name in sheet_names}
+    field = next((c for c in _ORIGINATOR_FIELD_CANDIDATES if loans and all(c in loan for loan in loans)), None)
+    if field is None:
+        return resolved
+    groups = sorted({str(loan[field]).strip() for loan in loans if loan.get(field)})
+    for name in sheet_names:
+        group = match_name(name, groups)
+        if group is not None and group not in resolved.values():
+            resolved[name] = group
+    return resolved
 
 
 def fetch_loans_by_selected_originators(page, captured_api_calls: list, selected_originators: list, min_interest_rate: float):
@@ -1063,18 +1083,24 @@ def run(headless: bool = True) -> None:
                             len(selected_originators), ", ".join(selected_originators), min_interest_rate,
                         )
                         originator_loans = {}
+                        group_of = _resolve_group_names(selected_originators, loans_now)
+                        for sheet_name, group in group_of.items():
+                            if group != sheet_name:
+                                log.info("Sheet originator %r matches Swaper's group %r.", sheet_name, group)
+                        sheet_of = {group: sheet_name for sheet_name, group in group_of.items()}
                         fast_grouped = None
                         try:
                             fast_grouped = _with_relogin_retry(
                                 lambda: fetch_loans_by_selected_originators(
-                                    page, captured_api_calls, selected_originators, min_interest_rate
+                                    page, captured_api_calls, list(group_of.values()), min_interest_rate
                                 )
                             )
                         except Exception:
                             log.exception("Combined multi-originator fetch failed - falling back to per-originator fetches.")
 
                         if fast_grouped is not None:
-                            for name, loans_for_name in fast_grouped.items():
+                            for group, loans_for_name in fast_grouped.items():
+                                name = sheet_of[group]
                                 if loans_for_name:
                                     originator_loans[name] = loans_for_name
                                     log.info("Originator %r currently has %d loan(s) available (fast combined fetch).", name, len(loans_for_name))
@@ -1084,7 +1110,7 @@ def run(headless: bool = True) -> None:
                             for name in selected_originators:
                                 try:
                                     originator_payload = _with_relogin_retry(
-                                        lambda name=name: fetch_loans(page, captured_api_calls, groups=[name])
+                                        lambda name=name: fetch_loans(page, captured_api_calls, groups=[group_of[name]])
                                     )
                                 except Exception:
                                     log.exception("Failed to fetch filtered loans for originator %r - skipping it.", name)
@@ -1097,6 +1123,14 @@ def run(headless: bool = True) -> None:
                                     log.info("Originator %r currently has %d loan(s) available.", name, len(loans_for_name))
                                 else:
                                     log.info("Originator %r currently has no loans available.", name)
+
+                        report_missing_loans(
+                            "Swaper",
+                            {name: bool(originator_loans.get(name)) for name in selected_originators},
+                            state.setdefault("missing_loans", {}),
+                            all_names=selected_originators,
+                            grace_seconds=TRANSIENT_GRACE_SECONDS,
+                        )
 
                         pass_attempts = []
                         if balance_now < MIN_INVESTMENT_AMOUNT:
@@ -1138,7 +1172,7 @@ def run(headless: bool = True) -> None:
                             for name in _available_originators_in_order(originator_loans):
                                 try:
                                     refreshed_payload = _with_relogin_retry(
-                                        lambda name=name: fetch_loans(page, captured_api_calls, groups=[name])
+                                        lambda name=name: fetch_loans(page, captured_api_calls, groups=[group_of[name]])
                                     )
                                 except Exception:
                                     log.exception("Failed to re-fetch loans for originator %r before investing - skipping it.", name)

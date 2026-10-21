@@ -20,6 +20,7 @@ import json
 import logging
 import os
 import re
+import traceback
 import unicodedata
 from collections import Counter
 from datetime import datetime
@@ -28,7 +29,7 @@ import requests
 from gspread.utils import rowcol_to_a1
 
 from shared.google_sheet import _call_with_retry, get_worksheet_by_name
-from shared.notifier import send_new_bilans_email
+from shared.notifier import send_bilans_sync_issues_email, send_new_bilans_email
 
 log = logging.getLogger(__name__)
 
@@ -214,7 +215,7 @@ def build_grid(header: list[str], items: list[dict], rows: list[dict],
         out[comment_idx] = comment
         return out
 
-    grid, kinds = [header], ["header"]
+    grid, kinds, issues = [header], ["header"], []
 
     def add_bilans(entity_rows):
         for r in sorted_bilans(entity_rows):
@@ -234,6 +235,9 @@ def build_grid(header: list[str], items: list[dict], rows: list[dict],
             own_rows += by_societe_id.get(same_name["id"], [])
         else:
             same_name = None
+        if not platform and not same_name and norm(item["b"]) not in EXTRA_PLATFORMS:
+            log.warning("Plateforme '%s' introuvable sur le site.", item["b"])
+            issues.append(f"Plateforme '{item['b']}' introuvable sur le site")
         grid.append(line(item["b"],
                          comment=(platform or {}).get("note_externe") or (same_name or {}).get("note_externe") or ""))
         kinds.append("platform")
@@ -255,11 +259,12 @@ def build_grid(header: list[str], items: list[dict], rows: list[dict],
             s = entry["societe"]
             if s is None:
                 log.warning("Société '%s' (sous %s) introuvable sur le site.", entry["label"], item["b"])
+                issues.append(f"Société '{entry['label']}' (sous {item['b']}) introuvable sur le site")
             grid.append(line(entry["label"], comment=(s or {}).get("note_externe") or ""))
             kinds.append("company")
             if s:
                 add_bilans(by_societe_id.get(s["id"], []))
-    return grid, kinds
+    return grid, kinds, issues
 
 
 def bilan_entries(grid: list[list]) -> list[tuple[str, str, list]]:
@@ -276,19 +281,30 @@ def bilan_entries(grid: list[list]) -> list[tuple[str, str, list]]:
     return out
 
 
-def find_new_bilans(existing: list[list[str]], grid: list[list]) -> list[dict]:
-    """Bilans du nouveau tableau absents de l'ancien (clé : propriétaire + exercice)."""
+def find_new_bilans(existing: list[list[str]], grid: list[list], kinds: list[str]) -> list[dict]:
+    """Bilans du nouveau tableau absents de l'ancien (clé : propriétaire + exercice).
+
+    `kinds` est aligné sur `grid` et permet de rattacher chaque bilan à sa plateforme.
+    """
     seen = Counter((o, e) for o, e, _ in bilan_entries(existing))
     idx = {c: 1 + i for i, c in enumerate(COLUMNS)}
     new = []
-    for owner, exercice, line in bilan_entries(grid):
+    platform = owner = ""
+    for raw, kind in list(zip(grid, kinds))[1:]:
+        name = str(raw[0]).strip() if raw else ""
+        if name:
+            owner = name
+            if kind == "platform":
+                platform = name
+            continue
+        exercice = str(raw[1]).strip() if len(raw) > 1 else ""
+        if not exercice:
+            continue
         if seen[(owner, exercice)] > 0:
             seen[(owner, exercice)] -= 1
             continue
-        new.append({"owner": owner, "exercice": exercice,
-                    **{k: line[idx[c]] for k, c in (
-                        ("audit", "Audit"), ("devise", "Devise"), ("ca_eur", "CA brut (€)"),
-                        ("resultat_net", "Résultat net (devise)"), ("note", "Note /5"))}})
+        new.append({"platform": platform, "owner": owner, "exercice": exercice,
+                    "note": raw[idx["Note /5"]]})
     return new
 
 
@@ -326,6 +342,16 @@ def apply_format(ws, kinds: list[str], total_rows: int) -> None:
 
 
 def run() -> None:
+    try:
+        _run()
+    except Exception:
+        log.exception("Échec de la synchronisation des bilans.")
+        if not DRY_RUN:
+            send_bilans_sync_issues_email([], error=traceback.format_exc())
+        raise
+
+
+def _run() -> None:
     rows = fetch_rows()
     plateformes, societes, links = fetch_reference_data()
     log.info("Site : %d plateformes, %d sociétés, %d liens.", len(plateformes), len(societes), len(links))
@@ -335,7 +361,9 @@ def run() -> None:
     platform_names = {norm(p["nom"]) for p in plateformes}
     items = parse_sheet(existing, platform_names)
     header_name = (existing[0][0] if existing and existing[0] else "") or "Nom"
-    grid, kinds = build_grid([header_name] + COLUMNS, items, rows, plateformes, societes, links)
+    grid, kinds, issues = build_grid([header_name] + COLUMNS, items, rows, plateformes, societes, links)
+    if issues and not DRY_RUN:
+        send_bilans_sync_issues_email(issues)
 
     counts = {k: kinds.count(k) for k in ("platform", "company", "bilan")}
     log.info("Tableau final : %d lignes (%s).", len(grid), counts)
@@ -358,7 +386,7 @@ def run() -> None:
 
     # Premier remplissage (aucun bilan existant) : pas d'email, tout serait "nouveau".
     if bilan_entries(existing):
-        new_bilans = find_new_bilans(existing, grid)
+        new_bilans = find_new_bilans(existing, grid, kinds)
         if new_bilans:
             log.info("%d nouveau(x) bilan(s) ajouté(s).", len(new_bilans))
             send_new_bilans_email(new_bilans)
