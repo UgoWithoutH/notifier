@@ -39,6 +39,7 @@ jobs:
           path: |
             monitors/afranga_invest_session_state.json
             monitors/afranga_cron_schedule_state.json
+            monitors/afranga_invest_state.json
           key: afranga-invest-session-${{ github.run_id }}
           restore-keys: |
             afranga-invest-session-
@@ -68,4 +69,5 @@ jobs:
           path: |
             monitors/afranga_invest_session_state.json
             monitors/afranga_cron_schedule_state.json
+            monitors/afranga_invest_state.json
           key: afranga-invest-session-${{ github.run_id }}

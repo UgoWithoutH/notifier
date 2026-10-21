@@ -17,10 +17,11 @@ broken down - one row per BORROWER (emprunteur, e.g. "EXCAVAN"), with a
 country-column matrix (one column per country, shared across every
 platform's block on that sheet). `fetch_active_loans_by_borrower()` fetches
 every currently active ("en cours") loan from
-https://www.bienpreter.com/u/mes-prets (paginated), sums the invested
+Bienprêter's JSON API (/api/v2/contracts/me, paginated), sums the invested
 amount per borrower (a borrower can have several concurrent loans/
-contracts), and resolves each loan's country via its project page
-(https://www.bienpreter.com/projets/{id}, "Localisation" field, e.g.
+contracts), and resolves each loan's country via its project's API record
+(/api/v2/project/{id}, "location" field - same text as the project page's
+"Localisation", e.g.
 "Madrid - Espagne" -> "Espagne" - see _country_from_location() for the
 French-domestic-postal-code special case). The result feeds
 shared.google_sheet.fill_bienpreter_borrower_geo_amounts(), which writes
@@ -53,30 +54,24 @@ per-session/per-request Symfony CSRF tokens, not static). POST fields:
 plus the two token fields above. A successful login response is a 200
 whose final URL (`requests` follows the redirect chain automatically) is
 `/u/tableau-de-bord` - the dashboard IS the login response body itself (no
-extra navigation needed), so `fetch_balances()` just parses that same
-response's HTML directly instead of a second GET. No 2FA/TOTP step exists
+extra navigation needed). No 2FA/TOTP step exists
 on this account (confirmed in the original 2026-07-09 Playwright build
 too).
 
-The dashboard's markup was inspected end-to-end against the real account,
-so `fetch_balances()` uses precise regex patterns (mirroring the original
-Playwright DOM-scraping selectors) rather than a generic heuristic:
-- "Capital à recevoir" is a proper `<dl><dt>Capital à recevoir</dt><dd
-  class="...">1 220,00 €</dd></dl>` pair - found via a regex anchored on
-  the `<dt>` text containing "recevoir", value from the following `<dd>`.
-- "Solde disponible" is a `<div class="useroffice-box"><p>Solde
-  disponible<br><span class="number big">955,25 €</span></p>...</div>`
-  block - found via a regex anchored on the `<p>` text starting with
-  "Solde disponible", value from the nested `<span>`.
-  Note: this exact balance value also appears elsewhere on the page with
-  no nearby label (top nav "Solde : ...", a bare `<span class="number
-  big">`) - a generic "scan every currency-looking string and guess by
-  nearby keyword" approach does NOT work reliably here (the account-
-  summary panel groups several different labeled values - Capital,
-  Capital remboursé, Capital à recevoir, Intérêts bruts/nets... - inside
-  one shared container, so several candidates' surrounding text
-  legitimately contains unrelated keywords). Hence the precise anchored
-  regexes above instead.
+UPDATED 2026-10-21: the site also exposes the JSON API its own front-end
+uses (`/api/v2/...`, JSON-LD only), authenticated by the `api-v2-token`
+cookie that `GET /api-token-from-session` sets from the PHP session (see
+_refresh_api_token()/_api_get_json()). Scraping the HTML silently broke
+once already (/u/mes-prets markup change -> 0 loans parsed), so
+`fetch_balances()` now reads "solde disponible" (`walletAmount` of
+/api/v2/user/me) and "capital à recevoir" (`capitalRemaining` of
+/api/v2/contracts/me) from the API instead of regexes on the dashboard
+HTML (verified live to equal the dashboard's figures exactly); the
+dashboard HTML is now only the persisted-session validity probe. Same for
+the active loans and project locations below. The /u/operations HTML is
+STILL scraped: /api/v2/operations has no running "Solde indicatif"
+(needed by compute_average_idle_cash()) nor per-row capital/interest/tax
+details, and the CSV export has neither the balance nor the time.
 
 Also fetches this calendar month's interest received (like every other
 *_diversification.py's equivalent) from the "Toutes mes opérations" page
@@ -362,117 +357,109 @@ def _strip_tags(html_fragment: str) -> str:
     return re.sub(r"\s+", " ", re.sub(r"<[^>]*>", "", html_fragment or "")).strip()
 
 
-def fetch_balances(dashboard_html: str) -> dict:
-    """Parse "solde disponible" and "capital à recevoir" out of the
-    dashboard HTML (the login() response body), returning both as floats.
-    See module docstring for the verified regex anchors."""
-    solde_match = re.search(
-        r"Solde disponible.*?<span[^>]*>(.*?)</span>", dashboard_html, re.DOTALL | re.IGNORECASE
-    )
-    recevoir_match = re.search(
-        r"<dt>[^<]*[Rr]ecevoir</dt>\s*<dd[^>]*>(.*?)</dd>", dashboard_html, re.DOTALL
-    )
-
-    if not solde_match:
-        raise RuntimeError("Could not find 'Solde disponible' on the Bienpreter dashboard.")
-    if not recevoir_match:
-        raise RuntimeError("Could not find 'Capital à recevoir' on the Bienpreter dashboard.")
-
-    raw_solde = _strip_tags(solde_match.group(1))
-    raw_recevoir = _strip_tags(recevoir_match.group(1))
-    log.info("Raw values found on the dashboard: solde=%r, capital_a_recevoir=%r", raw_solde, raw_recevoir)
-
-    available_balance = _parse_amount(raw_solde)
-    capital_to_receive = _parse_amount(raw_recevoir)
+def fetch_balances(session: requests.Session) -> dict:
+    """"solde disponible" and "capital à recevoir" as floats, from the JSON
+    API (verified live 2026-10-21 to equal the dashboard's own figures
+    exactly): available balance = `walletAmount` of /api/v2/user/me;
+    capital to receive = `capitalRemaining` of /api/v2/contracts/me (an
+    account-wide figure repeated on every contract row, so a single row
+    is enough; 0.0 when the account has no contract at all)."""
+    me = _api_get_json(session, USER_ME_API_URL)
+    available_balance = me.get("walletAmount")
     if available_balance is None:
-        raise RuntimeError(f"Could not parse 'Solde disponible' out of {raw_solde!r}.")
+        raise RuntimeError("Could not find 'walletAmount' in the Bienpreter /api/v2/user/me response.")
+
+    results = _get_contracts_page(session, {"page": 1, "limit": 1}).get("results") or []
+    capital_to_receive = results[0].get("capitalRemaining") if results else 0.0
     if capital_to_receive is None:
-        raise RuntimeError(f"Could not parse 'Capital à recevoir' out of {raw_recevoir!r}.")
+        raise RuntimeError("Could not find 'capitalRemaining' in the Bienpreter /api/v2/contracts/me response.")
+    log.info("Balances from the API: solde=%s, capital_a_recevoir=%s", available_balance, capital_to_receive)
 
-    return {"available_balance": available_balance, "capital_to_receive": capital_to_receive}
+    return {"available_balance": float(available_balance), "capital_to_receive": float(capital_to_receive)}
 
 
-ACTIVE_LOANS_URL = "https://www.bienpreter.com/u/mes-prets"
-# Fixed filter params matching the user's own reference URL (status[]=3 =
-# "en cours"/active loans, not fully repaid/sold ones) - only `page` is
-# overridden per request below.
-ACTIVE_LOANS_BASE_PARAMS = {
-    "magicSearch": "",
-    "year": "",
-    "status[]": "3",
-    "litigation": "",
-    "investmentFrom": "all",
-    "bpflexEligible": "",
-    "sellStatus": "",
-    "orderBy": "default",
-    "orderType": "ASC",
-    "join": "",
-}
+# The /u/mes-prets page is a server-rendered HTML table whose markup changed
+# without notice (2026-10-21: amount wrapped in a tooltip <span> -> 0 loans
+# parsed). The site's own front-end reads the same data from a JSON API
+# (`/api/v2/contracts/me`, JSON-LD only), authenticated by the `api-v2-token`
+# cookie that `GET /api-token-from-session` (204) sets from the PHP session -
+# verified live 2026-10-21 to return exactly the same 55 active loans,
+# amounts, borrowers, project ids and next-due dates as the HTML table.
+API_TOKEN_URL = "https://www.bienpreter.com/api-token-from-session"
+ACTIVE_LOANS_API_URL = "https://www.bienpreter.com/api/v2/contracts/me"
+ACTIVE_LOANS_PAGE_SIZE = 100
+LOAN_STATUS_ACTIVE = "3"  # criteria[status][] = "en cours"
 MAX_ACTIVE_LOANS_PAGES = 20  # safety net against an infinite loop
-LOAN_ROW_REGEX = re.compile(r'<tr[^>]*class="bp-tr-main"[^>]*>(.*?)</tr>', re.DOTALL)
-LOAN_PROJECT_BORROWER_REGEX = re.compile(
-    r'<a\s+href="/projets/(\d+)"[^>]*>.*?</a>\s*<br>\s*([^<]+?)\s*</p>', re.DOTALL
-)
-LOAN_CONTRACT_ID_REGEX = re.compile(r'<tr[^>]*class="bp-tr-main"[^>]*data-id="(\d+)"', re.DOTALL)
-LOAN_AMOUNT_REGEX = re.compile(r'contract__amount[^"]*">\s*([^<]+?)\s*</td>', re.DOTALL)
-PROJECT_LOCATION_REGEX = re.compile(r"<dt>\s*Localisation\s*</dt>\s*<dd[^>]*>(.*?)</dd>", re.DOTALL)
-# "<p class=\"text-center\">\n    24\n    r\u00e9sultats au total\n  </p>" - used to bound
-# pagination reliably instead of "stop on an empty page", since out-of-
-# range pages on this site don't reliably come back empty (same bug
-# already documented for the /u/operations pagination in this file's
-# module docstring/repo memory - out-of-range pages can echo stray rows
-# instead of a clean empty result set).
-TOTAL_RESULTS_REGEX = re.compile(r"(\d+)\s*r\u00e9sultats au total", re.IGNORECASE)
-# "<td class=\"contract__next-payment\">... (06/11/2026) ... 1 sur 16</td>"
-LOAN_NEXT_PAYMENT_DATE_REGEX = re.compile(r"contract__next-payment.*?\((\d{2}/\d{2}/\d{4})\)", re.DOTALL)
-# `litigation` filter of /u/mes-prets (verified live 2026-10-16 from the page's
-# own "Retards / Défauts" <select>): 11 = "Prêts en retard (retard < 6 mois)",
+PROJECT_API_URL = "https://www.bienpreter.com/api/v2/project/{project_id}"
+USER_ME_API_URL = "https://www.bienpreter.com/api/v2/user/me"
+# `criteria[litigation]` filter (same values as the old HTML page's
+# "Retards / Défauts" <select>): 11 = "Prêts en retard (retard < 6 mois)",
 # 12 = "Prêts en défaut (retard > 6 mois)" (1 = either of them).
 LITIGATION_LATE = "11"
 LITIGATION_DEFAULT = "12"
 
 
-def _parse_active_loans_rows(page_html: str) -> list:
-    """Parses one page of https://www.bienpreter.com/u/mes-prets into a
-    list of {"project_id", "borrower", "amount", "contract_id",
-    "next_payment_date"} dicts - see module docstring section on
-    active-loans fetching for the verified row markup (`<tr
-    class="bp-tr-main" data-id="...">`, project link + borrower name in
-    `.contract__project__name`, amount in `.contract__amount`, next payment
-    date as "(dd/mm/yyyy)" in `.contract__next-payment`, None if absent)."""
+def _parse_active_loans_results(results: list) -> list:
+    """Converts the `items.results` of /api/v2/contracts/me into a list of
+    {"project_id", "borrower", "amount", "contract_id", "next_payment_date"}
+    dicts. Verified API fields: `id`, `amount`, `project.id`,
+    `project.userSocietyInfo.name` (borrower), `nextDue.dueDate` (ISO
+    datetime, `nextDue` is null when nothing is due -> None). Rows missing
+    a borrower/amount are skipped (surfaced by the total-count check in
+    fetch_active_loans())."""
     rows = []
-    for row_match in LOAN_ROW_REGEX.finditer(page_html):
-        row_html = row_match.group(1)
-        project_match = LOAN_PROJECT_BORROWER_REGEX.search(row_html)
-        amount_match = LOAN_AMOUNT_REGEX.search(row_html)
-        if not project_match or not amount_match:
+    for result in results:
+        project = result.get("project") or {}
+        borrower = ((project.get("userSocietyInfo") or {}).get("name") or "").strip()
+        amount = result.get("amount")
+        if not borrower or amount is None or project.get("id") is None:
             continue
 
-        borrower = html.unescape(_strip_tags(project_match.group(2)))
-        amount = _parse_amount(amount_match.group(1))
-        if not borrower or amount is None:
-            continue
-
-        contract_id_match = LOAN_CONTRACT_ID_REGEX.search(row_match.group(0))
-        next_payment_match = LOAN_NEXT_PAYMENT_DATE_REGEX.search(row_html)
+        next_due = result.get("nextDue") or {}
+        due_date = next_due.get("dueDate")
         rows.append(
             {
-                "project_id": project_match.group(1),
+                "project_id": str(project["id"]),
                 "borrower": borrower,
-                "amount": amount,
-                "contract_id": contract_id_match.group(1) if contract_id_match else None,
-                "next_payment_date": (
-                    datetime.strptime(next_payment_match.group(1), "%d/%m/%Y").date() if next_payment_match else None
-                ),
+                "amount": float(amount),
+                "contract_id": str(result["id"]) if result.get("id") is not None else None,
+                "next_payment_date": datetime.fromisoformat(due_date).date() if due_date else None,
             }
         )
     return rows
 
 
+def _refresh_api_token(session: requests.Session) -> None:
+    """Sets the `api-v2-token` cookie the JSON API authenticates with, from
+    the PHP session cookie (what the site's own front-end does on a 401)."""
+    r = session.get(API_TOKEN_URL, timeout=30)
+    log.info("GET api-token-from-session: status=%s", r.status_code)
+    r.raise_for_status()
+
+
+def _api_get_json(session: requests.Session, url: str, params: dict = None) -> dict:
+    """GET on the JSON API -> parsed body. Re-fetches the API token once on
+    a 401 (expired/missing token) before retrying. Only JSON-LD is served,
+    hence the explicit Accept header."""
+    headers = {"Accept": "application/ld+json"}
+    r = session.get(url, params=params, headers=headers, timeout=30)
+    if r.status_code == 401:
+        _refresh_api_token(session)
+        r = session.get(url, params=params, headers=headers, timeout=30)
+    r.raise_for_status()
+    return r.json()
+
+
+def _get_contracts_page(session: requests.Session, params: dict) -> dict:
+    """One GET of /api/v2/contracts/me -> its `items` object ({"results",
+    "total", "limit", "page"})."""
+    return _api_get_json(session, ACTIVE_LOANS_API_URL, params)["items"]
+
+
 def fetch_active_loans(session: requests.Session, litigation: str = ""):
-    """Fetches every currently active ("en cours") Bienprêter loan from
-    https://www.bienpreter.com/u/mes-prets, paginating via the `page`
-    query param until a page returns no loan rows (bounded by
+    """Fetches every currently active ("en cours") Bienprêter loan from the
+    JSON API (/api/v2/contracts/me, see ACTIVE_LOANS_API_URL), paginating
+    via `page`/`limit` until the API's own `total` is reached (bounded by
     MAX_ACTIVE_LOANS_PAGES as a safety net). `litigation` optionally
     restricts it to late (LITIGATION_LATE) or defaulted (LITIGATION_DEFAULT)
     loans. Returns (loans, issues):
@@ -480,31 +467,41 @@ def fetch_active_loans(session: requests.Session, litigation: str = ""):
       "contract_id", "next_payment_date"} dicts, one per loan/contract (a
       single borrower can appear multiple times, once per contract).
     - issues : list of short strings describing a pagination problem (hit
-      the page safety net, or collected more/fewer rows than the site's
-      own "X résultats au total" - both signal the result may be
-      incomplete) - feeds shared.notifier.send_bienpreter_geo_issues_email()."""
+      the page safety net, or collected a different number of loans than
+      the API's own `total` - both signal the result may be incomplete) -
+      feeds shared.notifier.send_bienpreter_geo_issues_email()."""
     loans = []
     issues = []
+    seen_contract_ids = set()
     expected_total = None
+    _refresh_api_token(session)
     for page_number in range(1, MAX_ACTIVE_LOANS_PAGES + 1):
-        params = dict(ACTIVE_LOANS_BASE_PARAMS, page=str(page_number), litigation=litigation)
+        params = {
+            "page": page_number,
+            "limit": ACTIVE_LOANS_PAGE_SIZE,
+            "criteria[status][]": LOAN_STATUS_ACTIVE,
+        }
+        if litigation:
+            params["criteria[litigation]"] = litigation
         log.info("GET active loans page %d...", page_number)
-        r = session.get(ACTIVE_LOANS_URL, params=params, timeout=30)
-        log.info("GET active loans page %d: status=%s", page_number, r.status_code)
-        r.raise_for_status()
+        items = _get_contracts_page(session, params)
 
         if expected_total is None:
-            total_match = TOTAL_RESULTS_REGEX.search(r.text)
-            if total_match:
-                expected_total = int(total_match.group(1))
-                log.info("Active loans: %d résultat(s) au total (from page 1).", expected_total)
+            expected_total = items.get("total")
+            log.info("Active loans: %s résultat(s) au total (from page 1).", expected_total)
 
-        rows = _parse_active_loans_rows(r.text)
+        results = items.get("results") or []
+        rows = [
+            row
+            for row in _parse_active_loans_results(results)
+            if row["contract_id"] not in seen_contract_ids
+        ]
+        seen_contract_ids.update(row["contract_id"] for row in rows)
         log.info("Active loans page %d: %d loan(s) found.", page_number, len(rows))
-        if not rows:
+        if not results:
             break
         loans.extend(rows)
-        if expected_total is not None and len(loans) >= expected_total:
+        if expected_total is not None and page_number * ACTIVE_LOANS_PAGE_SIZE >= expected_total:
             break
     else:
         message = (
@@ -517,12 +514,11 @@ def fetch_active_loans(session: requests.Session, litigation: str = ""):
     if expected_total is not None and len(loans) != expected_total:
         message = (
             f"Prêts actifs : {expected_total} résultat(s) au total attendu(s) mais {len(loans)} "
-            "collecté(s) - seuls les premiers ont été conservés (une page hors limite a peut-être "
-            "renvoyé des lignes erronées/dupliquées au lieu d'être vide)."
+            "collecté(s) - des contrats ont peut-être été ignorés (emprunteur/montant manquant "
+            "dans la réponse de l'API) ou dupliqués."
         )
         log.warning(message)
         issues.append(message)
-        loans = loans[:expected_total]
 
     log.info("Total active loans found: %d", len(loans))
     return loans, issues
@@ -573,22 +569,21 @@ def _country_from_location(location: str):
 
 
 def fetch_project_country(session: requests.Session, project_id: str):
-    """Fetches https://www.bienpreter.com/projets/{project_id} and reads
-    the '<dt>Localisation</dt><dd>...</dd>' pair, returning just the
-    country part via _country_from_location(). Returns None if the
-    location can't be found/parsed."""
-    url = f"https://www.bienpreter.com/projets/{project_id}"
-    log.info("GET project page %s (for country)...", project_id)
-    r = session.get(url, timeout=30)
-    log.info("GET project page %s: status=%s", project_id, r.status_code)
-    r.raise_for_status()
-
-    match = PROJECT_LOCATION_REGEX.search(r.text)
-    if not match:
-        log.warning("Could not find 'Localisation' on project page %s.", project_id)
+    """Fetches https://www.bienpreter.com/api/v2/project/{project_id} and
+    reads its `location` field (same "City - Country" text the project
+    page's 'Localisation' shows, verified identical live 2026-10-21),
+    returning just the country part via _country_from_location(). NOT the
+    API's `borrowerCountry`/`userSocietyInfo.country` (the borrower
+    company's home country, e.g. 'RO' for ROMRADIATOARE whose project is in
+    Rotterdam/Pays Bas) - the Répartition géographique follows the
+    project's location. Returns None if the location can't be found."""
+    url = PROJECT_API_URL.format(project_id=project_id)
+    log.info("GET project %s (for country)...", project_id)
+    location = (_api_get_json(session, url).get("location") or "").strip()
+    if not location:
+        log.warning("Could not find 'location' for project %s.", project_id)
         return None
 
-    location = _strip_tags(match.group(1))
     country = _country_from_location(location)
     log.info("Project %s location=%r -> country=%r", project_id, location, country)
     return country
@@ -1120,13 +1115,15 @@ def run() -> None:
     session.headers.update(_HEADERS)
 
     try:
-        dashboard_html, _ = get_or_refresh_session(
+        # The dashboard HTML is only an "is the persisted session still
+        # authenticated" probe - the balances themselves come from the API.
+        get_or_refresh_session(
             session, SESSION_STATE_FILE,
             fetch_fn=lambda extra: _fetch_dashboard_html(session),
             login_fn=lambda: (login(session), {}),
             platform_name="Bienpreter",
         )
-        balances = fetch_balances(dashboard_html)
+        balances = fetch_balances(session)
     except Exception:
         log.exception("Failed to log in or fetch Bienpreter balances.")
         sys.exit(1)
