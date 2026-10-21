@@ -380,7 +380,7 @@ def search_lender_loans(sheet_names: list, search_state: dict, min_rates: dict |
         groups = {}
         for lender_id, name in resolved.items():
             rate = (min_rates or {}).get(name)
-            for regulation_status in catalog[lender_id].get("statuses") or INVEST_REGULATION_STATUSES:
+            for regulation_status in INVEST_REGULATION_STATUSES:
                 groups.setdefault((regulation_status, rate), []).append(lender_id)
         for (regulation_status, rate), ids in groups.items():
             fetched = fetch_marketplace_loans(regulation_status, ids, rate)
