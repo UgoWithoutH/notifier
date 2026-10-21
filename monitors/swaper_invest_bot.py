@@ -248,17 +248,15 @@ import pyotp
 from dotenv import load_dotenv
 from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
 
-from shared.notifier import send_swaper_email, send_swaper_investment_summary_email, send_swaper_api_structure_email
+from shared.notifier import send_swaper_investment_summary_email
 from shared.state import load_state, save_state
 from shared.cron_schedule import ensure_schedule, apply_startup_jitter
-from shared.notification_gate import should_notify
 from shared.google_sheet import get_geo_platform_snapshot
 from shared.missing_loans import TRANSIENT_GRACE_SECONDS, report_missing_loans
 from shared.robot_config import Candidate, build_tracker, get_platform_config, match_name, plan_allocations
 from shared.browser_stealth import get_context_options, apply_stealth, human_pause, human_mouse_wander, human_type
 
 DEFAULT_STATE = {
-    "gates": {},
     "missing_loans": {},
 }
 
@@ -833,7 +831,10 @@ def _invest_available_loans(page, loans: list, shares: dict, captured_api_calls:
                 pass
         except Exception:
             log.exception("Exception while attempting to invest in loan %s - stopping.", loan_label)
-            attempts.append({"loan_id": loan_id, "loan_number": loan.get("number"), "amount": amount, "error": True})
+            attempts.append({
+                "loan_id": loan_id, "loan_number": loan.get("number"), "amount": amount,
+                "rate": loan.get("interestRatePerYear"), "error": True,
+            })
             break
 
         modal_html = None
@@ -888,6 +889,7 @@ def _invest_available_loans(page, loans: list, shares: dict, captured_api_calls:
             "loan_id": loan_id,
             "loan_number": loan.get("number"),
             "amount": amount,
+            "rate": loan.get("interestRatePerYear"),
             "modal_html": modal_html,
             "row_html_after_click": row_html_after_click,
             "confirmed": confirmed,
@@ -908,7 +910,6 @@ def run(headless: bool = True) -> None:
     apply_startup_jitter(CRON_SCHEDULE_STATE_FILE)
 
     state = load_state(STATE_FILE, DEFAULT_STATE)
-    gates = state.setdefault("gates", {})
 
     # Pre-declared with safe defaults (added 2026-08-01, explicit user
     # request: "si y'a une erreur ou autre il faut arrêter le bot et à la
@@ -1298,13 +1299,8 @@ def run(headless: bool = True) -> None:
 
     log.info("Balance %s, %d loan(s) available.", "positive" if balance > 0 else "zero/unavailable", len(loans))
 
-    # Real investment summary email (see module docstring/
-    # _invest_available_loans()'s docstring) - independent of the passive
-    # exploration email above. Sent EVERY time at least one investment was
-    # actually attempted this run (not one-time - real money moves every
-    # time) OR an error occurred (explicit user request: "à la fin du run
-    # quoi qu'il arrive envoyer le mail") - so successes/failures/modals/
-    # errors are always visible.
+    # The only Swaper email: sent when an investment was attempted this run
+    # or an error occurred (explicit user request, 2026-10-21).
     if investment_attempts or run_error:
         log.info(
             "Sending Swaper investment summary email (%d attempt(s) this run, error=%s).",
@@ -1312,60 +1308,9 @@ def run(headless: bool = True) -> None:
         )
         send_swaper_investment_summary_email(
             investment_attempts,
-            min_interest_rate=min_interest_rate or None,
-            country_threshold_percentage=country_threshold_percentage,
-            country_status=country_status,
-            country_blocked=country_blocked_originators,
-            originator_cap_status=originator_cap_status,
-            originator_blocked=originator_cap_blocked,
             error=run_error,
             robot_config=robot_config,
         )
-    elif captured_api_calls and originator_loans and balance >= MIN_INVESTMENT_AMOUNT:
-        # Diagnostics email (added 2026-07-26, explicit user request: get
-        # the loans-listing/filter API structure right away, without
-        # waiting for balance >= MIN_INVESTMENT_AMOUNT and an actual
-        # investment attempt). Gated by a simple 24h anti-spam cooldown
-        # (added 2026-07-26, same day, follow-up request) instead of a
-        # one-time-ever flag, so it doesn't spam every run but still keeps
-        # coming back periodically. The real invest call's own structure
-        # still isn't known until a real investment actually happens, since
-        # it's never captured without real money moving (2026-07-25 decision).
-        # ALSO requires `originator_loans` to be non-empty (added 2026-07-26,
-        # later follow-up: "je veux juste [ce mail] si ça investit sur des
-        # prets") - `captured_api_calls` alone is basically ALWAYS non-empty
-        # (constraints/logged-in/loans-listing/history-statistics calls fire
-        # every single run regardless of loan availability), so without this
-        # extra check the email would fire every 24h even when there's
-        # nothing at all to invest in for any selected originator. Now it
-        # only fires when at least one selected originator currently HAS
-        # loan(s) available (i.e. a real investment attempt would have
-        # happened if only the balance had been sufficient).
-        # ALSO requires `balance >= MIN_INVESTMENT_AMOUNT` (added 2026-07-26,
-        # same follow-up request: "solde >= 10 car c'est 10 mini pour
-        # investir et capturer l'appel api") - reaching this `elif` branch
-        # already means investment_attempts is empty, so if the balance is
-        # still below the minimum a real investment wouldn't have been
-        # attempted anyway (see the `balance_now < MIN_INVESTMENT_AMOUNT`
-        # skip further up) - no point sending the diagnostics email in that
-        # case since it can never capture the real invest call either way.
-        # No anti-spam cooldown (removed 2026-07-26, explicit user request:
-        # "tu peux enlever l'anti spam pour swaper ?") - sent every run the
-        # conditions above hold.
-        log.info(
-            "Sending Swaper API-structure diagnostics email (%d call(s) captured, no "
-            "investment attempted yet this run).",
-            len(captured_api_calls),
-        )
-        send_swaper_api_structure_email(captured_api_calls)
-
-    # TEMPORARY DEBUG: force-send a recap email regardless of balance/new
-    # loans, to validate the SMTP pipeline end-to-end. Triggered via the
-    # `force_test_email` workflow_dispatch input. Remove once confirmed working.
-    force_test_email = os.environ.get("FORCE_TEST_EMAIL", "").lower() == "true"
-    if force_test_email:
-        log.info("FORCE_TEST_EMAIL is set - sending a forced test recap email.")
-        send_swaper_email(balance, loans)
 
     # Cron-job.org schedule speed-up/slow-down (re-enabled 2026-09-09, see
     # shared/cron_schedule.py's own docstring for the live-check-then-cache
@@ -1375,33 +1320,6 @@ def run(headless: bool = True) -> None:
         ensure_schedule("30m", cron_job_id=SWAPER_CRON_JOB_ID, state_file=CRON_SCHEDULE_STATE_FILE)
     else:
         ensure_schedule("2m", cron_job_id=SWAPER_CRON_JOB_ID, state_file=CRON_SCHEDULE_STATE_FILE)
-
-    # Same rule for both monitors (see notification_gate.py): only really
-    # "available" when there's money to invest AND at least one loan listed.
-    available = balance >= 10 and bool(loans)
-    send, was_reset = should_notify(gates, "swaper", available, record=not force_test_email)
-
-    if was_reset:
-        log.info("Resetting notification gate (balance < 10 or no loans available).")
-
-    log.info(
-        "Notification decision context: balance=%.2f, loans_count=%d, available=%s, force_test_email=%s",
-        balance,
-        len(loans),
-        available,
-        force_test_email,
-    )
-
-    if send and not force_test_email:
-        log.info("Notification decision: SEND (reason=balance >= 10 and loans available and gate open).")
-        send_swaper_email(balance, loans)
-    elif available:
-        if force_test_email:
-            log.info("Notification decision: SKIP normal cycle send (reason=force_test_email_already_sent).")
-        else:
-            log.info("Notification decision: SKIP (reason=already_notified_for_current_cycle).")
-    else:
-        log.info("Notification decision: SKIP (reason=balance < 10 or no loans available).")
 
     save_state(STATE_FILE, state)
 

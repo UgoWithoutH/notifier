@@ -1,17 +1,5 @@
 """Lendermarket investment bot.
 
-Mirrors swaper_monitor.py's notification-gate logic exactly, with the
-account balance as the same outer gate:
-  - balance <= 0 -> nothing to notify, regardless of loans; every segment's
-    gate is reset (so a fresh alert fires next time money becomes
-    available again).
-  - balance > 0 -> per loan segment (configured in LOAN_SEGMENTS below,
-    mirroring the filtered listing pages the user actually watches): notify
-    once while the segment has loans, only reset that segment's gate once
-    it drops back to 0 loans. Fluctuations in the loan count while staying
-    above 0 do NOT re-open the gate (avoids spamming on every small change)
-    - only an actual return to 0 does, exactly like Swaper's balance.
-
 Login + balance lookup is pure HTTP (no browser needed) - verified
 2026-07-18 via a real browser network capture that the whole auth flow
 (including the TOTP 2FA challenge) has NO reCAPTCHA or other client-side-JS
@@ -77,7 +65,7 @@ import requests
 from dotenv import load_dotenv
 
 from shared.missing_loans import report_missing_loans
-from shared.notifier import send_lendermarket_email, send_lendermarket_invest_summary_email
+from shared.notifier import send_lendermarket_invest_summary_email
 from shared.google_sheet import get_geo_platform_snapshot
 from shared.robot_config import (
     Candidate,
@@ -89,7 +77,6 @@ from shared.robot_config import (
 )
 from shared.state import load_state, save_state
 from shared.session_cache import get_or_refresh_session
-from shared.notification_gate import should_notify
 from shared.cron_schedule import ensure_schedule, apply_startup_jitter
 
 load_dotenv()
@@ -134,47 +121,7 @@ _HEADERS = {
     "Content-Type": "application/json",
 }
 
-# Verified against the real filtered listing pages on 2026-07-08.
-LOAN_SEGMENTS = [
-    {
-        "key": "non_reglemente",
-        "label": "Prêts non réglementés",
-        "regulation_status": "UNREGULATED",
-        "lenders": [
-            "9babf437-5bf8-41fb-840d-6edf7012e408",
-            "9babf437-6970-48e6-8175-62ef53465eba",
-            "9babf437-6ccb-4ae2-a22f-c887e9e3696c",
-        ],
-        "max_remaining_term_in_days": 360,
-        "page_url": (
-            "https://app.lendermarket.com/fr/listes-des-prets/non-reglemente"
-            "?lenders=9babf437-5bf8-41fb-840d-6edf7012e408,"
-            "9babf437-6970-48e6-8175-62ef53465eba,"
-            "9babf437-6ccb-4ae2-a22f-c887e9e3696c&maxRemainingTermInDays=360"
-        ),
-    },
-    {
-        "key": "reglemente",
-        "label": "Prêts réglementés",
-        "regulation_status": "REGULATED",
-        "lenders": [
-            "9ffdd9b6-bde3-445b-a3df-f2f57b94afe7",
-            "9d501521-54f8-4aa2-b975-6b34f8aac5a0",
-        ],
-        "max_remaining_term_in_days": 360,
-        "page_url": (
-            "https://app.lendermarket.com/fr/listes-des-prets/reglemente"
-            "?lenders=9ffdd9b6-bde3-445b-a3df-f2f57b94afe7,"
-            "9d501521-54f8-4aa2-b975-6b34f8aac5a0&maxRemainingTermInDays=360"
-        ),
-    },
-]
-
-# Per-segment notification gate (see notification_gate.py), shared with
-# swaper_monitor.py: notify once while a segment has loans, reset only when
-# it drops back to 0 (fluctuations while staying above 0 don't re-open it).
 DEFAULT_STATE = {
-    "gates": {},
     "lender_search": {},
 }
 
@@ -199,63 +146,6 @@ KNOWN_LENDERS = {
     "9babf437-6970-48e6-8175-62ef53465eba": {"displayName": "Creditstar Denmark", "statuses": ["UNREGULATED"]},
     "9babf437-5bf8-41fb-840d-6edf7012e408": {"displayName": "Creditstar Czech", "statuses": ["UNREGULATED"]},
 }
-
-def fetch_active_loans(segment: dict) -> list:
-    """Fetch the currently active loans for one segment via the public API,
-    with the same lenders/regulationStatus/maxRemainingTermInDays filters
-    used by the corresponding listing page."""
-    params = [
-        ("maxRemainingTermInDays", str(segment["max_remaining_term_in_days"])),
-        ("regulationStatus", segment["regulation_status"]),
-    ]
-    params += [("lenders[]", lender_id) for lender_id in segment["lenders"]]
-    url = f"{LOANS_API_URL}?{parse.urlencode(params)}"
-
-    req = request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-    try:
-        with request.urlopen(req, timeout=20) as resp:
-            payload = json.loads(resp.read())
-    except error.HTTPError as exc:
-        log.error("Lendermarket API returned HTTP %s for segment '%s'.", exc.code, segment["label"])
-        return []
-    except Exception:
-        log.exception("Failed to fetch loans for segment '%s'.", segment["label"])
-        return []
-
-    return payload.get("data") or []
-
-
-def aggregate_by_lender(loans: list) -> list:
-    """Group loans by lender (fournisseur de crédit), returning one entry per
-    lender with the loan count, total investable amount, and min/max
-    interest rate - sorted by lender name."""
-    buckets = {}
-    for loan in loans:
-        lender_name = (loan.get("lender") or {}).get("displayName") or "Fournisseur inconnu"
-        bucket = buckets.setdefault(
-            lender_name,
-            {"lender": lender_name, "count": 0, "total_amount": 0.0, "min_rate": None, "max_rate": None},
-        )
-
-        bucket["count"] += 1
-
-        amount = loan.get("investableAmount") or loan.get("loanAmount")
-        try:
-            bucket["total_amount"] += float(amount)
-        except (TypeError, ValueError):
-            pass
-
-        rate = loan.get("interestRate")
-        try:
-            rate = float(rate)
-        except (TypeError, ValueError):
-            rate = None
-        if rate is not None:
-            bucket["min_rate"] = rate if bucket["min_rate"] is None else min(bucket["min_rate"], rate)
-            bucket["max_rate"] = rate if bucket["max_rate"] is None else max(bucket["max_rate"], rate)
-
-    return sorted(buckets.values(), key=lambda b: b["lender"])
-
 
 def fetch_marketplace_loans(
     regulation_status: str, lender_ids: list | None = None, min_interest_rate: float | None = None,
@@ -858,7 +748,6 @@ def run() -> None:
     run_started_at = datetime.now(timezone.utc)
     apply_startup_jitter(CRON_SCHEDULE_STATE_FILE)
     state = load_state(STATE_FILE, DEFAULT_STATE)
-    gates = state.setdefault("gates", {})
 
     # Same rule as Swaper (see notification_gate.py): a segment is only
     # really "available" when there's money to invest AND at least one loan
@@ -966,54 +855,6 @@ def run() -> None:
     if balance is not None:
         mode = "30m" if balance < 10 else "2m"
         ensure_schedule(mode, cron_job_id=LENDERMARKET_CRON_JOB_ID, state_file=CRON_SCHEDULE_STATE_FILE)
-
-    newly_available = {}
-
-    # Below the minimum, every segment is unavailable regardless of its own
-    # loan count (see `available` below) - skip the per-segment API call
-    # entirely instead of fetching just to log a predetermined SKIP.
-    # should_notify() is still called (with count=0) so gates that were open
-    # get properly reset now, not silently left stale for next time.
-    skip_loan_fetch = balance is not None and balance < 10
-
-    for segment in LOAN_SEGMENTS:
-        if skip_loan_fetch:
-            count = 0
-            log.info("Segment '%s': skipping loan availability check (balance < 10 EUR).", segment["label"])
-        else:
-            loans = fetch_active_loans(segment)
-            count = len(loans)
-            log.info("Segment '%s': %d loan(s) currently available.", segment["label"], count)
-
-        available = (balance is None or balance >= 10) and count > 0
-        send, was_reset = should_notify(gates, segment["key"], available)
-
-        if was_reset:
-            log.info("Segment '%s': resetting notification gate.", segment["label"])
-
-        log.info(
-            "Notification decision context: segment='%s', loans_count=%d, available=%s",
-            segment["label"],
-            count,
-            available,
-        )
-
-        if send:
-            log.info("Notification decision: SEND (reason=loans_available_and_gate_open). loans_count=%d", count)
-            newly_available[segment["key"]] = {
-                "label": segment["label"],
-                "lenders": aggregate_by_lender(loans),
-            }
-        elif available:
-            log.info("Notification decision: SKIP (reason=already_notified_for_current_cycle).")
-        else:
-            log.info("Notification decision: SKIP (reason=balance < 10 or no loans available).")
-
-    if newly_available:
-        log.info("Sending notification for %d segment(s) with newly available loans.", len(newly_available))
-        send_lendermarket_email(balance, newly_available)
-    else:
-        log.info("Nothing new to notify.")
 
     save_state(STATE_FILE, state)
 

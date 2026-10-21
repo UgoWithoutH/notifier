@@ -527,8 +527,9 @@ def run() -> None:
     finally:
         _log_diagnostics("run_summary", stats=stats, error=error)
         had_problem = bool(error or stats["failures"])
-        # dry/probe runs only email on error; diagnostics are attached only when something went wrong.
-        if error or (MODE == "live" and (stats["plan"] or stats["attempts"])):
+        # Email only on error or when a real purchase was attempted (dry/probe never buy);
+        # diagnostics are attached only when something went wrong.
+        if error or (MODE == "live" and stats["attempts"]):
             send_afranga_invest_summary_email(
                 stats, error=error, diagnostics_text=_collect_run_diagnostics(run_started_at) if had_problem else None,
                 robot_config=config,
