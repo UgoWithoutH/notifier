@@ -187,7 +187,8 @@ from shared.google_sheet import (
     fill_geographic_repartition_uninvested_amount,
     fill_remaining_duration_amounts,
 )
-from shared.remaining_duration import overdue_months_and_days, remaining_months_and_days
+from shared.rate_sheet import fill_rate_amounts
+from shared.remaining_duration import RateWeights, base_term_between, base_term_from_days, overdue_months_and_days, remaining_months_and_days
 from shared.report_date import get_report_now, is_current_month
 from shared.session_cache import get_or_refresh_session
 from shared.state import load_state, save_state
@@ -204,6 +205,7 @@ ORIGINATORS_API_URL = "https://api.peerberry.com/v1/investor/overview/originator
 ACCOUNT_SUMMARY_API_URL = "https://api.peerberry.com/v2/investor/account-summary"
 TRANSACTIONS_API_URL = "https://api.peerberry.com/v2/investor/transactions"
 INVESTMENTS_API_URL = "https://api.peerberry.com/v1/investor/investments"
+LOANS_API_URL = "https://api.peerberry.com/v1/loans"
 # Server caps pageSize at 40 (verified live 2026-10-16: 100 -> 422 "Page Size must be no greater than 40").
 INVESTMENTS_PAGE_SIZE = 40
 MAX_INVESTMENTS_PAGES = 50
@@ -316,7 +318,38 @@ def _parse_iso_date(value):
         return None
 
 
-def aggregate_remaining_durations(investments: list, today: date) -> dict:
+def fetch_loan_base_terms(session: requests.Session, investments: list) -> dict:
+    """Original term of each loan of `investments`, as {loanId: (months, days)} for the "taux" tab.
+
+    The investments list only carries `term` (= REMAINING days, e.g. 1 for a loan due tomorrow) and
+    `dateOfPurchase` (when the user bought it, not the issue date), so the original term comes from
+    `GET /v1/loans/<loanId>` -> `{"loan": {"issuedDate": "2026-10-25", "finalPaymentDate": "2027-01-07",
+    "initialTerm": 74, ...}}`; `initialTerm` is the loan's term in days (verified live 2026-10-26 on all 88 loans:
+    always equal to finalPaymentDate - issuedDate, e.g. 15/30/31 days for CrediWise/Credito365, 65-124 for
+    Credit365 AU). Falls back to issuedDate -> finalPaymentDate if `initialTerm` is missing. A loan whose
+    lookup fails is left out (warned), it is then simply excluded from the "taux" tab."""
+    terms = {}
+    for loan_id in dict.fromkeys(inv.get("loanId") for inv in investments):
+        if loan_id is None:
+            continue
+        try:
+            r = session.get(f"{LOANS_API_URL}/{loan_id}", headers=_HEADERS, timeout=20)
+            r.raise_for_status()
+            loan = (r.json() or {}).get("loan") or {}
+            term = base_term_from_days(loan.get("initialTerm")) or base_term_between(
+                _parse_iso_date(loan.get("issuedDate")), _parse_iso_date(loan.get("finalPaymentDate"))
+            )
+        except Exception as exc:
+            log.warning("Could not fetch the base term of loan %s: %s", loan_id, exc)
+            continue
+        if term is None:
+            log.warning("Loan %s exposes no usable initialTerm/issuedDate - no base term for the 'taux' sheet.", loan_id)
+            continue
+        terms[loan_id] = term
+    return terms
+
+
+def aggregate_remaining_durations(investments: list, today: date, rates: RateWeights | None = None, base_terms: dict | None = None) -> dict:
     """Group current investments by loan originator (`originatorTitle`, same
     key as the originators distribution), then by remaining term as of
     `today` (months, days): {originator: {(months, days): remainingPrincipal}}.
@@ -329,7 +362,12 @@ def aggregate_remaining_durations(investments: list, today: date) -> dict:
     overdue_months_and_days() since their missed due date (the earliest of
     `finalPaymentDate`/`nextPaymentDate` that is in the past). PeerBerry has
     no default status, so a loan more than PEERBERRY_DEFAULT_DAYS late is
-    INFERRED to be in default ("de défaut" instead of "de retard")."""
+    INFERRED to be in default ("de défaut" instead of "de retard").
+
+    `rates` (optional RateWeights) collects each investment's `interestRate`
+    (already in percent, e.g. 9 or 10.5; identical to the `interest` field) and, for
+    the "taux" tab, its original term from `base_terms` ({loanId: (months, days)},
+    see fetch_loan_base_terms(); None excludes the investment from that tab)."""
     result = {}
     for inv in investments:
         originator = inv.get("originatorTitle") or "Unknown"
@@ -353,6 +391,9 @@ def aggregate_remaining_durations(investments: list, today: date) -> dict:
             term = remaining_months_and_days(today, maturity)
         durations = result.setdefault(originator, {})
         durations[term] = durations.get(term, 0.0) + amount
+        if rates is not None:
+            base_term = (base_terms or {}).get(inv.get("loanId"))
+            rates.add(originator, term, amount, inv.get("interestRate"), base_term=base_term)
     return result
 
 
@@ -1421,11 +1462,20 @@ def run() -> None:
         # Own try/except: the "durée" tab is a secondary view, its failure
         # must not fail the whole run.
         try:
+            rates = RateWeights()
+            investments = fetch_current_investments(session)
+            base_terms = fetch_loan_base_terms(session, investments)
             fill_remaining_duration_amounts(
-                "Peerberry", aggregate_remaining_durations(fetch_current_investments(session), today_date)
+                "Peerberry", aggregate_remaining_durations(investments, today_date, rates, base_terms), rates=rates
             )
         except Exception:
             log.exception("Failed to update the 'durée' sheet for Peerberry.")
+
+        # Own try/except too: the "taux" tab is independent of the "durée" one.
+        try:
+            fill_rate_amounts("Peerberry", rates)
+        except Exception:
+            log.exception("Failed to update the 'taux' sheet for Peerberry.")
 
 
 if __name__ == "__main__":

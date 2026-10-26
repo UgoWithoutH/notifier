@@ -168,7 +168,8 @@ import requests
 try:
     from shared.google_sheet import fill_current_month_amounts, fill_current_month_bonus_breakdown, fill_geographic_repartition_amounts, fill_geographic_repartition_uninvested_amount, fill_remaining_duration_amounts
     from shared.monthly_yield_waterfall import compute_monthly_yield_shares
-    from shared.remaining_duration import overdue_months_and_days, remaining_months_and_days
+    from shared.rate_sheet import fill_rate_amounts
+    from shared.remaining_duration import RateWeights, base_term_between, overdue_months_and_days, remaining_months_and_days
     from shared.report_date import get_report_now, is_current_month
     from shared.session_cache import get_or_refresh_session
     from shared.state import load_state, save_state
@@ -183,7 +184,8 @@ except ModuleNotFoundError:
         sys.path.insert(0, str(project_root))
     from shared.google_sheet import fill_current_month_amounts, fill_current_month_bonus_breakdown, fill_geographic_repartition_amounts, fill_geographic_repartition_uninvested_amount, fill_remaining_duration_amounts
     from shared.monthly_yield_waterfall import compute_monthly_yield_shares
-    from shared.remaining_duration import overdue_months_and_days, remaining_months_and_days
+    from shared.rate_sheet import fill_rate_amounts
+    from shared.remaining_duration import RateWeights, base_term_between, overdue_months_and_days, remaining_months_and_days
     from shared.report_date import get_report_now, is_current_month
     from shared.session_cache import get_or_refresh_session
     from shared.state import load_state, save_state
@@ -421,18 +423,22 @@ def fetch_loan_details(session: requests.Session, session_token: str, loan_id: s
     text = re.sub(r"\s+", " ", re.sub(r"<[^>]+>", " ", text).replace("&nbsp;", " "))
     originator = re.search(r"Loan originator (.+?) Loan score", text)
     closing = re.search(r"Closing date (\d{4})-(\d{2})-(\d{2})", text)
+    issue = re.search(r"Issue date (\d{4})-(\d{2})-(\d{2})", text)
     share = re.search(r"Your share ([\d,]+\.\d+)", text)
     status = re.search(r"Status (.+?) Loan purpose", text)
+    rate = re.search(r"Expected Annual Return \(%\) (\d+(?:\.\d+)?) %", text)  # already in percent (e.g. 15.04)
     return {
+        "rate": float(rate.group(1)) if rate else None,
         "originator": originator.group(1).strip() if originator else "Unknown",
         "maturity": date(*(int(g) for g in closing.groups())) if closing else None,
+        "issued": date(*(int(g) for g in issue.groups())) if issue else None,
         "amount": _parse_amount(share.group(1)) if share else None,
         "status": status.group(1).strip() if status else "",
         "unpaid_since": _first_unpaid_due_date(resp.text, today or date.today()),
     }
 
 
-def aggregate_remaining_durations(session: requests.Session, session_token: str, today: date) -> dict:
+def aggregate_remaining_durations(session: requests.Session, session_token: str, today: date, rates=None) -> dict:
     """Group the loans held by loan originator, then by remaining term as of
     `today` (months, days): {originator: {(months, days): amount}}. Loans
     whose maturity or amount can't be determined are skipped (with a
@@ -465,6 +471,11 @@ def aggregate_remaining_durations(session: requests.Session, session_token: str,
             term = remaining_months_and_days(today, details["maturity"])
         durations = result.setdefault(details["originator"], {})
         durations[term] = durations.get(term, 0.0) + details["amount"]
+        if rates is not None:
+            base_term = base_term_between(details["issued"], details["maturity"])
+            if base_term is None:
+                log.warning("No usable issue date for loan %s (%s) - excluded from the 'taux' sheet.", loan_id, details["originator"])
+            rates.add(details["originator"], term, details["amount"], details["rate"], base_term=base_term)
     return result
 
 
@@ -1109,11 +1120,17 @@ def run() -> None:
         # Own try/except: the "durée" tab is a secondary view, its failure
         # must not fail the whole run.
         try:
+            rates = RateWeights()
             fill_remaining_duration_amounts(
-                "Iuvo", aggregate_remaining_durations(session, session_token, today_date)
+                "Iuvo", aggregate_remaining_durations(session, session_token, today_date, rates=rates), rates=rates
             )
         except Exception:
             log.exception("Failed to update the 'durée' sheet for Iuvo.")
+
+        try:
+            fill_rate_amounts("Iuvo", rates)
+        except Exception:
+            log.exception("Failed to update the 'taux' sheet for Iuvo.")
 
 
 if __name__ == "__main__":
