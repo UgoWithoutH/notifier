@@ -38,6 +38,7 @@ from shared.google_sheet import (
     _duration_sections,
     get_worksheet_by_name,
 )
+from shared.remaining_duration import months_to_term
 from shared.report_date import get_report_date
 
 logger = logging.getLogger(__name__)
@@ -67,7 +68,6 @@ _PLATFORM_FORMATS = (
 )
 _PLATFORM_MONTH_FORMAT = {"backgroundColor": _GREY, "numberFormat": _DURATION_AMOUNT_FORMAT["numberFormat"], "borders": {"top": {"style": "NONE"}}}
 _RATE_MONTH_NUMBER_FORMAT = {"type": "PERCENT", "pattern": "0.00%"}
-_DURATION_MONTH_NUMBER_FORMAT = {"type": "NUMBER", "pattern": '0.0" mois"'}
 _DEFAULT_HORIZON = "1 an"
 
 
@@ -361,10 +361,15 @@ def fill_rate_amounts(platform: str, rates, platform_level: bool = False, projec
             month_cell = {}
             average = averages.get((history_key, month))
             if kind in ("rate", "duration"):
-                cell_format["numberFormat"] = _RATE_MONTH_NUMBER_FORMAT if kind == "rate" else _DURATION_MONTH_NUMBER_FORMAT
                 value = None if average is None else average[0 if kind == "rate" else 1]
-                if value is not None:
-                    month_cell["userEnteredValue"] = {"numberValue": round(value / 100, 6) if kind == "rate" else round(value, 2)}
+                if kind == "rate":
+                    cell_format["numberFormat"] = _RATE_MONTH_NUMBER_FORMAT
+                    if value is not None:
+                        month_cell["userEnteredValue"] = {"numberValue": round(value / 100, 6)}
+                else:
+                    cell_format["horizontalAlignment"] = "RIGHT"
+                    if value is not None:
+                        month_cell["userEnteredValue"] = {"stringValue": _duration_label(months_to_term(value))}
             month_cell["userEnteredFormat"] = cell_format
             cells.append(month_cell)
         rows.append({"values": cells})
