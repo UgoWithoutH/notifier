@@ -842,6 +842,7 @@ def run(session: requests.Session | None = None) -> None:
                     PLATFORM_LABEL,
                     aggregate_remaining_durations(session, active_loan_amounts, report_date, loan_statuses, loan_due_dates),
                     platform_level=True,
+                    projects=True,
                 )
             except Exception:
                 log.exception("Failed to update the 'durée' sheet for Lande.")
