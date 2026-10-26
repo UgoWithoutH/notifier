@@ -68,6 +68,15 @@ def term_in_months(term: tuple) -> float:
     return term[0] + term[1] / (365.25 / 12)
 
 
+def months_to_term(months: float) -> tuple:
+    """Inverse de `term_in_months` : nombre de mois (ex. 6.13) -> (mois, jours) arrondi au jour, ex. (6, 4)."""
+    whole = int(months)
+    days = round((months - whole) * 365.25 / 12)
+    if days >= 30:
+        return (whole + 1, 0)
+    return (whole, days)
+
+
 class RateWeights:
     """Taux de rendement (%) des prêts, regroupés par (clé, durée) comme les montants de l'onglet "durée".
 
