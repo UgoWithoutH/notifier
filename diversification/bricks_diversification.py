@@ -1220,6 +1220,7 @@ def run() -> None:
                         project_statuses, fetch_project_missed_payment_dates(session),
                     ),
                     platform_level=True,
+                    projects=True,
                 )
         except Exception:
             log.exception("Failed to update the 'durée' sheet for Bricks.")
