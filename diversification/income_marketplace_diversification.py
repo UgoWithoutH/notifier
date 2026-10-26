@@ -151,7 +151,8 @@ from shared.google_sheet import (
     fill_geographic_repartition_uninvested_amount,
     fill_remaining_duration_amounts,
 )
-from shared.remaining_duration import overdue_months_and_days, remaining_months_and_days
+from shared.rate_sheet import fill_rate_amounts
+from shared.remaining_duration import RateWeights, base_term_between, overdue_months_and_days, remaining_months_and_days
 from shared.report_date import get_report_date, is_current_month
 from shared.state import load_state, save_state
 from shared.weighted_average import INVESTED_BALANCE_LABEL, NON_INVESTED_BALANCE_LABEL, compute_time_weighted_average
@@ -352,6 +353,24 @@ def fetch_investor_details(page, token: str) -> dict:
     return {"cash_balance": cash_balance, "invested_total": invested_total, "companies": companies}
 
 
+def _base_term(item: dict) -> tuple | None:
+    """Original term of a loan as (months, days): `loan_term_period` (a number of months, verified live 2026-10-26:
+    it always equals `loan_issued_date` -> `loan_due_date`, e.g. 3, 9, 10, 12, 18, 24), else derived from
+    `loan_issued_date` and `loan_due_date`. None if neither is usable."""
+    try:
+        months = int(item.get("loan_term_period"))
+    except (TypeError, ValueError):
+        months = 0
+    if months > 0:
+        return (months, 0)
+    try:
+        return base_term_between(
+            date.fromisoformat(str(item.get("loan_issued_date"))[:10]), date.fromisoformat(str(item.get("loan_due_date"))[:10])
+        )
+    except ValueError:
+        return None
+
+
 def fetch_investments(page, token: str) -> list:
     """Every investment of the "My investments" page (GET /api/investments/
     ?page_size=1000, `{"items": [...], "total": N}`, verified live
@@ -359,7 +378,9 @@ def fetch_investments(page, token: str) -> list:
     page=2 return the same 20 rows), so everything is fetched in a single
     large page; a warning is logged if fewer than `total` rows come back.
     Returns [{"originator", "outstanding", "maturity", "status",
-    "overdue_since"}] where `maturity` is the loan's `loan_due_date` (the
+    "overdue_since", "rate", "base_term"}] where `rate` is the investor's interest rate in
+    percent (`loan_investor_interest_rate`, e.g. "15.00000" -> 15.0, verified
+    live 2026-10-26), None if missing; `maturity` is the loan's `loan_due_date` (the
     platform itself shows the remaining term as that date minus today), or
     None if missing/unparseable; `status` is the raw `loan_status` and
     `overdue_since` the loan's `overdue_base_date` (None if missing).
@@ -369,7 +390,8 @@ def fetch_investments(page, token: str) -> list:
     late ones (days since it always fall in the loan's bucket). The platform's
     i18n also defines "60+d"/"buybackInitiated" ("Buyback initiated": more
     than 60 days late, buyback obligation triggered), "forcedBuyback" and
-    "paidBack" - never observed on the account, so only inferred."""
+    "paidBack" - never observed on the account, so only inferred. `base_term` is the loan's original term
+    (see _base_term), None if unknown."""
     data = _fetch_json(page, INVESTMENTS_URL, token)
     items = data.get("items") or []
     if len(items) < data.get("total", len(items)):
@@ -384,8 +406,14 @@ def fetch_investments(page, token: str) -> list:
             overdue_since = date.fromisoformat(str(item.get("overdue_base_date"))[:10])
         except ValueError:
             overdue_since = None
+        try:
+            rate = float(item.get("loan_investor_interest_rate"))
+        except (TypeError, ValueError):
+            rate = None
         investments.append(
             {
+                "rate": rate,
+                "base_term": _base_term(item),
                 "originator": (item.get("loan_originator_name") or "Unknown").strip(),
                 "outstanding": float(item.get("investment_outstanding_principal") or 0.0),
                 "maturity": maturity,
@@ -421,7 +449,7 @@ def _overdue_term(inv: dict, today: date):
     )
 
 
-def aggregate_remaining_durations(investments: list, today: date) -> dict:
+def aggregate_remaining_durations(investments: list, today: date, rates: RateWeights | None = None) -> dict:
     """Group investments by loan originator (same key as the geographic
     repartition), then by remaining term as of `today` (months, days):
     {originator: {(months, days): outstanding}}. Late loans (status "1-15d"/
@@ -441,6 +469,10 @@ def aggregate_remaining_durations(investments: list, today: date) -> dict:
             term = remaining_months_and_days(today, inv["maturity"])
         durations = result.setdefault(inv["originator"], {})
         durations[term] = durations.get(term, 0.0) + inv["outstanding"]
+        if rates is not None:
+            if inv.get("base_term") is None:
+                log.warning("No base term found for an investment of %s (%.2f EUR) - excluded from the 'taux' sheet.", inv["originator"], inv["outstanding"])
+            rates.add(inv["originator"], term, inv["outstanding"], inv.get("rate"), base_term=inv.get("base_term"))
     return result
 
 
@@ -593,10 +625,11 @@ def run() -> None:
             today_date = get_report_date()
 
             remaining_durations = None
+            duration_rates = RateWeights()
             if current_month:
                 # Own try/except: the "durée" tab is a secondary view, its failure must not fail the whole run.
                 try:
-                    remaining_durations = aggregate_remaining_durations(fetch_investments(page, token), today_date)
+                    remaining_durations = aggregate_remaining_durations(fetch_investments(page, token), today_date, duration_rates)
                     durations_total = sum(a for terms in remaining_durations.values() for a in terms.values())
                     if abs(durations_total - overview["invested_total"]) > 0.01:
                         log.warning(
@@ -912,9 +945,14 @@ def run() -> None:
 
         if remaining_durations is not None:
             try:
-                fill_remaining_duration_amounts("Income Marketplace", remaining_durations)
+                fill_remaining_duration_amounts("Income Marketplace", remaining_durations, rates=duration_rates)
             except Exception:
                 log.exception("Failed to update the 'durée' sheet for Income Marketplace.")
+
+            try:
+                fill_rate_amounts("Income Marketplace", duration_rates)
+            except Exception:
+                log.exception("Failed to update the 'taux' sheet for Income Marketplace.")
 
 
 if __name__ == "__main__":

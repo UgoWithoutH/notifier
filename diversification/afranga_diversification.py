@@ -153,7 +153,14 @@ from shared.google_sheet import (
     fill_geographic_repartition_uninvested_amount,
     fill_remaining_duration_amounts,
 )
-from shared.remaining_duration import overdue_months_and_days, remaining_months_and_days
+from shared.rate_sheet import fill_rate_amounts
+from shared.remaining_duration import (
+    RateWeights,
+    base_term_between,
+    base_term_from_days,
+    overdue_months_and_days,
+    remaining_months_and_days,
+)
 from shared.report_date import get_report_now, is_current_month
 from shared.session_cache import get_or_refresh_session
 from shared.state import load_state, save_state
@@ -302,12 +309,15 @@ def login(session: requests.Session) -> None:
 
 
 _MATURITY_RE = re.compile(r"Maturity\s+(\d{2})\.(\d{2})\.(\d{4})")
+_LISTING_DATE_RE = re.compile(r"Listing date\s+(\d{2})\.(\d{2})\.(\d{4})")
+_LOAN_TERM_RE = re.compile(r"Loan Term\s+(\d+)\s*([md])\b", re.IGNORECASE)  # "Loan Term 36m."
 # One payment-schedule row of the panel: "Due Date dd.mm.yyyy ... Status <X>"
 # (X is "Paid" or "Scheduled" in everything seen live; the Status word is
 # followed by "Payment Date" or the next "Due Date").
 _SCHEDULE_ROW_RE = re.compile(
     r"Due Date\s+(\d{2})\.(\d{2})\.(\d{4})\b.*?\bStatus\s+([A-Za-z][A-Za-z ]*?)\s+(?:Payment Date|Due Date|The proceeds|KIIS|$)"
 )
+_CARD_RATE_RE = re.compile(r"(\d+(?:[.,]\d+)?)\s*%")  # "16% · 32m left" (annual interest rate, in percent)
 _MONTHS = {m: i for i, m in enumerate(("Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"), start=1)}
 _CARD_DATE_RE = re.compile(r"(\d{1,2})\s+([A-Za-z]{3})[a-z]*\.?\s+(\d{4})")
 
@@ -321,8 +331,9 @@ def _parse_card_date(text: str | None) -> date | None:
 
 
 def fetch_loan_dates(session: requests.Session, panel_url: str, today: date) -> tuple:
-    """(maturity, earliest_unpaid_due) of a loan, both date | None, read from
-    its investment panel. Maturity is the "Maturity dd.mm.yyyy" field
+    """(maturity, earliest_unpaid_due, base_term) of a loan, read from its
+    investment panel (dates are date | None; base_term is the loan's original
+    (months, days) term, see _panel_base_term). Maturity is the "Maturity dd.mm.yyyy" field
     (verified live 2026-10-16) - the card's own "32m left" label only has
     month precision. earliest_unpaid_due is the oldest payment-schedule row
     already due before `today` whose Status isn't "Paid" (None when there is
@@ -345,14 +356,30 @@ def fetch_loan_dates(session: requests.Session, panel_url: str, today: date) -> 
         for d, mo, y, status in _SCHEDULE_ROW_RE.findall(text)
         if status.strip().lower() != "paid" and date(int(y), int(mo), int(d)) < today
     ]
-    return maturity, min(unpaid_dues, default=None)
+    return maturity, min(unpaid_dues, default=None), _panel_base_term(text, maturity)
+
+
+def _panel_base_term(text: str, maturity: date | None) -> tuple | None:
+    """Original term of a loan from its panel text: the "Loan Term 36m." field
+    (months, or days if suffixed "d"), else "Listing date" -> "Maturity"."""
+    match = _LOAN_TERM_RE.search(text)
+    if match:
+        value = int(match.group(1))
+        return (value, 0) if match.group(2).lower() == "m" else base_term_from_days(value)
+    match = _LISTING_DATE_RE.search(text)
+    if match and maturity is not None:
+        day, month, year = (int(g) for g in match.groups())
+        return base_term_between(date(year, month, day), maturity)
+    return None
 
 
 def fetch_investments(session: requests.Session) -> list:
     """Fetch every active investment from the "My investments" JSON API
     (redesign verified live 2026-10-12: the old HTML `/refresh` fragment
     now 404s). Returns a list of {"originator", "outstanding", "loan_id",
-    "panel_url", "status", "overdue", "next_payment_date"} dicts.
+    "panel_url", "status", "overdue", "next_payment_date", "rate"} dicts
+    ("rate" = annual interest rate in percent from the card's "16% · 32m
+    left" label, None if absent).
 
     Late/default signals (verified live 2026-10-16 on a portfolio with only
     current loans, so the late/default values themselves are inferred from
@@ -381,6 +408,7 @@ def fetch_investments(session: requests.Session) -> list:
         for card in payload.get("cards") or []:
             invested = card.get("invested") or {}
             next_payment = card.get("next_payment") or {}
+            rate_match = _CARD_RATE_RE.search(invested.get("meta") or "")
             investments.append(
                 {
                     "originator": (card.get("originator") or {}).get("name") or "Unknown",
@@ -390,6 +418,7 @@ def fetch_investments(session: requests.Session) -> list:
                     "status": (card.get("status") or {}).get("label") or "",
                     "overdue": bool(next_payment.get("overdue")),
                     "next_payment_date": _parse_card_date(next_payment.get("date")),
+                    "rate": float(rate_match.group(1).replace(",", ".")) if rate_match else None,
                 }
             )
 
@@ -429,7 +458,7 @@ def _clean_originator_name(name: str) -> str:
     return re.sub(r"\s*logo$", "", name or "Unknown", flags=re.IGNORECASE).strip()
 
 
-def aggregate_remaining_durations(session: requests.Session, investments: list, today: date) -> dict:
+def aggregate_remaining_durations(session: requests.Session, investments: list, today: date, rates=None) -> dict:
     """Group investments by loan originator, then by remaining term as of
     `today` (months, days): {originator: {term: outstanding}}. The panel
     dates are fetched once per loan; investments whose maturity can't be
@@ -453,7 +482,7 @@ def aggregate_remaining_durations(session: requests.Session, investments: list, 
                     panel_dates[loan_key] = fetch_loan_dates(session, inv["panel_url"], today)
                 except Exception:
                     log.exception("Failed to fetch the panel dates of loan %s.", loan_key)
-                    panel_dates[loan_key] = (None, None)
+                    panel_dates[loan_key] = (None, None, None)
             return panel_dates[loan_key]
 
         status = (inv.get("status") or "").lower()
@@ -473,6 +502,11 @@ def aggregate_remaining_durations(session: requests.Session, investments: list, 
             term = remaining_months_and_days(today, maturity)
         durations = result.setdefault(originator, {})
         durations[term] = durations.get(term, 0.0) + inv.get("outstanding", 0.0)
+        if rates is not None:
+            base_term = loan_dates()[2]
+            if base_term is None:
+                log.warning("No base term found for an investment of %s (%.2f EUR) - excluded from the 'taux' sheet.", originator, inv.get("outstanding", 0.0))
+            rates.add(originator, term, inv.get("outstanding", 0.0), inv.get("rate"), base_term=base_term)
     return result
 
 
@@ -1799,12 +1833,18 @@ def run() -> None:
 
         # Own try/except: the "durée" tab is a secondary view, its failure
         # must not fail the whole run.
+        rates = RateWeights()
         try:
             fill_remaining_duration_amounts(
-                "Afranga", aggregate_remaining_durations(session, investments, today_date)
+                "Afranga", aggregate_remaining_durations(session, investments, today_date, rates=rates), rates=rates
             )
         except Exception:
             log.exception("Failed to update the 'durée' sheet for Afranga.")
+        else:
+            try:
+                fill_rate_amounts("Afranga", rates)
+            except Exception:
+                log.exception("Failed to update the 'taux' sheet for Afranga.")
 
 
 if __name__ == "__main__":

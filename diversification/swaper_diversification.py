@@ -112,7 +112,8 @@ from shared.google_sheet import (
     fill_geographic_repartition_uninvested_amount,
     fill_remaining_duration_amounts,
 )
-from shared.remaining_duration import overdue_months_and_days, remaining_months_and_days
+from shared.rate_sheet import fill_rate_amounts
+from shared.remaining_duration import RateWeights, base_term_between, base_term_from_days, overdue_months_and_days, remaining_months_and_days
 from shared.report_date import get_report_now, is_current_month
 from shared.state import load_state, save_state
 from shared.weighted_average import INVESTED_BALANCE_LABEL, NON_INVESTED_BALANCE_LABEL, compute_time_weighted_average
@@ -346,7 +347,25 @@ def _missed_payment_date(inv: dict):
     return min(unpaid) if unpaid else None
 
 
-def aggregate_remaining_durations(investments: list, today: date) -> dict:
+def _base_term(inv: dict):
+    """Original term of an investment as (months, days) for the "taux" tab, or None. Swaper's rows carry
+    "loanTerm": {"unit": "MONTHS"|"DAYS", "value": N} (verified live 2026-10-26: 24 or 12 months for the long-term
+    loans, 30 days for a short-term one, equal to startDate -> dueDate); falls back to "startDate" ->
+    "dueDate" when it is missing or in another unit."""
+    term = inv.get("loanTerm")
+    if isinstance(term, dict):
+        unit = str(term.get("unit") or "").upper()
+        value = term.get("value")
+        if unit == "DAYS":
+            result = base_term_from_days(value)
+            if result is not None:
+                return result
+        elif unit == "MONTHS" and isinstance(value, int) and value > 0:
+            return (value, 0)
+    return base_term_between(_parse_iso_date(inv.get("startDate")), _parse_iso_date(inv.get("dueDate")))
+
+
+def aggregate_remaining_durations(investments: list, today: date, rates: RateWeights | None = None) -> dict:
     """Group open investments by loan originator, then by remaining term as
     of `today` (months, days): {originator: {(months, days): outstanding}}.
     Investments without a parseable due date, or with nothing outstanding
@@ -358,7 +377,11 @@ def aggregate_remaining_durations(investments: list, today: date) -> dict:
     grouped by how long ago its missed payment was due (`nextPaymentDate`,
     else the earliest unpaid schedule item) when that date is in the past,
     otherwise it keeps its remaining term. Swaper exposes no default status
-    (its loans are bought back by the originator), so none is flagged."""
+    (its loans are bought back by the originator), so none is flagged.
+
+    `rates` (optional RateWeights) collects each investment's
+    `interestRatePerYear` (already in percent, e.g. 14 or 12) and its original
+    term (see _base_term(), None excludes it from the "taux" tab)."""
     result = {}
     for inv in investments:
         originator = (inv.get("group") or "Unknown").strip()
@@ -378,6 +401,11 @@ def aggregate_remaining_durations(investments: list, today: date) -> dict:
             term = remaining_months_and_days(today, maturity)
         durations = result.setdefault(originator, {})
         durations[term] = durations.get(term, 0.0) + amount
+        if rates is not None:
+            base_term = _base_term(inv)
+            if base_term is None:
+                log.warning("No base term found for an investment of %s (%.2f EUR) - excluded from the 'taux' sheet.", originator, amount)
+            rates.add(originator, term, amount, inv.get("interestRatePerYear"), base_term=base_term)
     return result
 
 
@@ -1652,12 +1680,20 @@ def run(headless: bool = True) -> None:
         # must not fail the whole run.
         if open_investments is not None:
             try:
+                rates = RateWeights()
                 fill_remaining_duration_amounts(
                     "Swaper",
-                    aggregate_remaining_durations(open_investments, get_report_now(REPORT_TIMEZONE).date()),
+                    aggregate_remaining_durations(open_investments, get_report_now(REPORT_TIMEZONE).date(), rates),
+                    rates=rates,
                 )
             except Exception:
                 log.exception("Failed to update the 'durée' sheet for Swaper.")
+
+            # Own try/except too: the "taux" tab is independent of the "durée" one.
+            try:
+                fill_rate_amounts("Swaper", rates)
+            except Exception:
+                log.exception("Failed to update the 'taux' sheet for Swaper.")
 
 
 if __name__ == "__main__":

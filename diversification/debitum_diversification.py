@@ -174,7 +174,14 @@ from shared.google_sheet import (
     fill_geographic_repartition_uninvested_amount,
     fill_remaining_duration_amounts,
 )
-from shared.remaining_duration import overdue_months_and_days, remaining_months_and_days
+from shared.rate_sheet import fill_rate_amounts
+from shared.remaining_duration import (
+    RateWeights,
+    base_term_between,
+    base_term_from_days,
+    overdue_months_and_days,
+    remaining_months_and_days,
+)
 from shared.report_date import get_report_date, is_current_month
 from shared.session_cache import get_or_refresh_session
 from shared.state import load_state, save_state
@@ -356,6 +363,23 @@ def _parse_entry_date(raw) -> date | None:
         return None
 
 
+def _fetch_invoice_base_term(session: requests.Session, headers: dict, invoice_id) -> tuple | None:
+    """Base (original) term of a loan: `GET /gtw/loans/api/invoices/{invoiceId}/personal` exposes `issueDate` and
+    `termDate` (verified live 2026-10-26; `initialTermInDays` is the same span in days and is the fallback). The
+    entry's own `termInDays` is NOT the base term (it is the remaining term, 1 day stale). None if unknown."""
+    if not invoice_id:
+        return None
+    try:
+        r = session.get(f"{API_BASE}/loans/api/invoices/{invoice_id}/personal", headers=headers, timeout=20)
+        r.raise_for_status()
+        invoice = r.json()
+    except (requests.RequestException, ValueError) as exc:
+        log.warning("Could not fetch the invoice %s to get its base term: %s", invoice_id, exc)
+        return None
+    base_term = base_term_between(_parse_entry_date(invoice.get("issueDate")), _parse_entry_date(invoice.get("termDate")))
+    return base_term if base_term is not None else base_term_from_days(invoice.get("initialTermInDays"))
+
+
 def fetch_loan_investments(session: requests.Session, headers: dict, today: date) -> list:
     """Every active loan investment: `POST /gtw/loans/api/investments/entries/v3`
     (empty body = active investments, verified live 2026-10-16): each entry
@@ -376,14 +400,22 @@ def fetch_loan_investments(session: requests.Session, headers: dict, today: date
     default = `status` DEFAULTED. The missed payment date is `term` when it
     is in the past, else (inferred) today - (`lateDays` + `daysInGracePeriod`).
     Returns [{"originator", "amount", "maturity", "late", "default",
-    "overdue_since"}]; entries without a usable `term` keep maturity None."""
+    "overdue_since", "rate"}]; entries without a usable `term` keep maturity None.
+    `rate` = gross yield in percent: `interestRate` + `interestBoostRate`
+    (both already in percent, e.g. 11.5 + 0.5 = 12.0), None if absent.
+    `base_term` = (months, days) original term of the loan (issue date to maturity of its invoice, see
+    _fetch_invoice_base_term, one call per distinct `invoiceId`), None if unknown."""
     entries = {}
     for body in ({}, {"gracePeriod": True, "lateAfterGracePeriod": True}):
         for entry in _fetch_investment_entries(session, headers, body):
             entries.setdefault(entry.get("id") or id(entry), entry)
 
+    base_terms = {}
     investments = []
     for entry in entries.values():
+        invoice_id = entry.get("invoiceId")
+        if invoice_id not in base_terms:
+            base_terms[invoice_id] = _fetch_invoice_base_term(session, headers, invoice_id)
         default = entry.get("status") == "DEFAULTED"
         late_days = int(entry.get("lateDays") or 0)
         grace_days = int(entry.get("daysInGracePeriod") or 0)
@@ -399,8 +431,12 @@ def fetch_loan_investments(session: requests.Session, headers: dict, today: date
             overdue_since = maturity if maturity is not None and maturity < today else None
             if overdue_since is None and late_days + grace_days > 0:
                 overdue_since = today - timedelta(days=late_days + grace_days)
+        base_rate = entry.get("interestRate")
+        rate = None if base_rate is None else float(base_rate) + float(entry.get("interestBoostRate") or 0.0)
         investments.append(
             {
+                "rate": rate,
+                "base_term": base_terms[invoice_id],
                 "originator": entry.get("originator") or "Unknown",
                 "amount": float(entry.get("remainingAmount") or 0.0),
                 "maturity": maturity,
@@ -412,7 +448,7 @@ def fetch_loan_investments(session: requests.Session, headers: dict, today: date
     return investments
 
 
-def aggregate_remaining_durations(investments: list, today: date) -> dict:
+def aggregate_remaining_durations(investments: list, today: date, rates: RateWeights | None = None) -> dict:
     """Group investments by lending company, then by remaining term as of
     `today` (months, days): {originator: {(months, days): remaining amount}}.
     Late loans are grouped by how long ago the missed payment was due
@@ -432,13 +468,17 @@ def aggregate_remaining_durations(investments: list, today: date) -> dict:
             term = remaining_months_and_days(today, inv["maturity"])
         durations = result.setdefault(inv["originator"], {})
         durations[term] = durations.get(term, 0.0) + inv["amount"]
+        if rates is not None:
+            if inv.get("base_term") is None:
+                log.warning("No base term found for an investment of %s (%.2f EUR) - excluded from the 'taux' sheet.", inv["originator"], inv["amount"])
+            rates.add(inv["originator"], term, inv["amount"], inv.get("rate"), base_term=inv.get("base_term"))
     return result
 
 
-def fetch_remaining_durations(session: requests.Session, headers: dict, today: date) -> dict:
+def fetch_remaining_durations(session: requests.Session, headers: dict, today: date, rates: RateWeights | None = None) -> dict:
     """{originator: {term: remaining amount}} for the "durée" sheet, see
     fetch_loan_investments() and aggregate_remaining_durations()."""
-    return aggregate_remaining_durations(fetch_loan_investments(session, headers, today), today)
+    return aggregate_remaining_durations(fetch_loan_investments(session, headers, today), today, rates)
 
 
 def fetch_transactions_summary(session: requests.Session, headers: dict, start_date: date | None, end_date: date | None) -> dict:
@@ -965,12 +1005,18 @@ def run() -> None:
 
         # Own try/except: the "durée" tab is a secondary view, its failure
         # must not fail the whole run.
+        rates = RateWeights()
         try:
             fill_remaining_duration_amounts(
-                "Debitum", fetch_remaining_durations(session, headers, today_date)
+                "Debitum", fetch_remaining_durations(session, headers, today_date, rates), rates=rates
             )
         except Exception:
             log.exception("Failed to update the 'durée' sheet for Debitum.")
+
+        try:
+            fill_rate_amounts("Debitum", rates)
+        except Exception:
+            log.exception("Failed to update the 'taux' sheet for Debitum.")
 
 
 if __name__ == "__main__":

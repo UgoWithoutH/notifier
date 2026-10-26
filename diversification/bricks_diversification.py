@@ -222,7 +222,8 @@ except ModuleNotFoundError:
     )
     from shared.report_date import get_report_now, is_current_month
 
-from shared.remaining_duration import overdue_months_and_days, remaining_months_and_days
+from shared.rate_sheet import fill_rate_amounts
+from shared.remaining_duration import RateWeights, overdue_months_and_days, remaining_months_and_days
 from shared.session_cache import get_or_refresh_session
 from shared.state import load_state, save_state
 from shared.weighted_average import INVESTED_BALANCE_LABEL, NON_INVESTED_BALANCE_LABEL, compute_time_weighted_average
@@ -547,12 +548,63 @@ def fetch_project_missed_payment_dates(session: requests.Session) -> dict:
     return missed
 
 
+def fetch_project_rates(session: requests.Session) -> dict:
+    """``{nom de projet: taux d'intérêt annuel en %}`` des projets en cours, depuis ``property.interestRate`` de
+    ``GET /investor/portfolio/properties/{propertyId}`` (ex. ``10.5`` ; vérifié en direct le 2026-10-26 : en pourcent,
+    cohérent avec le coupon mensuel ``nextRevenue``). La liste ne le donne pas. Un projet dont le taux est
+    introuvable est ignoré."""
+    resp = session.get(PORTFOLIO_PROPERTIES_URL, timeout=15)
+    if resp.status_code != 200:
+        raise RuntimeError(f"Bricks portfolio properties endpoint returned status {resp.status_code}")
+    resp.encoding = "utf-8"
+    project_rates = {}
+    for project in (resp.json() or {}).get("ongoing") or []:
+        name = (project.get("propertyName") or "").strip()
+        if not name:
+            continue
+        try:
+            detail_resp = session.get(f"{PORTFOLIO_PROPERTIES_URL}/{project.get('propertyId')}", timeout=15)
+            if detail_resp.status_code != 200:
+                raise RuntimeError(f"HTTP {detail_resp.status_code}")
+            project_rates[name] = float(detail_resp.json()["property"]["interestRate"])
+        except Exception as exc:
+            log.warning("No interest rate for Bricks project %r: %s", name, exc)
+    return project_rates
+
+
+def fetch_project_base_terms(session: requests.Session) -> dict:
+    """``{nom de projet: (mois, 0)}`` durée de base (d'origine) des projets en cours, depuis
+    ``investmentHorizonInMonths`` de ``GET /investor/portfolio/properties`` (horizon de placement annoncé à la
+    souscription, vérifié en direct le 2026-10-26 ; égal à ``property.investmentHorizonInMonths`` du détail). Les
+    prolongations ne sont pas comptées : ``contractDuration.totalMonths`` du détail les inclut (p. ex. 12 -> 24).
+    Un projet sans horizon valide est ignoré."""
+    resp = session.get(PORTFOLIO_PROPERTIES_URL, timeout=15)
+    if resp.status_code != 200:
+        raise RuntimeError(f"Bricks portfolio properties endpoint returned status {resp.status_code}")
+    resp.encoding = "utf-8"
+    base_terms = {}
+    for project in (resp.json() or {}).get("ongoing") or []:
+        name = (project.get("propertyName") or "").strip()
+        try:
+            months = int(project.get("investmentHorizonInMonths"))
+        except (TypeError, ValueError):
+            continue
+        if name and months > 0:
+            base_terms[name] = (months, 0)
+    return base_terms
+
+
 def aggregate_remaining_durations(
     project_amounts: dict, maturities: dict, today: date, project_statuses: dict = None, missed_dates: dict = None,
+    rates=None, project_rates: dict = None, base_terms: dict = None,
 ) -> dict:
     """Groupe les projets (même clé que la répartition géographique) par durée restante à `today`
     (mois, jours) : ``{projet: {(mois, jours): capital restant}}``. Les projets sans échéance connue
     sont ignorés (avec un avertissement).
+
+    Si `rates` (:class:`shared.remaining_duration.RateWeights`) est fourni, y ajoute le taux annuel en % de chaque
+    projet (`project_rates`, voir :func:`fetch_project_rates`) pondéré par son capital restant, ainsi que sa durée
+    de base `base_terms` (voir :func:`fetch_project_base_terms`, None si inconnue) pour l'onglet "taux".
 
     Projet en retard ("delay") ou en défaut ("default") d'après `project_statuses` : il est groupé par
     :func:`overdue_months_and_days` depuis le coupon manqué `missed_dates` (voir
@@ -577,6 +629,11 @@ def aggregate_remaining_durations(
             term = remaining_months_and_days(today, maturity)
         durations = result.setdefault(name, {})
         durations[term] = round(durations.get(term, 0.0) + sum(countries.values()), 2)
+        if rates is not None:
+            base_term = (base_terms or {}).get(name)
+            if base_term is None:
+                log.warning("No base term found for Bricks project %r - excluded from the 'taux' sheet.", name)
+            rates.add(name, term, sum(countries.values()), (project_rates or {}).get(name), base_term=base_term)
     return result
 
 
@@ -1211,19 +1268,28 @@ def run() -> None:
 
         # Own try/except: the "durée" tab is a secondary view, its failure
         # must not fail the whole run.
-        try:
-            if project_amounts:
+        if project_amounts:
+            rates = RateWeights()
+            try:
                 fill_remaining_duration_amounts(
                     "Bricks",
                     aggregate_remaining_durations(
                         project_amounts, fetch_project_maturity_dates(session), today_date,
                         project_statuses, fetch_project_missed_payment_dates(session),
+                        rates=rates, project_rates=fetch_project_rates(session),
+                        base_terms=fetch_project_base_terms(session),
                     ),
                     platform_level=True,
                     projects=True,
+                    rates=rates,
                 )
-        except Exception:
-            log.exception("Failed to update the 'durée' sheet for Bricks.")
+            except Exception:
+                log.exception("Failed to update the 'durée' sheet for Bricks.")
+            else:
+                try:
+                    fill_rate_amounts("Bricks", rates, platform_level=True, projects=True)
+                except Exception:
+                    log.exception("Failed to update the 'taux' sheet for Bricks.")
 
 
 if __name__ == "__main__":

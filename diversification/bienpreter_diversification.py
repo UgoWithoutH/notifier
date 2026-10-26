@@ -223,7 +223,8 @@ from shared.google_sheet import (
     fill_geographic_repartition_uninvested_amount,
     fill_remaining_duration_amounts,
 )
-from shared.remaining_duration import overdue_months_and_days, remaining_months_and_days
+from shared.rate_sheet import fill_rate_amounts
+from shared.remaining_duration import RateWeights, overdue_months_and_days, remaining_months_and_days
 from shared.report_date import get_report_now, is_current_month
 from shared.session_cache import get_or_refresh_session
 from shared.notifier import send_bienpreter_geo_issues_email
@@ -401,8 +402,9 @@ LITIGATION_DEFAULT = "12"
 
 def _parse_active_loans_results(results: list) -> list:
     """Converts the `items.results` of /api/v2/contracts/me into a list of
-    {"project_id", "borrower", "amount", "contract_id", "next_payment_date"}
-    dicts. Verified API fields: `id`, `amount`, `project.id`,
+    {"project_id", "borrower", "amount", "contract_id", "next_payment_date",
+    "rate"} dicts. Verified API fields: `id`, `amount`, `effectiveRefundRate`
+    (total yield in percent incl. boost bonus -> "rate", None if absent), `project.id`,
     `project.userSocietyInfo.name` (borrower), `nextDue.dueDate` (ISO
     datetime, `nextDue` is null when nothing is due -> None). Rows missing
     a borrower/amount are skipped (surfaced by the total-count check in
@@ -417,6 +419,8 @@ def _parse_active_loans_results(results: list) -> list:
 
         next_due = result.get("nextDue") or {}
         due_date = next_due.get("dueDate")
+        # Total yield in percent (base refundRate + boost bonus, e.g. 13.2 + 1.5 = 14.7), as shown by the platform.
+        rate = next((result[k] for k in ("effectiveRefundRate", "finalRefundRate", "refundRate") if result.get(k) is not None), None)
         rows.append(
             {
                 "project_id": str(project["id"]),
@@ -424,6 +428,7 @@ def _parse_active_loans_results(results: list) -> list:
                 "amount": float(amount),
                 "contract_id": str(result["id"]) if result.get("id") is not None else None,
                 "next_payment_date": datetime.fromisoformat(due_date).date() if due_date else None,
+                "rate": rate,
             }
         )
     return rows
@@ -589,6 +594,22 @@ def fetch_project_country(session: requests.Session, project_id: str):
     return country
 
 
+def fetch_project_base_term(session: requests.Session, project_id: str):
+    """Original term (months, 0) of a project from the same
+    /api/v2/project/{id} payload as fetch_project_country(): `refundDelay` =
+    "Durée du placement" in months (verified live 2026-10-26, e.g. 16 for a
+    loan whose 16 monthly dues run from the 1st due to its maturity). None
+    if absent or not a positive number."""
+    url = PROJECT_API_URL.format(project_id=project_id)
+    log.info("GET project %s (for base term)...", project_id)
+    delay = _api_get_json(session, url).get("refundDelay")
+    try:
+        months = int(delay)
+    except (TypeError, ValueError):
+        return None
+    return (months, 0) if months > 0 else None
+
+
 def fetch_active_loans_by_borrower(session: requests.Session):
     """Fetches every active loan (fetch_active_loans()) and its project's
     country (fetch_project_country(), cached per project_id since several
@@ -681,7 +702,7 @@ def fetch_litigation_loans(session: requests.Session) -> dict:
     return result
 
 
-def aggregate_remaining_durations(session: requests.Session, loans: list, today: date) -> dict:
+def aggregate_remaining_durations(session: requests.Session, loans: list, today: date, rates=None) -> dict:
     """Group the active loans (fetch_active_loans()) by borrower - same key
     as the geographic breakdown - then by remaining term as of `today`
     (months, days): {borrower: {(months, days): amount}}. Loans whose
@@ -701,6 +722,7 @@ def aggregate_remaining_durations(session: requests.Session, loans: list, today:
         litigation_loans = {}
 
     result = {}
+    base_terms = {}
     for loan in loans:
         name = loan["borrower"]
         contract_id = loan.get("contract_id")
@@ -725,6 +747,17 @@ def aggregate_remaining_durations(session: requests.Session, loans: list, today:
             term = remaining_months_and_days(today, maturity)
         durations = result.setdefault(name, {})
         durations[term] = durations.get(term, 0.0) + loan["amount"]
+        if rates is not None:
+            project_id = loan.get("project_id")
+            if project_id not in base_terms:
+                try:
+                    base_terms[project_id] = fetch_project_base_term(session, project_id)
+                except Exception:
+                    log.exception("Failed to fetch the base term of project %s.", project_id)
+                    base_terms[project_id] = None
+            if base_terms[project_id] is None:
+                log.warning("No base term found for a loan of %s (project %s) - excluded from the 'taux' sheet.", name, project_id)
+            rates.add(name, term, loan["amount"], loan.get("rate"), base_term=base_terms[project_id])
     return result
 
 
@@ -1492,11 +1525,18 @@ def run() -> None:
         # must not fail the whole run.
         try:
             active_loans, _ = fetch_active_loans(session)
+            rates = RateWeights()
             fill_remaining_duration_amounts(
-                "Bienprêter", aggregate_remaining_durations(session, active_loans, today_date), platform_level=True, projects=True
+                "Bienprêter", aggregate_remaining_durations(session, active_loans, today_date, rates=rates),
+                platform_level=True, projects=True, rates=rates,
             )
         except Exception:
             log.exception("Failed to update the 'durée' sheet for Bienprêter.")
+        else:
+            try:
+                fill_rate_amounts("Bienprêter", rates, platform_level=True, projects=True)
+            except Exception:
+                log.exception("Failed to update the 'taux' sheet for Bienprêter.")
 
     if geo_issues or geo_error:
         send_bienpreter_geo_issues_email(geo_issues, error=geo_error)

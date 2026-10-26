@@ -140,7 +140,8 @@ from shared.google_sheet import (
     fill_geographic_repartition_uninvested_amount,
     fill_remaining_duration_amounts,
 )
-from shared.remaining_duration import overdue_months_and_days, remaining_months_and_days
+from shared.rate_sheet import fill_rate_amounts
+from shared.remaining_duration import RateWeights, overdue_months_and_days, remaining_months_and_days
 from shared.report_date import get_report_date, is_current_month
 from shared.session_cache import get_or_refresh_session
 from shared.state import load_state, save_state
@@ -370,7 +371,8 @@ def fetch_current_loans(session: requests.Session, headers: dict) -> list:
     amount, not the outstanding one, and its `status` (SETTLED) says
     nothing about repayment lateness, see fetch_late_shares(). Only SETTLED
     loans are returned (FULFILLED ones aren't in Nectaro's outstanding yet). Returns
-    [{"originator", "amount", "maturity", "late": [(share, due date)]}]."""
+    [{"originator", "amount", "rate" (interestRate, in percent, e.g. 12 for
+    12%), "maturity", "late": [(share, due date)]}]."""
     loans = []
     seen = 0
     for page in range(1, MAX_STATEMENT_PAGES + 1):
@@ -398,6 +400,7 @@ def fetch_current_loans(session: requests.Session, headers: dict) -> list:
             loans.append({
                 "originator": loan["lendingCompany"],
                 "amount": float(loan["amount"]),
+                "rate": loan.get("interestRate"),
                 "maturity": date.fromisoformat(loan["maturityDate"]),
                 "late": fetch_late_shares(session, headers, loan["ISIN"]),
             })
@@ -438,7 +441,14 @@ def fetch_outstanding_by_loan(session: requests.Session, headers: dict, loans: l
     its group by remainingTerm + exact sum of original amounts, and gets
     amount * group residue/total ratio (loans of a group amortize
     identically). Unmatchable loans fall back to their remainingTerm bucket's
-    average ratio."""
+    average ratio.
+
+    Side effect: each loan gets "base_term" ((months, 0) = the matched group's
+    `maturityInMonths`, Nectaro's own original loan term in whole months,
+    verified live 2026-10-26: 12/15/21..24; for an unmatched loan, the bucket's
+    only maturityInMonths if unique) or None. This is cleaner than the dates
+    (the note's issueDate/purchaseDate to maturityDate give e.g. 23m13d for a
+    24-month loan) which only serve as a rough check."""
     r = session.get(
         DASHBOARD_INVESTMENT_URL,
         params={"isHistorical": "false", "grouping": "maturity-date"},
@@ -464,16 +474,21 @@ def fetch_outstanding_by_loan(session: requests.Session, headers: dict, loans: l
             for i, g in zip(indexes, assignment):
                 ratio = groups[g]["totalResidueAmount"] / groups[g]["totalAmount"]
                 outstanding[i] = loans[i]["amount"] * ratio
+                loans[i]["base_term"] = (int(groups[g]["maturityInMonths"]), 0)
             continue
         log.warning("Could not match the loans with %d month(s) left to Nectaro's maturity groups exactly - using the average ratio.", term)
         total = sum(g["totalAmount"] for g in groups)
         ratio = sum(g["totalResidueAmount"] for g in groups) / total if total else 1.0
+        bucket_months = {g.get("maturityInMonths") for g in groups}
+        single_months = int(next(iter(bucket_months))) if len(bucket_months) == 1 and None not in bucket_months else None
         for i in indexes:
             outstanding[i] = loans[i]["amount"] * ratio
+            if single_months is not None:
+                loans[i]["base_term"] = (single_months, 0)
     return outstanding
 
 
-def aggregate_remaining_durations(session: requests.Session, headers: dict, today: date) -> dict:
+def aggregate_remaining_durations(session: requests.Session, headers: dict, today: date, rates: RateWeights | None = None) -> dict:
     """Group the outstanding amounts by lending company (same key as the
     geographic breakdown), then by remaining term as of `today` (months,
     days) to each loan's exact maturity date:
@@ -483,11 +498,17 @@ def aggregate_remaining_durations(session: requests.Session, headers: dict, toda
     late; (months, days, "default") if still late beyond the 60-day buyback
     obligation, which is inferred and never observed: such loans turn
     BUYBACK). Totals per originator are unchanged. Verified live 2026-10-16
-    on late loans (dpd 4-47 days); the default case is untested."""
+    on late loans (dpd 4-47 days); the default case is untested.
+    `rates` (optional RateWeights) collects each loan's `interestRate` (already
+    in percent), under the same originator/term/amount as the durations, plus its
+    `base_term` (see fetch_outstanding_by_loan()) for the "taux" tab."""
     loans = fetch_current_loans(session, headers)
     outstanding = fetch_outstanding_by_loan(session, headers, loans, today)
     result = {}
     for loan, amount in zip(loans, outstanding):
+        base_term = loan.get("base_term")
+        if rates is not None and base_term is None:
+            log.warning("No base term found for the %s loan maturing %s - excluded from the 'taux' sheet.", loan["originator"], loan["maturity"])
         durations = result.setdefault(loan["originator"], {})
         normal_share = 1.0
         for share, due in loan["late"]:
@@ -496,11 +517,15 @@ def aggregate_remaining_durations(session: requests.Session, headers: dict, toda
             if term is None:
                 continue
             durations[term] = durations.get(term, 0.0) + amount * share
+            if rates is not None:
+                rates.add(loan["originator"], term, amount * share, loan["rate"], base_term=base_term)
             normal_share -= share
         if normal_share > 1e-9:
             term = remaining_months_and_days(today, loan["maturity"])
             normal_amount = amount if normal_share == 1.0 else amount * normal_share
             durations[term] = durations.get(term, 0.0) + normal_amount
+            if rates is not None:
+                rates.add(loan["originator"], term, normal_amount, loan["rate"], base_term=base_term)
     return result
 
 
@@ -965,11 +990,18 @@ def run() -> None:
         # Own try/except: the "durée" tab is a secondary view, its failure
         # must not fail the whole run.
         try:
+            rates = RateWeights()
             fill_remaining_duration_amounts(
-                "Nectaro", aggregate_remaining_durations(session, headers, today_date)
+                "Nectaro", aggregate_remaining_durations(session, headers, today_date, rates), rates=rates
             )
         except Exception:
             log.exception("Failed to update the 'durée' sheet for Nectaro.")
+
+        # Own try/except too: the "taux" tab is independent of the "durée" one.
+        try:
+            fill_rate_amounts("Nectaro", rates)
+        except Exception:
+            log.exception("Failed to update the 'taux' sheet for Nectaro.")
 
 
 if __name__ == "__main__":

@@ -273,6 +273,7 @@ import os
 import re
 import sys
 import logging
+from concurrent.futures import ThreadPoolExecutor
 from datetime import date, datetime, timedelta
 from pathlib import Path
 
@@ -286,7 +287,8 @@ from shared.google_sheet import (
     fill_geographic_repartition_uninvested_amount,
     fill_remaining_duration_amounts,
 )
-from shared.remaining_duration import overdue_months_and_days, remaining_months_and_days
+from shared.rate_sheet import fill_rate_amounts
+from shared.remaining_duration import RateWeights, base_term_between, overdue_months_and_days, remaining_months_and_days
 from shared.report_date import get_report_date, is_current_month
 from shared.state import load_state, save_state
 from shared.weighted_average import INVESTED_BALANCE_LABEL, NON_INVESTED_BALANCE_LABEL, compute_time_weighted_average
@@ -312,6 +314,8 @@ ACCOUNT_OVERVIEW_URL = f"https://www.mintos.com/webapp/api/marketplace-api/v1/us
 BONDS_INVESTMENTS_URL = "https://www.mintos.com/webapp/api/bonds-api/v3/investments/current"
 LOAN_INVESTMENTS_URL = "https://www.mintos.com/webapp/api/marketplace-api/v1/user/note-series/investments/current"
 LENDERS_URL = "https://www.mintos.com/webapp/api/marketplace-api/v1/lenders"
+NOTE_SERIES_URL = "https://www.mintos.com/webapp/api/marketplace-api/v1/note-series/{isin}"
+NOTE_SERIES_WORKERS = 6
 LOAN_INVESTMENTS_PAGE_SIZE = 300
 MAX_INVESTMENTS_PAGES = 100
 PLATFORM_LABEL = "Mintos"
@@ -497,6 +501,14 @@ def _money(value) -> float:
         return 0.0
 
 
+def _percent(value):
+    """Annual rate in percent from an API value (number or numeric string), None if absent/unreadable."""
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
 def _loan_originator_names_by_company(session: requests.Session) -> dict:
     """{lenderCompanyId: originator name as shown by the portfolio
     distribution}. An investment only carries its lender company id (and a
@@ -549,6 +561,8 @@ def fetch_loan_investments(session: requests.Session) -> list:
                     "pending": _money(item.get("pendingPaymentAmount")) > 0,
                     "in_recovery": _money(item.get("inRecoveryAmount")) > 0,
                     "next_payment": _parse_maturity_date(item.get("nextPaymentDate")),
+                    "rate": _percent(item.get("interestRate")),
+                    "isin": item.get("isin"),
                 }
             )
         if not (data.get("pagination") or {}).get("hasNextPage"):
@@ -570,16 +584,52 @@ def fetch_bond_investments(session: requests.Session) -> list:
             "originator": _BOND_NAME_DATE_SUFFIX.sub("", item.get("bondName") or "").strip(),
             "amount": _money(item.get("investedAmount")),
             "maturity": _parse_maturity_date(item.get("maturityDate")),
+            "rate": _percent(item.get("bondTotalInterestRate")),
+            "isin": next((s.get("isin") for s in item.get("noteSeriesInvestments") or [] if s.get("isin")), None),
         }
         for item in (r.json() or {}).get("items") or []
     ]
 
 
-def aggregate_remaining_durations(investments: list, today: date) -> dict:
+def _fetch_note_series_base_term(session: requests.Session, isin: str):
+    """(months, days) from the note series' listing date (`noteListedAt`) to its
+    initial maturity (`initialMaturityDate`), None if unavailable (verified
+    live 2026-10-26 on `GET /v1/note-series/{isin}` for loans and bonds)."""
+    r = session.get(NOTE_SERIES_URL.format(isin=isin), timeout=20)
+    _check_authenticated(r)
+    if not r.ok:
+        raise RuntimeError(f"Note series endpoint returned status {r.status_code}")
+    data = r.json() or {}
+    return base_term_between(
+        _parse_maturity_date(data.get("noteListedAt")),
+        _parse_maturity_date(data.get("initialMaturityDate") or data.get("maturityDate")),
+    )
+
+
+def fetch_note_series_base_terms(session: requests.Session, investments: list) -> dict:
+    """{isin: (months, days)} for the distinct ISINs of `investments`; an ISIN
+    whose lookup fails is left out (warning)."""
+    isins = sorted({inv["isin"] for inv in investments if inv.get("isin")})
+
+    def lookup(isin):
+        try:
+            return isin, _fetch_note_series_base_term(session, isin)
+        except Exception as exc:
+            log.warning("Base term lookup failed for %s: %s", isin, exc)
+            return isin, None
+
+    with ThreadPoolExecutor(max_workers=NOTE_SERIES_WORKERS) as pool:
+        return {isin: term for isin, term in pool.map(lookup, isins) if term is not None}
+
+
+def aggregate_remaining_durations(
+    investments: list, today: date, rates: RateWeights | None = None, base_terms: dict | None = None
+) -> dict:
     """Group investments (loans + bonds, merged by issuer name like the geo
     sheet) by remaining term as of `today` (months, days):
     {originator: {(months, days): amount}}. Investments without a usable
-    originator or maturity date are skipped (with a warning).
+    originator or maturity date are skipped (with a warning). `rates`
+    (optional) collects each note's interest rate (%) for the "durée" sheet.
 
     The only late/default signals Mintos gives per note are
     `pendingPaymentAmount` (> 0: a payment is late) and `inRecoveryAmount`
@@ -599,6 +649,11 @@ def aggregate_remaining_durations(investments: list, today: date) -> dict:
             term = remaining_months_and_days(today, inv["maturity"])
         durations = result.setdefault(originator, {})
         durations[term] = durations.get(term, 0.0) + inv["amount"]
+        if rates is not None:
+            base_term = (base_terms or {}).get(inv.get("isin"))
+            if base_term is None:
+                log.warning("No base term for %s (%s, %.2f EUR).", originator, inv.get("isin"), inv["amount"])
+            rates.add(originator, term, inv["amount"], inv.get("rate"), base_term=base_term)
     return result
 
 
@@ -1622,15 +1677,22 @@ def run(session: requests.Session | None = None) -> None:
 
         # Own try/except: the "durée" tab is a secondary view, its failure
         # must not fail the whole run.
+        rates = RateWeights()
         try:
+            investments = fetch_loan_investments(session) + fetch_bond_investments(session)
+            base_terms = fetch_note_series_base_terms(session, investments)
             fill_remaining_duration_amounts(
                 "Mintos",
-                aggregate_remaining_durations(
-                    fetch_loan_investments(session) + fetch_bond_investments(session), today_date
-                ),
+                aggregate_remaining_durations(investments, today_date, rates, base_terms),
+                rates=rates,
             )
         except Exception:
             log.exception("Failed to update the 'durée' sheet for Mintos.")
+        else:
+            try:
+                fill_rate_amounts("Mintos", rates)
+            except Exception:
+                log.exception("Failed to update the 'taux' sheet for Mintos.")
 
 
 if __name__ == "__main__":

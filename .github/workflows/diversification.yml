@@ -141,6 +141,7 @@ jobs:
             diversification/swaper_diversification_storage_state.json
             diversification/swaper_xirr_cashflows_state.json
             diversification/swaper_duration_status_state.json
+            diversification/swaper_rate_history_state.json
           key: swaper-diversification-state-${{ github.run_id }}
           restore-keys: |
             swaper-diversification-state-
@@ -162,6 +163,7 @@ jobs:
             diversification/swaper_diversification_storage_state.json
             diversification/swaper_xirr_cashflows_state.json
             diversification/swaper_duration_status_state.json
+            diversification/swaper_rate_history_state.json
           key: swaper-diversification-state-${{ github.run_id }}
 
   iuvo:
@@ -199,6 +201,7 @@ jobs:
             diversification/iuvo_diversification_session_state.json
             diversification/iuvo_xirr_cashflows_state.json
             diversification/iuvo_duration_status_state.json
+            diversification/iuvo_rate_history_state.json
           key: iuvo-diversification-state-${{ github.run_id }}
           restore-keys: |
             iuvo-diversification-state-
@@ -219,6 +222,7 @@ jobs:
             diversification/iuvo_diversification_session_state.json
             diversification/iuvo_xirr_cashflows_state.json
             diversification/iuvo_duration_status_state.json
+            diversification/iuvo_rate_history_state.json
           key: iuvo-diversification-state-${{ github.run_id }}
 
   afranga:
@@ -256,6 +260,7 @@ jobs:
             diversification/afranga_diversification_session_state.json
             diversification/afranga_xirr_cashflows_state.json
             diversification/afranga_duration_status_state.json
+            diversification/afranga_rate_history_state.json
           key: afranga-diversification-state-${{ github.run_id }}
           restore-keys: |
             afranga-diversification-state-
@@ -277,6 +282,7 @@ jobs:
             diversification/afranga_diversification_session_state.json
             diversification/afranga_xirr_cashflows_state.json
             diversification/afranga_duration_status_state.json
+            diversification/afranga_rate_history_state.json
           key: afranga-diversification-state-${{ github.run_id }}
 
   bienpreter:
@@ -313,6 +319,7 @@ jobs:
             diversification/bienpreter_diversification_session_state.json
             diversification/bienpreter_xirr_cashflows_state.json
             diversification/bienpreter_duration_status_state.json
+            diversification/bienpreter_rate_history_state.json
           key: bienpreter-diversification-state-${{ github.run_id }}
           restore-keys: |
             bienpreter-diversification-state-
@@ -339,6 +346,7 @@ jobs:
             diversification/bienpreter_diversification_session_state.json
             diversification/bienpreter_xirr_cashflows_state.json
             diversification/bienpreter_duration_status_state.json
+            diversification/bienpreter_rate_history_state.json
           key: bienpreter-diversification-state-${{ github.run_id }}
 
   lendermarket:
@@ -376,6 +384,7 @@ jobs:
             diversification/lendermarket_diversification_session_state.json
             diversification/lendermarket_xirr_cashflows_state.json
             diversification/lendermarket_duration_status_state.json
+            diversification/lendermarket_rate_history_state.json
           key: lendermarket-diversification-state-${{ github.run_id }}
           restore-keys: |
             lendermarket-diversification-state-
@@ -397,6 +406,7 @@ jobs:
             diversification/lendermarket_diversification_session_state.json
             diversification/lendermarket_xirr_cashflows_state.json
             diversification/lendermarket_duration_status_state.json
+            diversification/lendermarket_rate_history_state.json
           key: lendermarket-diversification-state-${{ github.run_id }}
 
   loanch:
@@ -436,6 +446,7 @@ jobs:
             diversification/loanch_diversification_session_state.json
             diversification/loanch_xirr_cashflows_state.json
             diversification/loanch_duration_status_state.json
+            diversification/loanch_rate_history_state.json
           key: loanch-diversification-state-${{ github.run_id }}
           restore-keys: |
             loanch-diversification-state-
@@ -457,6 +468,7 @@ jobs:
             diversification/loanch_diversification_session_state.json
             diversification/loanch_xirr_cashflows_state.json
             diversification/loanch_duration_status_state.json
+            diversification/loanch_rate_history_state.json
           key: loanch-diversification-state-${{ github.run_id }}
 
   monefit:
@@ -495,6 +507,7 @@ jobs:
             diversification/monefit_diversification_session_state.json
             diversification/monefit_xirr_cashflows_state.json
             diversification/monefit_duration_status_state.json
+            diversification/monefit_rate_history_state.json
           key: monefit-diversification-state-${{ github.run_id }}
           restore-keys: |
             monefit-diversification-state-
@@ -515,6 +528,7 @@ jobs:
             diversification/monefit_diversification_session_state.json
             diversification/monefit_xirr_cashflows_state.json
             diversification/monefit_duration_status_state.json
+            diversification/monefit_rate_history_state.json
           key: monefit-diversification-state-${{ github.run_id }}
 
   peerberry:
@@ -552,6 +566,7 @@ jobs:
             diversification/peerberry_diversification_session_state.json
             diversification/peerberry_xirr_cashflows_state.json
             diversification/peerberry_duration_status_state.json
+            diversification/peerberry_rate_history_state.json
           key: peerberry-diversification-state-${{ github.run_id }}
           restore-keys: |
             peerberry-diversification-state-
@@ -573,6 +588,7 @@ jobs:
             diversification/peerberry_diversification_session_state.json
             diversification/peerberry_xirr_cashflows_state.json
             diversification/peerberry_duration_status_state.json
+            diversification/peerberry_rate_history_state.json
           key: peerberry-diversification-state-${{ github.run_id }}
 
   goandgrow:
@@ -610,6 +626,7 @@ jobs:
           path: |
             diversification/goandgrow_diversification_session_state.json
             diversification/goandgrow_duration_status_state.json
+            diversification/goandgrow_rate_history_state.json
           key: goandgrow-diversification-state-${{ github.run_id }}
           restore-keys: |
             goandgrow-diversification-state-
@@ -629,6 +646,7 @@ jobs:
           path: |
             diversification/goandgrow_diversification_session_state.json
             diversification/goandgrow_duration_status_state.json
+            diversification/goandgrow_rate_history_state.json
           key: goandgrow-diversification-state-${{ github.run_id }}
 
   bricks:
@@ -664,6 +682,7 @@ jobs:
           path: |
             diversification/bricks_diversification_session_state.json
             diversification/bricks_duration_status_state.json
+            diversification/bricks_rate_history_state.json
           key: bricks-diversification-state-${{ github.run_id }}
           restore-keys: |
             bricks-diversification-state-
@@ -683,6 +702,7 @@ jobs:
           path: |
             diversification/bricks_diversification_session_state.json
             diversification/bricks_duration_status_state.json
+            diversification/bricks_rate_history_state.json
           key: bricks-diversification-state-${{ github.run_id }}
 
   nectaro:
@@ -719,6 +739,7 @@ jobs:
             diversification/nectaro_diversification_session_state.json
             diversification/nectaro_xirr_cashflows_state.json
             diversification/nectaro_duration_status_state.json
+            diversification/nectaro_rate_history_state.json
           key: nectaro-diversification-state-${{ github.run_id }}
           restore-keys: |
             nectaro-diversification-state-
@@ -740,6 +761,7 @@ jobs:
             diversification/nectaro_diversification_session_state.json
             diversification/nectaro_xirr_cashflows_state.json
             diversification/nectaro_duration_status_state.json
+            diversification/nectaro_rate_history_state.json
           key: nectaro-diversification-state-${{ github.run_id }}
 
   debitum:
@@ -776,6 +798,7 @@ jobs:
             diversification/debitum_diversification_session_state.json
             diversification/debitum_xirr_cashflows_state.json
             diversification/debitum_duration_status_state.json
+            diversification/debitum_rate_history_state.json
           key: debitum-diversification-state-${{ github.run_id }}
           restore-keys: |
             debitum-diversification-state-
@@ -797,6 +820,7 @@ jobs:
             diversification/debitum_diversification_session_state.json
             diversification/debitum_xirr_cashflows_state.json
             diversification/debitum_duration_status_state.json
+            diversification/debitum_rate_history_state.json
           key: debitum-diversification-state-${{ github.run_id }}
 
   income_marketplace:
@@ -854,6 +878,7 @@ jobs:
             diversification/income_marketplace_diversification_storage_state.json
             diversification/income_marketplace_xirr_cashflows_state.json
             diversification/incomemarketplace_duration_status_state.json
+            diversification/incomemarketplace_rate_history_state.json
           key: income-marketplace-diversification-state-${{ github.run_id }}
           restore-keys: |
             income-marketplace-diversification-state-
@@ -875,6 +900,7 @@ jobs:
             diversification/income_marketplace_diversification_storage_state.json
             diversification/income_marketplace_xirr_cashflows_state.json
             diversification/incomemarketplace_duration_status_state.json
+            diversification/incomemarketplace_rate_history_state.json
           key: income-marketplace-diversification-state-${{ github.run_id }}
 
   recap_email:
