@@ -137,7 +137,8 @@ import requests
 from dotenv import load_dotenv
 
 from shared.google_sheet import fill_current_month_amounts, fill_current_month_bonus_breakdown, fill_geographic_repartition_amounts, fill_remaining_duration_amounts
-from shared.remaining_duration import remaining_months_and_days
+from shared.rate_sheet import fill_rate_amounts
+from shared.remaining_duration import RateWeights, base_term_between, remaining_months_and_days
 from shared.report_date import get_report_now, is_current_month
 from shared.session_cache import get_or_refresh_session
 from shared.state import load_state, save_state
@@ -260,7 +261,7 @@ def fetch_vaults_breakdown(session: requests.Session) -> dict:
     return {"total_wealth": total_wealth, "invested": invested, "main_account": main_account}
 
 
-def fetch_remaining_durations(session: requests.Session, today: date) -> dict:
+def fetch_remaining_durations(session: requests.Session, today: date, rates: RateWeights | None = None) -> dict:
     """Amount per remaining term as of `today`, in the shape expected by
     fill_remaining_duration_amounts(): {LOAN_ORIGINATOR_LABEL: {(months,
     days): amount}}. A vault's term runs until its `expiresAt` date (verified
@@ -273,7 +274,14 @@ def fetch_remaining_durations(session: requests.Session, today: date) -> dict:
     seen, so no "late"/"default" status is known). Only a vault whose
     `expiresAt` is already past would show as late (negated term, same key
     as overdue_months_and_days(default=False)); a non-"active" status is
-    logged but not treated as default."""
+    logged but not treated as default.
+
+    `rates` (optional RateWeights) collects each vault's yield in percent: its
+    `nominal` field (the annual rate, e.g. "9.00"; `apy` is the compounded
+    equivalent, 9.42). Cash in the main account earns nothing, so it has no rate.
+    Each vault's base term (for the "taux" tab) runs from its `createdAt` to
+    its `expiresAt` (both in /v1/vaults, verified live 2026-10-26, e.g.
+    2026-02-13 -> 2027-02-13 = 12 months)."""
     r = session.get(VAULTS_URL, timeout=30)
     r.raise_for_status()
     data = (r.json() or {}).get("data") or {}
@@ -287,7 +295,14 @@ def fetch_remaining_durations(session: requests.Session, today: date) -> dict:
             log.warning("Vault %s has no expiresAt - skipped.", vault.get("id"))
             continue
         term = remaining_months_and_days(today, date.fromisoformat(expires_at))
-        durations[term] = durations.get(term, 0.0) + float(vault.get("balance") or 0.0)
+        balance = float(vault.get("balance") or 0.0)
+        durations[term] = durations.get(term, 0.0) + balance
+        if rates is not None:
+            created_at = vault.get("createdAt")
+            base_term = base_term_between(date.fromisoformat(created_at), date.fromisoformat(expires_at)) if created_at else None
+            if base_term is None:
+                log.warning("Vault %s has no usable createdAt/expiresAt - no base term for the 'taux' sheet.", vault.get("id"))
+            rates.add(LOAN_ORIGINATOR_LABEL, term, balance, vault.get("nominal"), base_term=base_term)
 
     main_account = float(data.get("mainAccount") or 0.0)
     if round(main_account, 2) > 0:
@@ -887,9 +902,16 @@ def run() -> None:
         # Own try/except: the "durée" tab is a secondary view, its failure
         # must not fail the whole run.
         try:
-            fill_remaining_duration_amounts("Monefit", fetch_remaining_durations(session, today_date), platform_level=True)
+            rates = RateWeights()
+            fill_remaining_duration_amounts("Monefit", fetch_remaining_durations(session, today_date, rates), platform_level=True, rates=rates)
         except Exception:
             log.exception("Failed to update the 'durée' sheet for Monefit.")
+
+        # Own try/except too: the "taux" tab is independent of the "durée" one.
+        try:
+            fill_rate_amounts("Monefit", rates, platform_level=True)
+        except Exception:
+            log.exception("Failed to update the 'taux' sheet for Monefit.")
 
 
 if __name__ == "__main__":

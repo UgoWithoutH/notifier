@@ -168,7 +168,14 @@ from shared.google_sheet import (
     fill_geographic_repartition_uninvested_amount,
     fill_remaining_duration_amounts,
 )
-from shared.remaining_duration import overdue_months_and_days, remaining_months_and_days
+from shared.rate_sheet import fill_rate_amounts
+from shared.remaining_duration import (
+    RateWeights,
+    base_term_between,
+    base_term_from_days,
+    overdue_months_and_days,
+    remaining_months_and_days,
+)
 from shared.report_date import get_report_now, is_current_month
 from shared.session_cache import get_or_refresh_session
 from shared.state import load_state, save_state
@@ -264,7 +271,19 @@ def aggregate_by_lender(investments: list) -> list:
     return lenders
 
 
-def aggregate_remaining_durations(investments: list, today: date) -> dict:
+def _base_term(loan: dict):
+    """Original term of a loan as (months, days): from `lenderIssueDate` to
+    `initialDueDate` (the maturity before any extension), verified live
+    2026-10-26 on 134 investments. `totalTermInDays` (= finalPaymentDate -
+    lenderIssueDate) includes the extensions used so it's only the fallback
+    when those dates are missing. None if undeterminable."""
+    try:
+        return base_term_between(date.fromisoformat(loan["lenderIssueDate"][:10]), date.fromisoformat(loan["initialDueDate"][:10]))
+    except (KeyError, TypeError, ValueError):
+        return base_term_from_days(loan.get("totalTermInDays"))
+
+
+def aggregate_remaining_durations(investments: list, today: date, rates=None) -> dict:
     """Group investments by loan originator (same key as aggregate_by_lender),
     then by remaining term as of `today` (months, days):
     {originator: {(months, days): remaining principal}}. The maturity date is
@@ -316,6 +335,11 @@ def aggregate_remaining_durations(investments: list, today: date) -> dict:
             term = remaining_months_and_days(today, maturity)
         durations = result.setdefault(lender_name, {})
         durations[term] = durations.get(term, 0.0) + remaining
+        if rates is not None:
+            base_term = _base_term(loan)
+            if base_term is None:
+                log.warning("No base term found for an investment of %s (%.2f EUR) - excluded from the 'taux' sheet.", lender_name, remaining)
+            rates.add(lender_name, term, remaining, loan.get("interestRate"), base_term=base_term)  # loan.interestRate is already in percent (e.g. "12.00")
     return result
 
 
@@ -1008,11 +1032,17 @@ def run() -> None:
         # Own try/except: the "durée" tab is a secondary view, its failure
         # must not fail the whole run.
         try:
+            rates = RateWeights()
             fill_remaining_duration_amounts(
-                "Lendermarket", aggregate_remaining_durations(investments, today_date)
+                "Lendermarket", aggregate_remaining_durations(investments, today_date, rates=rates), rates=rates
             )
         except Exception:
             log.exception("Failed to update the 'durée' sheet for Lendermarket.")
+
+        try:
+            fill_rate_amounts("Lendermarket", rates)
+        except Exception:
+            log.exception("Failed to update the 'taux' sheet for Lendermarket.")
 
 
 if __name__ == "__main__":

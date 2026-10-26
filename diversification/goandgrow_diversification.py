@@ -115,6 +115,8 @@ from dotenv import load_dotenv
 load_dotenv()
 
 from shared.google_sheet import fill_current_month_amounts, fill_current_month_bonus_breakdown, fill_geographic_repartition_amounts, fill_remaining_duration_amounts
+from shared.remaining_duration import RateWeights
+from shared.rate_sheet import fill_rate_amounts
 from shared.report_date import get_report_now, is_current_month
 from shared.session_cache import get_or_refresh_session
 from shared.weighted_average import INVESTED_BALANCE_LABEL, NON_INVESTED_BALANCE_LABEL, compute_time_weighted_average
@@ -696,11 +698,23 @@ def run() -> None:
         # Go & Grow has no vaults/terms - the whole balance is withdrawable
         # at any time, i.e. a remaining term of 0 days. Own try/except: the
         # "durée" tab is a secondary view, its failure must not fail the run.
+        rates = RateWeights()
         try:
             durations = {PLATFORM_LABEL: {(0, 0): round(balance, 2)}} if round(balance, 2) > 0 else {}
-            fill_remaining_duration_amounts(PLATFORM_LABEL, durations, platform_level=True)
+            # `AnnualTargetReturnRate` is a fraction (0.06 = 6 %). The goal exposes no loan term (`TargetDate` is
+            # the saver's own target, null here): base_term stays None, so Go & Grow is left out of the "taux" tab.
+            for goal in goals:
+                if goal.get("AnnualTargetReturnRate") is not None:
+                    log.warning("No base term exposed by Go & Grow for its goal - excluded from the 'taux' sheet.")
+                    rates.add(PLATFORM_LABEL, (0, 0), goal.get("ClientValue"), float(goal["AnnualTargetReturnRate"]) * 100, base_term=None)
+            fill_remaining_duration_amounts(PLATFORM_LABEL, durations, platform_level=True, rates=rates)
         except Exception:
             log.exception("Failed to update the 'durée' sheet for Go & Grow.")
+
+        try:
+            fill_rate_amounts(PLATFORM_LABEL, rates, platform_level=True)
+        except Exception:
+            log.exception("Failed to update the 'taux' sheet for Go & Grow.")
 
 
 if __name__ == "__main__":

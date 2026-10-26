@@ -222,7 +222,14 @@ from shared.google_sheet import (
     fill_geographic_repartition_uninvested_amount,
     fill_remaining_duration_amounts,
 )
-from shared.remaining_duration import overdue_months_and_days, remaining_months_and_days
+from shared.rate_sheet import fill_rate_amounts
+from shared.remaining_duration import (
+    RateWeights,
+    base_term_between,
+    base_term_from_days,
+    overdue_months_and_days,
+    remaining_months_and_days,
+)
 from shared.report_date import get_report_now, is_current_month
 from shared.session_cache import get_or_refresh_session
 from shared.state import load_state, save_state
@@ -447,7 +454,18 @@ def aggregate_by_originator(investments: list) -> list:
     return originators
 
 
-def aggregate_remaining_durations(investments: list, today: date) -> dict:
+def _base_term(inv: dict):
+    """Original term of the loan as (months, days): from the loan's `issue_date`
+    (list field - the loan's, not the investment date, which can be much later
+    on secondary-market purchases) to its `maturity_date` (detail endpoint),
+    falling back to the list's `term` (in days). None if undeterminable."""
+    try:
+        return base_term_between(date.fromisoformat(inv["issue_date"][:10]), date.fromisoformat(inv["maturity_date"][:10]))
+    except (KeyError, TypeError, ValueError):
+        return base_term_from_days(inv.get("term"))
+
+
+def aggregate_remaining_durations(investments: list, today: date, rates=None) -> dict:
     """Group active investments by loan originator (same key as
     aggregate_by_originator), then by remaining term as of `today` (months,
     days): {originator: {(months, days): principal_left}}. The maturity date
@@ -496,6 +514,11 @@ def aggregate_remaining_durations(investments: list, today: date) -> dict:
             term = remaining_months_and_days(today, maturity)
         durations = result.setdefault(originator, {})
         durations[term] = durations.get(term, 0.0) + amount
+        if rates is not None:
+            base_term = _base_term(inv)
+            if base_term is None:
+                log.warning("No base term found for an investment of %s (%.2f EUR) - excluded from the 'taux' sheet.", originator, amount)
+            rates.add(originator, term, amount, inv.get("interest_rate"), base_term=base_term)  # list field, already in percent (e.g. "14.50")
     return result
 
 
@@ -1413,9 +1436,17 @@ def run() -> None:
         # Own try/except: the "durée" tab is a secondary view, its failure
         # must not fail the whole run.
         try:
-            fill_remaining_duration_amounts("Loanch", aggregate_remaining_durations(investments, today_date))
+            rates = RateWeights()
+            fill_remaining_duration_amounts(
+                "Loanch", aggregate_remaining_durations(investments, today_date, rates=rates), rates=rates
+            )
         except Exception:
             log.exception("Failed to update the 'durée' sheet for Loanch.")
+
+        try:
+            fill_rate_amounts("Loanch", rates)
+        except Exception:
+            log.exception("Failed to update the 'taux' sheet for Loanch.")
 
 
 if __name__ == "__main__":

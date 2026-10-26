@@ -215,7 +215,8 @@ from shared.google_sheet import (
     fill_lande_loan_geo_amounts,
     fill_remaining_duration_amounts,
 )
-from shared.remaining_duration import overdue_months_and_days, remaining_months_and_days
+from shared.rate_sheet import fill_rate_amounts
+from shared.remaining_duration import RateWeights, base_term_from_days, overdue_months_and_days, remaining_months_and_days
 from shared.report_date import get_report_date, is_current_month
 from shared.weighted_average import INVESTED_BALANCE_LABEL, NON_INVESTED_BALANCE_LABEL, compute_time_weighted_average
 from shared.monthly_yield_waterfall import compute_monthly_yield_shares
@@ -650,17 +651,17 @@ def fetch_active_loan_geo_amounts(session: requests.Session) -> tuple:
     )
     return loan_amounts, loan_statuses, due_dates
 
-def fetch_loan_maturity_date(session: requests.Session, loan_id: str) -> date | None:
-    """Maturity date of a loan: the last date of the payment schedule
-    ("Calendrier" table: # | Date | Principal | ...) on its project page
-    /fr/investors/loans/<id> (verified live 2026-10-16; the investments
-    table itself only shows the next payment). None if no schedule found."""
-    url = f"https://lande.finance/fr/investors/loans/{loan_id}"
-    response = session.get(url, timeout=30)
+def _fetch_loan_page(session: requests.Session, loan_id: str) -> str:
+    response = session.get(f"https://lande.finance/fr/investors/loans/{loan_id}", timeout=30)
     _check_authenticated(response)
     response.raise_for_status()
+    response.encoding = "utf-8"
+    return response.text
+
+
+def _parse_loan_maturity_date(page_html: str) -> date | None:
     parser = _InvestmentTableParser()
-    parser.feed(response.text)
+    parser.feed(page_html)
     dates = [
         datetime.strptime(row["cells"][1], "%d.%m.%Y").date()
         for row in parser.rows
@@ -669,8 +670,40 @@ def fetch_loan_maturity_date(session: requests.Session, loan_id: str) -> date | 
     return max(dates) if dates else None
 
 
+_LOAN_RATE_RE = re.compile(r"Taux d'int[ée]r[êe]t\s*([\d]+(?:[.,]\d+)?)\s*%", re.IGNORECASE)
+
+
+def _parse_loan_rate(page_html: str) -> float | None:
+    """Annual interest rate (%) of a loan from its "Taux d'intérêt 13%" line (verified live 2026-10-26)."""
+    text = html.unescape(re.sub(r"\s+", " ", re.sub(r"<[^>]+>", " ", page_html)))
+    match = _LOAN_RATE_RE.search(text.replace("’", "'"))
+    return float(match.group(1).replace(",", ".")) if match else None
+
+
+_LOAN_TERM_RE = re.compile(r"\bTerme\s*(\d+)\s*(m|mois|months?|j|jours?|d|days?)\b", re.IGNORECASE)
+
+
+def _parse_loan_base_term(page_html: str) -> tuple | None:
+    """Base term (months, days) of a loan from its "Terme 12m" line (verified live 2026-10-26); None if absent."""
+    text = html.unescape(re.sub(r"\s+", " ", re.sub(r"<[^>]+>", " ", page_html)))
+    match = _LOAN_TERM_RE.search(text)
+    if not match:
+        return None
+    value, unit = int(match.group(1)), match.group(2).lower()
+    return (value, 0) if unit.startswith("m") else base_term_from_days(value)
+
+
+def fetch_loan_maturity_date(session: requests.Session, loan_id: str) -> date | None:
+    """Maturity date of a loan: the last date of the payment schedule
+    ("Calendrier" table: # | Date | Principal | ...) on its project page
+    /fr/investors/loans/<id> (verified live 2026-10-16; the investments
+    table itself only shows the next payment). None if no schedule found."""
+    return _parse_loan_maturity_date(_fetch_loan_page(session, loan_id))
+
+
 def aggregate_remaining_durations(
-    session: requests.Session, loan_amounts: dict, today: date, loan_statuses: dict | None = None, due_dates: dict | None = None
+    session: requests.Session, loan_amounts: dict, today: date, loan_statuses: dict | None = None, due_dates: dict | None = None,
+    rates: RateWeights | None = None,
 ) -> dict:
     """Group loans by loan id (same key as the geographic breakdown rows),
     then by remaining term as of `today` (months, days):
@@ -678,7 +711,8 @@ def aggregate_remaining_durations(
     (any payment_status other than "current") or in default ("default") is
     grouped by how long ago its missed payment was due (the "Paiement à
     venir" date Lande shows) instead - see overdue_months_and_days().
-    Loans whose maturity can't be determined are skipped (with a warning)."""
+    Loans whose maturity can't be determined are skipped (with a warning).
+    `rates` (optional) collects each loan's interest rate (%) from its project page."""
     loan_statuses = loan_statuses or {}
     due_dates = due_dates or {}
     result = {}
@@ -686,11 +720,13 @@ def aggregate_remaining_durations(
         amount = sum(countries.values())
         status = loan_statuses.get(loan_id, "current")
         term = None
+        page_html = None
         if status != "current" and loan_id in due_dates:
             term = overdue_months_and_days(today, due_dates[loan_id], default=status == "default")
         if term is None:
             try:
-                maturity = fetch_loan_maturity_date(session, loan_id)
+                page_html = _fetch_loan_page(session, loan_id)
+                maturity = _parse_loan_maturity_date(page_html)
             except Exception:
                 log.exception("Failed to fetch the maturity date of Lande loan %s.", loan_id)
                 maturity = None
@@ -700,6 +736,16 @@ def aggregate_remaining_durations(
             term = remaining_months_and_days(today, maturity)
         durations = result.setdefault(loan_id, {})
         durations[term] = durations.get(term, 0.0) + amount
+        if rates is not None:
+            try:
+                if page_html is None:
+                    page_html = _fetch_loan_page(session, loan_id)
+                rates.add(
+                    loan_id, term, amount, _parse_loan_rate(page_html),
+                    base_term=_parse_loan_base_term(page_html),
+                )
+            except Exception:
+                log.exception("Failed to fetch the interest rate of Lande loan %s.", loan_id)
     return result
 
 
@@ -838,14 +884,21 @@ def run(session: requests.Session | None = None) -> None:
         # must not fail the whole run.
         if active_loan_amounts is not None:
             try:
+                rates = RateWeights()
                 fill_remaining_duration_amounts(
                     PLATFORM_LABEL,
-                    aggregate_remaining_durations(session, active_loan_amounts, report_date, loan_statuses, loan_due_dates),
+                    aggregate_remaining_durations(session, active_loan_amounts, report_date, loan_statuses, loan_due_dates, rates),
                     platform_level=True,
                     projects=True,
+                    rates=rates,
                 )
             except Exception:
                 log.exception("Failed to update the 'durée' sheet for Lande.")
+            else:
+                try:
+                    fill_rate_amounts(PLATFORM_LABEL, rates, platform_level=True, projects=True)
+                except Exception:
+                    log.exception("Failed to update the 'taux' sheet for Lande.")
 
         try:
             available_funds = fetch_available_funds(session)
