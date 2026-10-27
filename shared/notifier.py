@@ -558,7 +558,7 @@ def send_bienpreter_geo_issues_email(issues: list, error: str | None = None) -> 
         log.exception("Failed to send Bienprêter geographic breakdown issues email.")
 
 
-def send_diversification_recap_email(amounts: dict, missing_platforms: list | None = None, error: str | None = None) -> None:
+def send_diversification_recap_email(amounts: dict, missing_platforms: list | None = None, error: str | None = None) -> bool:
     """Sent once at the very end of the ".github/workflows/diversification.yml"
     GitHub Actions workflow (a dedicated final job that runs after every
     platform job, `if: always()`), summarizing the "non investi" (uninvested
@@ -573,14 +573,18 @@ def send_diversification_recap_email(amounts: dict, missing_platforms: list | No
     so a silent gap is never mistaken for a real 0.00 €.
     `error` : set if reading the Sheet itself failed entirely; the email is
     still sent (with just the error) so a broken recap step is never silent.
+
+    Platforms with a 0.00 € amount are left out of the email. Returns True
+    if the email was sent.
     """
     if not all([SMTP_HOST, SMTP_USER, SMTP_PASSWORD, EMAIL_TO]):
         log.error(
             "SMTP configuration is incomplete; cannot send email. "
             "Required env vars: SMTP_HOST, SMTP_USER, SMTP_PASSWORD, EMAIL_TO."
         )
-        return
+        return False
 
+    amounts = {p: a for p, a in amounts.items() if round(a, 2) != 0}
     total = sum(amounts.values())
     subject = f"[Diversification] Récapitulatif montants non investis - {total:.2f} €"
     if error:
@@ -590,10 +594,13 @@ def send_diversification_recap_email(amounts: dict, missing_platforms: list | No
     if error:
         body_lines.append(f"⚠ ERREUR pendant la lecture du récapitulatif : {error}")
         body_lines.append("")
-    body_lines.append("Montants non investis (disponibles, pas encore prêtés) par plateforme :")
-    body_lines.append("")
-    for platform, amount in sorted(amounts.items()):
-        body_lines.append(f"- {platform:<15s} : {amount:.2f} €")
+    if amounts:
+        body_lines.append("Montants non investis (disponibles, pas encore prêtés) par plateforme :")
+        body_lines.append("")
+        for platform, amount in sorted(amounts.items()):
+            body_lines.append(f"- {platform:<15s} : {amount:.2f} €")
+    else:
+        body_lines.append("Aucun montant non investi sur les plateformes.")
     body_lines.append("")
     body_lines.append(f"Total : {total:.2f} €")
 
@@ -615,8 +622,10 @@ def send_diversification_recap_email(amounts: dict, missing_platforms: list | No
             server.login(SMTP_USER, SMTP_PASSWORD)
             server.sendmail(EMAIL_FROM, [EMAIL_TO], msg.as_string())
         log.info("Diversification recap email sent to %s.", EMAIL_TO)
+        return True
     except Exception:
         log.exception("Failed to send diversification recap email.")
+        return False
 
 
 def send_new_bilans_email(new_bilans: list) -> None:
