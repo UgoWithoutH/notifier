@@ -23,7 +23,9 @@ SMTP_USER, SMTP_PASSWORD, EMAIL_TO (SMTP_PORT/EMAIL_FROM optional, see
 shared/notifier.py).
 """
 
+import json
 import logging
+from pathlib import Path
 
 from dotenv import load_dotenv
 
@@ -35,10 +37,25 @@ from shared.notifier import send_diversification_recap_email
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger("send_diversification_recap_email")
 
+# Amounts of the last recap email actually sent, persisted across workflow
+# runs via actions/cache (see diversification.yml's recap_email job).
+STATE_PATH = Path(__file__).resolve().parent.parent / "diversification" / "uninvested_recap_state.json"
+
 WORKFLOW_PLATFORMS = [
     "Swaper", "Iuvo", "Afranga", "Bienprêter", "Lendermarket",
     "Loanch", "Peerberry", "Bricks", "Nectaro", "Debitum", "Income Marketplace",
 ]
+
+
+def _load_previous_amounts():
+    try:
+        data = json.loads(STATE_PATH.read_text(encoding="utf-8"))
+        return {p: round(float(a), 2) for p, a in data.items()}
+    except FileNotFoundError:
+        return None
+    except Exception:
+        log.warning("Unreadable recap state file, treating as first run.", exc_info=True)
+        return None
 
 
 def run():
@@ -53,7 +70,14 @@ def run():
     if missing:
         log.warning("No 'non investi' amount found for: %s", ", ".join(missing))
 
-    send_diversification_recap_email(amounts, missing_platforms=missing)
+    current = {p: round(a, 2) for p, a in amounts.items()}
+    previous = _load_previous_amounts()
+    if previous is not None and previous == current:
+        log.info("No uninvested amount changed since the last recap email; not sending.")
+        return
+
+    if send_diversification_recap_email(amounts, missing_platforms=missing):
+        STATE_PATH.write_text(json.dumps(current, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
 if __name__ == "__main__":
