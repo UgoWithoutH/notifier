@@ -32,7 +32,6 @@ from shared.google_sheet import (
     _DURATION_SECTION_LABELS,
     _call_with_retry,
     _col_letter,
-    _duration_label,
     _duration_month_columns,
     _duration_own_section,
     _duration_sections,
@@ -69,6 +68,20 @@ _PLATFORM_FORMATS = (
 _PLATFORM_MONTH_FORMAT = {"backgroundColor": _GREY, "numberFormat": _DURATION_AMOUNT_FORMAT["numberFormat"], "borders": {"top": {"style": "NONE"}}}
 _RATE_MONTH_NUMBER_FORMAT = {"type": "PERCENT", "pattern": "0.00%"}
 _DEFAULT_HORIZON = "1 an"
+
+
+def _term_label(term: tuple) -> str:
+    """(mois, jours) -> "1 an 1 mois 1 jour" / "2 ans" / "5 mois" / "0 jour" (les mois sont regroupés en années)."""
+    years, months = divmod(abs(term[0]), 12)
+    days = abs(term[1])
+    parts = []
+    if years:
+        parts.append(f"{years} an" + ("s" if years > 1 else ""))
+    if months:
+        parts.append(f"{months} mois")
+    if days or not parts:
+        parts.append(f"{days} jour" + ("s" if days > 1 else ""))
+    return " ".join(parts)
 
 
 def _range(worksheet, first_row: int, last_row: int, first_col: int = 0, last_col: int | None = None) -> dict:
@@ -257,7 +270,7 @@ def fill_rate_amounts(platform: str, rates, platform_level: bool = False, projec
         for term, project_key in terms:
             amount, weighted_sum, weighted_base = entries[(key, term, project_key)]
             rate = weighted_sum / weighted_base if weighted_base > 0 else None
-            desired.append(("term", history_key, project_names[project_key], _duration_label(term),
+            desired.append(("term", history_key, project_names[project_key],             _term_label(term),
                             (round(amount, 2), None if rate is None else round(rate / 100, 6))))
 
     own_window = history.window_months(today, horizon_months)
@@ -369,7 +382,7 @@ def fill_rate_amounts(platform: str, rates, platform_level: bool = False, projec
                 else:
                     cell_format["horizontalAlignment"] = "RIGHT"
                     if value is not None:
-                        month_cell["userEnteredValue"] = {"stringValue": _duration_label(months_to_term(value))}
+                        month_cell["userEnteredValue"] = {"stringValue": _term_label(months_to_term(value))}
             month_cell["userEnteredFormat"] = cell_format
             cells.append(month_cell)
         rows.append({"values": cells})
