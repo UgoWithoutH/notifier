@@ -922,7 +922,16 @@ jobs:
       # Runs after every platform job above ("if: always()", regardless of
       # any individual job's success/failure) - re-reads each platform's
       # already-written "non investi" row from the Sheet and sends one
-      # recap email (see scripts/send_diversification_recap_email.py).
+      # recap email (see scripts/send_diversification_recap_email.py),
+      # only if an amount changed since the last email actually sent.
+      - name: Restore last sent recap amounts
+        uses: actions/cache/restore@v4
+        with:
+          path: diversification/uninvested_recap_state.json
+          key: uninvested-recap-state-${{ github.run_id }}
+          restore-keys: |
+            uninvested-recap-state-
+
       - name: Send uninvested amounts recap email
         env:
           GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
@@ -934,3 +943,10 @@ jobs:
           EMAIL_FROM: ${{ secrets.EMAIL_FROM }}
           EMAIL_TO: ${{ secrets.EMAIL_TO }}
         run: python -m scripts.send_diversification_recap_email
+
+      - name: Save last sent recap amounts
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: diversification/uninvested_recap_state.json
+          key: uninvested-recap-state-${{ github.run_id }}
