@@ -226,7 +226,7 @@ from shared.google_sheet import (
 from shared.rate_sheet import fill_rate_amounts
 from shared.remaining_duration import RateWeights, overdue_months_and_days, remaining_months_and_days
 from shared.report_date import get_report_now, is_current_month
-from shared.session_cache import get_or_refresh_session
+from shared.session_cache import get_or_refresh_session, save_session_state
 from shared.notifier import send_bienpreter_geo_issues_email
 from shared.state import load_state, save_state
 from shared.weighted_average import INVESTED_BALANCE_LABEL, NON_INVESTED_BALANCE_LABEL, compute_time_weighted_average
@@ -436,9 +436,21 @@ def _parse_active_loans_results(results: list) -> list:
 
 def _refresh_api_token(session: requests.Session) -> None:
     """Sets the `api-v2-token` cookie the JSON API authenticates with, from
-    the PHP session cookie (what the site's own front-end does on a 401)."""
+    the PHP session cookie (what the site's own front-end does on a 401).
+
+    A 401 here means the PHP session itself is no longer authenticated
+    (observed 2026-10-28: dropped server-side mid-run, seconds after the
+    same endpoint answered 204) - log in again for real, persist the fresh
+    session, and retry once."""
     r = session.get(API_TOKEN_URL, timeout=30)
     log.info("GET api-token-from-session: status=%s", r.status_code)
+    if r.status_code == 401:
+        log.warning("Bienpreter PHP session no longer authenticated - logging in again.")
+        session.cookies.clear()
+        login(session)
+        save_session_state(session, SESSION_STATE_FILE)
+        r = session.get(API_TOKEN_URL, timeout=30)
+        log.info("GET api-token-from-session (after re-login): status=%s", r.status_code)
     r.raise_for_status()
 
 
