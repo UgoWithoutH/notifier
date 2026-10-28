@@ -37,8 +37,10 @@ for the rest of the page's lifetime.
 Usage: `python -m diversification.lande_get_session`
 1. Your real Chrome opens (a separate profile, not your everyday one) on
    the Lande login page.
-2. Solve ONLY the "I'm not a robot" checkbox yourself, leave the email/
-   password fields blank, then come back here and press Enter.
+2. Pass the Cloudflare check yourself (leave email/password blank). The
+   script watches Chrome's plain HTTP debug endpoint (NO CDP attached yet -
+   attaching during the challenge makes it loop) and continues by itself
+   as soon as the login page is displayed, no Enter needed.
 3. The script attaches via CDP and fills/submits email+password
    (LANDE_EMAIL/LANDE_PASSWORD) and, if a 2FA page appears, the TOTP code
    (LANDE_TOTP_SECRET) - fully automatic from here. If any step doesn't
@@ -62,11 +64,13 @@ are still needed (transitively, by lande_diversification.run()) to write
 the fetched data to the Sheet.
 """
 
+import json
 import os
 import subprocess
 import sys
 import time
 import logging
+import urllib.request
 
 import pyotp
 import requests
@@ -74,7 +78,7 @@ from dotenv import load_dotenv
 from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
 
 from diversification.lande_diversification import run as run_diversification
-from shared.browser_stealth import human_mouse_wander, human_pause, human_type
+from shared.browser_stealth import close_real_chrome, human_mouse_wander, human_pause, human_type
 from shared.report_date import REPORT_DATE_ENV_VAR, get_report_date_list
 
 load_dotenv()
@@ -146,6 +150,39 @@ def _submit_totp(page) -> bool:
     return False
 
 
+CHALLENGE_TITLES = ("un instant", "just a moment", "attention required")
+
+
+def _login_page_displayed() -> bool:
+    """Reads Chrome's plain HTTP debug endpoint (/json) - NO CDP session is
+    attached, since attaching while Cloudflare's challenge is running makes it
+    loop forever. True once a lande.finance tab is shown (login page, or
+    already logged in via the reused profile) with a non-challenge title."""
+    try:
+        with urllib.request.urlopen(f"http://localhost:{DEBUG_PORT}/json", timeout=2) as resp:
+            targets = json.load(resp)
+    except (OSError, ValueError):
+        return False
+    for target in targets:
+        if target.get("type") == "page" and "lande.finance/" in target.get("url", ""):
+            return not target.get("title", "").lower().startswith(CHALLENGE_TITLES)
+    return False
+
+
+def _wait_for_login_page(timeout: float = 300, settle: float = 2) -> bool:
+    """Waits (without attaching) until the Cloudflare challenge is passed and a
+    lande.finance page is displayed. Returns False on timeout."""
+    deadline = time.time() + timeout
+    log.info("Waiting for you to pass the Cloudflare check in Chrome (leave email/password blank)...")
+    while time.time() < deadline:
+        if _login_page_displayed():
+            time.sleep(settle)
+            if _login_page_displayed():
+                log.info("Lande page displayed - continuing automatically.")
+                return True
+        time.sleep(0.5)
+    return False
+
 def main() -> None:
     chrome_path = _find_chrome()
     log.info("Launching real Chrome (%s) with a separate profile, remote debugging on :%s ...", chrome_path, DEBUG_PORT)
@@ -159,11 +196,9 @@ def main() -> None:
     ])
     time.sleep(2)
 
-    input(
-        "\nA real Chrome window should now be open. Please solve ONLY the "
-        "'I'm not a robot' checkbox (leave email/password blank), THEN come "
-        "back here and press Enter...\n"
-    )
+    if not _wait_for_login_page():
+        log.error("Timed out waiting for the Cloudflare check to be passed / the login page to appear.")
+        sys.exit(1)
 
     with sync_playwright() as p:
         browser = p.chromium.connect_over_cdp(f"http://localhost:{DEBUG_PORT}")
@@ -187,9 +222,12 @@ def main() -> None:
             )
 
         raw_cookies = context.cookies()
-        # Don't close the browser (it's the user's real Chrome process) -
-        # just disconnect Playwright from it.
-        browser.close()
+        # Dedicated Chrome profile: quit it (closes every tab) now the cookies are read.
+        close_real_chrome(browser)
+        try:
+            browser.close()
+        except Exception:
+            pass
 
     wanted = {c["name"]: c["value"] for c in raw_cookies if c["name"] in ("cf_clearance", "lande_session", "XSRF-TOKEN")}
     missing = [name for name in ("cf_clearance", "lande_session", "XSRF-TOKEN") if name not in wanted]
