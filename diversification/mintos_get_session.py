@@ -49,11 +49,9 @@ Usage: `python -m diversification.mintos_get_session`
    session cookies, and immediately calls
    `mintos_diversification.run(session=...)` with them - the account's
    current data is fetched and written to the Google Sheet right away.
-6. The two cookie values are also printed at the end - copy them into your
-   local .env and the GitHub repository secrets (Settings > Secrets and
-   variables > Actions) of the same names, so the scheduled/cron-job.org
-   -triggered workflow can keep reusing this session headlessly afterward
-   without needing a fresh manual login every time.
+6. The cookie values are never printed (they stay in memory only). To seed
+   the scheduled/cron-job.org-triggered workflow's MINTOS_PHPSESSID /
+   MINTOS_MW_SESSION_ID secrets, copy them from the browser's dev tools.
 
 The Mintos session cookie renews itself on every authenticated request (a
 fresh `Set-Cookie` with a later `Expires` came back on every API call tested
@@ -84,7 +82,7 @@ from dotenv import load_dotenv
 from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
 
 from diversification.mintos_diversification import run as run_diversification
-from shared.browser_stealth import human_mouse_wander, human_pause, human_type
+from shared.browser_stealth import close_real_chrome, human_mouse_wander, human_pause, human_type
 from shared.report_date import REPORT_DATE_ENV_VAR, get_report_date_list
 
 load_dotenv()
@@ -246,8 +244,11 @@ def main() -> None:
 
         log.info("Navigating to the Mintos login page...")
         page.goto(LOGIN_URL, wait_until="domcontentloaded")
-        _dismiss_cookie_banner(page)
-        human_mouse_wander(page)
+        if "/login" in page.url:
+            _dismiss_cookie_banner(page)
+            human_mouse_wander(page)
+        else:
+            log.info("Already logged in (reused session) - skipping the login step.")
 
         if "/login" in page.url and MINTOS_EMAIL and MINTOS_PASSWORD:
             log.info("Filling email/password automatically...")
@@ -269,8 +270,12 @@ def main() -> None:
         raw_cookies = context.cookies()
         wanted = {c["name"]: c["value"] for c in raw_cookies if c["name"] in ("PHPSESSID", "MW_SESSION_ID")}
         page.close()
-        # Only disconnects Playwright - the real Chrome process stays open.
-        browser.close()
+        # Dedicated Chrome profile: quit it (closes every tab) now the cookies are read.
+        close_real_chrome(browser)
+        try:
+            browser.close()
+        except Exception:
+            pass
 
     if "PHPSESSID" not in wanted or "MW_SESSION_ID" not in wanted:
         log.error("Could not find PHPSESSID/MW_SESSION_ID cookies after login - got: %r", list(wanted.keys()))
@@ -287,10 +292,7 @@ def main() -> None:
         log.info("[%d/%d] Running the Mintos diversification fetch for %s...", i, len(report_dates), report_date or "today")
         run_diversification(session=session)
 
-    print("\nDone. To let the scheduled/cron-job.org-triggered workflow reuse this session")
-    print("headlessly afterward, also update these in your local .env AND as GitHub repository secrets:\n")
-    print(f"MINTOS_PHPSESSID={wanted['PHPSESSID']}")
-    print(f"MINTOS_MW_SESSION_ID={wanted['MW_SESSION_ID']}")
+    log.info("Done. The authenticated session was kept in memory; cookie values were not displayed or persisted.")
 
 
 if __name__ == "__main__":
