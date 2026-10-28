@@ -586,7 +586,7 @@ def send_diversification_recap_email(amounts: dict, missing_platforms: list | No
 
     amounts = {p: a for p, a in amounts.items() if round(a, 2) != 0}
     total = sum(amounts.values())
-    subject = f"[Diversification] Récapitulatif montants non investis - {total:.2f} €"
+    subject = f"Récapitulatif montants non investis - {total:.2f} €"
     if error:
         subject += " - ERREUR"
 

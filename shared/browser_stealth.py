@@ -138,3 +138,13 @@ def human_type(locator, text: str) -> None:
     locator.click()
     for char in text:
         locator.type(char, delay=random.uniform(60, 180))
+
+
+def close_real_chrome(browser) -> None:
+    """Quits a real Chrome attached via connect_over_cdp (all its tabs).
+    Only for the dedicated debug-port profile Chromes of the *_get_session.py
+    helpers, never the user's everyday Chrome."""
+    try:
+        browser.new_browser_cdp_session().send("Browser.close")
+    except Exception:
+        pass  # Chrome dropping the connection while quitting is expected
