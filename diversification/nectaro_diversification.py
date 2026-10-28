@@ -130,6 +130,8 @@ from pathlib import Path
 import pyotp
 import requests
 from dotenv import load_dotenv
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 load_dotenv()
 
@@ -650,6 +652,11 @@ def run() -> None:
     log.info("Starting Nectaro diversification run (pure HTTP, no browser).")
 
     session = requests.Session()
+    # Nectaro intermittently drops idle/fresh connections (RemoteDisconnected); only idempotent GETs are retried.
+    session.mount("https://", HTTPAdapter(max_retries=Retry(
+        total=4, connect=4, read=4, status=0, backoff_factor=1.0,
+        allowed_methods=frozenset(["GET"]),
+    )))
     try:
         (overview, companies), extra = get_or_refresh_session(
             session, SESSION_STATE_FILE,

@@ -139,6 +139,7 @@ from pathlib import Path
 
 import pyotp
 from dotenv import load_dotenv
+from playwright.sync_api import Error as PlaywrightError
 from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
 from playwright.sync_api import sync_playwright
 
@@ -192,6 +193,8 @@ XIRR_CACHE_OVERLAP_DAYS = 30
 XIRR_CASHFLOWS_STATE_FILE = Path(__file__).parent / "income_marketplace_xirr_cashflows_state.json"
 XIRR_CASHFLOWS_STATE_DEFAULT = {"transactions": [], "last_fetched_date": None}
 STORAGE_STATE_FILE = Path(__file__).parent / "income_marketplace_diversification_storage_state.json"
+FETCH_MAX_ATTEMPTS = 4
+FETCH_RETRY_BASE_DELAY_SECONDS = 3
 
 
 def _reuse_persisted_session(page) -> str | None:
@@ -315,18 +318,31 @@ def _fetch_json(page, url: str, token: str) -> dict:
     """Fetch `url` from inside the already-authenticated page's own JS
     context (never a plain `requests` call - see module docstring for why
     this stays Playwright-based) with the given Bearer token."""
-    result = page.evaluate(
-        """
-        async ({url, token}) => {
-            const r = await fetch(url, {
-                headers: {'Accept': 'application/json', 'Authorization': 'Bearer ' + token}
-            });
-            const body = await r.json();
-            return {status: r.status, body: body};
-        }
-        """,
-        {"url": url, "token": token},
-    )
+    # A browser-level "TypeError: Failed to fetch" is a transient network
+    # failure (no HTTP response at all, e.g. connection reset on a CI runner),
+    # so retry it with a short backoff before giving up.
+    result = None
+    for attempt in range(1, FETCH_MAX_ATTEMPTS + 1):
+        try:
+            result = page.evaluate(
+                """
+                async ({url, token}) => {
+                    const r = await fetch(url, {
+                        headers: {'Accept': 'application/json', 'Authorization': 'Bearer ' + token}
+                    });
+                    const body = await r.json();
+                    return {status: r.status, body: body};
+                }
+                """,
+                {"url": url, "token": token},
+            )
+            break
+        except PlaywrightError as exc:
+            if "Failed to fetch" not in str(exc) or attempt == FETCH_MAX_ATTEMPTS:
+                raise
+            delay = FETCH_RETRY_BASE_DELAY_SECONDS * attempt
+            log.warning("GET %s failed with a network error (attempt %d/%d) - retrying in %ds.", url, attempt, FETCH_MAX_ATTEMPTS, delay)
+            time.sleep(delay)
     if result["status"] != 200:
         raise RuntimeError(f"GET {url} returned HTTP {result['status']}: {result['body']}")
     return result["body"]
