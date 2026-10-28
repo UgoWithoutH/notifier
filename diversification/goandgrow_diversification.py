@@ -102,6 +102,7 @@ logging in again if the persisted session stops working.
 """
 
 import os
+import re
 import sys
 import logging
 from datetime import date, datetime, timedelta
@@ -168,11 +169,25 @@ class _LoginFormParser(HTMLParser):
                 self.inputs[name] = attrs.get("value", "")
 
 
-def _find_form(html: str):
+def _describe_page(resp: requests.Response) -> str:
+    """Short, secret-free description of a response (status, final URL,
+    <title>, first visible text) for diagnosing unexpected login pages."""
+    text = re.sub(r"(?is)<(script|style).*?</\1>", " ", resp.text)
+    title = re.search(r"(?is)<title[^>]*>(.*?)</title>", text)
+    title_text = re.sub(r"\s+", " ", title.group(1)).strip() if title else None
+    visible = re.sub(r"\s+", " ", re.sub(r"(?s)<[^>]+>", " ", text)).strip()
+    return (
+        f"status={resp.status_code}, url={resp.url.split('?')[0]}, length={len(resp.text)}, "
+        f"title={title_text!r}, text={visible[:300]!r}"
+    )
+
+
+def _find_form(html: str, resp: requests.Response | None = None):
     parser = _LoginFormParser()
     parser.feed(html)
     if not parser.action:
-        raise RuntimeError("No <form> found in the page - the login flow may have changed.")
+        details = f" Page: {_describe_page(resp)}" if resp is not None else ""
+        raise RuntimeError(f"No <form> found in the page - the login flow may have changed.{details}")
     return parser.action, parser.inputs
 
 
@@ -182,16 +197,20 @@ def login(session: requests.Session) -> None:
     3-step exchange. No browser/Playwright involved at all."""
     log.info("Starting Go & Grow login (pure HTTP, no browser - see module docstring)...")
 
+    # A persisted-but-rejected session leaves stale Keycloak/app cookies in
+    # the jar, which derail the fresh login flow below - always start clean.
+    session.cookies.clear()
+
     resp = session.get(LOGIN_URL, timeout=30)
     resp.raise_for_status()
-    action, inputs = _find_form(resp.text)
+    action, inputs = _find_form(resp.text, resp)
     inputs["username"] = GOANDGROW_EMAIL
     inputs["password"] = GOANDGROW_PASSWORD
     log.info("Submitting credentials to the Keycloak login form...")
     resp2 = session.post(action, data=inputs, timeout=30)
     resp2.raise_for_status()
 
-    action2, inputs2 = _find_form(resp2.text)
+    action2, inputs2 = _find_form(resp2.text, resp2)
     log.info("Submitting the OIDC callback form...")
     resp3 = session.post(action2, data=inputs2, timeout=30)
     resp3.raise_for_status()
