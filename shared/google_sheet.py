@@ -1096,21 +1096,26 @@ def fill_geographic_repartition_amounts(loan_originators: list, platform: str | 
 
 
 DURATION_SHEET_NAME = "durée"
-_DURATION_LABEL_RE = re.compile(r"^(?:(\d+)\s*mois)?\s*(?:(\d+)\s*jours?)?\s*(de\s+retard|de\s+d[ée]faut)?$", re.IGNORECASE)
+_DURATION_LABEL_RE = re.compile(
+    r"^(?:(\d+)\s*ans?)?\s*(?:(\d+)\s*mois)?\s*(?:(\d+)\s*jours?)?\s*(de\s+retard|de\s+d[ée]faut)?$", re.IGNORECASE
+)
 
 
 def _duration_label(term: tuple) -> str:
-    """(mois, jours) -> "32 mois 29 jours" / "32 mois" / "5 jours" / "0 jour".
+    """(mois, jours) -> "2 ans 8 mois 29 jours" / "1 an" / "5 jours" / "0 jour".
     Un terme négatif (prêt en retard) donne "2 mois 5 jours de retard" ;
     (mois, jours, "default") (prêt en défaut) donne "2 mois 5 jours de défaut"."""
     months, days = term[0], term[1]
     in_default = len(term) > 2
     late = months < 0 or days < 0
     months, days = abs(months), abs(days)
+    years, months = divmod(months, 12)
     parts = []
+    if years:
+        parts.append(f"{years} an" + ("s" if years > 1 else ""))
     if months:
         parts.append(f"{months} mois")
-    if days or not months:
+    if days or not (years or months):
         parts.append(f"{days} jour" + ("s" if days > 1 else ""))
     if in_default:
         parts.append("de défaut")
@@ -1122,10 +1127,11 @@ def _duration_label(term: tuple) -> str:
 def _parse_duration_label(label: str):
     """Inverse of _duration_label(); None if `label` isn't a duration."""
     match = _DURATION_LABEL_RE.match(label.strip())
-    if not label.strip() or not match or (match.group(1) is None and match.group(2) is None):
+    if not label.strip() or not match or all(match.group(i) is None for i in (1, 2, 3)):
         return None
-    suffix = (match.group(3) or "").casefold()
-    months, days = int(match.group(1) or 0), int(match.group(2) or 0)
+    suffix = (match.group(4) or "").casefold()
+    months = int(match.group(1) or 0) * 12 + int(match.group(2) or 0)
+    days = int(match.group(3) or 0)
     if "faut" in suffix:
         return (months, days, "default")
     sign = -1 if suffix else 1
@@ -1492,7 +1498,8 @@ def fill_remaining_duration_amounts(
         name = cell(row_idx)
         term = _parse_duration_label(cell(row_idx, _DURATION_LABEL_COL))
         if term is not None:
-            existing.append(("dur", current_originator, (originator_key(name), _duration_label(term)), name))
+            # Libellé brut de la cellule : un ancien format ("33 mois 18 jours") devient périmé et est réécrit.
+            existing.append(("dur", current_originator, (originator_key(name), cell(row_idx, _DURATION_LABEL_COL).strip()), name))
         elif name.casefold() in _DURATION_STATUS_LABELS:
             existing.append(("status", current_originator, name.casefold(), name))
         elif _parse_duration_label(name) is not None:
