@@ -1291,10 +1291,10 @@ def _duration_status_requests(worksheet, grid, platform, platform_row, end_row, 
         return "défauts %.2f%% | retards %.2f%% | normaux %.2f%%" % (shares[2] * 100, shares[1] * 100, shares[0] * 100)
 
     path = status_history.state_path(platform)
-    days, names = status_history.load_history(path)
+    days, names, runs = status_history.load_history(path)
     names_by_key = {status_history.PLATFORM_KEY if key is None else key: name for key, (name, _) in new_data.items()}
-    status_history.record_day(days, names, today, shares_by_key, names_by_key, today, horizon_months)
-    status_history.save_history(path, days, names)
+    status_history.record_day(days, names, runs, today, shares_by_key, names_by_key, today, horizon_months)
+    status_history.save_history(path, days, names, runs)
     for history_key, shares in shares_by_key.items():
         logger.info("[%s] %s - parts du jour %s enregistrées dans %s : %s", platform, display(history_key), today, path.name, percents(shares))
     if not shares_by_key:

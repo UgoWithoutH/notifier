@@ -3,9 +3,12 @@ the "durée" Google Sheet tab (see shared.google_sheet.fill_remaining_duration_a
 
 Every run records, for the day it runs, the share (fraction of the outstanding
 amount) of normal / late / defaulted loans per loan originator (or for the
-whole platform). Those daily shares are kept in a small JSON state file per
-platform (persisted between GitHub Actions runs with actions/cache, like the
-XIRR cashflow state files) and averaged per calendar month for the sheet.
+whole platform). The day's value is the average of its runs weighted by their
+outstanding amount (every run of the current day is kept in the state file's
+"runs" section until the next day). Those daily shares are kept in a small JSON
+state file per platform (persisted between GitHub Actions runs with
+actions/cache, like the XIRR cashflow state files) and averaged per calendar
+month for the sheet.
 
 Duration terms follow shared.google_sheet's convention: (months, days) >= 0 is
 a normal loan, a negative term is a late loan, (months, days, "default") is a
@@ -78,14 +81,15 @@ def classify_term(term: tuple) -> str:
 
 
 def status_shares(durations: dict):
-    """{term: amount} -> (normal, late, default) fractions of the total, or None if the total isn't positive."""
+    """{term: amount} -> (normal, late, default, total): the three fractions of the total amount plus that
+    total (the weight of the run when several runs of a day are merged), or None if the total isn't positive."""
     totals = {"normal": 0.0, "late": 0.0, "default": 0.0}
     for term, amount in durations.items():
         totals[classify_term(term)] += float(amount)
     total = sum(totals.values())
     if total <= 0:
         return None
-    return (totals["normal"] / total, totals["late"] / total, totals["default"] / total)
+    return (totals["normal"] / total, totals["late"] / total, totals["default"] / total, total)
 
 
 def merge_durations(durations_by_key: dict) -> dict:
@@ -101,25 +105,47 @@ def state_path(platform: str) -> Path:
     return STATE_DIR / f"{re.sub(r'[^a-z0-9]', '', ascii_name.lower())}_duration_status_state.json"
 
 
+def _dict_or_empty(value) -> dict:
+    return value if isinstance(value, dict) else {}
+
+
 def load_history(path: Path) -> tuple:
-    """(days, names): days = {"YYYY-MM-DD": {key: [normal, late, default]}}, names = {key: display name}.
-    Both empty if the file is missing/unreadable."""
+    """(days, names, runs): days = {"YYYY-MM-DD": {key: [normal, late, default]}}, names = {key: display name},
+    runs = {"YYYY-MM-DD": {key: [[normal, late, default, total], ...]}} (every run of the current day).
+    All empty if the file is missing/unreadable."""
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
-        return {}, {}
-    days, names = data.get("days", {}), data.get("names", {})
-    return (days if isinstance(days, dict) else {}), (names if isinstance(names, dict) else {})
+        return {}, {}, {}
+    return _dict_or_empty(data.get("days")), _dict_or_empty(data.get("names")), _dict_or_empty(data.get("runs"))
 
 
-def save_history(path: Path, days: dict, names: dict) -> None:
-    path.write_text(json.dumps({"days": days, "names": names}, indent=1, sort_keys=True), encoding="utf-8")
+def save_history(path: Path, days: dict, names: dict, runs: dict) -> None:
+    path.write_text(json.dumps({"days": days, "names": names, "runs": runs}, indent=1, sort_keys=True), encoding="utf-8")
 
 
-def record_day(days: dict, names: dict, day: date, shares_by_key: dict, names_by_key: dict, today: date, horizon_months: int) -> None:
-    """Stores `day`'s shares ({key: (normal, late, default)}) and the display names, and drops the days older
-    than the horizon window (and the names no longer present in any remaining day)."""
-    days[day.isoformat()] = {key: list(shares) for key, shares in shares_by_key.items()}
+def merge_runs(runs: list):
+    """[[normal, late, default, total], ...] -> [normal, late, default] weighted by each run's total amount,
+    or None if no run has a positive total."""
+    total = sum(run[3] for run in runs)
+    if total <= 0:
+        return None
+    return [sum(run[i] * run[3] for run in runs) / total for i in range(3)]
+
+
+def record_day(days: dict, names: dict, runs: dict, day: date, shares_by_key: dict, names_by_key: dict, today: date, horizon_months: int) -> None:
+    """Records one run of `day` ({key: (normal, late, default, total)}) and sets the day's shares to the
+    amount-weighted average of all its runs. The runs of previous days are dropped: their average is already
+    in `days`. Also stores the display names and drops the days older than the horizon window (and the names
+    no longer present in any remaining day)."""
+    day_key = day.isoformat()
+    for stale in [d for d in runs if d != day_key]:
+        del runs[stale]
+    day_runs = runs.setdefault(day_key, {})
+    for key, shares in shares_by_key.items():
+        day_runs.setdefault(key, []).append(list(shares))
+    merged = {key: merge_runs(key_runs) for key, key_runs in day_runs.items()}
+    days[day_key] = {key: shares for key, shares in merged.items() if shares}
     names.update({key: name for key, name in names_by_key.items() if key in shares_by_key})
     oldest = _window_start(today, horizon_months).isoformat()
     for stale in [d for d in days if d < oldest]:
@@ -132,7 +158,7 @@ def record_day(days: dict, names: dict, day: date, shares_by_key: dict, names_by
 def tracked_originators(path: Path, today: date, horizon_months: int) -> dict:
     """{key: display name} of the originators that still have shares recorded inside the horizon window, so
     their rows stay in the sheet even when they no longer have any loan."""
-    days, names = load_history(path)
+    days, names, _ = load_history(path)
     oldest = _window_start(today, horizon_months).isoformat()
     keys = {key for day, shares in days.items() if day >= oldest for key in shares if key != PLATFORM_KEY}
     return {key: names.get(key, key) for key in keys}
