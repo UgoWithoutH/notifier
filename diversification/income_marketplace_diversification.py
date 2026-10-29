@@ -193,6 +193,9 @@ XIRR_CACHE_OVERLAP_DAYS = 30
 XIRR_CASHFLOWS_STATE_FILE = Path(__file__).parent / "income_marketplace_xirr_cashflows_state.json"
 XIRR_CASHFLOWS_STATE_DEFAULT = {"transactions": [], "last_fetched_date": None}
 STORAGE_STATE_FILE = Path(__file__).parent / "income_marketplace_diversification_storage_state.json"
+LOGIN_SUBMIT_MAX_ATTEMPTS = 3
+LOGIN_RESPONSE_TIMEOUT_MS = 60000
+LOGIN_RETRY_DELAY_SECONDS = 10
 FETCH_MAX_ATTEMPTS = 4
 FETCH_RETRY_BASE_DELAY_SECONDS = 3
 
@@ -224,6 +227,38 @@ def _reuse_persisted_session(page) -> str | None:
     return token if status == 200 else None
 
 
+def _submit_credentials(page):
+    """Fill + submit the login form and return the auth0-login response.
+    On a CI runner the POST sometimes never gets any response within the
+    timeout (slow/throttled first hit), so reload the login page and retry
+    a couple of times, logging failed requests / page text for diagnosis."""
+    failed_requests: list[str] = []
+    page.on("requestfailed", lambda r: failed_requests.append(f"{r.method} {r.url} -> {r.failure}"))
+    last_exc: PlaywrightTimeoutError | None = None
+    for attempt in range(1, LOGIN_SUBMIT_MAX_ATTEMPTS + 1):
+        log.info("Submitting credentials (attempt %d/%d)...", attempt, LOGIN_SUBMIT_MAX_ATTEMPTS)
+        page.fill("#input-username", INCOME_MARKETPLACE_EMAIL)
+        page.fill("#input-password", INCOME_MARKETPLACE_PASSWORD)
+        try:
+            with page.expect_response(lambda r: r.url.endswith("/api/auth0-login"), timeout=LOGIN_RESPONSE_TIMEOUT_MS) as resp_info:
+                page.click("button[type='submit']")
+            return resp_info.value
+        except PlaywrightTimeoutError as exc:
+            last_exc = exc
+            try:
+                page_text = " ".join(page.inner_text("body").split())[:300]
+            except Exception:
+                page_text = "<unavailable>"
+            log.warning(
+                "No auth0-login response within %ds (attempt %d/%d). Failed requests: %s. Page text: %s",
+                LOGIN_RESPONSE_TIMEOUT_MS // 1000, attempt, LOGIN_SUBMIT_MAX_ATTEMPTS, failed_requests[-5:], page_text,
+            )
+            if attempt < LOGIN_SUBMIT_MAX_ATTEMPTS:
+                time.sleep(LOGIN_RETRY_DELAY_SECONDS * attempt)
+                page.goto(LOGIN_PAGE_URL, wait_until="networkidle", timeout=30000)
+    raise last_exc
+
+
 def login(page) -> str:
     """Log in to Income Marketplace using INCOME_MARKETPLACE_EMAIL/PASSWORD
     + INCOME_MARKETPLACE_TOTP_SECRET (2FA is always enabled on the
@@ -247,13 +282,8 @@ def login(page) -> str:
     if not INCOME_MARKETPLACE_EMAIL or not INCOME_MARKETPLACE_PASSWORD:
         raise RuntimeError("INCOME_MARKETPLACE_EMAIL and INCOME_MARKETPLACE_PASSWORD environment variables are required.")
 
-    log.info("Submitting credentials...")
-    page.fill("#input-username", INCOME_MARKETPLACE_EMAIL)
-    page.fill("#input-password", INCOME_MARKETPLACE_PASSWORD)
-
-    with page.expect_response(lambda r: r.url.endswith("/api/auth0-login")) as resp_info:
-        page.click("button[type='submit']")
-    login_data = resp_info.value.json()
+    resp = _submit_credentials(page)
+    login_data = resp.json()
 
     if not login_data.get("mfa_required"):
         # Not observed live (2FA always enabled on the test account), kept
