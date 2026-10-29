@@ -759,7 +759,7 @@ def send_missing_loans_email(platform: str, names: list, detail: str | None = No
         )
         return
 
-    subject = f"[{platform}] ATTENTION - société introuvable : {', '.join(names)}"
+    subject = f"[{platform} Invest Bot] ATTENTION - société introuvable : {', '.join(names)}"
     body_lines = [
         f"Aucun prêt n'a jamais été trouvé sur {platform} pour {len(names)} société(s) active(s) dans l'onglet \"config robots\" :",
         *(f"  - {name}" for name in names),
