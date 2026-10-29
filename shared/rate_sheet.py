@@ -226,7 +226,7 @@ def fill_rate_amounts(platform: str, rates, platform_level: bool = False, projec
             entry[2] += amount
 
     path = history.state_path(platform)
-    days, history_names = history.load_history(path)
+    days, history_names, runs = history.load_history(path)
     if platform_level:
         sums_by_key = {history.PLATFORM_KEY: history.loan_sums(loans_by_key.get(None, []))}
         names_by_key = {history.PLATFORM_KEY: platform}
@@ -239,8 +239,8 @@ def fill_rate_amounts(platform: str, rates, platform_level: bool = False, projec
             originators.setdefault(key, name)
 
     sums_by_key = {key: sums for key, sums in sums_by_key.items() if sums}
-    history.record_day(days, history_names, today, sums_by_key, names_by_key, today, horizon_months)
-    history.save_history(path, days, history_names)
+    history.record_day(days, history_names, runs, today, sums_by_key, names_by_key, today, horizon_months)
+    history.save_history(path, days, history_names, runs)
 
     def display(history_key: str) -> str:
         return "ensemble de la plateforme" if history_key == history.PLATFORM_KEY else history_names.get(history_key, history_key)
