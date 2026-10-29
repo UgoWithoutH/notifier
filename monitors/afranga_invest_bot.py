@@ -275,6 +275,7 @@ def plan_primary(rows: list, tracker, budget: float) -> list:
 
 
 def _add_to_cart(session: requests.Session, csrf: str, urls: dict, line: Line) -> tuple:
+    """Returns `(ok, body, failure_reason)`."""
     if line.market == "secondary":
         row = line.row
         payload = {
@@ -292,7 +293,8 @@ def _add_to_cart(session: requests.Session, csrf: str, urls: dict, line: Line) -
     ok = r.ok and isinstance(body, dict) and body.get("success") is not False
     _log_diagnostics("add_to_cart", market=line.market, payload=payload, status=r.status_code, ok=ok,
                      response=_redact(r.text[:5000]))
-    return ok, body
+    reason = None if ok else f"ajout au panier refusé (HTTP {r.status_code}) : {' '.join(_redact(r.text[:300]).split())}"
+    return ok, body, reason
 
 
 def _capture_review_page(session: requests.Session, review_url: str, market: str) -> str:
@@ -401,12 +403,13 @@ def execute_market(session: requests.Session, market: MarketRows, lines: list, t
     review_url = market.config.get("order", {}).get("review_url")
     for line in to_add:
         stats["attempts"] += 1
-        ok, body = _add_to_cart(session, csrf, urls, line)
+        ok, body, reason = _add_to_cart(session, csrf, urls, line)
         if ok:
             added.append((line, _find_key((body or {}).get("line", body), "cart_loan_id")))
             review_url = _find_key(body, "review_url") or review_url
         else:
             stats["failures"] += 1
+            stats["failed_attempts"].append({"label": f"[{line.market}] {line.loan_name}", "amount": line.amount, "reason": reason})
     if not added:
         return
 
@@ -437,6 +440,11 @@ def execute_market(session: requests.Session, market: MarketRows, lines: list, t
             )
     else:
         stats["failures"] += len(added)
+        for line, _id in added:
+            stats["failed_attempts"].append({
+                "label": f"[{line.market}] {line.loan_name}", "amount": line.amount,
+                "reason": "confirmation du panier refusée (voir diagnostics 'confirm_*')",
+            })
 
 
 def run() -> None:
@@ -444,7 +452,7 @@ def run() -> None:
     apply_startup_jitter(CRON_SCHEDULE_STATE_FILE)
     stats = {
         "mode": MODE, "attempts": 0, "successes": 0, "failures": 0, "total_invested": 0.0,
-        "invested": [], "plan": [], "probed": False,
+        "invested": [], "plan": [], "probed": False, "failed_attempts": [],
     }
     error = None
     config = None
