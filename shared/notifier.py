@@ -95,7 +95,9 @@ def _send_invest_summary_email(
         body_parts.append("=== Investissements ===")
         for item in invested:
             rates = ", ".join(f"{rate:.2f}%" for rate in item.get("rates") or [])
-            body_parts.append(f"- {item['label']} : {item['amount']:.2f} € @ {rates or 'n/a'}")
+            amounts = item.get("amounts") or []
+            detail = f" ({' + '.join(f'{a:.2f}' for a in amounts)})" if len(amounts) > 1 else ""
+            body_parts.append(f"- {item['label']} : {item['amount']:.2f} €{detail} @ {rates or 'n/a'}")
         body_parts.append(f"Total investi : {total:.2f} €")
 
     body_parts.extend(_robot_config_lines(robot_config))
@@ -134,8 +136,9 @@ def send_swaper_investment_summary_email(attempts: list, error: str | None = Non
     for attempt in attempts:
         if attempt.get("confirmed") and not attempt.get("error") and not attempt.get("not_approved"):
             name = attempt.get("originator") or f"Prêt {attempt.get('loan_number') or attempt.get('loan_id')}"
-            entry = invested.setdefault(name, {"label": name, "amount": 0.0, "rates": []})
+            entry = invested.setdefault(name, {"label": name, "amount": 0.0, "rates": [], "amounts": []})
             entry["amount"] += attempt.get("amount") or 0.0
+            entry["amounts"].append(attempt.get("amount") or 0.0)
             try:
                 entry["rates"].append(float(attempt.get("rate")))
             except (TypeError, ValueError):
@@ -214,6 +217,7 @@ def send_lendermarket_invest_summary_email(stats: dict, error: str | None = None
             "label": f"{name} ({country})" if country else name,
             "amount": s.get("invested_amount", 0.0),
             "rates": rates,
+            "amounts": [lo["amount"] for lo in (s.get("invested_loans") or []) if lo.get("amount") is not None],
         })
 
     attachment = None
