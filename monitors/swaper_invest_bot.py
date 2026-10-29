@@ -830,12 +830,14 @@ def _invest_available_loans(page, loans: list, shares: dict, captured_api_calls:
             except PlaywrightTimeoutError:
                 pass
         except Exception:
-            log.exception("Exception while attempting to invest in loan %s - stopping.", loan_label)
+            # Nothing was confirmed at this point (no modal/Confirm click yet),
+            # so no money is at stake: keep going with the next loan.
+            log.exception("Exception while attempting to invest in loan %s - skipping it.", loan_label)
             attempts.append({
                 "loan_id": loan_id, "loan_number": loan.get("number"), "amount": amount,
                 "rate": loan.get("interestRatePerYear"), "error": True,
             })
-            break
+            continue
 
         modal_html = None
         try:

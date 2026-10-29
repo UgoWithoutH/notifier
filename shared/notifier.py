@@ -61,6 +61,7 @@ def _send_invest_summary_email(
     error: str | None = None,
     robot_config=None,
     attachment: tuple | None = None,
+    failed: list | None = None,
 ) -> None:
     """Common recap email of the Swaper/Lendermarket/Afranga invest bots
     (same format on purpose, explicit user request 2026-10-21): what was
@@ -68,6 +69,8 @@ def _send_invest_summary_email(
     then the "config robot" reminder at the bottom.
 
     `invested`: list of `{"label": str, "amount": float, "rates": [float]}`.
+    `failed`: list of `{"label": str, "amount": float | None, "reason": str}`,
+    one per failed attempt, listed under the failure count.
     `attachment`: optional `(filename, text)` with the technical detail of a
     failure, only attached when something went wrong."""
     if not all([SMTP_HOST, SMTP_USER, SMTP_PASSWORD, EMAIL_TO]):
@@ -89,7 +92,12 @@ def _send_invest_summary_email(
     if error:
         body_parts += [f"⚠ ERREUR : {error}", ""]
     if failures:
-        body_parts += [f"⚠ {failures} tentative(s) d'investissement échouée(s).", ""]
+        body_parts.append(f"⚠ {failures} tentative(s) d'investissement échouée(s).")
+        for item in failed or []:
+            amount = item.get("amount")
+            amount_str = f" ({amount:.2f} €)" if amount is not None else ""
+            body_parts.append(f"  - {item['label']}{amount_str} : {item.get('reason') or 'raison inconnue'}")
+        body_parts.append("")
 
     if invested:
         body_parts.append("=== Investissements ===")
@@ -125,17 +133,33 @@ def _send_invest_summary_email(
         log.exception("Failed to send %s invest summary email.", platform)
 
 
+def _swaper_failure_reason(attempt: dict) -> str:
+    if attempt.get("error"):
+        return "exception pendant la saisie du montant ou le clic sur « + »"
+    if attempt.get("not_approved"):
+        return "investissement non approuvé par Swaper"
+    if not attempt.get("modal_html"):
+        return "aucun modal de confirmation détecté après le clic sur « + »"
+    if not attempt.get("confirmed"):
+        return "bouton « Confirm » introuvable ou non cliquable"
+    return "échec inconnu"
+
+
 def send_swaper_investment_summary_email(attempts: list, error: str | None = None, robot_config=None) -> None:
     """Swaper recap, built from the attempts of monitors/swaper_invest_bot.py
     (`_invest_available_loans()`): only confirmed attempts count as
     investments, the others as failures. The attachment (the real
-    investment requests/responses) is only joined when something failed."""
+    investment requests/responses, plus the modal/row HTML of each failed
+    attempt) is only joined when something failed."""
     invested = {}
     failures = 0
+    failed = []
+    failed_details = []
     investment_calls = []
     for attempt in attempts:
+        loan_ref = attempt.get("loan_number") or attempt.get("loan_id")
         if attempt.get("confirmed") and not attempt.get("error") and not attempt.get("not_approved"):
-            name = attempt.get("originator") or f"Prêt {attempt.get('loan_number') or attempt.get('loan_id')}"
+            name = attempt.get("originator") or f"Prêt {loan_ref}"
             entry = invested.setdefault(name, {"label": name, "amount": 0.0, "rates": [], "amounts": []})
             entry["amount"] += attempt.get("amount") or 0.0
             entry["amounts"].append(attempt.get("amount") or 0.0)
@@ -145,23 +169,37 @@ def send_swaper_investment_summary_email(attempts: list, error: str | None = Non
                 pass
         else:
             failures += 1
+            reason = _swaper_failure_reason(attempt)
+            label = f"{attempt.get('originator') or 'Swaper'} - prêt {loan_ref}"
+            failed.append({"label": label, "amount": attempt.get("amount"), "reason": reason})
+            failed_details.append({
+                "loan_number": loan_ref,
+                "originator": attempt.get("originator"),
+                "amount": attempt.get("amount"),
+                "reason": reason,
+                "modal_html": (attempt.get("modal_html") or "")[:20000] or None,
+                "row_html_after_click": (attempt.get("row_html_after_click") or "")[:20000] or None,
+            })
         for call in attempt.get("confirm_api_calls") or []:
             investment_calls.append({
-                "loan_number": attempt.get("loan_number") or attempt.get("loan_id"),
+                "loan_number": loan_ref,
                 "originator": attempt.get("originator"),
                 "amount": attempt.get("amount"),
                 **call,
             })
 
     attachment = None
-    if (failures or error) and investment_calls:
+    if failed_details or (error and investment_calls):
         attachment = (
             "swaper_investment_requests.json",
-            json.dumps(investment_calls, indent=2, ensure_ascii=False, default=str),
+            json.dumps(
+                {"failed_attempts": failed_details, "investment_calls": investment_calls},
+                indent=2, ensure_ascii=False, default=str,
+            ),
         )
     _send_invest_summary_email(
         "Swaper", list(invested.values()), failures=failures, error=error,
-        robot_config=robot_config, attachment=attachment,
+        robot_config=robot_config, attachment=attachment, failed=failed,
     )
 
 
@@ -225,7 +263,7 @@ def send_lendermarket_invest_summary_email(stats: dict, error: str | None = None
         attachment = ("lendermarket_invest_bot_diagnostics_this_run.log", diagnostics_text)
     _send_invest_summary_email(
         "Lendermarket", invested, failures=stats.get("invest_failures", 0), error=error,
-        robot_config=robot_config, attachment=attachment,
+        robot_config=robot_config, attachment=attachment, failed=stats.get("failed_attempts"),
     )
 
 
@@ -246,7 +284,7 @@ def send_afranga_invest_summary_email(stats: dict, error: str | None = None, dia
         attachment = ("afranga_invest_bot_diagnostics_this_run.log", diagnostics_text)
     _send_invest_summary_email(
         "Afranga", invested, failures=stats.get("failures", 0), error=error,
-        robot_config=robot_config, attachment=attachment,
+        robot_config=robot_config, attachment=attachment, failed=stats.get("failed_attempts"),
     )
 
 
