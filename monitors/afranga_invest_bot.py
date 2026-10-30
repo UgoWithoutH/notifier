@@ -110,13 +110,17 @@ def _log_diagnostics(tag: str, **fields) -> None:
         log.exception("Could not write to %s", DIAGNOSTICS_FILE)
 
 
-def _collect_run_diagnostics(since: datetime) -> str | None:
+def _collect_run_diagnostics(since: datetime, tags: set[str] | None = None) -> str | None:
     if not DIAGNOSTICS_FILE.exists():
         return None
     lines = []
     for line in DIAGNOSTICS_FILE.read_text(encoding="utf-8").splitlines():
         try:
-            if datetime.fromisoformat(json.loads(line)["timestamp"]) >= since:
+            entry = json.loads(line)
+            if (
+                datetime.fromisoformat(entry["timestamp"]) >= since
+                and (tags is None or entry.get("tag") in tags)
+            ):
                 lines.append(line)
         except (json.JSONDecodeError, KeyError, ValueError):
             continue
@@ -535,11 +539,15 @@ def run() -> None:
     finally:
         _log_diagnostics("run_summary", stats=stats, error=error)
         had_problem = bool(error or stats["failures"])
-        # Email only on error or when a real purchase was attempted (dry/probe never buy);
-        # diagnostics are attached only when something went wrong.
+        # Successful runs attach only the cart/confirmation exchanges; failures
+        # retain the full run diagnostics for troubleshooting.
         if error or (MODE == "live" and stats["attempts"]):
+            diagnostic_tags = None if had_problem else {
+                "add_to_cart", "confirm_primary", "confirm_secondary",
+            }
             send_afranga_invest_summary_email(
-                stats, error=error, diagnostics_text=_collect_run_diagnostics(run_started_at) if had_problem else None,
+                stats, error=error,
+                diagnostics_text=_collect_run_diagnostics(run_started_at, tags=diagnostic_tags),
                 robot_config=config,
             )
     if error:

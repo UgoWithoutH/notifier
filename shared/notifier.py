@@ -4,6 +4,7 @@ import json
 import os
 import smtplib
 import logging
+from math import isfinite
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 log = logging.getLogger("notifier")
@@ -101,12 +102,17 @@ def _send_invest_summary_email(
 
     if invested:
         body_parts.append("=== Investissements ===")
+        unverified_amounts = 0
         for item in invested:
             rates = ", ".join(f"{rate:.2f}%" for rate in item.get("rates") or [])
             amounts = item.get("amounts") or []
             detail = f" ({' + '.join(f'{a:.2f}' for a in amounts)})" if len(amounts) > 1 else ""
-            body_parts.append(f"- {item['label']} : {item['amount']:.2f} €{detail} @ {rates or 'n/a'}")
-        body_parts.append(f"Total investi : {total:.2f} €")
+            unverified = item.get("unverified_amounts", 0)
+            unverified_amounts += unverified
+            note = f" (montant demandé pour {unverified} prêt(s), réponse Swaper sans montant exploitable)" if unverified else ""
+            body_parts.append(f"- {item['label']} : {item['amount']:.2f} €{detail}{note} @ {rates or 'n/a'}")
+        total_note = f" (dont {unverified_amounts} montant(s) demandé(s), non vérifié(s) dans la réponse Swaper)" if unverified_amounts else ""
+        body_parts.append(f"Total investi : {total:.2f} €{total_note}")
 
     body_parts.extend(_robot_config_lines(robot_config))
     if attachment:
@@ -145,6 +151,33 @@ def _swaper_failure_reason(attempt: dict) -> str:
     return "échec inconnu"
 
 
+def _swaper_actual_amount(attempt: dict) -> float | None:
+    """Return Swaper's accepted buy amount, when the successful response provides it."""
+    for call in reversed(attempt.get("confirm_api_calls") or []):
+        if call.get("method") != "POST" or "/buy" not in (call.get("url") or ""):
+            continue
+        try:
+            status = int(call.get("status"))
+            body = json.loads(call.get("body") or "null") or {}
+        except (TypeError, ValueError):
+            continue
+        if not 200 <= status < 300 or not isinstance(body, dict):
+            continue
+        investment = body.get("investment")
+        if not isinstance(investment, dict):
+            continue
+        raw_amount = investment.get("amount")
+        if isinstance(raw_amount, bool):
+            continue
+        try:
+            amount = float(raw_amount)
+        except (TypeError, ValueError):
+            continue
+        if amount > 0 and isfinite(amount):
+            return amount
+    return None
+
+
 def send_swaper_investment_summary_email(attempts: list, error: str | None = None, robot_config=None) -> None:
     """Swaper recap, built from the attempts of monitors/swaper_invest_bot.py
     (`_invest_available_loans()`): only confirmed attempts count as
@@ -160,9 +193,13 @@ def send_swaper_investment_summary_email(attempts: list, error: str | None = Non
         loan_ref = attempt.get("loan_number") or attempt.get("loan_id")
         if attempt.get("confirmed") and not attempt.get("error") and not attempt.get("not_approved"):
             name = attempt.get("originator") or f"Prêt {loan_ref}"
-            entry = invested.setdefault(name, {"label": name, "amount": 0.0, "rates": [], "amounts": []})
-            entry["amount"] += attempt.get("amount") or 0.0
-            entry["amounts"].append(attempt.get("amount") or 0.0)
+            entry = invested.setdefault(name, {"label": name, "amount": 0.0, "rates": [], "amounts": [], "unverified_amounts": 0})
+            actual_amount = _swaper_actual_amount(attempt)
+            amount = actual_amount if actual_amount is not None else (attempt.get("amount") or 0.0)
+            entry["amount"] += amount
+            entry["amounts"].append(amount)
+            if actual_amount is None:
+                entry["unverified_amounts"] += 1
             try:
                 entry["rates"].append(float(attempt.get("rate")))
             except (TypeError, ValueError):
@@ -181,6 +218,9 @@ def send_swaper_investment_summary_email(attempts: list, error: str | None = Non
                 "row_html_after_click": (attempt.get("row_html_after_click") or "")[:20000] or None,
             })
         for call in attempt.get("confirm_api_calls") or []:
+            url = call.get("url") or ""
+            if not any(path in url for path in ("/buy", "is-manual-investment-approved")):
+                continue
             investment_calls.append({
                 "loan_number": loan_ref,
                 "originator": attempt.get("originator"),
@@ -189,7 +229,7 @@ def send_swaper_investment_summary_email(attempts: list, error: str | None = Non
             })
 
     attachment = None
-    if failed_details or (error and investment_calls):
+    if failed_details or investment_calls:
         attachment = (
             "swaper_investment_requests.json",
             json.dumps(
@@ -259,7 +299,7 @@ def send_lendermarket_invest_summary_email(stats: dict, error: str | None = None
         })
 
     attachment = None
-    if diagnostics_text and (stats.get("invest_failures", 0) > 0 or error):
+    if diagnostics_text:
         attachment = ("lendermarket_invest_bot_diagnostics_this_run.log", diagnostics_text)
     _send_invest_summary_email(
         "Lendermarket", invested, failures=stats.get("invest_failures", 0), error=error,
@@ -280,7 +320,7 @@ def send_afranga_invest_summary_email(stats: dict, error: str | None = None, dia
         for item in stats.get("invested") or []
     ]
     attachment = None
-    if diagnostics_text and (stats.get("failures", 0) > 0 or error):
+    if diagnostics_text:
         attachment = ("afranga_invest_bot_diagnostics_this_run.log", diagnostics_text)
     _send_invest_summary_email(
         "Afranga", invested, failures=stats.get("failures", 0), error=error,
