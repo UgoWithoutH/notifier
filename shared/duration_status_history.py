@@ -5,10 +5,10 @@ Every run records, for the day it runs, the share (fraction of the outstanding
 amount) of normal / late / defaulted loans per loan originator (or for the
 whole platform). The day's value is the average of its runs weighted by their
 outstanding amount (every run of the current day is kept in the state file's
-"runs" section until the next day). Those daily shares are kept in a small JSON
-state file per platform (persisted between GitHub Actions runs with
-actions/cache, like the XIRR cashflow state files) and averaged per calendar
-month for the sheet.
+"runs" section until the next day). Those daily shares (with the day's outstanding
+amount) are kept in a small JSON state file per platform (persisted between
+GitHub Actions runs with actions/cache, like the XIRR cashflow state files) and
+averaged per calendar month for the sheet, each day weighted by its outstanding amount.
 
 Duration terms follow shared.google_sheet's convention: (months, days) >= 0 is
 a normal loan, a negative term is a late loan, (months, days, "default") is a
@@ -110,7 +110,7 @@ def _dict_or_empty(value) -> dict:
 
 
 def load_history(path: Path) -> tuple:
-    """(days, names, runs): days = {"YYYY-MM-DD": {key: [normal, late, default]}}, names = {key: display name},
+    """(days, names, runs): days = {"YYYY-MM-DD": {key: [normal, late, default, total]}}, names = {key: display name},
     runs = {"YYYY-MM-DD": {key: [[normal, late, default, total], ...]}} (every run of the current day).
     All empty if the file is missing/unreadable."""
     try:
@@ -125,19 +125,20 @@ def save_history(path: Path, days: dict, names: dict, runs: dict) -> None:
 
 
 def merge_runs(runs: list):
-    """[[normal, late, default, total], ...] -> [normal, late, default] weighted by each run's total amount,
-    or None if no run has a positive total."""
+    """[[normal, late, default, total], ...] -> [normal, late, default, total] where the shares are weighted by
+    each run's total amount and the total is the mean of the runs' totals (the day keeps the weight of a single
+    run, used to weight the day in the monthly average). None if no run has a positive total."""
     total = sum(run[3] for run in runs)
     if total <= 0:
         return None
-    return [sum(run[i] * run[3] for run in runs) / total for i in range(3)]
+    return [*(sum(run[i] * run[3] for run in runs) / total for i in range(3)), total / len(runs)]
 
 
 def record_day(days: dict, names: dict, runs: dict, day: date, shares_by_key: dict, names_by_key: dict, today: date, horizon_months: int) -> None:
     """Records one run of `day` ({key: (normal, late, default, total)}) and sets the day's shares to the
-    amount-weighted average of all its runs. The runs of previous days are dropped: their average is already
-    in `days`. Also stores the display names and drops the days older than the horizon window (and the names
-    no longer present in any remaining day)."""
+    amount-weighted average of all its runs, plus their mean total (the day's weight in the monthly average).
+    The runs of previous days are dropped: their average is already in `days`. Also stores the display names
+    and drops the days older than the horizon window (and the names no longer present in any remaining day)."""
     day_key = day.isoformat()
     for stale in [d for d in runs if d != day_key]:
         del runs[stale]
@@ -165,14 +166,21 @@ def tracked_originators(path: Path, today: date, horizon_months: int) -> dict:
 
 
 def monthly_samples(days: dict, key: str, year: int, month: int) -> list:
-    """[(day, [normal, late, default])] recorded for `key` during the month, in date order."""
+    """[(day, [normal, late, default, total])] recorded for `key` during the month, in date order. Days recorded
+    before the total was stored only have the three shares."""
     prefix = f"{year:04d}-{month:02d}-"
     return sorted((day, shares[key]) for day, shares in days.items() if day.startswith(prefix) and key in shares)
 
 
 def monthly_average(days: dict, key: str, year: int, month: int):
-    """Mean of each daily share of `key` over the recorded days of the month: (normal, late, default) or None."""
+    """Average of the daily shares of `key` over the recorded days of the month, each day weighted by its total
+    outstanding amount: (normal, late, default) or None. A day recorded without total (old state files) gets the
+    mean weight of the other days of the month, or all days weigh the same when none has a total."""
     samples = [shares for _, shares in monthly_samples(days, key, year, month)]
     if not samples:
         return None
-    return tuple(sum(sample[i] for sample in samples) / len(samples) for i in range(3))
+    known = [sample[3] for sample in samples if len(sample) > 3 and sample[3] > 0]
+    default_weight = sum(known) / len(known) if known else 1.0
+    weights = [sample[3] if len(sample) > 3 and sample[3] > 0 else default_weight for sample in samples]
+    total = sum(weights)
+    return tuple(sum(sample[i] * weight for sample, weight in zip(samples, weights)) / total for i in range(3))
