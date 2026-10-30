@@ -311,13 +311,23 @@ def send_afranga_invest_summary_email(stats: dict, error: str | None = None, dia
     """Recap of monitors/afranga_invest_bot.py (same email format as the
     Swaper/Lendermarket ones). Only real purchases (`stats["invested"]`) are
     listed; dry/probe runs never buy anything, so they only get here on error."""
+    grouped = {}
+    for item in stats.get("invested") or []:
+        entry = grouped.setdefault(item["loan"], {"markets": [], "amount": 0.0, "rates": [], "amounts": []})
+        if item["market"] not in entry["markets"]:
+            entry["markets"].append(item["market"])
+        entry["amount"] += item["amount"]
+        entry["amounts"].append(item["amount"])
+        if item.get("rate") is not None:
+            entry["rates"].append(item["rate"])
     invested = [
         {
-            "label": f"[{item['market']}] {item['loan']}",
-            "amount": item["amount"],
-            "rates": [item["rate"]] if item.get("rate") is not None else [],
+            "label": f"[{'/'.join(entry['markets'])}] {loan}",
+            "amount": entry["amount"],
+            "rates": entry["rates"],
+            "amounts": entry["amounts"],
         }
-        for item in stats.get("invested") or []
+        for loan, entry in grouped.items()
     ]
     attachment = None
     if diagnostics_text:
