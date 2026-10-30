@@ -1264,7 +1264,8 @@ def _duration_horizon_months(sections: list, platform_row: int, log_problem: boo
 
 def _duration_status_requests(worksheet, grid, platform, platform_row, end_row, desired, new_data, platform_level, row_range) -> list:
     """Requêtes batchUpdate gérant les colonnes de mois (partagées par tous les secteurs, mois courant à gauche)
-    et, sur les lignes "normaux"/"retards"/"défauts" de `desired`, la moyenne mensuelle des parts (%)
+    et, sur les lignes "normaux"/"retards"/"défauts" de `desired`, la moyenne mensuelle des parts (%), pondérée
+    par l'encours de chaque jour,
     enregistrées dans le cache d'historique de la plateforme, sur l'horizon de SON secteur.
 
     - une colonne n'est créée que si la plateforme a des données pour ce mois ;
