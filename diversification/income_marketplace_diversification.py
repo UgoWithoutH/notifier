@@ -307,7 +307,7 @@ def login(page) -> str:
     # Diagnostic only (no secret/code values logged): compare the server's
     # Date response header to our local clock - same precaution as every
     # other TOTP-gated platform in this repo.
-    server_date_header = resp_info.value.headers.get("date")
+    server_date_header = resp.headers.get("date")
     if server_date_header:
         try:
             server_time = parsedate_to_datetime(server_date_header)
