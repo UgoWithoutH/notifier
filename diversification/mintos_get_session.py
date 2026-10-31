@@ -34,10 +34,9 @@ Usage: `python -m diversification.mintos_get_session`
 1. A tab opens in real Chrome on the Mintos login page.
 2. Email/password are filled and submitted automatically.
 3. IF a CAPTCHA puzzle appears on THIS login/password page (unpredictable,
-   detected by looking for the reCAPTCHA iframe), the script pauses and
-   asks you to solve it AND submit the form yourself in the window, then
-   press Enter here - it then waits for the resulting navigation instead
-   of assuming it already happened.
+   detected by looking for the reCAPTCHA iframe), the script waits for you
+   to solve it AND submit the form yourself in the window, and continues
+   automatically as soon as the navigation happens (no Enter needed).
 4. IF a 2FA page appears, the TOTP code is filled and submitted
    automatically (tries the current/previous/next 30s window for clock-
    drift safety, same pattern as afranga_diversification.py). IF a
@@ -92,6 +91,7 @@ log = logging.getLogger("mintos_get_session")
 
 LOGIN_URL = "https://www.mintos.com/fr/login/"
 LOGIN_WAIT_TIMEOUT_MS = 15_000  # after auto-submitting credentials, how long to wait before assuming a CAPTCHA is blocking
+MANUAL_WAIT_TIMEOUT_MS = 300_000  # how long to wait for a human to solve a CAPTCHA / finish logging in (detected automatically, no Enter needed)
 DEBUG_PORT = 9334  # distinct from lande_get_session.py's 9333 so both can run side by side
 CHROME_CANDIDATES = [
     r"C:\Program Files\Google\Chrome\Application\chrome.exe",
@@ -187,13 +187,13 @@ def _submit_credentials(page) -> None:
         log.warning("CAPTCHA puzzle detected on the login page (Mintos's reCAPTCHA is adaptive/unpredictable).")
     else:
         log.warning("Still on the login page after submitting credentials (no CAPTCHA iframe detected - might just be slow).")
-    input("\nPlease solve the CAPTCHA puzzle (if shown) and submit the login form in the browser window, THEN come back here and press Enter...\n")
+    log.warning("Please solve the CAPTCHA puzzle (if shown) and submit the login form in the browser window - continuing automatically once the login goes through...")
     try:
         # The user's own submit click (after solving the puzzle) triggers the
-        # navigation - just wait for it instead of assuming it already happened.
-        page.wait_for_url(_reached_twofactor_or_past_login, timeout=LOGIN_WAIT_TIMEOUT_MS)
+        # navigation - wait for it instead of asking for an Enter key press.
+        page.wait_for_url(_reached_twofactor_or_past_login, timeout=MANUAL_WAIT_TIMEOUT_MS)
     except PlaywrightTimeoutError:
-        log.warning("Still on the login page after pressing Enter - will fall back to a fully manual login.")
+        log.warning("Still on the login page after waiting - will fall back to a fully manual login.")
 
 
 def _submit_totp(page) -> bool:
@@ -218,9 +218,9 @@ def _submit_totp(page) -> bool:
             if not _captcha_visible(page):
                 continue
             log.warning("CAPTCHA puzzle detected on the 2FA page.")
-            input("\nPlease solve the CAPTCHA puzzle and submit the 2FA form in the browser window, THEN come back here and press Enter...\n")
+            log.warning("Please solve the CAPTCHA puzzle and submit the 2FA form in the browser window - continuing automatically once it goes through...")
             try:
-                page.wait_for_url(lambda u: "/login/twofactor" not in u, timeout=LOGIN_WAIT_TIMEOUT_MS)
+                page.wait_for_url(lambda u: "/login/twofactor" not in u, timeout=MANUAL_WAIT_TIMEOUT_MS)
                 return True
             except PlaywrightTimeoutError:
                 continue
@@ -260,10 +260,12 @@ def main() -> None:
                 log.warning("All 3 TOTP candidates were rejected.")
 
         if "/login" in page.url:
-            input(
-                f"\nStill on {page.url} - please finish logging in manually "
-                "in the browser window, THEN come back here and press Enter...\n"
-            )
+            log.warning("Still on %s - please finish logging in manually in the browser window - continuing automatically once done...", page.url)
+            try:
+                page.wait_for_url(lambda u: "/login" not in u, timeout=MANUAL_WAIT_TIMEOUT_MS)
+            except PlaywrightTimeoutError:
+                log.error("Timed out waiting for the manual login to complete.")
+                sys.exit(1)
 
         log.info("Login detected, current URL: %s", page.url)
 

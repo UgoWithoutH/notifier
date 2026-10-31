@@ -544,7 +544,7 @@ def _format_amount(amount: float) -> str:
     return f"{rounded:.2f}".rstrip("0").rstrip(".")
 
 
-def attempt_investment(session: requests.Session, loan_uuid: str, amount: float) -> bool:
+def attempt_investment(session: requests.Session, loan_uuid: str, amount: float) -> tuple[bool, str | None]:
     """Real invest submission call - `POST claims/v1/investor/createInvestment`,
     see module docstring/repo memory ("2026-07-24 ... createInvestment") for
     how this was captured (safe, network-intercepted click-through, no real
@@ -556,7 +556,7 @@ def attempt_investment(session: requests.Session, loan_uuid: str, amount: float)
     checkbox, wasn't expanded/checked - but a real bot should accept both
     sets of terms to actually invest properly).
     Always logs the full request+response to INVEST_DIAGNOSTICS_FILE,
-    whether it succeeds or fails."""
+    whether it succeeds or fails. Returns `(success, failure_reason)`."""
     payload = {
         "investmentAmount": _format_amount(amount),
         "acceptedLimitedPurposeTerms": True,
@@ -575,7 +575,7 @@ def attempt_investment(session: requests.Session, loan_uuid: str, amount: float)
             traceback=traceback.format_exc(),
         )
         log.exception("Investment attempt raised an exception for loan %s.", loan_uuid)
-        return False
+        return False, f"exception : {exc}"
 
     _log_invest_diagnostics(
         "invest_attempt",
@@ -587,12 +587,12 @@ def attempt_investment(session: requests.Session, loan_uuid: str, amount: float)
     )
     if r.ok:
         log.info("Investment attempt for loan %s (%.2f EUR) returned status=%s.", loan_uuid, amount, r.status_code)
-        return True
+        return True, None
     log.warning(
         "Investment attempt for loan %s (%.2f EUR) FAILED status=%s - full request/response saved to diagnostics.",
         loan_uuid, amount, r.status_code,
     )
-    return False
+    return False, f"HTTP {r.status_code} : {' '.join(r.text.split())[:300]}"
 
 
 def invest_selected_lenders(
@@ -639,6 +639,7 @@ def invest_selected_lenders(
         "invest_attempts": 0,
         "invest_successes": 0,
         "invest_failures": 0,
+        "failed_attempts": [],
         "total_invested": 0.0,
         "lender_stats": {},
         "country_blocked": [],
@@ -727,7 +728,8 @@ def invest_selected_lenders(
         lender_stat = stats["lender_stats"][sheet_name]
         stats["invest_attempts"] += 1
         lender_stat["attempts"] += 1
-        if attempt_investment(session, loan_uuid, amount):
+        success, failure_reason = attempt_investment(session, loan_uuid, amount)
+        if success:
             stats["invest_successes"] += 1
             stats["total_invested"] += amount
             stats["balance_after"] -= amount
@@ -738,6 +740,7 @@ def invest_selected_lenders(
         else:
             stats["invest_failures"] += 1
             lender_stat["failures"] += 1
+            stats["failed_attempts"].append({"label": sheet_name, "amount": amount, "reason": failure_reason})
 
     stats["country_status"] = tracker.country_status(relevant_countries)
     stats["originator_cap_status"] = tracker.loan_cap_status()
