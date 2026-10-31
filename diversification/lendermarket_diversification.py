@@ -170,6 +170,7 @@ from shared.google_sheet import (
 )
 from shared.rate_sheet import fill_rate_amounts
 from shared.remaining_duration import (
+    DEFAULT_AFTER_LATE_DAYS,
     RateWeights,
     base_term_between,
     base_term_from_days,
@@ -298,7 +299,9 @@ def aggregate_remaining_durations(investments: list, today: date, rates=None) ->
     instead, falling back to today - loanOverdueDays. Defaulted loans
     (`loan.status` "DEFAULT"/"DEFAULTED" - INFERRED, no defaulted loan on the
     account to verify; active/finished investments only ever showed ACTIVE/
-    FINISHED) get the "default" key variant. Otherwise the remaining term
+    FINISHED) or loans more than DEFAULT_AFTER_LATE_DAYS overdue (every loan
+    has `hasBuybackGuarantee`, so the buyback is still unpaid) get the
+    "default" key variant. Otherwise the remaining term
     above applies."""
     result = {}
     for inv in investments:
@@ -321,7 +324,10 @@ def aggregate_remaining_durations(investments: list, today: date, rates=None) ->
             overdue_days = int(loan.get("loanOverdueDays") or 0)
         except (TypeError, ValueError):
             overdue_days = 0
-        is_default = str(loan.get("status") or "").upper() in ("DEFAULT", "DEFAULTED")
+        is_default = (
+            str(loan.get("status") or "").upper() in ("DEFAULT", "DEFAULTED")
+            or overdue_days > DEFAULT_AFTER_LATE_DAYS
+        )
         term = None
         if overdue_days > 0 or is_default:
             try:
