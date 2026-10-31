@@ -240,6 +240,7 @@ throughout.
 import json
 import os
 import sys
+import time
 import logging
 from datetime import datetime, timezone
 from pathlib import Path
@@ -285,6 +286,10 @@ MIN_INVESTMENT_AMOUNT = float(os.environ.get("MIN_INVESTMENT_AMOUNT", "10"))
 # why a manually-built request gets 403).
 LOANS_PAGE_URL = "https://swaper.com/en/loans"
 LOANS_URL = "https://swaper.com/rest/public/loans"
+
+TWO_FACTOR_ATTEMPTS = 3
+TWO_FACTOR_REDIRECT_TIMEOUT_MS = 15000
+
 
 class SwaperSessionExpired(RuntimeError):
     """Raised by the post-login page.evaluate(fetch()) calls
@@ -334,30 +339,65 @@ def handle_two_factor(page) -> None:
 
     log.info("2FA prompt detected, generating and submitting TOTP code...")
     totp = pyotp.TOTP(SWAPER_TOTP_SECRET)
-    code = totp.now()
-    human_type(otp_input, code)
-    human_pause()
 
-    try:
-        page.get_by_text("Trust this browser").click(timeout=3000)
-    except PlaywrightTimeoutError:
-        log.warning("Could not find the 'trust this browser' checkbox, continuing anyway.")
+    # Real GitHub Actions failure, 2026-10-29: the code was submitted but the
+    # page never left /login within 20s (code rejected, e.g. stale/already
+    # used, or a transient server error) and the whole run failed with a bare
+    # wait_for_url timeout. Now: wait for the redirect after each submit and,
+    # if the 2FA form is still showing, retry with a code from a NEW 30s
+    # window (resubmitting the same code would be rejected as a replay).
+    last_code = None
+    for attempt in range(1, TWO_FACTOR_ATTEMPTS + 1):
+        code = totp.now()
+        if code == last_code:
+            wait_s = 30 - (time.time() % 30) + 1
+            log.info("Waiting %.0fs for the next TOTP window before retrying 2FA.", wait_s)
+            time.sleep(wait_s)
+            code = totp.now()
 
-    # Guard against the 30s TOTP window rolling over while we were typing
-    # the code / clicking "trust this browser" - suspected cause of a
-    # GitHub Actions failure on 2026-07-09 where the whole 2FA sequence
-    # completed without any Playwright error, but the page never left
-    # /login (i.e. the code was silently rejected as stale). If a
-    # freshly-generated code differs from what's currently filled in,
-    # clear the field and retype it right before submitting.
-    fresh_code = totp.now()
-    if fresh_code != code:
-        log.info("TOTP code rolled over to a new 30s window while typing, retyping the fresh code.")
         otp_input.fill("")
-        human_type(otp_input, fresh_code)
+        human_type(otp_input, code)
         human_pause()
 
-    page.locator("div.button.clickable", has_text="Log In").click()
+        if attempt == 1:
+            # Only click once: it's a toggle, a second click would untick it.
+            try:
+                page.get_by_text("Trust this browser").click(timeout=3000)
+            except PlaywrightTimeoutError:
+                log.warning("Could not find the 'trust this browser' checkbox, continuing anyway.")
+
+        # Guard against the 30s TOTP window rolling over while we were typing
+        # the code / clicking "trust this browser" - suspected cause of a
+        # GitHub Actions failure on 2026-07-09 where the whole 2FA sequence
+        # completed without any Playwright error, but the page never left
+        # /login (i.e. the code was silently rejected as stale). If a
+        # freshly-generated code differs from what's currently filled in,
+        # clear the field and retype it right before submitting.
+        fresh_code = totp.now()
+        if fresh_code != code:
+            log.info("TOTP code rolled over to a new 30s window while typing, retyping the fresh code.")
+            otp_input.fill("")
+            human_type(otp_input, fresh_code)
+            human_pause()
+            code = fresh_code
+        last_code = code
+
+        page.locator("div.button.clickable", has_text="Log In").click()
+
+        try:
+            page.wait_for_url(lambda url: "/login" not in url, timeout=TWO_FACTOR_REDIRECT_TIMEOUT_MS)
+            return
+        except PlaywrightTimeoutError:
+            try:
+                page_text = " ".join(page.locator("body").inner_text(timeout=2000).split())[:300]
+            except Exception:
+                page_text = "<unavailable>"
+            log.warning(
+                "2FA attempt %d/%d did not leave /login (url=%s). Page text: %s",
+                attempt, TWO_FACTOR_ATTEMPTS, page.url, page_text,
+            )
+            if not otp_input.is_visible():
+                return  # form is gone: let login()'s final wait report the failure
 
 
 class _NavigatedAwayFromLogin(Exception):
@@ -830,12 +870,14 @@ def _invest_available_loans(page, loans: list, shares: dict, captured_api_calls:
             except PlaywrightTimeoutError:
                 pass
         except Exception:
-            log.exception("Exception while attempting to invest in loan %s - stopping.", loan_label)
+            # Nothing was confirmed at this point (no modal/Confirm click yet),
+            # so no money is at stake: keep going with the next loan.
+            log.exception("Exception while attempting to invest in loan %s - skipping it.", loan_label)
             attempts.append({
                 "loan_id": loan_id, "loan_number": loan.get("number"), "amount": amount,
                 "rate": loan.get("interestRatePerYear"), "error": True,
             })
-            break
+            continue
 
         modal_html = None
         try:
