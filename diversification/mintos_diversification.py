@@ -315,6 +315,8 @@ BONDS_INVESTMENTS_URL = "https://www.mintos.com/webapp/api/bonds-api/v3/investme
 LOAN_INVESTMENTS_URL = "https://www.mintos.com/webapp/api/marketplace-api/v1/user/note-series/investments/current"
 LENDERS_URL = "https://www.mintos.com/webapp/api/marketplace-api/v1/lenders"
 NOTE_SERIES_URL = "https://www.mintos.com/webapp/api/marketplace-api/v1/note-series/{isin}"
+NOTE_SERIES_PAYMENT_SCHEDULE_URL = NOTE_SERIES_URL + "/payment-schedule"
+NOTE_SERIES_LOANS_URL = NOTE_SERIES_URL + "/loans"
 NOTE_SERIES_WORKERS = 6
 LOAN_INVESTMENTS_PAGE_SIZE = 300
 MAX_INVESTMENTS_PAGES = 100
@@ -622,6 +624,56 @@ def fetch_note_series_base_terms(session: requests.Session, investments: list) -
         return {isin: term for isin, term in pool.map(lookup, isins) if term is not None}
 
 
+def _fetch_note_series_late_since(session: requests.Session, isin: str, today: date) -> date | None:
+    """Due date of the oldest payment still unpaid on a still-active loan of
+    the note series, None if there is none (verified live 2026-10-31 on
+    `GET /v1/note-series/{isin}/payment-schedule` + `/loans`, both
+    unpaginated). A late schedule row stays `not_paid_on_time` after the
+    lender rebought its loan, so rows of `rebought` loans are ignored;
+    `lateDays` is only the final delay of a repayment (it never grows while
+    a row is unpaid), so the age is `today - paymentDate`."""
+    r = session.get(NOTE_SERIES_LOANS_URL.format(isin=isin), timeout=20)
+    _check_authenticated(r)
+    if not r.ok:
+        raise RuntimeError(f"Note series loans endpoint returned status {r.status_code}")
+    active = {
+        loan.get("identifier") for loan in (r.json() or {}).get("items") or [] if loan.get("status") == "active"
+    }
+    r = session.get(NOTE_SERIES_PAYMENT_SCHEDULE_URL.format(isin=isin), timeout=20)
+    _check_authenticated(r)
+    if not r.ok:
+        raise RuntimeError(f"Note series payment schedule endpoint returned status {r.status_code}")
+    unpaid = [
+        _parse_maturity_date(row.get("paymentDate"))
+        for row in (r.json() or {}).get("paymentSchedule") or []
+        if row.get("status") == "not_paid_on_time"
+        and not row.get("isClosed")
+        and (row.get("loan") or {}).get("identifier") in active
+    ]
+    unpaid = [d for d in unpaid if d is not None and d < today]
+    return min(unpaid) if unpaid else None
+
+
+def fetch_late_since(session: requests.Session, investments: list, today: date) -> None:
+    """Set `late_since` (date, or None when nothing is really unpaid) on the
+    loan investments Mintos flags as late (`pending` or `in_recovery`). A
+    failed lookup leaves the key unset (warning)."""
+    isins = sorted({inv["isin"] for inv in investments if inv.get("isin") and (inv.get("pending") or inv.get("in_recovery"))})
+
+    def lookup(isin):
+        try:
+            return isin, _fetch_note_series_late_since(session, isin, today)
+        except Exception as exc:
+            log.warning("Late payments lookup failed for %s: %s", isin, exc)
+            return isin, False
+
+    with ThreadPoolExecutor(max_workers=NOTE_SERIES_WORKERS) as pool:
+        results = dict(pool.map(lookup, isins))
+    for inv in investments:
+        if inv.get("isin") in results and results[inv["isin"]] is not False:
+            inv["late_since"] = results[inv["isin"]]
+
+
 def aggregate_remaining_durations(
     investments: list, today: date, rates: RateWeights | None = None, base_terms: dict | None = None
 ) -> dict:
@@ -631,13 +683,15 @@ def aggregate_remaining_durations(
     originator or maturity date are skipped (with a warning). `rates`
     (optional) collects each note's interest rate (%) for the "durée" sheet.
 
-    The only late/default signals Mintos gives per note are
-    `pendingPaymentAmount` (> 0: a payment is late) and `inRecoveryAmount`
-    (> 0: in recovery, treated as default); such a note is grouped by how
-    long ago its `nextPaymentDate` was due instead, when that date is in the
-    past (otherwise it keeps its remaining term). A late note is also a
-    default once more than DEFAULT_AFTER_LATE_DAYS late (the lender's
-    buyback, due at 60 days, is then still unpaid)."""
+    A note is late when it has an unpaid payment on a still-active loan: its
+    oldest such due date is `late_since` (see fetch_late_since(), which only
+    looks at notes with `pendingPaymentAmount` > 0 or `inRecoveryAmount` >
+    0, the latter treated as default). A note with `late_since` None keeps
+    its remaining term: `pendingPaymentAmount` is just payments in transit
+    (e.g. rebuy proceeds) and `nextPaymentDate` is a pool-level date that
+    can be stale. It is a default once in recovery or more than
+    DEFAULT_AFTER_LATE_DAYS late. A note in recovery without `late_since`
+    (none found, or lookup failed) falls back to its `nextPaymentDate`."""
     result = {}
     for inv in investments:
         originator = inv.get("originator")
@@ -645,11 +699,12 @@ def aggregate_remaining_durations(
             log.warning("Missing originator/maturity for an investment of %s (%.2f EUR) - skipped.", originator, inv.get("amount", 0.0))
             continue
         term = None
-        if (inv.get("pending") or inv.get("in_recovery")) and inv.get("next_payment"):
-            late_days = (today - inv["next_payment"]).days
-            term = overdue_months_and_days(
-                today, inv["next_payment"], default=bool(inv.get("in_recovery")) or late_days > DEFAULT_AFTER_LATE_DAYS
-            )
+        in_recovery = bool(inv.get("in_recovery"))
+        due = inv.get("late_since")
+        if due is None and in_recovery:
+            due = inv.get("next_payment")
+        if due and due < today:
+            term = overdue_months_and_days(today, due, default=in_recovery or (today - due).days > DEFAULT_AFTER_LATE_DAYS)
         if term is None:
             term = remaining_months_and_days(today, inv["maturity"])
         durations = result.setdefault(originator, {})
@@ -1686,6 +1741,7 @@ def run(session: requests.Session | None = None) -> None:
         try:
             investments = fetch_loan_investments(session) + fetch_bond_investments(session)
             base_terms = fetch_note_series_base_terms(session, investments)
+            fetch_late_since(session, investments, today_date)
             fill_remaining_duration_amounts(
                 "Mintos",
                 aggregate_remaining_durations(investments, today_date, rates, base_terms),
