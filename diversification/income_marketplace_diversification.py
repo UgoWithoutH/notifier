@@ -153,7 +153,14 @@ from shared.google_sheet import (
     fill_remaining_duration_amounts,
 )
 from shared.rate_sheet import fill_rate_amounts
-from shared.remaining_duration import RateWeights, base_term_between, overdue_months_and_days, remaining_months_and_days
+from shared.remaining_duration import (
+    BUYBACK_GRACE_DAYS,
+    DEFAULT_AFTER_LATE_DAYS,
+    RateWeights,
+    base_term_between,
+    overdue_months_and_days,
+    remaining_months_and_days,
+)
 from shared.report_date import get_report_date, is_current_month
 from shared.state import load_state, save_state
 from shared.weighted_average import INVESTED_BALANCE_LABEL, NON_INVESTED_BALANCE_LABEL, compute_time_weighted_average
@@ -405,8 +412,9 @@ def fetch_investments(page, token: str) -> list:
     scheduled payment date for current loans but the missed payment date for
     late ones (days since it always fall in the loan's bucket). The platform's
     i18n also defines "60+d"/"buybackInitiated" ("Buyback initiated": more
-    than 60 days late, buyback obligation triggered), "forcedBuyback" and
-    "paidBack" - never observed on the account, so only inferred. `base_term` is the loan's original term
+    than 60 days late, buyback obligation triggered; observed live 2026-10-31),
+    "forcedBuyback" and "paidBack" - never observed on the account, so only
+    inferred. `buyback_guarantee` is `loan_buyback_guarantee == 1`. `base_term` is the loan's original term
     (see _base_term), None if unknown."""
     data = _fetch_json(page, INVESTMENTS_URL, token)
     items = data.get("items") or []
@@ -435,6 +443,7 @@ def fetch_investments(page, token: str) -> list:
                 "maturity": maturity,
                 "status": str(item.get("loan_status") or "").strip(),
                 "overdue_since": overdue_since,
+                "buyback_guarantee": item.get("loan_buyback_guarantee") == 1,
             }
         )
     return investments
@@ -442,25 +451,40 @@ def fetch_investments(page, token: str) -> list:
 
 # Lateness bucket -> minimum days late, only used when overdue_base_date is unusable.
 LATE_BUCKET_MIN_DAYS = {"1-15d": 1, "16-30d": 16, "31-60d": 31}
-# More than 60 days late, buyback obligation triggered - treated as "default" (inferred, never observed live).
+# More than 60 days late. "Buyback initiated" was observed live 2026-10-31 (loan_is_active 0, nothing received yet,
+# loan_buyback_guarantee 1): the originator owes the buyback, so it is only a loss ("default") if the loan has no buyback guarantee.
 DEFAULT_STATUSES = {"60+d", "buyback initiated", "buybackinitiated"}
 NON_LATE_STATUSES = {"", "current", "paid back", "paidback", "forced buyback", "forcedbuyback"}
+# A guaranteed loan still "Buyback initiated" after shared.remaining_duration.DEFAULT_AFTER_LATE_DAYS of lateness is
+# counted as a default (buyback not honored); the platform exposes no "buyback failed" status.
 
 
 def _overdue_term(inv: dict, today: date):
     """Late/default duration key of an investment (see shared.remaining_duration.
     overdue_months_and_days), or None if it isn't late. Measured from the missed
     payment date (`overdue_since`); if that isn't in the past, from today minus
-    the minimum days of the loan's lateness bucket."""
+    the minimum days of the loan's lateness bucket. A status the platform
+    doesn't document here is counted as a default (and logged) rather than
+    silently as a healthy loan."""
     status = inv.get("status", "").lower()
     if status in NON_LATE_STATUSES:
         return None
-    is_default = status in DEFAULT_STATUSES
-    min_days = 61 if is_default else LATE_BUCKET_MIN_DAYS.get(status)
-    if min_days is None:
-        return None
+    beyond_60_days = status in DEFAULT_STATUSES
+    if status not in LATE_BUCKET_MIN_DAYS and not beyond_60_days:
+        log.warning("Unknown Income Marketplace loan status %r (%s, %.2f EUR) - counted as a default.", inv.get("status"), inv.get("originator"), inv.get("outstanding", 0.0))
+        beyond_60_days, is_default = True, True
+    else:
+        is_default = beyond_60_days and not inv.get("buyback_guarantee", False)
+    overdue_since = inv.get("overdue_since")
+    if beyond_60_days and not is_default:
+        late_days = (today - overdue_since).days if overdue_since else 61
+        log.warning("%s (%.2f EUR): %s, %d days late - buyback guaranteed but not paid yet.", inv.get("originator"), inv.get("outstanding", 0.0), inv.get("status"), late_days)
+        if late_days > DEFAULT_AFTER_LATE_DAYS:
+            log.warning("Buyback still unpaid after %d days of grace - counted as a default.", BUYBACK_GRACE_DAYS)
+            is_default = True
+    min_days = 61 if beyond_60_days else LATE_BUCKET_MIN_DAYS.get(status)
     return (
-        overdue_months_and_days(today, inv.get("overdue_since") or today, default=is_default)
+        overdue_months_and_days(today, overdue_since or today, default=is_default)
         or overdue_months_and_days(today, today - timedelta(days=min_days), default=is_default)
     )
 
@@ -470,8 +494,9 @@ def aggregate_remaining_durations(investments: list, today: date, rates: RateWei
     repartition), then by remaining term as of `today` (months, days):
     {originator: {(months, days): outstanding}}. Late loans (status "1-15d"/
     "16-30d"/"31-60d", verified live) use the negated lateness since the missed
-    payment date, "Buyback initiated" (60+ days, inferred) ones the same with a
-    "default" marker (see _overdue_term). Fully repaid investments are ignored;
+    payment date; "Buyback initiated" (60+ days, verified live 2026-10-31) ones
+    too while the loan has a buyback guarantee, otherwise with a "default"
+    marker (see _overdue_term). Fully repaid investments are ignored;
     non-late ones without a maturity date are skipped (with a warning)."""
     result = {}
     for inv in investments:

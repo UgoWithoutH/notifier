@@ -288,7 +288,7 @@ from shared.google_sheet import (
     fill_remaining_duration_amounts,
 )
 from shared.rate_sheet import fill_rate_amounts
-from shared.remaining_duration import RateWeights, base_term_between, overdue_months_and_days, remaining_months_and_days
+from shared.remaining_duration import DEFAULT_AFTER_LATE_DAYS, RateWeights, base_term_between, overdue_months_and_days, remaining_months_and_days
 from shared.report_date import get_report_date, is_current_month
 from shared.state import load_state, save_state
 from shared.weighted_average import INVESTED_BALANCE_LABEL, NON_INVESTED_BALANCE_LABEL, compute_time_weighted_average
@@ -635,7 +635,9 @@ def aggregate_remaining_durations(
     `pendingPaymentAmount` (> 0: a payment is late) and `inRecoveryAmount`
     (> 0: in recovery, treated as default); such a note is grouped by how
     long ago its `nextPaymentDate` was due instead, when that date is in the
-    past (otherwise it keeps its remaining term)."""
+    past (otherwise it keeps its remaining term). A late note is also a
+    default once more than DEFAULT_AFTER_LATE_DAYS late (the lender's
+    buyback, due at 60 days, is then still unpaid)."""
     result = {}
     for inv in investments:
         originator = inv.get("originator")
@@ -644,7 +646,10 @@ def aggregate_remaining_durations(
             continue
         term = None
         if (inv.get("pending") or inv.get("in_recovery")) and inv.get("next_payment"):
-            term = overdue_months_and_days(today, inv["next_payment"], default=bool(inv.get("in_recovery")))
+            late_days = (today - inv["next_payment"]).days
+            term = overdue_months_and_days(
+                today, inv["next_payment"], default=bool(inv.get("in_recovery")) or late_days > DEFAULT_AFTER_LATE_DAYS
+            )
         if term is None:
             term = remaining_months_and_days(today, inv["maturity"])
         durations = result.setdefault(originator, {})
