@@ -624,54 +624,62 @@ def fetch_note_series_base_terms(session: requests.Session, investments: list) -
         return {isin: term for isin, term in pool.map(lookup, isins) if term is not None}
 
 
-def _fetch_note_series_late_since(session: requests.Session, isin: str, today: date) -> date | None:
-    """Due date of the oldest payment still unpaid on a still-active loan of
-    the note series, None if there is none (verified live 2026-10-31 on
-    `GET /v1/note-series/{isin}/payment-schedule` + `/loans`, both
-    unpaginated). A late schedule row stays `not_paid_on_time` after the
-    lender rebought its loan, so rows of `rebought` loans are ignored;
+def _fetch_note_series_late_loans(session: requests.Session, isin: str, today: date) -> list:
+    """[(due_date, share)] for each still-active loan of the note series that
+    has an unpaid payment: `due_date` is its oldest unpaid due date and
+    `share` the fraction of the note that loan represents (its remaining
+    principal over the series' loans' total). Verified live 2026-10-31 on
+    `GET /v1/note-series/{isin}/payment-schedule` + `/loans` (both
+    unpaginated): summing the notes' invested amount x share by days late
+    reproduces Mintos' own "1 à 15 / 16 à 30 / 31 à 60 jours de retard"
+    totals to the cent. A late schedule row stays `not_paid_on_time` after
+    the lender rebought its loan, so rows of `rebought` loans are ignored;
     `lateDays` is only the final delay of a repayment (it never grows while
     a row is unpaid), so the age is `today - paymentDate`."""
     r = session.get(NOTE_SERIES_LOANS_URL.format(isin=isin), timeout=20)
     _check_authenticated(r)
     if not r.ok:
         raise RuntimeError(f"Note series loans endpoint returned status {r.status_code}")
-    active = {
-        loan.get("identifier") for loan in (r.json() or {}).get("items") or [] if loan.get("status") == "active"
-    }
+    loans = (r.json() or {}).get("items") or []
+    remaining = {loan.get("identifier"): _money(loan.get("remainingAmount")) for loan in loans}
+    total = sum(remaining.values())
+    if total <= 0:
+        return []
+    active = {loan.get("identifier") for loan in loans if loan.get("status") == "active"}
     r = session.get(NOTE_SERIES_PAYMENT_SCHEDULE_URL.format(isin=isin), timeout=20)
     _check_authenticated(r)
     if not r.ok:
         raise RuntimeError(f"Note series payment schedule endpoint returned status {r.status_code}")
-    unpaid = [
-        _parse_maturity_date(row.get("paymentDate"))
-        for row in (r.json() or {}).get("paymentSchedule") or []
-        if row.get("status") == "not_paid_on_time"
-        and not row.get("isClosed")
-        and (row.get("loan") or {}).get("identifier") in active
-    ]
-    unpaid = [d for d in unpaid if d is not None and d < today]
-    return min(unpaid) if unpaid else None
+    oldest = {}
+    for row in (r.json() or {}).get("paymentSchedule") or []:
+        loan_id = (row.get("loan") or {}).get("identifier")
+        if row.get("status") != "not_paid_on_time" or row.get("isClosed") or loan_id not in active:
+            continue
+        due = _parse_maturity_date(row.get("paymentDate"))
+        if due is not None and due < today and (loan_id not in oldest or due < oldest[loan_id]):
+            oldest[loan_id] = due
+    return [(due, remaining[loan_id] / total) for loan_id, due in oldest.items() if remaining[loan_id] > 0]
 
 
-def fetch_late_since(session: requests.Session, investments: list, today: date) -> None:
-    """Set `late_since` (date, or None when nothing is really unpaid) on the
-    loan investments Mintos flags as late (`pending` or `in_recovery`). A
-    failed lookup leaves the key unset (warning)."""
-    isins = sorted({inv["isin"] for inv in investments if inv.get("isin") and (inv.get("pending") or inv.get("in_recovery"))})
+def fetch_late_loans(session: requests.Session, investments: list, today: date) -> None:
+    """Set `late_loans` ([(due_date, share)], empty when nothing is really
+    unpaid) on every loan investment, mirroring how Mintos itself buckets
+    late amounts (per loan, not per note). A failed lookup leaves the key
+    unset (warning)."""
+    isins = sorted({inv["isin"] for inv in investments if inv.get("isin") and "pending" in inv})
 
     def lookup(isin):
         try:
-            return isin, _fetch_note_series_late_since(session, isin, today)
+            return isin, _fetch_note_series_late_loans(session, isin, today)
         except Exception as exc:
             log.warning("Late payments lookup failed for %s: %s", isin, exc)
-            return isin, False
+            return isin, None
 
     with ThreadPoolExecutor(max_workers=NOTE_SERIES_WORKERS) as pool:
         results = dict(pool.map(lookup, isins))
     for inv in investments:
-        if inv.get("isin") in results and results[inv["isin"]] is not False:
-            inv["late_since"] = results[inv["isin"]]
+        if results.get(inv.get("isin")) is not None:
+            inv["late_loans"] = results[inv["isin"]]
 
 
 def aggregate_remaining_durations(
@@ -683,37 +691,42 @@ def aggregate_remaining_durations(
     originator or maturity date are skipped (with a warning). `rates`
     (optional) collects each note's interest rate (%) for the "durée" sheet.
 
-    A note is late when it has an unpaid payment on a still-active loan: its
-    oldest such due date is `late_since` (see fetch_late_since(), which only
-    looks at notes with `pendingPaymentAmount` > 0 or `inRecoveryAmount` >
-    0, the latter treated as default). A note with `late_since` None keeps
-    its remaining term: `pendingPaymentAmount` is just payments in transit
-    (e.g. rebuy proceeds) and `nextPaymentDate` is a pool-level date that
-    can be stale. It is a default once in recovery or more than
-    DEFAULT_AFTER_LATE_DAYS late. A note in recovery without `late_since`
-    (none found, or lookup failed) falls back to its `nextPaymentDate`."""
+    A loan note is split per underlying loan (see fetch_late_loans()): the
+    share of each loan with an unpaid payment on a still-active loan goes to
+    its own late bucket (age of its oldest unpaid due date), the rest keeps
+    the note's remaining term. A late share is a default once the note is in
+    recovery (`inRecoveryAmount` > 0) or more than DEFAULT_AFTER_LATE_DAYS
+    late. A note without late loans keeps its remaining term:
+    `pendingPaymentAmount` is just payments in transit (e.g. rebuy proceeds)
+    and `nextPaymentDate` is a pool-level date that can be stale. A note in
+    recovery without any late loan (none found, or lookup failed) falls back
+    to its `nextPaymentDate` for the whole amount."""
     result = {}
     for inv in investments:
         originator = inv.get("originator")
         if not originator or inv.get("maturity") is None:
             log.warning("Missing originator/maturity for an investment of %s (%.2f EUR) - skipped.", originator, inv.get("amount", 0.0))
             continue
-        term = None
         in_recovery = bool(inv.get("in_recovery"))
-        due = inv.get("late_since")
-        if due is None and in_recovery:
-            due = inv.get("next_payment")
-        if due and due < today:
+        late_loans = [(due, share) for due, share in inv.get("late_loans") or [] if due < today]
+        if not late_loans and in_recovery and inv.get("next_payment") and inv["next_payment"] < today:
+            late_loans = [(inv["next_payment"], 1.0)]
+        pieces = []
+        late_share = min(sum(share for _, share in late_loans), 1.0)
+        for due, share in late_loans:
             term = overdue_months_and_days(today, due, default=in_recovery or (today - due).days > DEFAULT_AFTER_LATE_DAYS)
-        if term is None:
-            term = remaining_months_and_days(today, inv["maturity"])
+            if term is not None:
+                pieces.append((term, inv["amount"] * share))
+        if late_share < 1.0:
+            pieces.append((remaining_months_and_days(today, inv["maturity"]), inv["amount"] * (1.0 - late_share)))
+        base_term = (base_terms or {}).get(inv.get("isin"))
+        if rates is not None and base_term is None:
+            log.warning("No base term for %s (%s, %.2f EUR).", originator, inv.get("isin"), inv["amount"])
         durations = result.setdefault(originator, {})
-        durations[term] = durations.get(term, 0.0) + inv["amount"]
-        if rates is not None:
-            base_term = (base_terms or {}).get(inv.get("isin"))
-            if base_term is None:
-                log.warning("No base term for %s (%s, %.2f EUR).", originator, inv.get("isin"), inv["amount"])
-            rates.add(originator, term, inv["amount"], inv.get("rate"), base_term=base_term)
+        for term, amount in pieces:
+            durations[term] = durations.get(term, 0.0) + amount
+            if rates is not None:
+                rates.add(originator, term, amount, inv.get("rate"), base_term=base_term)
     return result
 
 
@@ -1741,7 +1754,7 @@ def run(session: requests.Session | None = None) -> None:
         try:
             investments = fetch_loan_investments(session) + fetch_bond_investments(session)
             base_terms = fetch_note_series_base_terms(session, investments)
-            fetch_late_since(session, investments, today_date)
+            fetch_late_loans(session, investments, today_date)
             fill_remaining_duration_amounts(
                 "Mintos",
                 aggregate_remaining_durations(investments, today_date, rates, base_terms),
