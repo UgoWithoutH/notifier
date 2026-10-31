@@ -1,0 +1,74 @@
+name: Fix duration history (one-off)
+
+# One-off: restores the persisted state caches of Income Marketplace and Nectaro, moves every recorded "default"
+# share of their duration-status history into "late" (see scripts/reclassify_duration_defaults.py), and saves the
+# caches again under a new key (newer than the previous ones, so the next diversification run restores it).
+# Afterwards, re-run "Diversification Reports" for the affected months to rewrite the sheet, then delete this file.
+on:
+  workflow_dispatch:
+
+jobs:
+  fix:
+    runs-on: ubuntu-22.04
+    strategy:
+      max-parallel: 1
+      matrix:
+        include:
+          - prefix: income-marketplace-diversification-state
+            status_file: diversification/incomemarketplace_duration_status_state.json
+          - prefix: nectaro-diversification-state
+            status_file: diversification/nectaro_duration_status_state.json
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Restore Income Marketplace state
+        if: ${{ matrix.prefix == 'income-marketplace-diversification-state' }}
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            diversification/income_marketplace_diversification_storage_state.json
+            diversification/income_marketplace_xirr_cashflows_state.json
+            diversification/incomemarketplace_duration_status_state.json
+            diversification/incomemarketplace_rate_history_state.json
+          key: ${{ matrix.prefix }}-${{ github.run_id }}
+          restore-keys: |
+            ${{ matrix.prefix }}-
+
+      - name: Restore Nectaro state
+        if: ${{ matrix.prefix == 'nectaro-diversification-state' }}
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            diversification/nectaro_diversification_session_state.json
+            diversification/nectaro_xirr_cashflows_state.json
+            diversification/nectaro_duration_status_state.json
+            diversification/nectaro_rate_history_state.json
+          key: ${{ matrix.prefix }}-${{ github.run_id }}
+          restore-keys: |
+            ${{ matrix.prefix }}-
+
+      - name: Reclassify defaults as late
+        run: python scripts/reclassify_duration_defaults.py "${{ matrix.status_file }}"
+
+      - name: Save Income Marketplace state
+        if: ${{ matrix.prefix == 'income-marketplace-diversification-state' }}
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            diversification/income_marketplace_diversification_storage_state.json
+            diversification/income_marketplace_xirr_cashflows_state.json
+            diversification/incomemarketplace_duration_status_state.json
+            diversification/incomemarketplace_rate_history_state.json
+          key: ${{ matrix.prefix }}-${{ github.run_id }}
+
+      - name: Save Nectaro state
+        if: ${{ matrix.prefix == 'nectaro-diversification-state' }}
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            diversification/nectaro_diversification_session_state.json
+            diversification/nectaro_xirr_cashflows_state.json
+            diversification/nectaro_duration_status_state.json
+            diversification/nectaro_rate_history_state.json
+          key: ${{ matrix.prefix }}-${{ github.run_id }}

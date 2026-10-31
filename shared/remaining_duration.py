@@ -4,6 +4,12 @@ shared.google_sheet.fill_remaining_duration_amounts)."""
 
 from datetime import date, timedelta
 
+# Buyback-guaranteed platforms: the originator owes the buyback once a loan is BUYBACK_TRIGGER_DAYS late. A loan only
+# counts as a default (real loss) if it is still unpaid BUYBACK_GRACE_DAYS after that, i.e. DEFAULT_AFTER_LATE_DAYS late.
+BUYBACK_TRIGGER_DAYS = 60
+BUYBACK_GRACE_DAYS = 30
+DEFAULT_AFTER_LATE_DAYS = BUYBACK_TRIGGER_DAYS + BUYBACK_GRACE_DAYS
+
 
 def _add_months(start: date, months: int) -> date:
     index = start.year * 12 + start.month - 1 + months
