@@ -4,6 +4,7 @@ import json
 import os
 import smtplib
 import logging
+from math import isfinite
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 log = logging.getLogger("notifier")
@@ -61,6 +62,7 @@ def _send_invest_summary_email(
     error: str | None = None,
     robot_config=None,
     attachment: tuple | None = None,
+    failed: list | None = None,
 ) -> None:
     """Common recap email of the Swaper/Lendermarket/Afranga invest bots
     (same format on purpose, explicit user request 2026-10-21): what was
@@ -68,6 +70,8 @@ def _send_invest_summary_email(
     then the "config robot" reminder at the bottom.
 
     `invested`: list of `{"label": str, "amount": float, "rates": [float]}`.
+    `failed`: list of `{"label": str, "amount": float | None, "reason": str}`,
+    one per failed attempt, listed under the failure count.
     `attachment`: optional `(filename, text)` with the technical detail of a
     failure, only attached when something went wrong."""
     if not all([SMTP_HOST, SMTP_USER, SMTP_PASSWORD, EMAIL_TO]):
@@ -89,14 +93,26 @@ def _send_invest_summary_email(
     if error:
         body_parts += [f"⚠ ERREUR : {error}", ""]
     if failures:
-        body_parts += [f"⚠ {failures} tentative(s) d'investissement échouée(s).", ""]
+        body_parts.append(f"⚠ {failures} tentative(s) d'investissement échouée(s).")
+        for item in failed or []:
+            amount = item.get("amount")
+            amount_str = f" ({amount:.2f} €)" if amount is not None else ""
+            body_parts.append(f"  - {item['label']}{amount_str} : {item.get('reason') or 'raison inconnue'}")
+        body_parts.append("")
 
     if invested:
         body_parts.append("=== Investissements ===")
+        unverified_amounts = 0
         for item in invested:
             rates = ", ".join(f"{rate:.2f}%" for rate in item.get("rates") or [])
-            body_parts.append(f"- {item['label']} : {item['amount']:.2f} € @ {rates or 'n/a'}")
-        body_parts.append(f"Total investi : {total:.2f} €")
+            amounts = item.get("amounts") or []
+            detail = f" ({' + '.join(f'{a:.2f}' for a in amounts)})" if len(amounts) > 1 else ""
+            unverified = item.get("unverified_amounts", 0)
+            unverified_amounts += unverified
+            note = f" (montant demandé pour {unverified} prêt(s), réponse Swaper sans montant exploitable)" if unverified else ""
+            body_parts.append(f"- {item['label']} : {item['amount']:.2f} €{detail}{note} @ {rates or 'n/a'}")
+        total_note = f" (dont {unverified_amounts} montant(s) demandé(s), non vérifié(s) dans la réponse Swaper)" if unverified_amounts else ""
+        body_parts.append(f"Total investi : {total:.2f} €{total_note}")
 
     body_parts.extend(_robot_config_lines(robot_config))
     if attachment:
@@ -123,42 +139,107 @@ def _send_invest_summary_email(
         log.exception("Failed to send %s invest summary email.", platform)
 
 
+def _swaper_failure_reason(attempt: dict) -> str:
+    if attempt.get("error"):
+        return "exception pendant la saisie du montant ou le clic sur « + »"
+    if attempt.get("not_approved"):
+        return "investissement non approuvé par Swaper"
+    if not attempt.get("modal_html"):
+        return "aucun modal de confirmation détecté après le clic sur « + »"
+    if not attempt.get("confirmed"):
+        return "bouton « Confirm » introuvable ou non cliquable"
+    return "échec inconnu"
+
+
+def _swaper_actual_amount(attempt: dict) -> float | None:
+    """Return Swaper's accepted buy amount, when the successful response provides it."""
+    for call in reversed(attempt.get("confirm_api_calls") or []):
+        if call.get("method") != "POST" or "/buy" not in (call.get("url") or ""):
+            continue
+        try:
+            status = int(call.get("status"))
+            body = json.loads(call.get("body") or "null") or {}
+        except (TypeError, ValueError):
+            continue
+        if not 200 <= status < 300 or not isinstance(body, dict):
+            continue
+        investment = body.get("investment")
+        if not isinstance(investment, dict):
+            continue
+        raw_amount = investment.get("amount")
+        if isinstance(raw_amount, bool):
+            continue
+        try:
+            amount = float(raw_amount)
+        except (TypeError, ValueError):
+            continue
+        if amount > 0 and isfinite(amount):
+            return amount
+    return None
+
+
 def send_swaper_investment_summary_email(attempts: list, error: str | None = None, robot_config=None) -> None:
     """Swaper recap, built from the attempts of monitors/swaper_invest_bot.py
     (`_invest_available_loans()`): only confirmed attempts count as
     investments, the others as failures. The attachment (the real
-    investment requests/responses) is only joined when something failed."""
+    investment requests/responses, plus the modal/row HTML of each failed
+    attempt) is only joined when something failed."""
     invested = {}
     failures = 0
+    failed = []
+    failed_details = []
     investment_calls = []
     for attempt in attempts:
+        loan_ref = attempt.get("loan_number") or attempt.get("loan_id")
         if attempt.get("confirmed") and not attempt.get("error") and not attempt.get("not_approved"):
-            name = attempt.get("originator") or f"Prêt {attempt.get('loan_number') or attempt.get('loan_id')}"
-            entry = invested.setdefault(name, {"label": name, "amount": 0.0, "rates": []})
-            entry["amount"] += attempt.get("amount") or 0.0
+            name = attempt.get("originator") or f"Prêt {loan_ref}"
+            entry = invested.setdefault(name, {"label": name, "amount": 0.0, "rates": [], "amounts": [], "unverified_amounts": 0})
+            actual_amount = _swaper_actual_amount(attempt)
+            amount = actual_amount if actual_amount is not None else (attempt.get("amount") or 0.0)
+            entry["amount"] += amount
+            entry["amounts"].append(amount)
+            if actual_amount is None:
+                entry["unverified_amounts"] += 1
             try:
                 entry["rates"].append(float(attempt.get("rate")))
             except (TypeError, ValueError):
                 pass
         else:
             failures += 1
+            reason = _swaper_failure_reason(attempt)
+            label = f"{attempt.get('originator') or 'Swaper'} - prêt {loan_ref}"
+            failed.append({"label": label, "amount": attempt.get("amount"), "reason": reason})
+            failed_details.append({
+                "loan_number": loan_ref,
+                "originator": attempt.get("originator"),
+                "amount": attempt.get("amount"),
+                "reason": reason,
+                "modal_html": (attempt.get("modal_html") or "")[:20000] or None,
+                "row_html_after_click": (attempt.get("row_html_after_click") or "")[:20000] or None,
+            })
         for call in attempt.get("confirm_api_calls") or []:
+            url = call.get("url") or ""
+            if not any(path in url for path in ("/buy", "is-manual-investment-approved")):
+                continue
             investment_calls.append({
-                "loan_number": attempt.get("loan_number") or attempt.get("loan_id"),
+                "loan_number": loan_ref,
                 "originator": attempt.get("originator"),
                 "amount": attempt.get("amount"),
                 **call,
             })
 
     attachment = None
-    if (failures or error) and investment_calls:
+    if failed_details or investment_calls:
         attachment = (
             "swaper_investment_requests.json",
-            json.dumps(investment_calls, indent=2, ensure_ascii=False, default=str),
+            json.dumps(
+                {"failed_attempts": failed_details, "investment_calls": investment_calls},
+                indent=2, ensure_ascii=False, default=str,
+            ),
         )
     _send_invest_summary_email(
         "Swaper", list(invested.values()), failures=failures, error=error,
-        robot_config=robot_config, attachment=attachment,
+        robot_config=robot_config, attachment=attachment, failed=failed,
     )
 
 
@@ -214,14 +295,15 @@ def send_lendermarket_invest_summary_email(stats: dict, error: str | None = None
             "label": f"{name} ({country})" if country else name,
             "amount": s.get("invested_amount", 0.0),
             "rates": rates,
+            "amounts": [lo["amount"] for lo in (s.get("invested_loans") or []) if lo.get("amount") is not None],
         })
 
     attachment = None
-    if diagnostics_text and (stats.get("invest_failures", 0) > 0 or error):
+    if diagnostics_text:
         attachment = ("lendermarket_invest_bot_diagnostics_this_run.log", diagnostics_text)
     _send_invest_summary_email(
         "Lendermarket", invested, failures=stats.get("invest_failures", 0), error=error,
-        robot_config=robot_config, attachment=attachment,
+        robot_config=robot_config, attachment=attachment, failed=stats.get("failed_attempts"),
     )
 
 
@@ -229,20 +311,30 @@ def send_afranga_invest_summary_email(stats: dict, error: str | None = None, dia
     """Recap of monitors/afranga_invest_bot.py (same email format as the
     Swaper/Lendermarket ones). Only real purchases (`stats["invested"]`) are
     listed; dry/probe runs never buy anything, so they only get here on error."""
+    grouped = {}
+    for item in stats.get("invested") or []:
+        entry = grouped.setdefault(item["loan"], {"markets": [], "amount": 0.0, "rates": [], "amounts": []})
+        if item["market"] not in entry["markets"]:
+            entry["markets"].append(item["market"])
+        entry["amount"] += item["amount"]
+        entry["amounts"].append(item["amount"])
+        if item.get("rate") is not None:
+            entry["rates"].append(item["rate"])
     invested = [
         {
-            "label": f"[{item['market']}] {item['loan']}",
-            "amount": item["amount"],
-            "rates": [item["rate"]] if item.get("rate") is not None else [],
+            "label": f"[{'/'.join(entry['markets'])}] {loan}",
+            "amount": entry["amount"],
+            "rates": entry["rates"],
+            "amounts": entry["amounts"],
         }
-        for item in stats.get("invested") or []
+        for loan, entry in grouped.items()
     ]
     attachment = None
-    if diagnostics_text and (stats.get("failures", 0) > 0 or error):
+    if diagnostics_text:
         attachment = ("afranga_invest_bot_diagnostics_this_run.log", diagnostics_text)
     _send_invest_summary_email(
         "Afranga", invested, failures=stats.get("failures", 0), error=error,
-        robot_config=robot_config, attachment=attachment,
+        robot_config=robot_config, attachment=attachment, failed=stats.get("failed_attempts"),
     )
 
 
@@ -717,7 +809,7 @@ def send_missing_loans_email(platform: str, names: list, detail: str | None = No
         )
         return
 
-    subject = f"[{platform}] ATTENTION - société introuvable : {', '.join(names)}"
+    subject = f"[{platform} Invest Bot] ATTENTION - société introuvable : {', '.join(names)}"
     body_lines = [
         f"Aucun prêt n'a jamais été trouvé sur {platform} pour {len(names)} société(s) active(s) dans l'onglet \"config robots\" :",
         *(f"  - {name}" for name in names),
