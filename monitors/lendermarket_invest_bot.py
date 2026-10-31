@@ -544,7 +544,16 @@ def _format_amount(amount: float) -> str:
     return f"{rounded:.2f}".rstrip("0").rstrip(".")
 
 
-def attempt_investment(session: requests.Session, loan_uuid: str, amount: float) -> tuple[bool, str | None]:
+def _extract_invested_amount(response_text: str) -> float | None:
+    """`data.investmentAmount` of the createInvestment response, i.e. what
+    Lendermarket really booked."""
+    try:
+        return float(((json.loads(response_text) or {}).get("data") or {}).get("investmentAmount"))
+    except (TypeError, ValueError, AttributeError):
+        return None
+
+
+def attempt_investment(session: requests.Session, loan_uuid: str, amount: float) -> tuple[bool, str | None, float]:
     """Real invest submission call - `POST claims/v1/investor/createInvestment`,
     see module docstring/repo memory ("2026-07-24 ... createInvestment") for
     how this was captured (safe, network-intercepted click-through, no real
@@ -556,7 +565,9 @@ def attempt_investment(session: requests.Session, loan_uuid: str, amount: float)
     checkbox, wasn't expanded/checked - but a real bot should accept both
     sets of terms to actually invest properly).
     Always logs the full request+response to INVEST_DIAGNOSTICS_FILE,
-    whether it succeeds or fails. Returns `(success, failure_reason)`."""
+    whether it succeeds or fails. Returns `(success, failure_reason,
+    invested_amount)`; `invested_amount` is read from the API response
+    (`data.investmentAmount`), 0.0 on failure."""
     payload = {
         "investmentAmount": _format_amount(amount),
         "acceptedLimitedPurposeTerms": True,
@@ -575,7 +586,7 @@ def attempt_investment(session: requests.Session, loan_uuid: str, amount: float)
             traceback=traceback.format_exc(),
         )
         log.exception("Investment attempt raised an exception for loan %s.", loan_uuid)
-        return False, f"exception : {exc}"
+        return False, f"exception : {exc}", 0.0
 
     _log_invest_diagnostics(
         "invest_attempt",
@@ -586,13 +597,22 @@ def attempt_investment(session: requests.Session, loan_uuid: str, amount: float)
         response_body=r.text[:5000],
     )
     if r.ok:
-        log.info("Investment attempt for loan %s (%.2f EUR) returned status=%s.", loan_uuid, amount, r.status_code)
-        return True, None
+        invested = _extract_invested_amount(r.text)
+        if invested is None:
+            log.warning(
+                "Investment for loan %s returned status=%s but no investmentAmount could be read from the response, "
+                "falling back to the requested %.2f EUR.", loan_uuid, r.status_code, amount,
+            )
+            invested = amount
+        elif abs(invested - amount) > 0.005:
+            log.warning("Loan %s: requested %.2f EUR but the API reports %.2f EUR invested.", loan_uuid, amount, invested)
+        log.info("Investment for loan %s: %.2f EUR invested (status=%s).", loan_uuid, invested, r.status_code)
+        return True, None, invested
     log.warning(
         "Investment attempt for loan %s (%.2f EUR) FAILED status=%s - full request/response saved to diagnostics.",
         loan_uuid, amount, r.status_code,
     )
-    return False, f"HTTP {r.status_code} : {' '.join(r.text.split())[:300]}"
+    return False, f"HTTP {r.status_code} : {' '.join(r.text.split())[:300]}", 0.0
 
 
 def invest_selected_lenders(
@@ -719,15 +739,15 @@ def invest_selected_lenders(
 
     for loan_uuid, amount in plan.items():
         sheet_name, _rate = loan_lookup[loan_uuid]
-        stats["lender_budgets"][sheet_name] = stats["lender_budgets"].get(sheet_name, 0.0) + amount
-        stats["lender_stats"][sheet_name]["budget"] += amount
-    log.info("Investment plan (loan uuid -> EUR): %s", plan)
-
-    for loan_uuid, amount in plan.items():
-        sheet_name, rate = loan_lookup[loan_uuid]
-        lender_stat = stats["lender_stats"][sheet_name]
-        stats["invest_attempts"] += 1
-        lender_stat["attempts"] += 1
+        stats["lender_budgets"], invested = attempt_investment(session, loan_uuid, amount)
+        if success:
+            stats["invest_successes"] += 1
+            stats["total_invested"] += invested
+            stats["balance_after"] -= invested
+            lender_stat["successes"] += 1
+            lender_stat["invested_amount"] += invested
+            lender_stat["invested_loans"].append({"amount": invested, "interestRate": rate})
+            tracker.add(sheet_name, invested
         success, failure_reason = attempt_investment(session, loan_uuid, amount)
         if success:
             stats["invest_successes"] += 1
