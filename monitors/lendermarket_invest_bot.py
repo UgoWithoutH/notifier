@@ -739,7 +739,16 @@ def invest_selected_lenders(
 
     for loan_uuid, amount in plan.items():
         sheet_name, _rate = loan_lookup[loan_uuid]
-        stats["lender_budgets"], invested = attempt_investment(session, loan_uuid, amount)
+        stats["lender_budgets"][sheet_name] = stats["lender_budgets"].get(sheet_name, 0.0) + amount
+        stats["lender_stats"][sheet_name]["budget"] += amount
+    log.info("Investment plan (loan uuid -> EUR): %s", plan)
+
+    for loan_uuid, amount in plan.items():
+        sheet_name, rate = loan_lookup[loan_uuid]
+        lender_stat = stats["lender_stats"][sheet_name]
+        stats["invest_attempts"] += 1
+        lender_stat["attempts"] += 1
+        success, failure_reason, invested = attempt_investment(session, loan_uuid, amount)
         if success:
             stats["invest_successes"] += 1
             stats["total_invested"] += invested
@@ -747,16 +756,7 @@ def invest_selected_lenders(
             lender_stat["successes"] += 1
             lender_stat["invested_amount"] += invested
             lender_stat["invested_loans"].append({"amount": invested, "interestRate": rate})
-            tracker.add(sheet_name, invested
-        success, failure_reason = attempt_investment(session, loan_uuid, amount)
-        if success:
-            stats["invest_successes"] += 1
-            stats["total_invested"] += amount
-            stats["balance_after"] -= amount
-            lender_stat["successes"] += 1
-            lender_stat["invested_amount"] += amount
-            lender_stat["invested_loans"].append({"amount": amount, "interestRate": rate})
-            tracker.add(sheet_name, amount)
+            tracker.add(sheet_name, invested)
         else:
             stats["invest_failures"] += 1
             lender_stat["failures"] += 1
