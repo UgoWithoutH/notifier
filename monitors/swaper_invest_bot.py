@@ -20,7 +20,7 @@ Optional:
     SWAPER_CRON_JOB_ID                     -> cron-job.org job id: used to
                                                speed up/slow down the external
                                                trigger's own schedule based on
-                                               balance (see ensure_schedule())
+                                               balance (see ensure_schedule_interval())
 
 REAL auto-invest bot (added 2026-07-25, explicit user decision - real money,
 no more click-and-abort safety net): does a SINGLE discovery+invest pass per
@@ -251,10 +251,12 @@ from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeo
 
 from shared.notifier import send_swaper_investment_summary_email
 from shared.state import load_state, save_state
-from shared.cron_schedule import ensure_schedule, apply_startup_jitter
+from shared.cron_schedule import ensure_schedule_interval, apply_startup_jitter
 from shared.google_sheet import get_geo_platform_snapshot
 from shared.missing_loans import TRANSIENT_GRACE_SECONDS, report_missing_loans
-from shared.robot_config import Candidate, build_tracker, get_platform_config, match_name, plan_allocations
+from shared.robot_config import (
+    Candidate, build_tracker, get_platform_config, match_name, plan_allocations, resolve_schedule_minutes,
+)
 from shared.browser_stealth import get_context_options, apply_stealth, human_pause, human_mouse_wander, human_type
 
 DEFAULT_STATE = {
@@ -1363,13 +1365,15 @@ def run(headless: bool = True) -> None:
         )
 
     # Cron-job.org schedule speed-up/slow-down (re-enabled 2026-09-09, see
-    # shared/cron_schedule.py's own docstring for the live-check-then-cache
-    # fallback + randomized-jitter details) - poll faster while there's
-    # money to invest.
-    if balance < 10:
-        ensure_schedule("30m", cron_job_id=SWAPER_CRON_JOB_ID, state_file=CRON_SCHEDULE_STATE_FILE)
-    else:
-        ensure_schedule("2m", cron_job_id=SWAPER_CRON_JOB_ID, state_file=CRON_SCHEDULE_STATE_FILE)
+    # shared/cron_schedule.py's own docstring) - poll faster while there's
+    # money to invest. The two intervals come from the "Temps planification
+    # solde (in)suffisant" columns of the Swaper row in "config robots"
+    # (defaults 30 min / 2 min).
+    sufficient = balance >= 10
+    ensure_schedule_interval(
+        resolve_schedule_minutes("Swaper", sufficient, 2 if sufficient else 30, robot_config),
+        cron_job_id=SWAPER_CRON_JOB_ID, state_file=CRON_SCHEDULE_STATE_FILE,
+    )
 
     save_state(STATE_FILE, state)
 
