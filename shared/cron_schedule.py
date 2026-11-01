@@ -58,6 +58,9 @@ DEFAULT_STATE = {
     "cron_schedule_mode": None,
     "cron_schedule_minutes": None,
     "cron_schedule_interval_minutes": None,
+    # True/False = the balance state ("solde suffisant" / "insuffisant") the
+    # recorded interval was chosen for; None = unknown (older state files).
+    "cron_schedule_sufficient": None,
 }
 
 # Legacy fixed modes (still used by PeerBerry): name -> interval in minutes.
@@ -153,15 +156,25 @@ def _build_schedule(interval: int) -> dict:
     return {"minutes": [0], "hours": [DAILY_HOUR], "mdays": mdays}
 
 
-def apply_startup_jitter(state_file: Path) -> None:
-    """Sleeps once, for a random whole-minute duration drawn from the
-    jitter range of the LAST KNOWN cron interval (read from `state_file` -
+def apply_startup_jitter(state_file: Path, wait_range: tuple | None = None) -> None:
+    """Sleeps once, for a random whole-minute duration drawn from `wait_range`
+    (low, high in minutes, "Temps attente avant démarrage" bornes of the
+    "config robots" sheet) when given,
+    else from the jitter range of the LAST KNOWN cron interval (read from `state_file` -
     the same one passed to `ensure_schedule_interval()`; falls back to the
     30 min range if none has ever been recorded yet). Meant to be called
     once, right at the very start of a monitor's own `run()` (before
     login/any real work) - this is where the anti-robotic-cadence
     randomness lives, since the cron-job.org schedule itself is a plain
     fixed interval (see module docstring)."""
+    if wait_range is not None:
+        low, high = wait_range
+        delay_minutes = random.randint(low, high)
+        if delay_minutes <= 0:
+            return
+        log.info("Startup wait: sleeping %sm (random within %s-%s) before proceeding...", delay_minutes, format_duration(low), format_duration(high))
+        time.sleep(delay_minutes * 60)
+        return
     state = load_state(state_file, DEFAULT_STATE)
     interval = _last_interval(state) or 30
     delay_minutes = random.randint(0, min(MAX_JITTER_MINUTES, interval // 2))
@@ -239,14 +252,19 @@ def ensure_schedule(mode: str, cron_job_id: str, state_file: Path) -> None:
     ensure_schedule_interval(interval_from_mode(mode), cron_job_id, state_file)
 
 
-def ensure_schedule_interval(interval_minutes: int, cron_job_id: str, state_file: Path) -> None:
+def ensure_schedule_interval(
+    interval_minutes: int, cron_job_id: str, state_file: Path, sufficient: bool | None = None,
+) -> None:
     """PATCHes cron-job.org's schedule to a plain fixed interval ONLY when it
     differs from the last interval recorded in `state_file` - staying on the
     same interval across runs makes zero API calls, to stay well under
     cron-job.org's 100-requests/day account cap (re-added 2026-09-10, after
     the brief 2026-09-09 "always rebuild+PATCH" design blew through that
     budget). An interval cron-job.org cannot express exactly (e.g. 7 min) is
-    snapped to the nearest one that it can (see snap_interval_minutes())."""
+    snapped to the nearest one that it can (see snap_interval_minutes()).
+    `sufficient` (balance state the interval was chosen for) is recorded in
+    the state file so a later run can re-check the right sheet value before
+    its balance is known."""
     interval = snap_interval_minutes(max(1, int(interval_minutes)))
     if interval != interval_minutes:
         log.warning(
@@ -259,6 +277,9 @@ def ensure_schedule_interval(interval_minutes: int, cron_job_id: str, state_file
 
     if current == interval:
         log.info("Cron decision: already every %s, skipping cron-job.org API call.", format_duration(interval))
+        if sufficient is not None and state.get("cron_schedule_sufficient") != sufficient:
+            state["cron_schedule_sufficient"] = sufficient
+            save_state(state_file, state)
         return
 
     old_minutes = state.get("cron_schedule_minutes")
@@ -273,6 +294,8 @@ def ensure_schedule_interval(interval_minutes: int, cron_job_id: str, state_file
         state["cron_schedule_mode"] = format_duration(interval)
         state["cron_schedule_interval_minutes"] = interval
         state["cron_schedule_minutes"] = schedule["minutes"]
+        if sufficient is not None:
+            state["cron_schedule_sufficient"] = sufficient
         save_state(state_file, state)
         log.info("Cron timer AFTER update: every %s (minutes=%s) - was minutes=%s.", format_duration(interval), schedule["minutes"], old_minutes)
     else:

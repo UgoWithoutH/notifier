@@ -1,14 +1,15 @@
 """Configuration des robots d'investissement (Lendermarket, Swaper, PeerBerry)
 lue depuis l'onglet Google Sheets "config robots".
 
-Structure de l'onglet (une ligne d'en-tête, repérée par la colonne "Nom",
-puis un bloc par plateforme : la ligne de la plateforme suivie d'une ligne
+Structure de l'onglet (une ligne d'en-tête, repérée par la cellule "Nom"
+(quelle que soit sa colonne), puis un bloc par plateforme : la ligne de la plateforme suivie d'une ligne
 par loan/lender/loan originator jusqu'à la plateforme ou la section
 suivante) :
 
 - Nom : nom de la plateforme (ligne de bloc) ou du loan.
 - Pays : pays du loan (peut être vide).
-- Actif marché primaire : "x" = le robot peut investir sur ce loan.
+- Actif marché primaire : "x" = le robot peut investir sur ce loan. Sur la
+  ligne de la PLATEFORME, vide = marché primaire désactivé pour tous les loans.
 - Taux min / Taux max : bornes du taux d'intérêt des prêts acceptés
   (vide = pas de borne).
 - Pourcentage max du solde par pays : sur la ligne de la plateforme,
@@ -20,6 +21,9 @@ suivante) :
   est réparti à parts égales entre les prêts disponibles du run.
 - Actif marché secondaire : "x" = le robot peut acheter ce loan sur le marché
   secondaire (colonnes optionnelles ci-dessous, ignorées sur le marché primaire).
+  Sur la ligne de la PLATEFORME, vide/colonne absente = marché secondaire
+  désactivé pour tous les loans. Si les deux marchés sont inactifs sur la
+  ligne de la plateforme, le robot s'arrête dès le début du run.
 - Durée restante min / max : durée restante du prêt, en mois.
 - décote / prime min / max : en % du principal, négatif = décote, positif = prime.
 - Temps planification solde insuffisant / suffisant (colonnes facultatives,
@@ -30,6 +34,11 @@ suivante) :
   (nombre seul = minutes). Vide ou invalide = valeur par défaut du robot.
   cron-job.org ne sait exprimer exactement que : diviseurs de 60 min, heures
   entières divisant 24, jours entiers ; le reste est arrondi au plus proche.
+- Temps attente avant démarrage borne inférieure / supérieure (colonnes
+  facultatives, ligne de la PLATEFORME, même format) : le robot attend une
+  durée aléatoire (jitter) entre ces deux bornes avant de démarrer. Borne
+  inférieure vide = 0 ; borne supérieure vide = égale à la borne inférieure
+  (attente fixe) ; les deux vides ou invalides = jitter par défaut du robot.
 """
 
 import logging
@@ -37,9 +46,11 @@ import re
 import unicodedata
 from dataclasses import dataclass, field
 from math import floor, inf
+from pathlib import Path
 
-from shared.cron_schedule import parse_duration_minutes
+from shared.cron_schedule import DEFAULT_STATE as CRON_DEFAULT_STATE, ensure_schedule_interval, parse_duration_minutes
 from shared.google_sheet import _call_with_retry, get_worksheet_by_name
+from shared.state import load_state
 
 log = logging.getLogger(__name__)
 
@@ -79,8 +90,15 @@ _OPTIONAL_COLUMN_PREFIXES = {
 
 
 def _schedule_column_key(normalized_header: str) -> str | None:
-    """Colonnes "Temps planification solde (in)suffisant", tolérant aux fautes
-    de frappe de l'en-tête ("plannficiation", "insufisant"...)."""
+    """Colonnes "Temps planification solde (in)suffisant" et "Temps attente
+    avant démarrage borne inférieure / supérieure", tolérant aux fautes de
+    frappe de l'en-tête ("plannficiation", "insufisant"...)."""
+    if normalized_header.startswith("temps attente"):
+        if "inf" in normalized_header:
+            return "startup_wait_min"
+        if "sup" in normalized_header:
+            return "startup_wait_max"
+        return None
     if not normalized_header.startswith("temps plan"):
         return None
     if "insuf" in normalized_header:
@@ -184,6 +202,26 @@ class PlatformConfig:
     loans: dict = field(default_factory=dict)
     schedule_insufficient_minutes: int | None = None
     schedule_sufficient_minutes: int | None = None
+    startup_wait_min_minutes: int | None = None
+    startup_wait_max_minutes: int | None = None
+    primary_active: bool = True
+    secondary_market_active: bool = True
+
+    @property
+    def disabled(self) -> bool:
+        """True si ni le marché primaire ni le marché secondaire ne sont actifs
+        sur la ligne de la plateforme : le robot ne doit rien faire."""
+        return not (self.primary_active or self.secondary_market_active)
+
+    def startup_wait_range(self) -> tuple | None:
+        """(borne basse, borne haute) en minutes du jitter de démarrage ; None
+        si les deux colonnes sont vides/invalides."""
+        low, high = self.startup_wait_min_minutes, self.startup_wait_max_minutes
+        if low is None and high is None:
+            return None
+        low = 0 if low is None else low
+        high = low if high is None else high
+        return min(low, high), max(low, high)
 
     def active_names(self) -> list:
         return [name for name, loan in self.loans.items() if loan.active]
@@ -232,7 +270,7 @@ def get_platform_config(platform: str) -> PlatformConfig:
     worksheet = get_worksheet_by_name(CONFIG_SHEET_NAME)
     grid = _call_with_retry(worksheet.get_all_values)
 
-    header_idx = next((i for i, row in enumerate(grid) if row and _norm(row[0]) == "nom"), None)
+    header_idx = next((i for i, row in enumerate(grid) if any(_norm(c) == "nom" for c in row)), None)
     if header_idx is None:
         raise RuntimeError(f"En-tête 'Nom' introuvable dans l'onglet '{CONFIG_SHEET_NAME}'.")
 
@@ -271,15 +309,20 @@ def get_platform_config(platform: str) -> PlatformConfig:
     for key, attr in (
         ("schedule_insufficient", "schedule_insufficient_minutes"),
         ("schedule_sufficient", "schedule_sufficient_minutes"),
+        ("startup_wait_min", "startup_wait_min_minutes"),
+        ("startup_wait_max", "startup_wait_max_minutes"),
     ):
         raw = cell(grid[platform_idx], key)
         minutes = parse_duration_minutes(raw)
         if raw and minutes is None:
             log.warning(
-                "Config robot %s : temps de planification '%s' invalide (ex. '5min', '1h 5min', '2j'), valeur par défaut utilisée.",
+                "Config robot %s : durée '%s' invalide (ex. '5min', '1h 5min', '2j'), valeur par défaut utilisée.",
                 platform, raw,
             )
         setattr(config, attr, minutes)
+
+    config.primary_active = cell(grid[platform_idx], "active").lower() == "x"
+    config.secondary_market_active = cell(grid[platform_idx], "secondary_active").lower() == "x"
 
     for row in grid[platform_idx + 1:]:
         name = cell(row, "name")
@@ -304,11 +347,77 @@ def get_platform_config(platform: str) -> PlatformConfig:
             max_premium=_parse_number(cell(row, "max_premium")),
         )
 
+    # Un marché désactivé sur la ligne de la plateforme est ignoré pour tous ses loans.
+    for loan in config.loans.values():
+        loan.active = loan.active and config.primary_active
+        loan.secondary_active = loan.secondary_active and config.secondary_market_active
+
+    log.info(
+        "Config robot %s : marché primaire %s, marché secondaire %s.",
+        platform, "actif" if config.primary_active else "inactif",
+        "actif" if config.secondary_market_active else "inactif",
+    )
     log.info(
         "Config robot %s : %d loan(s) dont %d actif(s) et %d actif(s) marché secondaire, plafond par pays=%s%%.",
         platform, len(config.loans), len(config.active_names()), len(config.secondary_names()), config.country_max_pct,
     )
     return config
+
+
+def begin_run(
+    platform: str, cron_job_id, state_file: Path, default_sufficient: int, default_insufficient: int,
+) -> tuple:
+    """À appeler tout au début du run, avant le jitter de démarrage. Lit
+    "config robots" et remet le cron cron-job.org au bon intervalle si besoin :
+    celui des colonnes "Temps planification solde suffisant / insuffisant"
+    correspondant à l'état du solde enregistré dans `state_file` au dernier
+    run (rien ne change si l'intervalle en cache est déjà bon ou si l'état du
+    solde est inconnu). Retourne (arrêter, plage du jitter) : `arrêter` est
+    True si ni le marché primaire ni le marché secondaire ne sont actifs ;
+    une config illisible ne bloque pas le run (False, None)."""
+    try:
+        config = get_platform_config(platform)
+    except Exception:
+        log.exception("Config robot %s illisible, vérifications de début de run ignorées.", platform)
+        return False, None
+
+    sufficient = load_state(state_file, CRON_DEFAULT_STATE).get("cron_schedule_sufficient")
+    if isinstance(sufficient, bool):
+        ensure_schedule_interval(
+            config.schedule_minutes(sufficient, default_sufficient if sufficient else default_insufficient),
+            cron_job_id=cron_job_id, state_file=state_file, sufficient=sufficient,
+        )
+    else:
+        log.info("%s : état du solde du dernier run inconnu, planification vérifiée après lecture du solde.", platform)
+
+    if config.disabled:
+        log.info("%s : marchés primaire et secondaire inactifs dans 'config robots', run ignoré.", platform)
+    return config.disabled, config.startup_wait_range()
+
+
+def is_platform_disabled(platform: str) -> bool:
+    """True si l'onglet "config robots" désactive les deux marchés (primaire et
+    secondaire) de `platform` : à appeler au tout début du run, qui s'arrête
+    alors sans rien faire. Une lecture impossible ne bloque pas le robot."""
+    try:
+        config = get_platform_config(platform)
+    except Exception:
+        log.exception("Config robot %s illisible, vérification d'activation ignorée.", platform)
+        return False
+    if config.disabled:
+        log.info("%s : marchés primaire et secondaire inactifs dans 'config robots', run ignoré.", platform)
+    return config.disabled
+
+
+def resolve_startup_wait_range(platform: str) -> tuple | None:
+    """(borne basse, borne haute) en minutes du jitter de démarrage du robot
+    `platform`, lues dans l'onglet "config robots" ; None si les deux sont
+    vides/invalides ou si la lecture échoue."""
+    try:
+        return get_platform_config(platform).startup_wait_range()
+    except Exception:
+        log.exception("Config robot %s illisible, jitter de démarrage par défaut utilisé.", platform)
+        return None
 
 
 def resolve_schedule_minutes(platform: str, sufficient: bool, default: int, config: "PlatformConfig | None" = None) -> int:

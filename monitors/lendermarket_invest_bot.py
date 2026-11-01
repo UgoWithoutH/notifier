@@ -72,6 +72,7 @@ from shared.robot_config import (
     PlatformConfig,
     build_tracker,
     get_platform_config,
+    begin_run,
     match_name,
     plan_allocations,
     resolve_schedule_minutes,
@@ -769,8 +770,13 @@ def invest_selected_lenders(
 
 
 def run() -> None:
+    # Before the startup wait: schedule check against the sheet + stop if no market is active.
+    disabled, wait_range = begin_run("Lendermarket", LENDERMARKET_CRON_JOB_ID, CRON_SCHEDULE_STATE_FILE, 2, 30)
+    if disabled:
+        return
+
     run_started_at = datetime.now(timezone.utc)
-    apply_startup_jitter(CRON_SCHEDULE_STATE_FILE)
+    apply_startup_jitter(CRON_SCHEDULE_STATE_FILE, wait_range)
     state = load_state(STATE_FILE, DEFAULT_STATE)
 
     # Same rule as Swaper (see notification_gate.py): a segment is only
@@ -883,7 +889,7 @@ def run() -> None:
         sufficient = balance >= 10
         ensure_schedule_interval(
             resolve_schedule_minutes("Lendermarket", sufficient, 2 if sufficient else 30, config),
-            cron_job_id=LENDERMARKET_CRON_JOB_ID, state_file=CRON_SCHEDULE_STATE_FILE,
+            cron_job_id=LENDERMARKET_CRON_JOB_ID, state_file=CRON_SCHEDULE_STATE_FILE, sufficient=sufficient,
         )
 
     save_state(STATE_FILE, state)
