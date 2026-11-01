@@ -74,10 +74,11 @@ from shared.robot_config import (
     get_platform_config,
     match_name,
     plan_allocations,
+    resolve_schedule_minutes,
 )
 from shared.state import load_state, save_state
 from shared.session_cache import get_or_refresh_session
-from shared.cron_schedule import ensure_schedule, apply_startup_jitter
+from shared.cron_schedule import ensure_schedule_interval, apply_startup_jitter
 
 load_dotenv()
 
@@ -780,6 +781,7 @@ def run() -> None:
     # (not discarded) so the real auto-invest step below can reuse this same
     # login instead of authenticating twice per run.
     session, investor_id, balance = login_and_fetch_balance()
+    config = None
     log.info("Account balance: %s", f"{balance:.2f} €" if balance is not None else "unavailable")
 
     # Real auto-invest (added 2026-07-24, per explicit user request) - runs
@@ -872,12 +874,17 @@ def run() -> None:
                 log.info("Auto-invest: no fundable loan found this run for the selected lenders.")
 
     # Same cron-job.org speed-up/slow-down as Swaper (see cron_schedule.py):
-    # poll faster while there's money to invest. Skipped when the balance
-    # couldn't be determined, rather than guessing and possibly slowing down
-    # polling incorrectly.
+    # poll faster while there's money to invest. The two intervals come from
+    # the "Temps planification solde (in)suffisant" columns of the Lendermarket
+    # row in "config robots" (defaults 30 min / 2 min). Skipped when the
+    # balance couldn't be determined, rather than guessing and possibly
+    # slowing down polling incorrectly.
     if balance is not None:
-        mode = "30m" if balance < 10 else "2m"
-        ensure_schedule(mode, cron_job_id=LENDERMARKET_CRON_JOB_ID, state_file=CRON_SCHEDULE_STATE_FILE)
+        sufficient = balance >= 10
+        ensure_schedule_interval(
+            resolve_schedule_minutes("Lendermarket", sufficient, 2 if sufficient else 30, config),
+            cron_job_id=LENDERMARKET_CRON_JOB_ID, state_file=CRON_SCHEDULE_STATE_FILE,
+        )
 
     save_state(STATE_FILE, state)
 
