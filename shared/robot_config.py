@@ -8,8 +8,7 @@ suivante) :
 
 - Nom : nom de la plateforme (ligne de bloc) ou du loan.
 - Pays : pays du loan (peut être vide).
-- Actif marché primaire : "x" = le robot peut investir sur ce loan. Sur la
-  ligne de la PLATEFORME, vide = marché primaire désactivé pour tous les loans.
+- Actif marché primaire : "x" = le robot peut investir sur ce loan.
 - Taux min / Taux max : bornes du taux d'intérêt des prêts acceptés
   (vide = pas de borne).
 - Pourcentage max du solde par pays : sur la ligne de la plateforme,
@@ -21,9 +20,8 @@ suivante) :
   est réparti à parts égales entre les prêts disponibles du run.
 - Actif marché secondaire : "x" = le robot peut acheter ce loan sur le marché
   secondaire (colonnes optionnelles ci-dessous, ignorées sur le marché primaire).
-  Sur la ligne de la PLATEFORME, vide/colonne absente = marché secondaire
-  désactivé pour tous les loans. Si les deux marchés sont inactifs sur la
-  ligne de la plateforme, le robot s'arrête dès le début du run.
+  Si aucun loan de la plateforme n'est actif (primaire ou secondaire), le
+  robot s'arrête dès le début du run, avant le jitter.
 - Durée restante min / max : durée restante du prêt, en mois.
 - décote / prime min / max : en % du principal, négatif = décote, positif = prime.
 - Temps planification solde insuffisant / suffisant (colonnes facultatives,
@@ -204,14 +202,12 @@ class PlatformConfig:
     schedule_sufficient_minutes: int | None = None
     startup_wait_min_minutes: int | None = None
     startup_wait_max_minutes: int | None = None
-    primary_active: bool = True
-    secondary_market_active: bool = True
 
     @property
     def disabled(self) -> bool:
-        """True si ni le marché primaire ni le marché secondaire ne sont actifs
-        sur la ligne de la plateforme : le robot ne doit rien faire."""
-        return not (self.primary_active or self.secondary_market_active)
+        """True si aucune société de prêt de la plateforme n'est active (ni sur
+        le marché primaire ni sur le secondaire) : le robot ne doit rien faire."""
+        return not (self.active_names() or self.secondary_names())
 
     def startup_wait_range(self) -> tuple | None:
         """(borne basse, borne haute) en minutes du jitter de démarrage ; None
@@ -321,9 +317,6 @@ def get_platform_config(platform: str) -> PlatformConfig:
             )
         setattr(config, attr, minutes)
 
-    config.primary_active = cell(grid[platform_idx], "active").lower() == "x"
-    config.secondary_market_active = cell(grid[platform_idx], "secondary_active").lower() == "x"
-
     for row in grid[platform_idx + 1:]:
         name = cell(row, "name")
         if not name:
@@ -347,16 +340,6 @@ def get_platform_config(platform: str) -> PlatformConfig:
             max_premium=_parse_number(cell(row, "max_premium")),
         )
 
-    # Un marché désactivé sur la ligne de la plateforme est ignoré pour tous ses loans.
-    for loan in config.loans.values():
-        loan.active = loan.active and config.primary_active
-        loan.secondary_active = loan.secondary_active and config.secondary_market_active
-
-    log.info(
-        "Config robot %s : marché primaire %s, marché secondaire %s.",
-        platform, "actif" if config.primary_active else "inactif",
-        "actif" if config.secondary_market_active else "inactif",
-    )
     log.info(
         "Config robot %s : %d loan(s) dont %d actif(s) et %d actif(s) marché secondaire, plafond par pays=%s%%.",
         platform, len(config.loans), len(config.active_names()), len(config.secondary_names()), config.country_max_pct,
@@ -373,7 +356,8 @@ def begin_run(
     correspondant à l'état du solde enregistré dans `state_file` au dernier
     run (rien ne change si l'intervalle en cache est déjà bon ou si l'état du
     solde est inconnu). Retourne (arrêter, plage du jitter) : `arrêter` est
-    True si ni le marché primaire ni le marché secondaire ne sont actifs ;
+    True si aucune société de prêt de la plateforme n'est active (marché
+    primaire ou secondaire) ;
     une config illisible ne bloque pas le run (False, None)."""
     try:
         config = get_platform_config(platform)
@@ -391,13 +375,13 @@ def begin_run(
         log.info("%s : état du solde du dernier run inconnu, planification vérifiée après lecture du solde.", platform)
 
     if config.disabled:
-        log.info("%s : marchés primaire et secondaire inactifs dans 'config robots', run ignoré.", platform)
+        log.info("%s : aucune société de prêt active (primaire ou secondaire) dans 'config robots', run ignoré.", platform)
     return config.disabled, config.startup_wait_range()
 
 
 def is_platform_disabled(platform: str) -> bool:
-    """True si l'onglet "config robots" désactive les deux marchés (primaire et
-    secondaire) de `platform` : à appeler au tout début du run, qui s'arrête
+    """True si aucune société de prêt de `platform` n'est active dans l'onglet
+    "config robots" : à appeler au tout début du run, qui s'arrête
     alors sans rien faire. Une lecture impossible ne bloque pas le robot."""
     try:
         config = get_platform_config(platform)
@@ -405,7 +389,7 @@ def is_platform_disabled(platform: str) -> bool:
         log.exception("Config robot %s illisible, vérification d'activation ignorée.", platform)
         return False
     if config.disabled:
-        log.info("%s : marchés primaire et secondaire inactifs dans 'config robots', run ignoré.", platform)
+        log.info("%s : aucune société de prêt active (primaire ou secondaire) dans 'config robots', run ignoré.", platform)
     return config.disabled
 
 
