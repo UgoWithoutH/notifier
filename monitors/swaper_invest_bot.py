@@ -255,7 +255,8 @@ from shared.cron_schedule import ensure_schedule_interval, apply_startup_jitter
 from shared.google_sheet import get_geo_platform_snapshot
 from shared.missing_loans import TRANSIENT_GRACE_SECONDS, report_missing_loans
 from shared.robot_config import (
-    Candidate, build_tracker, get_platform_config, match_name, plan_allocations, resolve_schedule_minutes,
+    Candidate, begin_run, build_tracker, get_platform_config, match_name, plan_allocations,
+    resolve_schedule_minutes,
 )
 from shared.browser_stealth import get_context_options, apply_stealth, human_pause, human_mouse_wander, human_type
 
@@ -955,11 +956,16 @@ def _invest_available_loans(page, loans: list, shares: dict, captured_api_calls:
 
 
 def run(headless: bool = True) -> None:
+    # Before the startup wait: schedule check against the sheet + stop if no market is active.
+    disabled, wait_range = begin_run("Swaper", SWAPER_CRON_JOB_ID, CRON_SCHEDULE_STATE_FILE, 2, 30)
+    if disabled:
+        return
+
     if not SWAPER_EMAIL or not SWAPER_PASSWORD:
         log.error("SWAPER_EMAIL and SWAPER_PASSWORD environment variables are required.")
         sys.exit(1)
 
-    apply_startup_jitter(CRON_SCHEDULE_STATE_FILE)
+    apply_startup_jitter(CRON_SCHEDULE_STATE_FILE, wait_range)
 
     state = load_state(STATE_FILE, DEFAULT_STATE)
 
@@ -1372,7 +1378,7 @@ def run(headless: bool = True) -> None:
     sufficient = balance >= 10
     ensure_schedule_interval(
         resolve_schedule_minutes("Swaper", sufficient, 2 if sufficient else 30, robot_config),
-        cron_job_id=SWAPER_CRON_JOB_ID, state_file=CRON_SCHEDULE_STATE_FILE,
+        cron_job_id=SWAPER_CRON_JOB_ID, state_file=CRON_SCHEDULE_STATE_FILE, sufficient=sufficient,
     )
 
     save_state(STATE_FILE, state)
