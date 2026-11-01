@@ -166,7 +166,8 @@ def _swaper_actual_amount(attempt: dict) -> float | None:
         investment = body.get("investment")
         if not isinstance(investment, dict):
             continue
-        raw_amount = investment.get("amount")
+        # `amount` is the whole loan's size (e.g. 1000.00); `investedAmount` is our share.
+        raw_amount = investment.get("investedAmount")
         if isinstance(raw_amount, bool):
             continue
         try:

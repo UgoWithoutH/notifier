@@ -908,6 +908,14 @@ def _invest_available_loans(page, loans: list, shares: dict, captured_api_calls:
                 except PlaywrightTimeoutError:
                     pass
                 confirmed = True
+                # The buy response can land after the modal closes; wait for it so it isn't dropped.
+                for _ in range(20):
+                    if any(
+                        c.get("method") == "POST" and "/buy" in (c.get("url") or "")
+                        for c in captured_api_calls[calls_before_confirm:]
+                    ):
+                        break
+                    page.wait_for_timeout(500)
             except Exception:
                 log.exception(
                     "Could not click the Confirm button for loan %s - stopping here rather than guessing.",
