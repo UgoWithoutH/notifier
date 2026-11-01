@@ -34,9 +34,10 @@ MODE (env AFRANGA_BOT_MODE, default "probe"):
 
 Required env vars: AFRANGA_EMAIL, AFRANGA_PASSWORD, AFRANGA_TOTP_SECRET (if 2FA),
 GOOGLE_SHEET_ID, GOOGLE_CREDENTIALS, SMTP_* / EMAIL_TO.
-Optional: CRON_JOB_API_KEY, AFRANGA_CRON_JOB_ID -> cron-job.org schedule every 2 min
-(balance >= minimum) / once a day (below), cached in a local state file so the API
-is only called when the mode changes (see shared/cron_schedule.py).
+Optional: CRON_JOB_API_KEY, AFRANGA_CRON_JOB_ID -> cron-job.org schedule: the "Temps
+planification solde suffisant / insuffisant" columns of the Afranga row in "config robots"
+(defaults: every 2 min when the balance >= minimum, once a day below), cached in a local
+state file so the API is only called when the interval changes (see shared/cron_schedule.py).
 """
 
 import json
@@ -56,7 +57,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 from diversification.afranga_diversification import _HEADERS, fetch_uninvested_balance, login
-from shared.cron_schedule import apply_startup_jitter, ensure_schedule
+from shared.cron_schedule import DAY_MINUTES, apply_startup_jitter, ensure_schedule_interval
 from shared.google_sheet import get_geo_platform_snapshot
 from shared.missing_loans import TRANSIENT_GRACE_SECONDS, report_missing_loans
 from shared.notifier import send_afranga_invest_summary_email
@@ -471,16 +472,26 @@ def run() -> None:
         # login() returns None, so the balance is fetched by fetch_fn on the fresh session.
         stats["balance_before"] = stats["balance_after"] = balance
         log.info("Afranga mode=%s, uninvested balance: %.2f EUR", MODE, balance)
-        # Before any early return, so the schedule always follows the balance.
-        ensure_schedule(
-            "24h" if balance < MIN_INVESTMENT_AMOUNT else "2m",
+        # Read before any early return, so the schedule always follows the
+        # balance; a read failure only matters once the balance is sufficient.
+        config_error = None
+        try:
+            config = get_platform_config("Afranga")
+        except Exception as exc:
+            config_error = exc
+            log.exception("Could not read the Afranga configuration from the 'config robots' sheet.")
+        sufficient = balance >= MIN_INVESTMENT_AMOUNT
+        default_minutes = 2 if sufficient else DAY_MINUTES
+        ensure_schedule_interval(
+            config.schedule_minutes(sufficient, default_minutes) if config else default_minutes,
             cron_job_id=AFRANGA_CRON_JOB_ID, state_file=CRON_SCHEDULE_STATE_FILE,
         )
-        if balance < MIN_INVESTMENT_AMOUNT:
+        if not sufficient:
             log.info("Balance below the minimum investment amount - nothing to do.")
             return
 
-        config = get_platform_config("Afranga")
+        if config is None:
+            raise config_error
         if not config.active_names() and not config.secondary_names():
             log.info("No Afranga loan is active (primary or secondary) in the config sheet.")
             return
