@@ -299,6 +299,14 @@ def send_lendermarket_invest_summary_email(stats: dict, error: str | None = None
         })
 
     attachment = None
+    failed_context = [
+        {k: v for k, v in item.items() if k in ("label", "amount", "loan_uuid", "loan", "context")}
+        for item in stats.get("failed_attempts") or [] if item.get("loan") is not None
+    ]
+    if failed_context:
+        diagnostics_text = (diagnostics_text or "") + "\n\n=== Contexte des tentatives échouées (données marketplace du prêt) ===\n" + json.dumps(
+            failed_context, indent=2, default=str, ensure_ascii=False,
+        )
     if diagnostics_text:
         attachment = ("lendermarket_invest_bot_diagnostics_this_run.log", diagnostics_text)
     _send_invest_summary_email(
