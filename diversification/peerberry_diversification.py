@@ -188,7 +188,7 @@ from shared.google_sheet import (
     fill_remaining_duration_amounts,
 )
 from shared.rate_sheet import fill_rate_amounts
-from shared.remaining_duration import RateWeights, base_term_between, base_term_from_days, overdue_months_and_days, remaining_months_and_days
+from shared.remaining_duration import DEFAULT_AFTER_LATE_DAYS, RateWeights, base_term_between, base_term_from_days, overdue_months_and_days, remaining_months_and_days
 from shared.report_date import get_report_now, is_current_month
 from shared.session_cache import get_or_refresh_session
 from shared.state import load_state, save_state
@@ -209,9 +209,8 @@ LOANS_API_URL = "https://api.peerberry.com/v1/loans"
 # Server caps pageSize at 40 (verified live 2026-10-16: 100 -> 422 "Page Size must be no greater than 40").
 INVESTMENTS_PAGE_SIZE = 40
 MAX_INVESTMENTS_PAGES = 50
-# PeerBerry only exposes CURRENT/LATE statuses (no default status): a loan late by more than this many days is
-# treated as in default in the "durée" tab (inferred, 60 days = common industry threshold).
-PEERBERRY_DEFAULT_DAYS = 60
+# PeerBerry only exposes CURRENT/LATE statuses (no default status): a loan late by more than the shared
+# DEFAULT_AFTER_LATE_DAYS (buyback trigger + grace period) is treated as in default in the "durée" tab (inferred).
 # The Account Summary page's default "This month" period (verified 2026-07-10
 # by capturing its own request) = 1st of the current month through TODAY, not
 # the full calendar month - same semantics as Swaper/Afranga/Lendermarket's
@@ -361,7 +360,7 @@ def aggregate_remaining_durations(investments: list, today: date, rates: RateWei
     `nextPaymentDate` just rolled over to today) are grouped by
     overdue_months_and_days() since their missed due date (the earliest of
     `finalPaymentDate`/`nextPaymentDate` that is in the past). PeerBerry has
-    no default status, so a loan more than PEERBERRY_DEFAULT_DAYS late is
+    no default status, so a loan more than DEFAULT_AFTER_LATE_DAYS late is
     INFERRED to be in default ("de défaut" instead of "de retard").
 
     `rates` (optional RateWeights) collects each investment's `interestRate`
@@ -381,7 +380,7 @@ def aggregate_remaining_durations(investments: list, today: date, rates: RateWei
             due_dates = [d for d in (maturity, _parse_iso_date(inv.get("nextPaymentDate"))) if d and d < today]
             if due_dates:
                 due = min(due_dates)
-                term = overdue_months_and_days(today, due, default=(today - due).days > PEERBERRY_DEFAULT_DAYS)
+                term = overdue_months_and_days(today, due, default=(today - due).days > DEFAULT_AFTER_LATE_DAYS)
             else:
                 log.warning("Late investment of %s (%.2f EUR) has no past due date - using its remaining term.", originator, amount)
         if term is None:

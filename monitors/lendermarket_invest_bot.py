@@ -72,12 +72,14 @@ from shared.robot_config import (
     PlatformConfig,
     build_tracker,
     get_platform_config,
+    begin_run,
     match_name,
     plan_allocations,
+    resolve_schedule_minutes,
 )
 from shared.state import load_state, save_state
 from shared.session_cache import get_or_refresh_session
-from shared.cron_schedule import ensure_schedule, apply_startup_jitter
+from shared.cron_schedule import ensure_schedule_interval, apply_startup_jitter
 
 load_dotenv()
 
@@ -544,7 +546,16 @@ def _format_amount(amount: float) -> str:
     return f"{rounded:.2f}".rstrip("0").rstrip(".")
 
 
-def attempt_investment(session: requests.Session, loan_uuid: str, amount: float) -> tuple[bool, str | None]:
+def _extract_invested_amount(response_text: str) -> float | None:
+    """`data.investmentAmount` of the createInvestment response, i.e. what
+    Lendermarket really booked."""
+    try:
+        return float(((json.loads(response_text) or {}).get("data") or {}).get("investmentAmount"))
+    except (TypeError, ValueError, AttributeError):
+        return None
+
+
+def attempt_investment(session: requests.Session, loan_uuid: str, amount: float) -> tuple[bool, str | None, float]:
     """Real invest submission call - `POST claims/v1/investor/createInvestment`,
     see module docstring/repo memory ("2026-07-24 ... createInvestment") for
     how this was captured (safe, network-intercepted click-through, no real
@@ -556,7 +567,9 @@ def attempt_investment(session: requests.Session, loan_uuid: str, amount: float)
     checkbox, wasn't expanded/checked - but a real bot should accept both
     sets of terms to actually invest properly).
     Always logs the full request+response to INVEST_DIAGNOSTICS_FILE,
-    whether it succeeds or fails. Returns `(success, failure_reason)`."""
+    whether it succeeds or fails. Returns `(success, failure_reason,
+    invested_amount)`; `invested_amount` is read from the API response
+    (`data.investmentAmount`), 0.0 on failure."""
     payload = {
         "investmentAmount": _format_amount(amount),
         "acceptedLimitedPurposeTerms": True,
@@ -575,7 +588,7 @@ def attempt_investment(session: requests.Session, loan_uuid: str, amount: float)
             traceback=traceback.format_exc(),
         )
         log.exception("Investment attempt raised an exception for loan %s.", loan_uuid)
-        return False, f"exception : {exc}"
+        return False, f"exception : {exc}", 0.0
 
     _log_invest_diagnostics(
         "invest_attempt",
@@ -586,13 +599,22 @@ def attempt_investment(session: requests.Session, loan_uuid: str, amount: float)
         response_body=r.text[:5000],
     )
     if r.ok:
-        log.info("Investment attempt for loan %s (%.2f EUR) returned status=%s.", loan_uuid, amount, r.status_code)
-        return True, None
+        invested = _extract_invested_amount(r.text)
+        if invested is None:
+            log.warning(
+                "Investment for loan %s returned status=%s but no investmentAmount could be read from the response, "
+                "falling back to the requested %.2f EUR.", loan_uuid, r.status_code, amount,
+            )
+            invested = amount
+        elif abs(invested - amount) > 0.005:
+            log.warning("Loan %s: requested %.2f EUR but the API reports %.2f EUR invested.", loan_uuid, amount, invested)
+        log.info("Investment for loan %s: %.2f EUR invested (status=%s).", loan_uuid, invested, r.status_code)
+        return True, None, invested
     log.warning(
         "Investment attempt for loan %s (%.2f EUR) FAILED status=%s - full request/response saved to diagnostics.",
         loan_uuid, amount, r.status_code,
     )
-    return False, f"HTTP {r.status_code} : {' '.join(r.text.split())[:300]}"
+    return False, f"HTTP {r.status_code} : {' '.join(r.text.split())[:300]}", 0.0
 
 
 def invest_selected_lenders(
@@ -730,15 +752,15 @@ def invest_selected_lenders(
         lender_stat = stats["lender_stats"][sheet_name]
         stats["invest_attempts"] += 1
         lender_stat["attempts"] += 1
-        success, failure_reason = attempt_investment(session, loan_uuid, amount)
+        success, failure_reason, invested = attempt_investment(session, loan_uuid, amount)
         if success:
             stats["invest_successes"] += 1
-            stats["total_invested"] += amount
-            stats["balance_after"] -= amount
+            stats["total_invested"] += invested
+            stats["balance_after"] -= invested
             lender_stat["successes"] += 1
-            lender_stat["invested_amount"] += amount
-            lender_stat["invested_loans"].append({"amount": amount, "interestRate": rate})
-            tracker.add(sheet_name, amount)
+            lender_stat["invested_amount"] += invested
+            lender_stat["invested_loans"].append({"amount": invested, "interestRate": rate})
+            tracker.add(sheet_name, invested)
         else:
             stats["invest_failures"] += 1
             lender_stat["failures"] += 1
@@ -755,8 +777,13 @@ def invest_selected_lenders(
 
 
 def run() -> None:
+    # Before the startup wait: schedule check against the sheet + stop if no market is active.
+    disabled, wait_range = begin_run("Lendermarket", LENDERMARKET_CRON_JOB_ID, CRON_SCHEDULE_STATE_FILE, 2, 30)
+    if disabled:
+        return
+
     run_started_at = datetime.now(timezone.utc)
-    apply_startup_jitter(CRON_SCHEDULE_STATE_FILE)
+    apply_startup_jitter(CRON_SCHEDULE_STATE_FILE, wait_range)
     state = load_state(STATE_FILE, DEFAULT_STATE)
 
     # Same rule as Swaper (see notification_gate.py): a segment is only
@@ -767,6 +794,7 @@ def run() -> None:
     # (not discarded) so the real auto-invest step below can reuse this same
     # login instead of authenticating twice per run.
     session, investor_id, balance = login_and_fetch_balance()
+    config = None
     log.info("Account balance: %s", f"{balance:.2f} €" if balance is not None else "unavailable")
 
     # Real auto-invest (added 2026-07-24, per explicit user request) - runs
@@ -859,12 +887,17 @@ def run() -> None:
                 log.info("Auto-invest: no fundable loan found this run for the selected lenders.")
 
     # Same cron-job.org speed-up/slow-down as Swaper (see cron_schedule.py):
-    # poll faster while there's money to invest. Skipped when the balance
-    # couldn't be determined, rather than guessing and possibly slowing down
-    # polling incorrectly.
+    # poll faster while there's money to invest. The two intervals come from
+    # the "Temps planification solde (in)suffisant" columns of the Lendermarket
+    # row in "config robots" (defaults 30 min / 2 min). Skipped when the
+    # balance couldn't be determined, rather than guessing and possibly
+    # slowing down polling incorrectly.
     if balance is not None:
-        mode = "30m" if balance < 10 else "2m"
-        ensure_schedule(mode, cron_job_id=LENDERMARKET_CRON_JOB_ID, state_file=CRON_SCHEDULE_STATE_FILE)
+        sufficient = balance >= 10
+        ensure_schedule_interval(
+            resolve_schedule_minutes("Lendermarket", sufficient, 2 if sufficient else 30, config),
+            cron_job_id=LENDERMARKET_CRON_JOB_ID, state_file=CRON_SCHEDULE_STATE_FILE, sufficient=sufficient,
+        )
 
     save_state(STATE_FILE, state)
 
