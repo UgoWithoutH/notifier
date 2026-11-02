@@ -143,7 +143,7 @@ from shared.google_sheet import (
     fill_remaining_duration_amounts,
 )
 from shared.rate_sheet import fill_rate_amounts
-from shared.remaining_duration import RateWeights, overdue_months_and_days, remaining_months_and_days
+from shared.remaining_duration import DEFAULT_AFTER_LATE_DAYS, RateWeights, overdue_months_and_days, remaining_months_and_days
 from shared.report_date import get_report_date, is_current_month
 from shared.session_cache import get_or_refresh_session
 from shared.state import load_state, save_state
@@ -195,8 +195,6 @@ XIRR_CASHFLOWS_STATE_FILE = Path(__file__).parent / "nectaro_xirr_cashflows_stat
 XIRR_CASHFLOWS_STATE_DEFAULT = {"transactions": [], "last_fetched_date": None}
 # Rows can be posted days after their own date, so re-fetch this many days before the cache frontier.
 XIRR_CACHE_OVERLAP_DAYS = 30
-# Days of lateness after which the lending company must buy a loan back.
-BUYBACK_DAYS = 60
 
 
 def login(session: requests.Session) -> str:
@@ -498,8 +496,8 @@ def aggregate_remaining_durations(session: requests.Session, headers: dict, toda
     The share of a note held by DELAYED underlying loans is grouped by
     overdue_months_and_days() since the missed payment instead (negated =
     late; (months, days, "default") if still late beyond the 60-day buyback
-    obligation, which is inferred and never observed: such loans turn
-    BUYBACK). Totals per originator are unchanged. Verified live 2026-10-16
+    obligation plus the grace period (shared DEFAULT_AFTER_LATE_DAYS; such loans turn
+    BUYBACK as soon as the 60 days pass, so the default case is inferred and never observed). Totals per originator are unchanged. Verified live 2026-10-16
     on late loans (dpd 4-47 days); the default case is untested.
     `rates` (optional RateWeights) collects each loan's `interestRate` (already
     in percent), under the same originator/term/amount as the durations, plus its
@@ -515,7 +513,7 @@ def aggregate_remaining_durations(session: requests.Session, headers: dict, toda
         normal_share = 1.0
         for share, due in loan["late"]:
             overdue_days = (today - due).days
-            term = overdue_months_and_days(today, due, default=overdue_days > BUYBACK_DAYS)
+            term = overdue_months_and_days(today, due, default=overdue_days > DEFAULT_AFTER_LATE_DAYS)
             if term is None:
                 continue
             durations[term] = durations.get(term, 0.0) + amount * share

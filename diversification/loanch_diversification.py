@@ -224,6 +224,7 @@ from shared.google_sheet import (
 )
 from shared.rate_sheet import fill_rate_amounts
 from shared.remaining_duration import (
+    DEFAULT_AFTER_LATE_DAYS,
     RateWeights,
     base_term_between,
     base_term_from_days,
@@ -251,10 +252,10 @@ STATEMENT_API_URL = "https://api.loanch.com/api/v1/statement-report"
 DASHBOARD_API_URL = "https://api.loanch.com/api/v1/dashboard"
 TRANSACTIONS_API_URL = "https://api.loanch.com/api/v1/transaction"
 PAGE_SIZE = 100
-# Loanch exposes no default status: a loan late by more than this many days
-# is treated as in default in the "durée" tab (inferred, 60 days = common
-# industry threshold).
-LOANCH_DEFAULT_DAYS = 60# Every valid `transaction_type` choice as of 2026-08-14 (probed live by
+# Loanch exposes no default status: a loan late by more than the shared
+# DEFAULT_AFTER_LATE_DAYS (buyback trigger + grace period) is treated as in
+# default in the "durée" tab (inferred).
+# Every valid `transaction_type` choice as of 2026-08-14 (probed live by
 # requesting each value individually - 11+ all returned 400
 # "invalid_choice") - see module docstring for what each observed value means.
 TRANSACTION_TYPES = list(range(0, 11))
@@ -480,7 +481,7 @@ def aggregate_remaining_durations(investments: list, today: date, rates=None) ->
     today - days_delayed, verified), falling back to today - days_delayed.
     Loanch exposes no default status (no defaulted investment on the account
     to verify; `secondary_status`/`closed_reason` were always empty), so a
-    loan more than LOANCH_DEFAULT_DAYS late is INFERRED to be in default
+    loan more than DEFAULT_AFTER_LATE_DAYS late is INFERRED to be in default
     ("de défaut" instead of "de retard")."""
     result = {}
     for inv in investments:
@@ -501,7 +502,7 @@ def aggregate_remaining_durations(investments: list, today: date, rates=None) ->
                 due = today - timedelta(days=delayed_days)
             if due >= today:
                 due = today - timedelta(days=delayed_days)
-            term = overdue_months_and_days(today, due, default=delayed_days > LOANCH_DEFAULT_DAYS)
+            term = overdue_months_and_days(today, due, default=delayed_days > DEFAULT_AFTER_LATE_DAYS)
         if term is None:
             try:
                 maturity = date.fromisoformat(inv["maturity_date"][:10])
