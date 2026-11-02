@@ -681,6 +681,7 @@ def invest_selected_lenders(
 
     candidates = []
     loan_lookup = {}
+    loan_raw = {}
     for sheet_name, country in matched:
         loans = loans_by_name[sheet_name]
         stats["lender_stats"][sheet_name] = {
@@ -707,6 +708,7 @@ def invest_selected_lenders(
                 rate = None
             candidates.append(Candidate(loan_uuid, sheet_name, available, rate))
             loan_lookup[loan_uuid] = (sheet_name, rate)
+            loan_raw[loan_uuid] = loan
 
     if not candidates:
         log.info("No available loan for the active Lendermarket lenders %s - nothing to invest this run.", [m[0] for m in matched])
@@ -740,7 +742,12 @@ def invest_selected_lenders(
         else:
             stats["invest_failures"] += 1
             lender_stat["failures"] += 1
-            stats["failed_attempts"].append({"label": sheet_name, "amount": amount, "reason": failure_reason})
+            stats["failed_attempts"].append({
+                "label": sheet_name, "amount": amount, "reason": failure_reason,
+                # Marketplace data of the loan + plan, attached to the email to diagnose a rejection.
+                "loan_uuid": loan_uuid, "loan": loan_raw.get(loan_uuid),
+                "context": {"balance_before": balance, "balance_now": stats["balance_after"], "plan": plan},
+            })
 
     stats["country_status"] = tracker.country_status(relevant_countries)
     stats["originator_cap_status"] = tracker.loan_cap_status()
