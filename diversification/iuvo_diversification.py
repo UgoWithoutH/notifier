@@ -169,7 +169,7 @@ try:
     from shared.google_sheet import fill_current_month_amounts, fill_current_month_bonus_breakdown, fill_geographic_repartition_amounts, fill_geographic_repartition_uninvested_amount, fill_remaining_duration_amounts
     from shared.monthly_yield_waterfall import compute_monthly_yield_shares
     from shared.rate_sheet import fill_rate_amounts
-    from shared.remaining_duration import RateWeights, base_term_between, overdue_months_and_days, remaining_months_and_days
+    from shared.remaining_duration import DEFAULT_AFTER_LATE_DAYS, RateWeights, base_term_between, overdue_months_and_days, remaining_months_and_days
     from shared.report_date import get_report_now, is_current_month
     from shared.session_cache import get_or_refresh_session
     from shared.state import load_state, save_state
@@ -185,7 +185,7 @@ except ModuleNotFoundError:
     from shared.google_sheet import fill_current_month_amounts, fill_current_month_bonus_breakdown, fill_geographic_repartition_amounts, fill_geographic_repartition_uninvested_amount, fill_remaining_duration_amounts
     from shared.monthly_yield_waterfall import compute_monthly_yield_shares
     from shared.rate_sheet import fill_rate_amounts
-    from shared.remaining_duration import RateWeights, base_term_between, overdue_months_and_days, remaining_months_and_days
+    from shared.remaining_duration import DEFAULT_AFTER_LATE_DAYS, RateWeights, base_term_between, overdue_months_and_days, remaining_months_and_days
     from shared.report_date import get_report_now, is_current_month
     from shared.session_cache import get_or_refresh_session
     from shared.state import load_state, save_state
@@ -445,7 +445,9 @@ def aggregate_remaining_durations(session: requests.Session, session_token: str,
     warning).
 
     A loan whose status isn't "Current" is late, or in default if "In
-    recovery" (inferred: not seen live); it is grouped by how long ago its
+    recovery" (inferred: not seen live) or more than DEFAULT_AFTER_LATE_DAYS
+    late (the platform's 100% buyback obligation, due at 60 days, is then
+    still unpaid); it is grouped by how long ago its
     oldest unpaid instalment fell due (payment schedule; falling back to the
     table's "<N> Days delay"), otherwise it keeps its remaining term."""
     result = {}
@@ -466,7 +468,11 @@ def aggregate_remaining_durations(session: requests.Session, session_token: str,
             if late_since is None and days_late:
                 late_since = today - timedelta(days=int(days_late.group(1)))
             if late_since is not None:
-                term = overdue_months_and_days(today, late_since, default="recovery" in f"{status} {table_status}".lower())
+                late_days = (today - late_since).days
+                term = overdue_months_and_days(
+                    today, late_since,
+                    default="recovery" in f"{status} {table_status}".lower() or late_days > DEFAULT_AFTER_LATE_DAYS,
+                )
         if term is None:
             term = remaining_months_and_days(today, details["maturity"])
         durations = result.setdefault(details["originator"], {})

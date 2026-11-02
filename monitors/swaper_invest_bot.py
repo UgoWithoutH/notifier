@@ -20,7 +20,7 @@ Optional:
     SWAPER_CRON_JOB_ID                     -> cron-job.org job id: used to
                                                speed up/slow down the external
                                                trigger's own schedule based on
-                                               balance (see ensure_schedule())
+                                               balance (see ensure_schedule_interval())
 
 REAL auto-invest bot (added 2026-07-25, explicit user decision - real money,
 no more click-and-abort safety net): does a SINGLE discovery+invest pass per
@@ -251,10 +251,13 @@ from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeo
 
 from shared.notifier import send_swaper_investment_summary_email
 from shared.state import load_state, save_state
-from shared.cron_schedule import ensure_schedule, apply_startup_jitter
+from shared.cron_schedule import ensure_schedule_interval, apply_startup_jitter
 from shared.google_sheet import get_geo_platform_snapshot
 from shared.missing_loans import TRANSIENT_GRACE_SECONDS, report_missing_loans
-from shared.robot_config import Candidate, build_tracker, get_platform_config, match_name, plan_allocations
+from shared.robot_config import (
+    Candidate, begin_run, build_tracker, get_platform_config, match_name, plan_allocations,
+    resolve_schedule_minutes,
+)
 from shared.browser_stealth import get_context_options, apply_stealth, human_pause, human_mouse_wander, human_type
 
 DEFAULT_STATE = {
@@ -908,6 +911,14 @@ def _invest_available_loans(page, loans: list, shares: dict, captured_api_calls:
                 except PlaywrightTimeoutError:
                     pass
                 confirmed = True
+                # The buy response can land after the modal closes; wait for it so it isn't dropped.
+                for _ in range(20):
+                    if any(
+                        c.get("method") == "POST" and "/buy" in (c.get("url") or "")
+                        for c in captured_api_calls[calls_before_confirm:]
+                    ):
+                        break
+                    page.wait_for_timeout(500)
             except Exception:
                 log.exception(
                     "Could not click the Confirm button for loan %s - stopping here rather than guessing.",
@@ -945,11 +956,16 @@ def _invest_available_loans(page, loans: list, shares: dict, captured_api_calls:
 
 
 def run(headless: bool = True) -> None:
+    # Before the startup wait: schedule check against the sheet + stop if no market is active.
+    disabled, wait_range = begin_run("Swaper", SWAPER_CRON_JOB_ID, CRON_SCHEDULE_STATE_FILE, 2, 30)
+    if disabled:
+        return
+
     if not SWAPER_EMAIL or not SWAPER_PASSWORD:
         log.error("SWAPER_EMAIL and SWAPER_PASSWORD environment variables are required.")
         sys.exit(1)
 
-    apply_startup_jitter(CRON_SCHEDULE_STATE_FILE)
+    apply_startup_jitter(CRON_SCHEDULE_STATE_FILE, wait_range)
 
     state = load_state(STATE_FILE, DEFAULT_STATE)
 
@@ -1355,13 +1371,15 @@ def run(headless: bool = True) -> None:
         )
 
     # Cron-job.org schedule speed-up/slow-down (re-enabled 2026-09-09, see
-    # shared/cron_schedule.py's own docstring for the live-check-then-cache
-    # fallback + randomized-jitter details) - poll faster while there's
-    # money to invest.
-    if balance < 10:
-        ensure_schedule("30m", cron_job_id=SWAPER_CRON_JOB_ID, state_file=CRON_SCHEDULE_STATE_FILE)
-    else:
-        ensure_schedule("2m", cron_job_id=SWAPER_CRON_JOB_ID, state_file=CRON_SCHEDULE_STATE_FILE)
+    # shared/cron_schedule.py's own docstring) - poll faster while there's
+    # money to invest. The two intervals come from the "Temps planification
+    # solde (in)suffisant" columns of the Swaper row in "config robots"
+    # (defaults 30 min / 2 min).
+    sufficient = balance >= 10
+    ensure_schedule_interval(
+        resolve_schedule_minutes("Swaper", sufficient, 2 if sufficient else 30, robot_config),
+        cron_job_id=SWAPER_CRON_JOB_ID, state_file=CRON_SCHEDULE_STATE_FILE, sufficient=sufficient,
+    )
 
     save_state(STATE_FILE, state)
 

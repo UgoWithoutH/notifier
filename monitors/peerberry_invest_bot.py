@@ -236,7 +236,7 @@ from monitors.peerberry_monitor import login, _login_for_cache, PEERBERRY_EMAIL,
 from shared.session_cache import get_or_refresh_session, save_session_state
 from shared.notifier import send_peerberry_invest_bot_summary_email
 from shared.google_sheet import get_geo_platform_snapshot
-from shared.robot_config import Candidate, build_tracker, get_platform_config, plan_allocations
+from shared.robot_config import Candidate, build_tracker, get_platform_config, is_platform_disabled, plan_allocations
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger("peerberry_invest_bot")
@@ -697,6 +697,9 @@ def attempt_investment(session: requests.Session, loan: dict, amount: float) -> 
 
 
 def run() -> None:
+    if is_platform_disabled("Peerberry"):
+        return
+
     if not PEERBERRY_EMAIL or not PEERBERRY_PASSWORD:
         log.error("PEERBERRY_EMAIL and PEERBERRY_PASSWORD environment variables are required.")
         sys.exit(1)
