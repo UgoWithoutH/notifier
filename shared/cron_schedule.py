@@ -90,9 +90,9 @@ _UNIT_MINUTES = {
 _DURATION_PART = re.compile(r"(\d+(?:[.,]\d+)?)\s*([a-z]*)")
 
 
-def parse_duration_minutes(raw) -> int | None:
+def parse_duration_minutes(raw, allow_zero: bool = False) -> int | None:
     """'5min' -> 5, '1h 5min' -> 65, '2j' -> 2880, '1h30' -> 90, '90' -> 90.
-    Empty, zero or unparsable text -> None."""
+    Empty or unparsable text -> None; zero -> None unless `allow_zero`."""
     text = str(raw or "").casefold().replace("\u00a0", " ").replace("\u202f", " ").strip()
     if not text:
         return None
@@ -107,7 +107,7 @@ def parse_duration_minutes(raw) -> int | None:
             return None
         total += float(part.group(1).replace(",", ".")) * _UNIT_MINUTES.get(unit, 1)
     minutes = round(total)
-    return minutes if minutes > 0 else None
+    return minutes if minutes > 0 or allow_zero else None
 
 
 def format_duration(minutes: int) -> str:

@@ -309,7 +309,7 @@ def get_platform_config(platform: str) -> PlatformConfig:
         ("startup_wait_max", "startup_wait_max_minutes"),
     ):
         raw = cell(grid[platform_idx], key)
-        minutes = parse_duration_minutes(raw)
+        minutes = parse_duration_minutes(raw, allow_zero=key.startswith("startup_wait"))
         if raw and minutes is None:
             log.warning(
                 "Config robot %s : durée '%s' invalide (ex. '5min', '1h 5min', '2j'), valeur par défaut utilisée.",
