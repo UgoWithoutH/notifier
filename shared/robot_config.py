@@ -538,6 +538,25 @@ def _split_equally(budget: float, items: list) -> dict:
         for loan_id, _cap, _min in active:
             shares[loan_id] = _floor2(equal)
         break
+    return _distribute_leftover_cents(budget, items, shares)
+
+
+def _distribute_leftover_cents(budget: float, items: list, shares: dict) -> dict:
+    """L'arrondi au centime inférieur laisse quelques centimes sur le solde
+    (ex. 141.05 / 3 -> 3 x 47.01 = 141.03) : on les redistribue 1 ct par prêt,
+    dans l'ordre du listing, tant que le plafond du prêt le permet."""
+    caps = {item[0]: item[1] for item in items}
+    leftover = round((budget - sum(shares.values())) * 100)
+    progressed = True
+    while leftover > 0 and progressed:
+        progressed = False
+        for loan_id in shares:
+            if leftover <= 0:
+                break
+            if shares[loan_id] + 0.01 <= caps[loan_id] + 1e-9:
+                shares[loan_id] = round(shares[loan_id] + 0.01, 2)
+                leftover -= 1
+                progressed = True
     return shares
 
 
