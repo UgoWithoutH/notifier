@@ -11,6 +11,7 @@ from google.oauth2.service_account import Credentials
 from gspread.utils import rowcol_to_a1
 
 from shared import duration_status_history as status_history
+from shared.amount_rounding import round_to_total
 from shared.remaining_duration import weighted_rate
 from shared.report_date import get_report_date
 
@@ -1408,6 +1409,7 @@ def _duration_status_requests(worksheet, grid, platform, platform_row, end_row, 
 
 def fill_remaining_duration_amounts(
     platform: str, durations_by_originator: dict, platform_level: bool = False, projects: bool = False, rates=None,
+    target_totals: dict | None = None,
 ):
     """Synchronise le bloc de la plateforme `platform` (ligne dont la
     colonne A vaut exactement son nom) dans l'onglet "durée" :
@@ -1441,6 +1443,9 @@ def fill_remaining_duration_amounts(
     calculée sur tout son encours, et `durations_by_originator` regroupe ses prêts par clé quelconque.
     `projects` (avec `platform_level`) : ces clés sont des noms de projets, écrits en colonne A de chaque ligne
     de durée (sinon la colonne A de ces lignes reste vide).
+    `target_totals` : {société de prêt (casse et espaces ignorés) : montant total} - (None pour une plateforme
+    `platform_level`) ; les montants arrondis au centime de ses lignes somment alors exactement à ce total (le
+    montant affiché dans l'onglet "répartition géographique"). Sans total connu, la somme des prêts fait foi.
         Le bloc s'arrête à la prochaine plateforme/section ou à la fin de la feuille.
     """
     worksheet = get_worksheet_by_name(DURATION_SHEET_NAME)
@@ -1535,7 +1540,7 @@ def fill_remaining_duration_amounts(
             project_names.setdefault(project_key, project.strip())
             for term, amount in durations.items():
                 project_amounts = by_term.setdefault(term, {})
-                project_amounts[project_key] = round(project_amounts.get(project_key, 0.0) + float(amount), 2)
+                project_amounts[project_key] = project_amounts.get(project_key, 0.0) + float(amount)
                 merged[term] = round(merged.get(term, 0.0) + float(amount), 2)
         new_data = {None: (platform, merged)}
         amounts_by_term[None] = by_term
@@ -1561,6 +1566,14 @@ def fill_remaining_duration_amounts(
             if rates is not None:
                 for term in durations:
                     rate_entries[(key, term, "")] = [rates.entry(key, term)]
+    # Arrondi au centime des montants de chaque société, sans que la somme de ses lignes dérive du total voulu.
+    targets = {None if key is None else originator_key(key): total for key, total in (target_totals or {}).items()}
+    for key, by_term in amounts_by_term.items():
+        leaves = {(term, project_key): amount for term, projects_ in by_term.items() for project_key, amount in projects_.items()}
+        rounded = {}
+        for (term, project_key), amount in round_to_total(leaves, targets.get(key)).items():
+            rounded.setdefault(term, {})[project_key] = amount
+        amounts_by_term[key] = rounded
     existing_order = [key for kind, key, _, _ in existing if kind == "orig" and key in new_data]
     existing_order = list(dict.fromkeys(existing_order))
     new_keys = sorted(

@@ -996,15 +996,17 @@ def run() -> None:
         # must not fail the whole run.
         try:
             rates = RateWeights()
+            company_totals = {c["name"]: c["amount"] for c in companies}
             fill_remaining_duration_amounts(
-                "Nectaro", aggregate_remaining_durations(session, headers, today_date, rates), rates=rates
+                "Nectaro", aggregate_remaining_durations(session, headers, today_date, rates), rates=rates,
+                target_totals=company_totals,
             )
         except Exception:
             log.exception("Failed to update the 'durée' sheet for Nectaro.")
 
         # Own try/except too: the "taux" tab is independent of the "durée" one.
         try:
-            fill_rate_amounts("Nectaro", rates)
+            fill_rate_amounts("Nectaro", rates, target_totals=company_totals)
         except Exception:
             log.exception("Failed to update the 'taux' sheet for Nectaro.")
 
