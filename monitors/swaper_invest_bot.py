@@ -292,6 +292,8 @@ LOANS_URL = "https://swaper.com/rest/public/loans"
 
 TWO_FACTOR_ATTEMPTS = 3
 TWO_FACTOR_REDIRECT_TIMEOUT_MS = 15000
+TWO_FACTOR_PROMPT_TIMEOUT_MS = 30000
+LOGIN_REDIRECT_TIMEOUT_MS = 30000
 
 
 class SwaperSessionExpired(RuntimeError):
@@ -329,10 +331,23 @@ def handle_two_factor(page) -> None:
     the same "Log In" div is reused to submit the code.
     """
     otp_input = page.locator("input[name='code']")
-    try:
-        otp_input.wait_for(timeout=8000)
-    except PlaywrightTimeoutError:
-        return  # no 2FA prompt shown, nothing to do
+    # Real GitHub Actions failure, 2026-11-05: after submitting credentials
+    # no 2FA prompt was seen within the old fixed 8s wait, and the page then
+    # never left /login within 20s either (slow login response / 2FA form
+    # appearing late). Now: wait up to TWO_FACTOR_PROMPT_TIMEOUT_MS for
+    # EITHER the 2FA input to show up OR the redirect away from /login.
+    deadline = time.time() + TWO_FACTOR_PROMPT_TIMEOUT_MS / 1000
+    while True:
+        if "/login" not in page.url:
+            return  # logged in without 2FA
+        try:
+            if otp_input.is_visible():
+                break
+        except Exception:
+            pass
+        if time.time() >= deadline:
+            return  # no 2FA prompt shown, login()'s final wait reports the outcome
+        time.sleep(0.5)
 
     if not SWAPER_TOTP_SECRET:
         raise RuntimeError(
@@ -498,7 +513,15 @@ def login(page) -> None:
     handle_two_factor(page)
 
     # Wait until we've left the login page (successful redirect to dashboard).
-    page.wait_for_url(lambda url: "/login" not in url, timeout=20000)
+    try:
+        page.wait_for_url(lambda url: "/login" not in url, timeout=LOGIN_REDIRECT_TIMEOUT_MS)
+    except PlaywrightTimeoutError:
+        try:
+            page_text = " ".join(page.locator("body").inner_text(timeout=2000).split())[:300]
+        except Exception:
+            page_text = "<unavailable>"
+        log.error("Login did not leave /login (url=%s). Page text: %s", page.url, page_text)
+        raise
     log.info("Logged in successfully, current URL: %s", page.url)
 
 
