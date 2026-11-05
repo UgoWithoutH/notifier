@@ -479,6 +479,16 @@ def fetch_investments(page, token: str) -> list:
     return investments
 
 
+def companies_from_investments(investments: list) -> list:
+    """Per-originator outstanding totals [{"name", "amount"}] summed from the investments, i.e. the same
+    figures as the 'durée'/'taux' sheets (the investor-details chart can lag behind them)."""
+    totals = {}
+    for inv in investments:
+        if inv["outstanding"] > 0:
+            totals[inv["originator"]] = totals.get(inv["originator"], 0.0) + inv["outstanding"]
+    return sorted(({"name": n, "amount": round(a, 2)} for n, a in totals.items()), key=lambda c: c["amount"], reverse=True)
+
+
 # Lateness bucket -> minimum days late, only used when overdue_base_date is unusable.
 LATE_BUCKET_MIN_DAYS = {"1-15d": 1, "16-30d": 16, "31-60d": 31}
 # More than 60 days late. "Buyback initiated" was observed live 2026-10-31 (loan_is_active 0, nothing received yet,
@@ -696,11 +706,14 @@ def run() -> None:
             today_date = get_report_date()
 
             remaining_durations = None
+            investments_companies = None
             duration_rates = RateWeights()
             if current_month:
                 # Own try/except: the "durée" tab is a secondary view, its failure must not fail the whole run.
                 try:
-                    remaining_durations = aggregate_remaining_durations(fetch_investments(page, token), today_date, duration_rates)
+                    investments = fetch_investments(page, token)
+                    investments_companies = companies_from_investments(investments)
+                    remaining_durations = aggregate_remaining_durations(investments, today_date, duration_rates)
                     durations_total = sum(a for terms in remaining_durations.values() for a in terms.values())
                     if abs(durations_total - overview["invested_total"]) > 0.01:
                         log.warning(
@@ -1011,7 +1024,17 @@ def run() -> None:
     )
 
     if current_month:
-        fill_geographic_repartition_amounts(overview["companies"], platform="Income Marketplace")
+        companies = overview["companies"]
+        if investments_companies is not None:
+            chart = {c["name"]: c["amount"] for c in companies}
+            for c in investments_companies:
+                if abs(c["amount"] - chart.get(c["name"], 0.0)) > 0.01:
+                    log.warning(
+                        "%s: investor-details chart says %.2f EUR but the investments add up to %.2f EUR - using the investments.",
+                        c["name"], chart.get(c["name"], 0.0), c["amount"],
+                    )
+            companies = investments_companies
+        fill_geographic_repartition_amounts(companies, platform="Income Marketplace")
         fill_geographic_repartition_uninvested_amount("Income Marketplace", overview["cash_balance"])
 
         if remaining_durations is not None:

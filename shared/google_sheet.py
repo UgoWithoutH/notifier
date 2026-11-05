@@ -1055,14 +1055,27 @@ def fill_geographic_repartition_amounts(loan_originators: list, platform: str | 
         # Ligne existante sans aucun montant par pays (ex. société ajoutée
         # automatiquement avant que le pays soit géré) : on le renseigne.
         country_col = _geo_country_column_of(grid, geo_row, geo_col, lo.get("country"))
-        if country_col:
-            current_row = grid[row - 1]
-            has_country_amount = any(
-                cell.strip() for cell in current_row[geo_col + 1:]
-            )
-            if not has_country_amount:
+        current_row = grid[row - 1]
+        filled_country_cells = [
+            (col_idx, _parse_french_amount(cell))
+            for col_idx, cell in enumerate(current_row, start=1)
+            if col_idx > geo_col + 1 and cell.strip()
+        ]
+        if country_col and not filled_country_cells:
+            updates.append({
+                "range": rowcol_to_a1(row, country_col),
+                "values": [[f"=${_col_letter(target_col)}{row}"]],
+            })
+        elif len(filled_country_cells) == 1:
+            # Un montant pays saisi à la main qui n'a pas suivi le total de la société fausse la somme par plateforme.
+            filled_col, filled_amount = filled_country_cells[0]
+            if filled_amount is not None and abs(filled_amount - float(amount)) > 0.005:
+                logger.warning(
+                    "'%s' : montant pays (%s) != total (%s) - recalé sur le total.",
+                    lo["name"], filled_amount, amount,
+                )
                 updates.append({
-                    "range": rowcol_to_a1(row, country_col),
+                    "range": rowcol_to_a1(row, filled_col),
                     "values": [[f"=${_col_letter(target_col)}{row}"]],
                 })
 
