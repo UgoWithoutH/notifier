@@ -18,6 +18,7 @@ elle n'a pas de société de prêt) :
 import logging
 
 from shared import rate_history as history
+from shared.amount_rounding import round_to_total
 from shared.google_sheet import (
     GEO_SECTION_BOUNDARY_LABELS,
     _DURATION_AMOUNT_COL,
@@ -167,7 +168,9 @@ def _horizon_months(sections: list, platform_row: int) -> int:
     return history.DEFAULT_HORIZON_MONTHS
 
 
-def fill_rate_amounts(platform: str, rates, platform_level: bool = False, projects: bool = False) -> None:
+def fill_rate_amounts(
+    platform: str, rates, platform_level: bool = False, projects: bool = False, target_totals: dict | None = None,
+) -> None:
     """Synchronise le bloc de la plateforme `platform` (ligne dont la colonne A vaut exactement son nom) de l'onglet
     "taux" avec les prêts de `rates` (`shared.remaining_duration.RateWeights`, alimenté par
     `rates.add(..., base_term=(mois, jours))`).
@@ -181,6 +184,9 @@ def fill_rate_amounts(platform: str, rates, platform_level: bool = False, projec
       deux lignes d'historique sont posées sous la ligne de la plateforme, à sa maille ;
     - `projects` (avec `platform_level`) : les clés de `rates` sont des noms de projets, écrits en colonne A de
       chaque ligne de durée.
+    - `target_totals` : {société de prêt (casse et espaces ignorés) : montant total} - (None avec `platform_level`) ;
+      les montants arrondis au centime de ses lignes somment alors exactement à ce total (celui de l'onglet "durée"
+      et de "répartition géographique"). Sans total connu, la somme des prêts fait foi.
     Le bloc va jusqu'à la prochaine plateforme/section et est réécrit en entier à chaque exécution."""
     worksheet = get_worksheet_by_name(RATE_SHEET_NAME)
     grid = _call_with_retry(worksheet.get_all_values)
@@ -224,6 +230,14 @@ def fill_rate_amounts(platform: str, rates, platform_level: bool = False, projec
         if rate is not None:
             entry[1] += amount * rate
             entry[2] += amount
+
+    # Arrondi au centime des montants de chaque société, sans que la somme de ses lignes dérive du total voulu.
+    targets = {None if key is None else str(key).strip().casefold(): total for key, total in (target_totals or {}).items()}
+    for group in {group for (group, _, _) in entries}:
+        keys = [entry_key for entry_key in entries if entry_key[0] == group]
+        rounded = round_to_total({entry_key: entries[entry_key][0] for entry_key in keys}, targets.get(group))
+        for entry_key in keys:
+            entries[entry_key][0] = rounded[entry_key]
 
     path = history.state_path(platform)
     days, history_names, runs = history.load_history(path)
