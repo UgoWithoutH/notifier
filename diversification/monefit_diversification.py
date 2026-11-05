@@ -307,7 +307,7 @@ def fetch_remaining_durations(session: requests.Session, today: date, rates: Rat
     main_account = float(data.get("mainAccount") or 0.0)
     if round(main_account, 2) > 0:
         durations[(0, 0)] = durations.get((0, 0), 0.0) + main_account
-    return {LOAN_ORIGINATOR_LABEL: {term: round(amount, 2) for term, amount in durations.items()}} if durations else {}
+    return {LOAN_ORIGINATOR_LABEL: durations} if durations else {}
 
 
 def fetch_statement_summary(session: requests.Session, start_date: date, end_date: date) -> dict:
@@ -903,13 +903,16 @@ def run() -> None:
         # must not fail the whole run.
         try:
             rates = RateWeights()
-            fill_remaining_duration_amounts("Monefit", fetch_remaining_durations(session, today_date, rates), platform_level=True, rates=rates)
+            fill_remaining_duration_amounts(
+                "Monefit", fetch_remaining_durations(session, today_date, rates), platform_level=True, rates=rates,
+                target_totals={None: balance},
+            )
         except Exception:
             log.exception("Failed to update the 'durée' sheet for Monefit.")
 
         # Own try/except too: the "taux" tab is independent of the "durée" one.
         try:
-            fill_rate_amounts("Monefit", rates, platform_level=True)
+            fill_rate_amounts("Monefit", rates, platform_level=True, target_totals={None: balance})
         except Exception:
             log.exception("Failed to update the 'taux' sheet for Monefit.")
 
