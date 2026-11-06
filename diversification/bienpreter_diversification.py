@@ -214,6 +214,8 @@ from datetime import date, datetime, timedelta
 from pathlib import Path
 
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 from dotenv import load_dotenv
 
 from shared.google_sheet import (
@@ -272,6 +274,22 @@ BIENPRETER_EMAIL = os.environ.get("BIENPRETER_EMAIL")
 BIENPRETER_PASSWORD = os.environ.get("BIENPRETER_PASSWORD")
 
 _HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+
+
+def _build_session() -> requests.Session:
+    """Session that retries idempotent GETs on read/connect timeouts and 502/503/504
+    (www.bienpreter.com intermittently hangs > 30s, observed 2026-11-06)."""
+    session = requests.Session()
+    session.headers.update(_HEADERS)
+    retry = Retry(
+        total=4, connect=4, read=4, status=4,
+        backoff_factor=3, status_forcelist=(502, 503, 504),
+        allowed_methods=frozenset(["GET"]), raise_on_status=False,
+    )
+    adapter = HTTPAdapter(max_retries=retry)
+    session.mount("https://", adapter)
+    session.mount("http://", adapter)
+    return session
 
 
 def login(session: requests.Session) -> str:
@@ -1156,8 +1174,7 @@ def run() -> None:
 
     log.info("Starting Bienpreter diversification run (pure HTTP, no browser).")
 
-    session = requests.Session()
-    session.headers.update(_HEADERS)
+    session = _build_session()
 
     try:
         # The dashboard HTML is only an "is the persisted session still
