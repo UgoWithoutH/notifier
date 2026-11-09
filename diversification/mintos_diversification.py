@@ -286,9 +286,10 @@ from shared.google_sheet import (
     fill_geographic_repartition_amounts,
     fill_geographic_repartition_uninvested_amount,
     fill_remaining_duration_amounts,
+    default_after_late_days,
 )
 from shared.rate_sheet import fill_rate_amounts
-from shared.remaining_duration import DEFAULT_AFTER_LATE_DAYS, RateWeights, base_term_between, overdue_months_and_days, remaining_months_and_days
+from shared.remaining_duration import RateWeights, base_term_between, overdue_months_and_days, remaining_months_and_days
 from shared.report_date import get_report_date, is_current_month
 from shared.state import load_state, save_state
 from shared.weighted_average import INVESTED_BALANCE_LABEL, NON_INVESTED_BALANCE_LABEL, compute_time_weighted_average
@@ -714,7 +715,7 @@ def aggregate_remaining_durations(
         pieces = []
         late_share = min(sum(share for _, share in late_loans), 1.0)
         for due, share in late_loans:
-            term = overdue_months_and_days(today, due, default=in_recovery or (today - due).days > DEFAULT_AFTER_LATE_DAYS)
+            term = overdue_months_and_days(today, due, default=in_recovery or (today - due).days > default_after_late_days(PLATFORM_LABEL, originator))
             if term is not None:
                 pieces.append((term, inv["amount"] * share))
         if late_share < 1.0:

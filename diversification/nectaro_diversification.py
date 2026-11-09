@@ -141,9 +141,10 @@ from shared.google_sheet import (
     fill_geographic_repartition_amounts,
     fill_geographic_repartition_uninvested_amount,
     fill_remaining_duration_amounts,
+    default_after_late_days,
 )
 from shared.rate_sheet import fill_rate_amounts
-from shared.remaining_duration import DEFAULT_AFTER_LATE_DAYS, RateWeights, overdue_months_and_days, remaining_months_and_days
+from shared.remaining_duration import RateWeights, overdue_months_and_days, remaining_months_and_days
 from shared.report_date import get_report_date, is_current_month
 from shared.session_cache import get_or_refresh_session
 from shared.state import load_state, save_state
@@ -513,7 +514,7 @@ def aggregate_remaining_durations(session: requests.Session, headers: dict, toda
         normal_share = 1.0
         for share, due in loan["late"]:
             overdue_days = (today - due).days
-            term = overdue_months_and_days(today, due, default=overdue_days > DEFAULT_AFTER_LATE_DAYS)
+            term = overdue_months_and_days(today, due, default=overdue_days > default_after_late_days("Nectaro", loan["originator"]))
             if term is None:
                 continue
             durations[term] = durations.get(term, 0.0) + amount * share

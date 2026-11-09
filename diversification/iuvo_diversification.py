@@ -167,10 +167,10 @@ load_dotenv()
 import requests
 
 try:
-    from shared.google_sheet import fill_current_month_amounts, fill_current_month_bonus_breakdown, fill_geographic_repartition_amounts, fill_geographic_repartition_uninvested_amount, fill_remaining_duration_amounts
+    from shared.google_sheet import default_after_late_days, fill_current_month_amounts, fill_current_month_bonus_breakdown, fill_geographic_repartition_amounts, fill_geographic_repartition_uninvested_amount, fill_remaining_duration_amounts
     from shared.monthly_yield_waterfall import compute_monthly_yield_shares
     from shared.rate_sheet import fill_rate_amounts
-    from shared.remaining_duration import DEFAULT_AFTER_LATE_DAYS, RateWeights, base_term_between, overdue_months_and_days, remaining_months_and_days
+    from shared.remaining_duration import RateWeights, base_term_between, overdue_months_and_days, remaining_months_and_days
     from shared.report_date import get_report_now, is_current_month
     from shared.session_cache import get_or_refresh_session
     from shared.state import load_state, save_state
@@ -184,10 +184,10 @@ except ModuleNotFoundError:
     project_root = Path(__file__).resolve().parents[1]
     if str(project_root) not in sys.path:
         sys.path.insert(0, str(project_root))
-    from shared.google_sheet import fill_current_month_amounts, fill_current_month_bonus_breakdown, fill_geographic_repartition_amounts, fill_geographic_repartition_uninvested_amount, fill_remaining_duration_amounts
+    from shared.google_sheet import default_after_late_days, fill_current_month_amounts, fill_current_month_bonus_breakdown, fill_geographic_repartition_amounts, fill_geographic_repartition_uninvested_amount, fill_remaining_duration_amounts
     from shared.monthly_yield_waterfall import compute_monthly_yield_shares
     from shared.rate_sheet import fill_rate_amounts
-    from shared.remaining_duration import DEFAULT_AFTER_LATE_DAYS, RateWeights, base_term_between, overdue_months_and_days, remaining_months_and_days
+    from shared.remaining_duration import RateWeights, base_term_between, overdue_months_and_days, remaining_months_and_days
     from shared.report_date import get_report_now, is_current_month
     from shared.session_cache import get_or_refresh_session
     from shared.state import load_state, save_state
@@ -478,7 +478,7 @@ def aggregate_remaining_durations(session: requests.Session, session_token: str,
                 late_days = (today - late_since).days
                 term = overdue_months_and_days(
                     today, late_since,
-                    default="recovery" in f"{status} {table_status}".lower() or late_days > DEFAULT_AFTER_LATE_DAYS,
+                    default="recovery" in f"{status} {table_status}".lower() or late_days > default_after_late_days("Iuvo", details["originator"]),
                 )
         if term is None:
             term = remaining_months_and_days(today, details["maturity"])
