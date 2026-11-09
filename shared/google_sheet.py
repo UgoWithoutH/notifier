@@ -1292,12 +1292,14 @@ _DEFAULT_BUYBACK_DAYS = {
     "mintos": (60, {}),
     "peerberry": (60, {}),
     "swaper": (60, {}),
-    "nectaro": (60, {}),
     "iuvo": (60, {}),
-    "income marketplace": (60, {}),
     "loanch": (30, {}),
     "lendermarket": (60, {}),
 }
+# Plateformes dont l'API indique elle-même le buyback : pas de délai configurable (colonne D laissée vide, ignorée si remplie).
+# Income Marketplace : statut de prêt "Buyback initiated" (prêt toujours en encours). Nectaro : statut "BUYBACK" de chaque prêt
+# sous-jacent, qui sort alors de l'encours (jamais de montant en buyback à afficher).
+API_BUYBACK_PLATFORMS = frozenset({"income marketplace", "nectaro"})
 
 
 def default_buyback_days(platform: str, originator: str):
@@ -1346,6 +1348,8 @@ def buyback_days_for(platform: str, originator: str):
     par plateforme et par processus) ; None si elle n'en a pas. Une société sans ligne dans l'onglet (ou un onglet
     illisible) reçoit la valeur par défaut de `default_buyback_days`."""
     cache_key = platform.strip().casefold()
+    if cache_key in API_BUYBACK_PLATFORMS:
+        return None
     if cache_key not in _buyback_days_cache:
         try:
             grid = _call_with_retry(get_worksheet_by_name(DURATION_SHEET_NAME).get_all_values)
@@ -1668,7 +1672,10 @@ def fill_remaining_duration_amounts(
         existing_buyback_texts = _duration_originator_buyback_texts(grid, platform_row, end_row)
         report_date = get_report_date()
         for key, (name, durations) in list(new_data.items()):
-            if key in existing_buyback_texts:
+            if platform.strip().casefold() in API_BUYBACK_PLATFORMS:
+                buyback_texts[key] = ""
+                days = None
+            elif key in existing_buyback_texts:
                 buyback_texts[key] = existing_buyback_texts[key]
                 days = status_history.parse_buyback_days(buyback_texts[key])
                 if buyback_texts[key] and days is None:
