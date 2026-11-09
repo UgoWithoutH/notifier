@@ -494,6 +494,8 @@ LATE_BUCKET_MIN_DAYS = {"1-15d": 1, "16-30d": 16, "31-60d": 31}
 # More than 60 days late. "Buyback initiated" was observed live 2026-10-31 (loan_is_active 0, nothing received yet,
 # loan_buyback_guarantee 1): the originator owes the buyback, so it is only a loss ("default") if the loan has no buyback guarantee.
 DEFAULT_STATUSES = {"60+d", "buyback initiated", "buybackinitiated"}
+# Explicit buyback status of the API: the "durée" tab needs no buyback delay for this platform (see google_sheet.API_BUYBACK_PLATFORMS).
+BUYBACK_STATUSES = {"buyback initiated", "buybackinitiated"}
 NON_LATE_STATUSES = {"", "current", "paid back", "paidback", "forced buyback", "forcedbuyback"}
 # A guaranteed loan still "Buyback initiated" after shared.remaining_duration.DEFAULT_AFTER_LATE_DAYS of lateness is
 # counted as a default (buyback not honored); the platform exposes no "buyback failed" status.
@@ -523,10 +525,13 @@ def _overdue_term(inv: dict, today: date):
             log.warning("Buyback still unpaid after %d days of grace - counted as a default.", BUYBACK_GRACE_DAYS)
             is_default = True
     min_days = 61 if beyond_60_days else LATE_BUCKET_MIN_DAYS.get(status)
-    return (
+    term = (
         overdue_months_and_days(today, overdue_since or today, default=is_default)
         or overdue_months_and_days(today, today - timedelta(days=min_days), default=is_default)
     )
+    if term is not None and len(term) == 2 and not is_default and status in BUYBACK_STATUSES:
+        term = (-term[0], -term[1], "buyback")
+    return term
 
 
 def aggregate_remaining_durations(investments: list, today: date, rates: RateWeights | None = None) -> dict:
@@ -535,7 +540,7 @@ def aggregate_remaining_durations(investments: list, today: date, rates: RateWei
     {originator: {(months, days): outstanding}}. Late loans (status "1-15d"/
     "16-30d"/"31-60d", verified live) use the negated lateness since the missed
     payment date; "Buyback initiated" (60+ days, verified live 2026-10-31) ones
-    too while the loan has a buyback guarantee, otherwise with a "default"
+    get the "buyback" key variant while the loan has a buyback guarantee, otherwise a "default"
     marker (see _overdue_term). Fully repaid investments are ignored;
     non-late ones without a maturity date are skipped (with a warning)."""
     result = {}
@@ -1039,7 +1044,7 @@ def run() -> None:
 
         if remaining_durations is not None:
             try:
-                fill_remaining_duration_amounts("Income Marketplace", remaining_durations, rates=duration_rates)
+                fill_remaining_duration_amounts("Income Marketplace", remaining_durations, rates=duration_rates, reclassify_buyback=False)
             except Exception:
                 log.exception("Failed to update the 'durée' sheet for Income Marketplace.")
 
