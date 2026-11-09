@@ -1622,6 +1622,7 @@ def fill_remaining_duration_amounts(
     buyback_days_by_key = {}  # clé société -> délai de buyback en jours (None = pas de buyback)
     buyback_texts = {}  # clé société -> texte écrit en colonne D de sa ligne
     rate_terms = {}  # (clé société, terme reclassé en buyback) -> terme d'origine, sous lequel `rates` a rangé son taux
+    history_days = {}  # historique des parts journalières (voir shared.duration_status_history.load_history)
     if platform_level:
         # Plateforme sans société de prêt : un seul bloc (clé None) regroupant tous les prêts, sans ligne de société.
         merged = {}
@@ -1645,6 +1646,7 @@ def fill_remaining_duration_amounts(
         # de l'horizon contient des données pour elle.
         horizon_months = _duration_horizon_months(_duration_sections(grid), platform_row)
         tracked = status_history.tracked_originators(status_history.state_path(platform), get_report_date(), horizon_months)
+        history_days = status_history.load_history(status_history.state_path(platform))[0]
         new_data = {}
         for name, durations in durations_by_originator.items():
             key = originator_key(name)
@@ -1718,8 +1720,13 @@ def fill_remaining_duration_amounts(
             desired.append(("orig", key, key))
             desired_texts[("orig", key, key)] = (name, "")
         # Pour chaque statut (défauts, buyback, retards, normaux) : sa ligne de part (%) puis ses lignes de durée.
-        # La ligne "buyback" n'existe que pour une société ayant un délai de buyback ou un prêt en buyback.
-        has_buyback = bool(buyback_days_by_key.get(key)) or any(status_history.classify_term(term) == "buyback" for term in durations)
+        # La ligne "buyback" n'existe que pour une société ayant un délai de buyback, un prêt en buyback ou du buyback
+        # dans son historique (pour que son % des mois passés ne disparaisse pas dès que ses prêts en buyback sont remboursés).
+        has_buyback = (
+            bool(buyback_days_by_key.get(key))
+            or any(status_history.classify_term(term) == "buyback" for term in durations)
+            or any(key in shares and status_history.buyback_share(shares[key]) > 0 for shares in history_days.values())
+        )
         for status_label in _DURATION_STATUS_DISPLAY_ORDER:
             if status_label == "buyback" and not has_buyback:
                 continue
