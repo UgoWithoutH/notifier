@@ -200,6 +200,7 @@ jobs:
           path: |
             diversification/iuvo_diversification_session_state.json
             diversification/iuvo_xirr_cashflows_state.json
+            diversification/iuvo_daily_state.json
             diversification/iuvo_duration_status_state.json
             diversification/iuvo_rate_history_state.json
           key: iuvo-diversification-state-${{ github.run_id }}
@@ -221,6 +222,7 @@ jobs:
           path: |
             diversification/iuvo_diversification_session_state.json
             diversification/iuvo_xirr_cashflows_state.json
+            diversification/iuvo_daily_state.json
             diversification/iuvo_duration_status_state.json
             diversification/iuvo_rate_history_state.json
           key: iuvo-diversification-state-${{ github.run_id }}
@@ -383,6 +385,7 @@ jobs:
           path: |
             diversification/lendermarket_diversification_session_state.json
             diversification/lendermarket_xirr_cashflows_state.json
+            diversification/lendermarket_daily_state.json
             diversification/lendermarket_duration_status_state.json
             diversification/lendermarket_rate_history_state.json
           key: lendermarket-diversification-state-${{ github.run_id }}
@@ -405,6 +408,7 @@ jobs:
           path: |
             diversification/lendermarket_diversification_session_state.json
             diversification/lendermarket_xirr_cashflows_state.json
+            diversification/lendermarket_daily_state.json
             diversification/lendermarket_duration_status_state.json
             diversification/lendermarket_rate_history_state.json
           key: lendermarket-diversification-state-${{ github.run_id }}
@@ -506,6 +510,7 @@ jobs:
           path: |
             diversification/monefit_diversification_session_state.json
             diversification/monefit_xirr_cashflows_state.json
+            diversification/monefit_daily_state.json
             diversification/monefit_duration_status_state.json
             diversification/monefit_rate_history_state.json
           key: monefit-diversification-state-${{ github.run_id }}
@@ -527,6 +532,7 @@ jobs:
           path: |
             diversification/monefit_diversification_session_state.json
             diversification/monefit_xirr_cashflows_state.json
+            diversification/monefit_daily_state.json
             diversification/monefit_duration_status_state.json
             diversification/monefit_rate_history_state.json
           key: monefit-diversification-state-${{ github.run_id }}

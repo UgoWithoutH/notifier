@@ -146,6 +146,7 @@ from shared.weighted_average import INVESTED_BALANCE_LABEL, NON_INVESTED_BALANCE
 from shared.monthly_yield_waterfall import compute_monthly_yield_shares
 from shared.xirr import compute_xirr
 from shared.xirr_waterfall import compute_waterfall_xirr_shares
+from shared.daily_balances import DailyBalances, build_daily_balances, first_active_day, previous_month_range, refresh_daily_cache
 
 load_dotenv()
 
@@ -185,6 +186,9 @@ MONEFIT_PASSWORD = os.environ.get("MONEFIT_PASSWORD")
 SESSION_STATE_FILE = Path(__file__).parent / "monefit_diversification_session_state.json"
 XIRR_CASHFLOWS_STATE_FILE = Path(__file__).parent / "monefit_xirr_cashflows_state.json"
 XIRR_CASHFLOWS_STATE_DEFAULT = {"monthly_summaries": {}, "last_fetched_month": None}
+# One account/summary query per calendar day: real deposit dates and the true whole-account value of
+# every day (see shared/daily_balances.py).
+DAILY_STATE_FILE = Path(__file__).parent / "monefit_daily_state.json"
 XIRR_CACHE_SCHEMA_VERSION = 3
 # Conservative floor for the one-time yearly scan used to find the
 # account's real inception year (see _find_first_active_year()) - well
@@ -310,7 +314,7 @@ def fetch_remaining_durations(session: requests.Session, today: date, rates: Rat
     return {LOAN_ORIGINATOR_LABEL: durations} if durations else {}
 
 
-def fetch_statement_summary(session: requests.Session, start_date: date, end_date: date) -> dict:
+def fetch_statement_summary(session: requests.Session, start_date: date, end_date: date, quiet: bool = False) -> dict:
     """Fetch account/summary for an arbitrary [start_date, end_date] range -
     generalized 2026-08-14 (was fetch_current_month_statement_totals(),
     hardcoded to the current calendar month - kept below as a thin
@@ -322,13 +326,14 @@ def fetch_statement_summary(session: requests.Session, start_date: date, end_dat
     withdrawalSum=38.42, fees=0`).
     """
     params = {"dateFrom": start_date.isoformat(), "dateTo": end_date.isoformat()}
-    log.info("GET %s (fetching statement totals for %s to %s)...", SUMMARY_URL, start_date, end_date)
+    log_level = logging.DEBUG if quiet else logging.INFO
+    log.log(log_level, "GET %s (fetching statement totals for %s to %s)...", SUMMARY_URL, start_date, end_date)
     r = session.get(SUMMARY_URL, params=params, timeout=30)
-    log.info("GET account/summary: status=%s", r.status_code)
+    log.log(log_level, "GET account/summary: status=%s", r.status_code)
     r.raise_for_status()
 
     result = (r.json() or {}).get("data", {}).get("result") or {}
-    log.info("Raw account/summary result: %r", result)
+    log.log(log_level, "Raw account/summary result: %r", result)
 
     def _amount(key):
         try:
@@ -386,7 +391,8 @@ def fetch_statement_summary(session: requests.Session, start_date: date, end_dat
             daily_returns = ledger_interest
             vault_interest = 0.0  # the ledger figure already includes vault interest
 
-    log.info(
+    log.log(
+        log_level,
         "Parsed statement totals: daily_returns=%.2f, vault_interest=%.2f, rewards_bonuses=%.2f, matured_vaults=%.2f, "
         "deposits=%.2f, withdrawals=%.2f, fees=%.2f, opening_balance=%.2f, closing_balance=%s",
         daily_returns, vault_interest, rewards_bonuses, matured_vaults, deposits, withdrawals, fees, opening_balance, closing_balance,
@@ -497,6 +503,29 @@ def get_cached_monthly_summaries(session: requests.Session, today: date) -> dict
     })
     log.info("Monthly summaries cache now holds %d month(s).", len(monthly_summaries))
     return monthly_summaries
+
+
+def fetch_daily_record(session: requests.Session, day: date) -> dict:
+    """One-day account/summary as a record for shared/daily_balances.py: closingBalance is the whole-account
+    value of that day (matches "Total Wealth"), so no backward reconstruction is needed."""
+    s = fetch_statement_summary(session, day, day, quiet=True)
+    if s["closing_balance"] is None:
+        raise RuntimeError(f"No closingBalance returned for {day}.")
+    net_deposit = s["deposits"] - s["withdrawals"]
+    return {
+        "net_deposit": round(net_deposit, 2),
+        "value_change": round(s["closing_balance"] - s["opening_balance"], 2),
+        "total_close": s["closing_balance"],
+    }
+
+
+def get_daily_balances(session: requests.Session, monthly_summaries: dict, last_day: date) -> DailyBalances | None:
+    """Day-by-day whole-account value since the first active month (see shared/daily_balances.py)."""
+    first_day = first_active_day(monthly_summaries)
+    if first_day is None:
+        return None
+    days = refresh_daily_cache(DAILY_STATE_FILE, lambda day: fetch_daily_record(session, day), first_day, last_day)
+    return build_daily_balances(days, last_day)
 
 
 def run() -> None:
@@ -640,9 +669,25 @@ def run() -> None:
         log.exception("Failed to fetch the monthly statement summary history - XIRR will not be updated.")
         monthly_summaries = None
 
+    # Day-by-day whole-account value (real deposit dates, true daily averages); on any failure every figure
+    # below silently falls back to the monthly approximation.
+    daily_balances = None
+    if monthly_summaries:
+        try:
+            daily_balances = get_daily_balances(session, monthly_summaries, end_date)
+        except Exception:
+            log.exception("Failed to build the daily balances - falling back to the monthly approximation.")
+            daily_balances = None
+
     # Like the other platforms, "Rendements % brut" divides by the PREVIOUS month's average balance
     # (None for an account's first month, so no yield is reported for it).
     prev_avg_total_balance = _prev_month_avg_balance(monthly_summaries, f"{end_date.year:04d}-{end_date.month:02d}")
+    if daily_balances is not None:
+        prev_start, prev_end = previous_month_range(end_date)
+        daily_prev_avg = daily_balances.average("total", prev_start, prev_end)
+        if daily_prev_avg is not None:
+            prev_avg_total_balance = daily_prev_avg
+            log.info("Solde moyen journalier du mois N-1 (%s -> %s): %.2f EUR.", prev_start, prev_end, prev_avg_total_balance)
 
     if monthly_summaries:
         # get_cached_monthly_summaries()'s cache accumulates every month
@@ -654,8 +699,10 @@ def run() -> None:
         relevant_summaries = {k: v for k, v in monthly_summaries.items() if k <= today_month_key}
         total_account_value = balance if current_month else closing_balance
         if total_account_value is not None:
-            signed_cashflows = []
-            for month_key in sorted(relevant_summaries):
+            # Real-dated flows when the daily balances are available, else the monthly approximation (loop below).
+            signed_cashflows = daily_balances.cashflows(end_date) if daily_balances is not None else []
+            monthly_flow_keys = [] if daily_balances is not None else sorted(relevant_summaries)
+            for month_key in monthly_flow_keys:
                 summary = relevant_summaries[month_key]
                 net_deposit = summary["deposits"] - summary["withdrawals"]
                 if abs(net_deposit) < 0.005:
@@ -866,6 +913,12 @@ def run() -> None:
         )
 
     bonus_breakdown = {"Bonus": statement_totals["rewards_bonuses"]}
+    if daily_balances is not None:
+        # Whole-account value averaged day by day; the live idle cash (tiny, see above) is carved out for the current month.
+        daily_total_avg = daily_balances.average("total", end_date.replace(day=1), end_date)
+        if daily_total_avg is not None:
+            avg_invested_balance = max(daily_total_avg - (avg_non_invested_balance or 0.0), 0.0)
+            log.info("Solde moyen pondéré journalier (%s -> %s) - investi: %.2f EUR.", end_date.replace(day=1), end_date, avg_invested_balance)
     if xirr_value is not None:
         bonus_breakdown["XIRR"] = xirr_value
     if rendement_brut_value is not None:
