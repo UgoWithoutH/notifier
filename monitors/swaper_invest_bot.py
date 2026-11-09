@@ -237,6 +237,7 @@ throughout.
 """
 
 
+import contextlib
 import json
 import os
 import sys
@@ -546,6 +547,32 @@ def _record_http_call(captured: list, method: str, url: str, request_headers: di
     captured.append(entry)
 
 
+@contextlib.contextmanager
+def _originator_filter(page, groups: list = None):
+    """Rewrite every outgoing `POST /rest/public/loans` of the SPA so it
+    carries `"groups": [...]` (no-op when `groups` is empty). Kept active
+    while investing too: after each buy the SPA silently re-fetches the list
+    with `groups: []`, which replaced the filtered rows by other originators'
+    loans and made every remaining loan of the plan "not found" (live-verified
+    2026-11-09: only the first loan of each run was ever bought)."""
+    def _patch_body(route):
+        try:
+            body = json.loads(route.request.post_data or "{}")
+        except Exception:
+            body = {}
+        body["groups"] = groups
+        route.continue_(post_data=json.dumps(body))
+
+    if not groups:
+        yield
+        return
+    page.route("**/rest/public/loans", _patch_body)
+    try:
+        yield
+    finally:
+        page.unroute("**/rest/public/loans", _patch_body)
+
+
 def fetch_loans(page, captured_api_calls: list, groups: list = None) -> dict:
     """Fetch the loans list by letting Swaper's own Angular SPA fire its
     REAL request (`page.goto()` to the loans page) - NOT a manually
@@ -568,26 +595,12 @@ def fetch_loans(page, captured_api_calls: list, groups: list = None) -> dict:
     `captured_api_calls`, feeding the investment summary/diagnostics
     emails.
     """
-    def _patch_body(route):
-        request = route.request
-        try:
-            body = json.loads(request.post_data or "{}")
-        except Exception:
-            body = {}
-        body["groups"] = groups
-        route.continue_(post_data=json.dumps(body))
-
-    if groups:
-        page.route("**/rest/public/loans", _patch_body)
-    try:
+    with _originator_filter(page, groups):
         with page.expect_response(
             lambda r: r.url == LOANS_URL and r.request.method == "POST"
         ) as response_info:
             page.goto(LOANS_PAGE_URL, wait_until="domcontentloaded")
         response = response_info.value
-    finally:
-        if groups:
-            page.unroute("**/rest/public/loans", _patch_body)
 
     request = response.request
     text = response.text()
@@ -823,7 +836,14 @@ def _extract_balance_from_attempts(attempts: list):
     return None
 
 
-def _invest_available_loans(page, loans: list, shares: dict, captured_api_calls: list) -> list:
+def _invest_available_loans(page, loans: list, shares: dict, captured_api_calls: list, groups: list = None) -> list:
+    """See `_invest_loans_via_ui()`. `groups` keeps the originator filter
+    applied to the SPA's list refreshes that follow every buy."""
+    with _originator_filter(page, groups):
+        return _invest_loans_via_ui(page, loans, shares, captured_api_calls)
+
+
+def _invest_loans_via_ui(page, loans: list, shares: dict, captured_api_calls: list) -> list:
     """Actually invest into available manual loans, using the exact
     per-loan amounts precomputed by `_compute_swaper_loan_shares()` (loans
     with no entry in `shares`, e.g. below the minimum, are skipped).
@@ -871,8 +891,12 @@ def _invest_available_loans(page, loans: list, shares: dict, captured_api_calls:
         if not amount or amount < MIN_INVESTMENT_AMOUNT:
             continue
 
+        # The list is re-fetched by the SPA after every buy: give the row a
+        # moment to reappear instead of failing on a transient empty table.
         row = page.locator("tr.loan-row", has_text=str(loan_label))
-        if row.count() == 0:
+        try:
+            row.first.wait_for(state="visible", timeout=10000)
+        except PlaywrightTimeoutError:
             log.warning("Could not find the row for loan %s on the page - skipping it.", loan_label)
             continue
         row = row.first
@@ -942,6 +966,15 @@ def _invest_available_loans(page, loans: list, shares: dict, captured_api_calls:
                     ):
                         break
                     page.wait_for_timeout(500)
+                # Let the SPA's post-buy list refresh land before touching the next row.
+                for _ in range(10):
+                    if any(
+                        c.get("method") == "POST" and c.get("url") == LOANS_URL
+                        for c in captured_api_calls[calls_before_confirm:]
+                    ):
+                        break
+                    page.wait_for_timeout(500)
+                page.wait_for_timeout(500)
             except Exception:
                 log.exception(
                     "Could not click the Confirm button for loan %s - stopping here rather than guessing.",
@@ -1294,7 +1327,9 @@ def run(headless: bool = True) -> None:
                                 log.info("Investing %.2f EUR into originator %r's loan(s).", sum(shares.values()), name)
                                 try:
                                     attempts = _with_relogin_retry(
-                                        lambda: _invest_available_loans(page, loans_by_name[name], shares, captured_api_calls)
+                                        lambda: _invest_available_loans(
+                                            page, loans_by_name[name], shares, captured_api_calls, groups=[group_of[name]]
+                                        )
                                     )
                                 except Exception:
                                     log.exception("Failed to invest into originator %r's loan(s) - skipping it this run.", name)
