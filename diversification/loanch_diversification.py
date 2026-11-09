@@ -221,10 +221,10 @@ from shared.google_sheet import (
     fill_geographic_repartition_amounts,
     fill_geographic_repartition_uninvested_amount,
     fill_remaining_duration_amounts,
+    default_after_late_days,
 )
 from shared.rate_sheet import fill_rate_amounts
 from shared.remaining_duration import (
-    DEFAULT_AFTER_LATE_DAYS,
     RateWeights,
     base_term_between,
     base_term_from_days,
@@ -502,7 +502,7 @@ def aggregate_remaining_durations(investments: list, today: date, rates=None) ->
                 due = today - timedelta(days=delayed_days)
             if due >= today:
                 due = today - timedelta(days=delayed_days)
-            term = overdue_months_and_days(today, due, default=delayed_days > DEFAULT_AFTER_LATE_DAYS)
+            term = overdue_months_and_days(today, due, default=delayed_days > default_after_late_days("Loanch", originator))
         if term is None:
             try:
                 maturity = date.fromisoformat(inv["maturity_date"][:10])

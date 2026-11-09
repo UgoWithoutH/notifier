@@ -186,9 +186,10 @@ from shared.google_sheet import (
     fill_geographic_repartition_amounts,
     fill_geographic_repartition_uninvested_amount,
     fill_remaining_duration_amounts,
+    default_after_late_days,
 )
 from shared.rate_sheet import fill_rate_amounts
-from shared.remaining_duration import DEFAULT_AFTER_LATE_DAYS, RateWeights, base_term_between, base_term_from_days, overdue_months_and_days, remaining_months_and_days
+from shared.remaining_duration import RateWeights, base_term_between, base_term_from_days, overdue_months_and_days, remaining_months_and_days
 from shared.report_date import get_report_now, is_current_month
 from shared.session_cache import get_or_refresh_session
 from shared.state import load_state, save_state
@@ -380,7 +381,7 @@ def aggregate_remaining_durations(investments: list, today: date, rates: RateWei
             due_dates = [d for d in (maturity, _parse_iso_date(inv.get("nextPaymentDate"))) if d and d < today]
             if due_dates:
                 due = min(due_dates)
-                term = overdue_months_and_days(today, due, default=(today - due).days > DEFAULT_AFTER_LATE_DAYS)
+                term = overdue_months_and_days(today, due, default=(today - due).days > default_after_late_days("Peerberry", originator))
             else:
                 log.warning("Late investment of %s (%.2f EUR) has no past due date - using its remaining term.", originator, amount)
         if term is None:

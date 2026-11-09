@@ -1,8 +1,8 @@
-"""Daily "normaux / retards / défauts" shares and their monthly averages, used by
+"""Daily "normaux / retards / buyback / défauts" shares and their monthly averages, used by
 the "durée" Google Sheet tab (see shared.google_sheet.fill_remaining_duration_amounts).
 
 Every run records, for the day it runs, the share (fraction of the outstanding
-amount) of normal / late / defaulted loans per loan originator (or for the
+amount) of normal / late / buyback / defaulted loans per loan originator (or for the
 whole platform). The day's value is the average of its runs weighted by their
 outstanding amount (every run of the current day is kept in the state file's
 "runs" section until the next day). Those daily shares (with the day's outstanding
@@ -11,8 +11,12 @@ GitHub Actions runs with actions/cache, like the XIRR cashflow state files) and
 averaged per calendar month for the sheet, each day weighted by its outstanding amount.
 
 Duration terms follow shared.google_sheet's convention: (months, days) >= 0 is
-a normal loan, a negative term is a late loan, (months, days, "default") is a
+a normal loan, a negative term is a late loan, (months, days, "buyback") is a loan
+late for at least its originator's buyback delay, (months, days, "default") is a
 defaulted loan.
+
+A day's shares are stored as [normal, late, default, total, buyback]; the days recorded before the
+buyback status existed only have the first four values (their buyback share is 0).
 """
 
 import json
@@ -50,6 +54,38 @@ def parse_horizon_months(text: str):
     return months or None
 
 
+_BUYBACK_UNITS_RE = re.compile(r"(\d+)\s*(ans?|mois|jours?|j)\b", re.IGNORECASE)
+
+
+def parse_buyback_days(text) -> int | None:
+    """Delay before a late loan becomes a buyback, as written in the "durée" tab: "60 jours" -> 60, "60" -> 60,
+    "2 mois" -> 60 (a month counts for 30 days, a year for 365). None if empty, unreadable or zero."""
+    text = str(text if text is not None else "").strip()
+    if not text:
+        return None
+    bare = _BARE_NUMBER_RE.match(text)
+    if bare:
+        return int(bare.group(1)) or None
+    if _BUYBACK_UNITS_RE.sub("", text).replace("et", "").strip(" ,"):
+        return None
+    days = 0
+    for number, unit in _BUYBACK_UNITS_RE.findall(text):
+        unit = unit.casefold()
+        days += int(number) * (365 if unit.startswith("an") else 30 if unit == "mois" else 1)
+    return days or None
+
+
+def buyback_label(days: int) -> str:
+    """240 -> "8 mois", 75 -> "2 mois 15 jours" (the text written in the "durée" tab; a month counts for 30 days)."""
+    months, rest = divmod(int(days), 30)
+    parts = []
+    if months:
+        parts.append(f"{months} mois")
+    if rest or not months:
+        parts.append(f"{rest} jour" + ("s" if rest > 1 else ""))
+    return " ".join(parts)
+
+
 def month_label(year: int, month: int) -> str:
     return f"{FRENCH_MONTHS[month - 1]} {year}"
 
@@ -74,22 +110,27 @@ def _window_start(today: date, horizon_months: int) -> date:
 
 
 def classify_term(term: tuple) -> str:
-    """"default", "late" or "normal"."""
+    """"default", "buyback", "late" or "normal"."""
     if len(term) > 2:
-        return "default"
+        return "buyback" if term[2] == "buyback" else "default"
     return "late" if term[0] < 0 or term[1] < 0 else "normal"
 
 
 def status_shares(durations: dict):
-    """{term: amount} -> (normal, late, default, total): the three fractions of the total amount plus that
+    """{term: amount} -> (normal, late, default, total, buyback): the fractions of the total amount plus that
     total (the weight of the run when several runs of a day are merged), or None if the total isn't positive."""
-    totals = {"normal": 0.0, "late": 0.0, "default": 0.0}
+    totals = {"normal": 0.0, "late": 0.0, "default": 0.0, "buyback": 0.0}
     for term, amount in durations.items():
         totals[classify_term(term)] += float(amount)
     total = sum(totals.values())
     if total <= 0:
         return None
-    return (totals["normal"] / total, totals["late"] / total, totals["default"] / total, total)
+    return (totals["normal"] / total, totals["late"] / total, totals["default"] / total, total, totals["buyback"] / total)
+
+
+def buyback_share(shares) -> float:
+    """Buyback share of a day's/run's [normal, late, default, total, buyback] (0 for the older, shorter records)."""
+    return shares[4] if len(shares) > 4 else 0.0
 
 
 def merge_durations(durations_by_key: dict) -> dict:
@@ -110,8 +151,8 @@ def _dict_or_empty(value) -> dict:
 
 
 def load_history(path: Path) -> tuple:
-    """(days, names, runs): days = {"YYYY-MM-DD": {key: [normal, late, default, total]}}, names = {key: display name},
-    runs = {"YYYY-MM-DD": {key: [[normal, late, default, total], ...]}} (every run of the current day).
+    """(days, names, runs): days = {"YYYY-MM-DD": {key: [normal, late, default, total, buyback]}}, names = {key: display name},
+    runs = {"YYYY-MM-DD": {key: [[normal, late, default, total, buyback], ...]}} (every run of the current day).
     All empty if the file is missing/unreadable."""
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
@@ -125,17 +166,21 @@ def save_history(path: Path, days: dict, names: dict, runs: dict) -> None:
 
 
 def merge_runs(runs: list):
-    """[[normal, late, default, total], ...] -> [normal, late, default, total] where the shares are weighted by
-    each run's total amount and the total is the mean of the runs' totals (the day keeps the weight of a single
-    run, used to weight the day in the monthly average). None if no run has a positive total."""
+    """[[normal, late, default, total, buyback], ...] -> [normal, late, default, total, buyback] where the shares
+    are weighted by each run's total amount and the total is the mean of the runs' totals (the day keeps the
+    weight of a single run, used to weight the day in the monthly average). None if no run has a positive total."""
     total = sum(run[3] for run in runs)
     if total <= 0:
         return None
-    return [*(sum(run[i] * run[3] for run in runs) / total for i in range(3)), total / len(runs)]
+    return [
+        *(sum(run[i] * run[3] for run in runs) / total for i in range(3)),
+        total / len(runs),
+        sum(buyback_share(run) * run[3] for run in runs) / total,
+    ]
 
 
 def record_day(days: dict, names: dict, runs: dict, day: date, shares_by_key: dict, names_by_key: dict, today: date, horizon_months: int) -> None:
-    """Records one run of `day` ({key: (normal, late, default, total)}) and sets the day's shares to the
+    """Records one run of `day` ({key: (normal, late, default, total, buyback)}) and sets the day's shares to the
     amount-weighted average of all its runs, plus their mean total (the day's weight in the monthly average).
     The runs of previous days are dropped: their average is already in `days`. Also stores the display names
     and drops the days older than the horizon window (and the names no longer present in any remaining day)."""
@@ -166,15 +211,15 @@ def tracked_originators(path: Path, today: date, horizon_months: int) -> dict:
 
 
 def monthly_samples(days: dict, key: str, year: int, month: int) -> list:
-    """[(day, [normal, late, default, total])] recorded for `key` during the month, in date order. Days recorded
-    before the total was stored only have the three shares."""
+    """[(day, [normal, late, default, total, buyback])] recorded for `key` during the month, in date order. Days
+    recorded before the total was stored only have the three shares, those before the buyback status four values."""
     prefix = f"{year:04d}-{month:02d}-"
     return sorted((day, shares[key]) for day, shares in days.items() if day.startswith(prefix) and key in shares)
 
 
 def monthly_average(days: dict, key: str, year: int, month: int):
     """Average of the daily shares of `key` over the recorded days of the month, each day weighted by its total
-    outstanding amount: (normal, late, default) or None. A day recorded without total (old state files) gets the
+    outstanding amount: (normal, late, default, buyback) or None. A day recorded without total (old state files) gets the
     mean weight of the other days of the month, or all days weigh the same when none has a total."""
     samples = [shares for _, shares in monthly_samples(days, key, year, month)]
     if not samples:
@@ -183,4 +228,6 @@ def monthly_average(days: dict, key: str, year: int, month: int):
     default_weight = sum(known) / len(known) if known else 1.0
     weights = [sample[3] if len(sample) > 3 and sample[3] > 0 else default_weight for sample in samples]
     total = sum(weights)
-    return tuple(sum(sample[i] * weight for sample, weight in zip(samples, weights)) / total for i in range(3))
+    shares = [sum(sample[i] * weight for sample, weight in zip(samples, weights)) / total for i in range(3)]
+    shares.append(sum(buyback_share(sample) * weight for sample, weight in zip(samples, weights)) / total)
+    return tuple(shares)

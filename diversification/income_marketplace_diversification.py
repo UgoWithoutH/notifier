@@ -151,11 +151,11 @@ from shared.google_sheet import (
     fill_geographic_repartition_amounts,
     fill_geographic_repartition_uninvested_amount,
     fill_remaining_duration_amounts,
+    default_after_late_days,
 )
 from shared.rate_sheet import fill_rate_amounts
 from shared.remaining_duration import (
     BUYBACK_GRACE_DAYS,
-    DEFAULT_AFTER_LATE_DAYS,
     RateWeights,
     base_term_between,
     overdue_months_and_days,
@@ -519,7 +519,7 @@ def _overdue_term(inv: dict, today: date):
     if beyond_60_days and not is_default:
         late_days = (today - overdue_since).days if overdue_since else 61
         log.warning("%s (%.2f EUR): %s, %d days late - buyback guaranteed but not paid yet.", inv.get("originator"), inv.get("outstanding", 0.0), inv.get("status"), late_days)
-        if late_days > DEFAULT_AFTER_LATE_DAYS:
+        if late_days > default_after_late_days("Income Marketplace", inv.get("originator")):
             log.warning("Buyback still unpaid after %d days of grace - counted as a default.", BUYBACK_GRACE_DAYS)
             is_default = True
     min_days = 61 if beyond_60_days else LATE_BUCKET_MIN_DAYS.get(status)

@@ -167,10 +167,11 @@ from shared.google_sheet import (
     fill_geographic_repartition_amounts,
     fill_geographic_repartition_uninvested_amount,
     fill_remaining_duration_amounts,
+    buyback_days_for,
+    default_after_late_days,
 )
 from shared.rate_sheet import fill_rate_amounts
 from shared.remaining_duration import (
-    DEFAULT_AFTER_LATE_DAYS,
     RateWeights,
     base_term_between,
     base_term_from_days,
@@ -299,12 +300,13 @@ def aggregate_remaining_durations(investments: list, today: date, rates=None) ->
     128 active investments, all with `loan.status` still "ACTIVE" and
     `nextPaymentDate` = the missed due date = today - loanOverdueDays) are
     grouped by overdue_months_and_days() since that missed payment date
-    instead, falling back to today - loanOverdueDays. Defaulted loans
-    (`loan.status` "DEFAULT"/"DEFAULTED" - INFERRED, no defaulted loan on the
+    instead, falling back to today - loanOverdueDays. Loans past their final
+    (extended) maturity by at least the originator's buyback delay ("durée" tab) get the "buyback"
+    key variant, those past it by more than that delay + the grace period
+    (every loan has `hasBuybackGuarantee`, so the buyback is still unpaid) or with
+    `loan.status` "DEFAULT"/"DEFAULTED" (INFERRED, no defaulted loan on the
     account to verify; active/finished investments only ever showed ACTIVE/
-    FINISHED) or loans more than DEFAULT_AFTER_LATE_DAYS overdue (every loan
-    has `hasBuybackGuarantee`, so the buyback is still unpaid) get the
-    "default" key variant. Otherwise the remaining term
+    FINISHED) the "default" one. Otherwise the remaining term
     above applies."""
     result = {}
     for inv in investments:
@@ -327,12 +329,17 @@ def aggregate_remaining_durations(investments: list, today: date, rates=None) ->
             overdue_days = int(loan.get("loanOverdueDays") or 0)
         except (TypeError, ValueError):
             overdue_days = 0
+        # The buyback guarantee activates N days after the FINAL maturity (`finalPaymentDate` already includes the
+        # extensions used, verified live 2026-11-09), not N days after a missed instalment.
+        past_maturity = (today - maturity).days
+        buyback_days = buyback_days_for("Lendermarket", lender_name)
         is_default = (
             str(loan.get("status") or "").upper() in ("DEFAULT", "DEFAULTED")
-            or overdue_days > DEFAULT_AFTER_LATE_DAYS
+            or past_maturity > default_after_late_days("Lendermarket", lender_name)
         )
+        is_buyback = not is_default and bool(buyback_days) and past_maturity >= buyback_days
         term = None
-        if overdue_days > 0 or is_default:
+        if overdue_days > 0 or is_default or is_buyback:
             try:
                 missed_due_date = date.fromisoformat(inv["nextPaymentDate"][:10])
             except (KeyError, TypeError, ValueError):
@@ -340,6 +347,10 @@ def aggregate_remaining_durations(investments: list, today: date, rates=None) ->
             term = missed_due_date and overdue_months_and_days(today, missed_due_date, default=is_default)
             if term is None and overdue_days > 0:
                 term = overdue_months_and_days(today, today - timedelta(days=overdue_days), default=is_default)
+            if term is None and (is_default or is_buyback):
+                term = overdue_months_and_days(today, maturity, default=is_default)
+            if is_buyback and term is not None and len(term) == 2:
+                term = (-term[0], -term[1], "buyback")
         if term is None:
             term = remaining_months_and_days(today, maturity)
         durations = result.setdefault(lender_name, {})
@@ -1107,7 +1118,8 @@ def run() -> None:
         try:
             rates = RateWeights()
             fill_remaining_duration_amounts(
-                "Lendermarket", aggregate_remaining_durations(investments, today_date, rates=rates), rates=rates
+                "Lendermarket", aggregate_remaining_durations(investments, today_date, rates=rates), rates=rates,
+                reclassify_buyback=False,
             )
         except Exception:
             log.exception("Failed to update the 'durée' sheet for Lendermarket.")

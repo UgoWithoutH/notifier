@@ -140,6 +140,22 @@ def weighted_rate(entries) -> float | None:
     return weighted_sum / base if base > 0 else None
 
 
+def default_after_late_days(buyback_days: int | None) -> int:
+    """Lateness (in days) beyond which a loan that is still unpaid is INFERRED to be in default: the originator's
+    buyback delay (BUYBACK_TRIGGER_DAYS when it has none configured) plus BUYBACK_GRACE_DAYS."""
+    return (buyback_days or BUYBACK_TRIGGER_DAYS) + BUYBACK_GRACE_DAYS
+
+
+def to_buyback_term(today: date, term: tuple, buyback_days: int | None) -> tuple:
+    """`term` as (months, days, "buyback") (positive months/days, like the "default" variant) when it is a late term
+    (negative months/days) that has been late for at least `buyback_days` days; otherwise `term` unchanged. The comparison is done on
+    (months, days) against the lateness of a payment due exactly `buyback_days` days ago, so it is calendar-exact."""
+    if not buyback_days or buyback_days <= 0 or len(term) > 2 or not (term[0] < 0 or term[1] < 0):
+        return term
+    threshold = _months_and_days_between(today - timedelta(days=buyback_days), today)
+    return (-term[0], -term[1], "buyback") if (-term[0], -term[1]) >= threshold else term
+
+
 def overdue_months_and_days(today: date, due: date, default: bool = False):
     """Term of a loan that is late (or in default) since the missed payment
     date `due`, as a duration key for the "durée" sheet: late loans use the
