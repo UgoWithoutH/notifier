@@ -1285,27 +1285,14 @@ def _duration_horizon_months(sections: list, platform_row: int, log_problem: boo
 # Délai de buyback d'une société de prêt = nombre de jours de retard à partir duquel un de ses prêts passe de
 # "retard" à "buyback" (le prêteur ou la plateforme rachète alors le prêt). Il est saisi en colonne D de la ligne de
 # la société dans l'onglet "durée" ("2 mois", "8 mois", "2 mois 15 jours" ; vide = pas de buyback) et modifiable depuis la vue "Durées" de la
-# page CarteDetailPage. Valeurs ci-dessous : posées à la création de la ligne d'une société, et utilisées quand
-# l'onglet est illisible. plateforme (casse ignorée) -> (délai par défaut, {société (casse ignorée): délai}).
+# page CarteDetailPage. Aucune valeur par défaut dans le code : sans délai dans l'onglet (cellule vide, société ou
+# onglet absents/illisibles), il n'y a pas de buyback.
 _DURATION_BUYBACK_COL = _DURATION_AMOUNT_COL
-_DEFAULT_BUYBACK_DAYS = {
-    "mintos": (60, {}),
-    "peerberry": (60, {}),
-    "swaper": (60, {}),
-    "iuvo": (60, {}),
-    "loanch": (30, {}),
-    "lendermarket": (60, {}),
-}
 # Plateformes dont l'API indique elle-même le buyback : pas de délai configurable (colonne D laissée vide, ignorée si remplie).
+# Income Marketplace : statut de prêt "Buyback initiated" (prêt toujours en encours). Nectaro : statut "BUYBACK" de chaque prêt
 # Income Marketplace : statut de prêt "Buyback initiated" (prêt toujours en encours). Nectaro : statut "BUYBACK" de chaque prêt
 # sous-jacent, qui sort alors de l'encours (jamais de montant en buyback à afficher).
 API_BUYBACK_PLATFORMS = frozenset({"income marketplace", "nectaro"})
-
-
-def default_buyback_days(platform: str, originator: str):
-    """Délai de buyback (jours) par défaut d'une société de prêt, None si elle n'en a pas."""
-    platform_default, by_originator = _DEFAULT_BUYBACK_DAYS.get(platform.strip().casefold(), (None, {}))
-    return by_originator.get(str(originator or "").strip().casefold(), platform_default)
 
 
 def _duration_block_bounds(grid: list, platform: str):
@@ -1345,8 +1332,7 @@ _buyback_days_cache: dict = {}  # plateforme (casse ignorée) -> {société: jou
 
 def buyback_days_for(platform: str, originator: str):
     """Délai de buyback (jours) de la société `originator` de `platform`, lu dans l'onglet "durée" (une seule lecture
-    par plateforme et par processus) ; None si elle n'en a pas. Une société sans ligne dans l'onglet (ou un onglet
-    illisible) reçoit la valeur par défaut de `default_buyback_days`."""
+    par plateforme et par processus) ; None si elle n'en a pas (cellule vide, société sans ligne ou onglet illisible)."""
     cache_key = platform.strip().casefold()
     if cache_key in API_BUYBACK_PLATFORMS:
         return None
@@ -1357,13 +1343,13 @@ def buyback_days_for(platform: str, originator: str):
             texts = _duration_originator_buyback_texts(grid, *bounds) if bounds else {}
             _buyback_days_cache[cache_key] = {key: status_history.parse_buyback_days(text) for key, text in texts.items()}
         except Exception as exc:
-            logger.warning("Délais de buyback de %s illisibles dans '%s' (%s) - valeurs par défaut utilisées.", platform, DURATION_SHEET_NAME, exc)
+            logger.warning("Délais de buyback de %s illisibles dans '%s' (%s) - aucun buyback appliqué.", platform, DURATION_SHEET_NAME, exc)
             _buyback_days_cache[cache_key] = None
     days_by_originator = _buyback_days_cache[cache_key]
     key = str(originator or "").strip().casefold()
     if days_by_originator is not None and key in days_by_originator:
         return days_by_originator[key]
-    return default_buyback_days(platform, originator)
+    return None
 
 
 def default_after_late_days(platform: str, originator: str) -> int:
@@ -1511,7 +1497,7 @@ def fill_remaining_duration_amounts(
     colonne A vaut exactement son nom) dans l'onglet "durée" :
 
     - une ligne par société de prêt (nom en colonne A, délai de buyback en colonne D - "2 mois", vide = pas de buyback,
-      conservé tel quel ; valeur par défaut de `default_buyback_days` à la création), créée
+      conservé tel quel ; vide à la création), créée
       si absente et supprimée seulement quand elle n'a plus de prêt ET plus aucune donnée
       dans l'historique de l'horizon (une société sans prêt en cours garde sa ligne et ses lignes de statut) ;
     - sous chacune, les lignes "défauts", "buyback", "retards", "normaux" (dans cet ordre ; "buyback" seulement pour une
@@ -1684,8 +1670,8 @@ def fill_remaining_duration_amounts(
                         DURATION_SHEET_NAME, _col_letter(_DURATION_BUYBACK_COL + 1), platform_row, buyback_texts[key],
                     )
             else:
-                days = default_buyback_days(platform, name)
-                buyback_texts[key] = status_history.buyback_label(days) if days else ""
+                days = None
+                buyback_texts[key] = ""
             buyback_days_by_key[key] = days
             if not days or not reclassify_buyback:
                 continue
