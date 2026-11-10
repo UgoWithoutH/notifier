@@ -37,6 +37,11 @@ suivante) :
   durée aléatoire (jitter) entre ces deux bornes avant de démarrer. Borne
   inférieure vide = 0 ; borne supérieure vide = égale à la borne inférieure
   (attente fixe) ; les deux vides ou invalides = jitter par défaut du robot.
+- Garder non investi (colonne facultative, ligne de la PLATEFORME, en €) :
+  somme que le robot laisse non investie. Il n'investit que le solde
+  disponible au-delà de cette somme (et seulement si l'excédent atteint le
+  montant minimum d'investissement). Vide ou invalide = tout le solde est
+  investissable.
 """
 
 import logging
@@ -84,6 +89,7 @@ _OPTIONAL_COLUMN_PREFIXES = {
     "max_months": "duree restante max",
     "min_premium": "decote / prime min",
     "max_premium": "decote / prime max",
+    "keep_uninvested": "garder non investi",
 }
 
 
@@ -202,6 +208,12 @@ class PlatformConfig:
     schedule_sufficient_minutes: int | None = None
     startup_wait_min_minutes: int | None = None
     startup_wait_max_minutes: int | None = None
+    keep_uninvested: float = 0.0
+
+    def investable_balance(self, balance: float) -> float:
+        """Part du solde disponible que le robot peut investir : le solde moins
+        la somme à garder non investie (jamais négatif)."""
+        return max(0.0, round(balance - self.keep_uninvested, 2))
 
     @property
     def disabled(self) -> bool:
@@ -316,6 +328,12 @@ def get_platform_config(platform: str) -> PlatformConfig:
                 platform, raw,
             )
         setattr(config, attr, minutes)
+
+    keep_raw = cell(grid[platform_idx], "keep_uninvested")
+    keep = _parse_number(keep_raw)
+    if keep_raw and keep is None:
+        log.warning("Config robot %s : 'Garder non investi' = '%s' invalide (ex. '200'), aucune somme gardée.", platform, keep_raw)
+    config.keep_uninvested = max(0.0, keep or 0.0)
 
     for row in grid[platform_idx + 1:]:
         name = cell(row, "name")

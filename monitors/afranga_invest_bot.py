@@ -485,14 +485,18 @@ def run() -> None:
         except Exception as exc:
             config_error = exc
             log.exception("Could not read the Afranga configuration from the 'config robots' sheet.")
-        sufficient = balance >= MIN_INVESTMENT_AMOUNT
+        investable = config.investable_balance(balance) if config else balance
+        sufficient = investable >= MIN_INVESTMENT_AMOUNT
         default_minutes = 2 if sufficient else DAY_MINUTES
         ensure_schedule_interval(
             config.schedule_minutes(sufficient, default_minutes) if config else default_minutes,
             cron_job_id=AFRANGA_CRON_JOB_ID, state_file=CRON_SCHEDULE_STATE_FILE, sufficient=sufficient,
         )
         if not sufficient:
-            log.info("Balance below the minimum investment amount - nothing to do.")
+            log.info(
+                "Investable balance %.2f EUR (balance %.2f EUR minus %.2f EUR kept uninvested) is below the minimum investment amount - nothing to do.",
+                investable, balance, config.keep_uninvested if config else 0.0,
+            )
             return
 
         if config is None:
@@ -525,7 +529,7 @@ def run() -> None:
             )
             save_state(STATE_FILE, state)
 
-        budget = balance
+        budget = investable
         if config.secondary_names():
             filters = {}
             _range_filters(filters, "interest_rate_percent", config.lowest_min_rate(secondary=True), None)
@@ -537,7 +541,7 @@ def run() -> None:
             log.info("Secondary: %d listing(s) fetched, %d planned.", len(market.rows), len(lines))
             stats["plan"] += [_line_summary(line) for line in lines]
             execute_market(session, market, lines, tracker, stats)
-            budget = stats["balance_after"] if MODE == "live" else budget - sum(line.cost for line in lines)
+            budget = config.investable_balance(stats["balance_after"]) if MODE == "live" else budget - sum(line.cost for line in lines)
 
         if config.active_names() and budget >= MIN_INVESTMENT_AMOUNT:
             filters = {}
