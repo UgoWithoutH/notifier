@@ -1061,19 +1061,16 @@ def run() -> None:
         log.exception("Failed to log in or fetch Bricks balances.")
         sys.exit(1)
 
-    try:
-        log.info("Fetching this month's revenue totals...")
-        revenue_totals = fetch_current_month_revenue_totals(session)
-    except Exception:
-        log.exception(
-            "Failed to fetch this month's gross/net interest received/withholding tax/bonus - "
-            "defaulting all four to 0.0."
-        )
-        revenue_totals = {
-            "gross_interest_received": 0.0, "net_interest_received": 0.0,
-            "withholding_tax": 0.0, "bonus_cashback_contest": 0.0,
-            "referrals": 0.0, "boosted_balance_gain": 0.0,
-        }
+    revenue_totals = None
+    for attempt in range(1, 4):
+        try:
+            log.info("Fetching this month's revenue totals (attempt %d/3)...", attempt)
+            revenue_totals = fetch_current_month_revenue_totals(session)
+            break
+        except Exception:
+            log.exception("Failed to fetch this month's revenue totals (attempt %d/3).", attempt)
+    if revenue_totals is None:
+        log.error("Revenue totals unavailable - interest/tax/bonus cells left untouched in the Sheet (NOT defaulted to 0).")
 
     total = round(balances["investments_en_cours"] + balances["solde_total"], 2)
     log.info(
@@ -1180,20 +1177,21 @@ def run() -> None:
 
     amounts = {
         "total": total,
-        "gross_interest_received": revenue_totals["gross_interest_received"],
-        "net_interest_received": revenue_totals["net_interest_received"],
-        "withholding_tax": revenue_totals["withholding_tax"],
-        "bonus_cashback_contest": revenue_totals["bonus_cashback_contest"],
+        "gross_interest_received": revenue_totals["gross_interest_received"] if revenue_totals else None,
+        "net_interest_received": revenue_totals["net_interest_received"] if revenue_totals else None,
+        "withholding_tax": revenue_totals["withholding_tax"] if revenue_totals else None,
+        "bonus_cashback_contest": revenue_totals["bonus_cashback_contest"] if revenue_totals else None,
         "investments_en_cours": balances["investments_en_cours"],
         "solde_total": balances["solde_total"],
         "solde_principal": balances["solde_principal"],
         "solde_cadeau": balances["solde_cadeau"],
     }
-    log.info(
-        "This month's revenue totals: gross_interest_received=%.2f EUR, net_interest_received=%.2f EUR, "
-        "withholding_tax=%.2f EUR",
-        amounts["gross_interest_received"], amounts["net_interest_received"], amounts["withholding_tax"],
-    )
+    if revenue_totals:
+        log.info(
+            "This month's revenue totals: gross_interest_received=%.2f EUR, net_interest_received=%.2f EUR, "
+            "withholding_tax=%.2f EUR",
+            amounts["gross_interest_received"], amounts["net_interest_received"], amounts["withholding_tax"],
+        )
 
     # Per the user's explicit decision (2026-07-15, after being warned
     # twice about the Sheet layout issue described in the module
@@ -1234,11 +1232,13 @@ def run() -> None:
     # (stops at the next platform's own row), no hardcoded `max_rows`
     # needed - only included when actually computed (soft-fail, same
     # convention as everywhere else).
-    breakdown = {
-        "parrainages": revenue_totals["referrals"],
-        "soldes boost\u00e9s": revenue_totals["boosted_balance_gain"],
-        "pr\u00e9l\u00e8vements": revenue_totals["withholding_tax"],
-    }
+    breakdown = {}
+    if revenue_totals:
+        breakdown = {
+            "parrainages": revenue_totals["referrals"],
+            "soldes boost\u00e9s": revenue_totals["boosted_balance_gain"],
+            "pr\u00e9l\u00e8vements": revenue_totals["withholding_tax"],
+        }
     breakdown.update(xirr_block)
     if avg_invested_balance is not None:
         breakdown[INVESTED_BALANCE_LABEL] = avg_invested_balance

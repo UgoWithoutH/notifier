@@ -228,6 +228,7 @@ from shared.google_sheet import (
 from shared.rate_sheet import fill_rate_amounts
 from shared.remaining_duration import RateWeights, overdue_months_and_days, remaining_months_and_days
 from shared.report_date import get_report_now, is_current_month
+from shared.retry import retry_call
 from shared.session_cache import get_or_refresh_session, save_session_state
 from shared.notifier import send_bienpreter_geo_issues_email
 from shared.state import load_state, save_state
@@ -1192,13 +1193,10 @@ def run() -> None:
 
     try:
         log.info("Fetching this month's interest totals from the operations page...")
-        interest_totals = fetch_current_month_interest_totals(session)
+        interest_totals = retry_call(lambda: fetch_current_month_interest_totals(session), "this month's interest totals")
     except Exception:
-        log.exception("Failed to fetch this month's interest totals - defaulting all figures to 0.0.")
-        interest_totals = {
-            "net_interest_received": 0.0, "withholding_tax": 0.0,
-            "gross_interest_received": 0.0, "bonus_total": 0.0,
-        }
+        log.exception("Failed to fetch this month's interest totals - aborting rather than writing 0 to the Sheet.")
+        sys.exit(1)
 
     total = balances["available_balance"] + balances["capital_to_receive"]
     interest_totals["total"] = total
