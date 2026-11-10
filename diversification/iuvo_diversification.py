@@ -167,6 +167,7 @@ load_dotenv()
 import requests
 
 try:
+    from shared.retry import retry_call
     from shared.google_sheet import default_after_late_days, fill_current_month_amounts, fill_current_month_bonus_breakdown, fill_geographic_repartition_amounts, fill_geographic_repartition_uninvested_amount, fill_remaining_duration_amounts
     from shared.monthly_yield_waterfall import compute_monthly_yield_shares
     from shared.rate_sheet import fill_rate_amounts
@@ -184,6 +185,7 @@ except ModuleNotFoundError:
     project_root = Path(__file__).resolve().parents[1]
     if str(project_root) not in sys.path:
         sys.path.insert(0, str(project_root))
+    from shared.retry import retry_call
     from shared.google_sheet import default_after_late_days, fill_current_month_amounts, fill_current_month_bonus_breakdown, fill_geographic_repartition_amounts, fill_geographic_repartition_uninvested_amount, fill_remaining_duration_amounts
     from shared.monthly_yield_waterfall import compute_monthly_yield_shares
     from shared.rate_sheet import fill_rate_amounts
@@ -809,13 +811,10 @@ def run() -> None:
 
     try:
         log.info("Fetching this month's interest received from the account statement...")
-        interest_totals = fetch_current_month_interest(session, session_token)
+        interest_totals = retry_call(lambda: fetch_current_month_interest(session, session_token), "this month's interest received")
     except Exception:
-        log.exception("Failed to fetch this month's interest received - defaulting to 0.0.")
-        interest_totals = {
-            "gross_interest_received": 0.0, "net_interest_received": 0.0,
-            "withholding_tax": 0.0, "bonus_cashback_contest": 0.0,
-        }
+        log.exception("Failed to fetch this month's interest received - aborting rather than writing 0 to the Sheet.")
+        sys.exit(1)
 
     log.info(
         "Iuvo balance: total=%.2f EUR, receivables_in_p2p=%.2f EUR across %d loan originator(s):",

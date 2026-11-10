@@ -115,6 +115,7 @@ from shared.google_sheet import (
 from shared.rate_sheet import fill_rate_amounts
 from shared.remaining_duration import RateWeights, base_term_between, base_term_from_days, overdue_months_and_days, remaining_months_and_days
 from shared.report_date import get_report_now, is_current_month
+from shared.retry import retry_call
 from shared.state import load_state, save_state
 from shared.weighted_average import INVESTED_BALANCE_LABEL, NON_INVESTED_BALANCE_LABEL, compute_time_weighted_average
 from shared.monthly_yield_waterfall import compute_monthly_yield_shares
@@ -1224,24 +1225,31 @@ def run(headless: bool = True) -> None:
             browser.close()
             sys.exit(1)
 
+        def _fetch_interest_received():
+            page.goto(STATEMENT_PAGE_URL, wait_until="domcontentloaded")
+            return fetch_current_month_interest_received(page)
+
         try:
             log.info("Navigating to the account statement page to fetch this month's Interest Received...")
-            page.goto(STATEMENT_PAGE_URL, wait_until="domcontentloaded")
-            statement_totals = fetch_current_month_interest_received(page)
+            statement_totals = retry_call(_fetch_interest_received, "this month's Interest Received")
             interest_received = statement_totals["earned_interest"]
         except Exception:
-            log.exception("Failed to fetch this month's Interest Received - defaulting to 0.0.")
-            interest_received = 0.0
-            statement_totals = None
+            log.exception("Failed to fetch this month's Interest Received - aborting rather than writing 0 to the Sheet.")
+            browser.close()
+            sys.exit(1)
+
+        def _fetch_referral_bonus():
+            page.goto(REFERRAL_BONUS_PAGE_URL, wait_until="domcontentloaded")
+            page.wait_for_timeout(1000)
+            return fetch_referral_bonus_earned(page)
 
         try:
             log.info("Navigating to the Refer Friends bonus page to fetch 'Earned from referral'...")
-            page.goto(REFERRAL_BONUS_PAGE_URL, wait_until="domcontentloaded")
-            page.wait_for_timeout(1000)
-            referral_bonus_earned = fetch_referral_bonus_earned(page)
+            referral_bonus_earned = retry_call(_fetch_referral_bonus, "the referral bonus earned")
         except Exception:
-            log.exception("Failed to fetch the referral bonus earned - defaulting to 0.0.")
-            referral_bonus_earned = 0.0
+            log.exception("Failed to fetch the referral bonus earned - aborting rather than writing 0 to the Sheet.")
+            browser.close()
+            sys.exit(1)
 
         try:
             log.info("Navigating to the loans page to fetch the uninvested account balance ('non investi')...")

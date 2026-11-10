@@ -162,6 +162,7 @@ from shared.remaining_duration import (
     remaining_months_and_days,
 )
 from shared.report_date import get_report_now, is_current_month
+from shared.retry import retry_call
 from shared.session_cache import get_or_refresh_session
 from shared.state import load_state, save_state
 from shared.weighted_average import INVESTED_BALANCE_LABEL, NON_INVESTED_BALANCE_LABEL, compute_time_weighted_average
@@ -1454,13 +1455,10 @@ def run() -> None:
         sys.exit(1)
 
     try:
-        statement_totals = fetch_current_month_statement_totals(session)
+        statement_totals = retry_call(lambda: fetch_current_month_statement_totals(session), "this month's statement totals")
     except Exception:
-        log.exception("Failed to fetch this month's Gross interest received/Withholding Tax - defaulting both to 0.0.")
-        statement_totals = {
-            "gross_interest_received": 0.0, "withholding_tax": 0.0,
-            "opening_balance": 0.0, "closing_balance": 0.0, "bonus_total": 0.0,
-        }
+        log.exception("Failed to fetch this month's Gross interest received/Withholding Tax - aborting rather than writing 0 to the Sheet.")
+        sys.exit(1)
 
     try:
         uninvested_balance = fetch_uninvested_balance(session)

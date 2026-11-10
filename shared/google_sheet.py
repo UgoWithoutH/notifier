@@ -406,6 +406,9 @@ def fill_current_month_amounts(
         interest_row = platform_row + 1
 
     if skip_total:
+        if gross_interest_received is None:
+            logger.warning("Intérêts indisponibles et total ignoré : rien écrit pour %s.", platform)
+            return
         address = rowcol_to_a1(interest_row, current_month_col)
         logger.info(
             "skip_total=True (mois non courant) : écriture uniquement des intérêts = %s (%s), total ignoré",
@@ -428,14 +431,13 @@ def fill_current_month_amounts(
         platform, total_amount, total_a1, gross_interest_received, interest_a1,
     )
 
-    _call_with_retry(
-        worksheet.batch_update,
-        [
-            {"range": total_a1, "values": [[total_amount]]},
-            {"range": interest_a1, "values": [[gross_interest_received]]},
-        ],
-        value_input_option="USER_ENTERED"
-    )
+    updates = [{"range": total_a1, "values": [[total_amount]]}]
+    if gross_interest_received is None:
+        logger.warning("Intérêts indisponibles pour %s : cellule %s laissée intacte.", platform, interest_a1)
+    else:
+        updates.append({"range": interest_a1, "values": [[gross_interest_received]]})
+
+    _call_with_retry(worksheet.batch_update, updates, value_input_option="USER_ENTERED")
 
     logger.info("Mise à jour terminée pour %s (total %s, intérêts %s)", platform, total_a1, interest_a1)
 

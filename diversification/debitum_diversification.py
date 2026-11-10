@@ -183,6 +183,7 @@ from shared.remaining_duration import (
     remaining_months_and_days,
 )
 from shared.report_date import get_report_date, is_current_month
+from shared.retry import retry_call
 from shared.session_cache import get_or_refresh_session
 from shared.state import load_state, save_state
 from shared.weighted_average import INVESTED_BALANCE_LABEL, NON_INVESTED_BALANCE_LABEL, compute_time_weighted_average
@@ -681,7 +682,10 @@ def run() -> None:
     }
 
     try:
-        month_summary = fetch_transactions_summary(session, headers, month_start_date, today_date)
+        month_summary = retry_call(
+            lambda: fetch_transactions_summary(session, headers, month_start_date, today_date),
+            "this month's transactions summary",
+        )
         gross_interest = month_summary.get("interest", 0.0) or 0.0
         withholding_tax = month_summary.get("totalTax", 0.0) or 0.0
         amounts["gross_interest_received"] = gross_interest
@@ -694,7 +698,8 @@ def run() -> None:
             gross_interest, withholding_tax, amounts["bonus_cashback_contest"],
         )
     except Exception:
-        log.exception("Failed to fetch this month's transactions summary - defaulting interest/tax/bonus to 0.0.")
+        log.exception("Failed to fetch this month's transactions summary - aborting rather than writing 0 to the Sheet.")
+        sys.exit(1)
 
     # Since-inception XIRR/Cash drag block - see module docstring for the
     # full methodology (mirrors nectaro_diversification.py's design).

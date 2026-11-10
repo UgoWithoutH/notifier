@@ -162,6 +162,7 @@ from shared.remaining_duration import (
     remaining_months_and_days,
 )
 from shared.report_date import get_report_date, is_current_month
+from shared.retry import retry_call
 from shared.state import load_state, save_state
 from shared.weighted_average import INVESTED_BALANCE_LABEL, NON_INVESTED_BALANCE_LABEL, compute_time_weighted_average
 from shared.monthly_yield_waterfall import compute_monthly_yield_shares
@@ -738,7 +739,10 @@ def run() -> None:
 
             try:
                 month_start_date = today_date.replace(day=1)
-                this_month_transactions = fetch_all_statement_transactions(page, token, month_start_date, today_date)
+                this_month_transactions = retry_call(
+                    lambda: fetch_all_statement_transactions(page, token, month_start_date, today_date),
+                    "this month's statement transactions",
+                )
                 gross_interest = sum(t["amount"] for t in this_month_transactions if t["account_type"] == INTEREST_TYPE)
                 bonus = sum(t["amount"] for t in this_month_transactions if t["account_type"] == BONUS_TYPE)
                 amounts["gross_interest_received"] = gross_interest
@@ -749,7 +753,8 @@ def run() -> None:
                     gross_interest, bonus,
                 )
             except Exception:
-                log.exception("Failed to fetch this month's statement totals - defaulting interest/bonus to 0.0.")
+                log.exception("Failed to fetch this month's statement totals - aborting rather than writing 0 to the Sheet.")
+                sys.exit(1)
 
             # Since-inception XIRR/Cash drag block - see module docstring.
             xirr_value = None

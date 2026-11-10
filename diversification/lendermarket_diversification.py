@@ -179,6 +179,7 @@ from shared.remaining_duration import (
     remaining_months_and_days,
 )
 from shared.report_date import get_report_now, is_current_month
+from shared.retry import retry_call
 from shared.session_cache import get_or_refresh_session
 from shared.state import load_state, save_state
 from shared.weighted_average import INVESTED_BALANCE_LABEL, NON_INVESTED_BALANCE_LABEL
@@ -646,14 +647,12 @@ def run() -> None:
         sys.exit(1)
 
     try:
-        statement_totals = fetch_current_month_statement_totals(session, investor_id)
+        statement_totals = retry_call(
+            lambda: fetch_current_month_statement_totals(session, investor_id), "this month's statement totals"
+        )
     except Exception:
-        log.exception("Failed to fetch this month's interest received/bonuses - defaulting to 0.0.")
-        statement_totals = {
-            "interest_received": 0.0, "bonuses": 0.0, "fees": 0.0,
-            "opening_balance": 0.0, "closing_balance": 0.0, "deposits": 0.0, "withdrawals": 0.0,
-            "investment_amount": 0.0, "received_principal_amount": 0.0,
-        }
+        log.exception("Failed to fetch this month's interest received/bonuses - aborting rather than writing 0 to the Sheet.")
+        sys.exit(1)
 
     lenders = aggregate_by_lender(investments)
     log.info("Fetched %d active investment(s) across %d loan originator(s).", len(investments), len(lenders))

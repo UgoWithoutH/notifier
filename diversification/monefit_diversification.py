@@ -140,6 +140,7 @@ from shared.google_sheet import fill_current_month_amounts, fill_current_month_b
 from shared.rate_sheet import fill_rate_amounts
 from shared.remaining_duration import RateWeights, base_term_between, remaining_months_and_days
 from shared.report_date import get_report_now, is_current_month
+from shared.retry import retry_call
 from shared.session_cache import get_or_refresh_session
 from shared.state import load_state, save_state
 from shared.weighted_average import INVESTED_BALANCE_LABEL, NON_INVESTED_BALANCE_LABEL
@@ -552,13 +553,13 @@ def run() -> None:
 
     try:
         log.info("Fetching this month's statement totals...")
-        statement_totals = fetch_current_month_statement_totals(session)
+        statement_totals = retry_call(lambda: fetch_current_month_statement_totals(session), "this month's statement totals")
     except Exception:
         log.exception(
             "Failed to fetch this month's From daily returns/Rewards & bonuses/Matured Vaults - "
-            "defaulting all three to 0.0."
+            "aborting rather than writing 0 to the Sheet."
         )
-        statement_totals = {"daily_returns": 0.0, "vault_interest": 0.0, "rewards_bonuses": 0.0, "matured_vaults": 0.0, "deposits": 0.0, "withdrawals": 0.0, "fees": 0.0, "opening_balance": 0.0, "closing_balance": None}
+        sys.exit(1)
 
     interest_total = _total_interest(statement_totals)
     originators = [{"originator": LOAN_ORIGINATOR_LABEL, "outstanding": balance}]

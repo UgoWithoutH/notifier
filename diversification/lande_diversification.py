@@ -218,6 +218,7 @@ from shared.google_sheet import (
 from shared.rate_sheet import fill_rate_amounts
 from shared.remaining_duration import RateWeights, base_term_from_days, overdue_months_and_days, remaining_months_and_days
 from shared.report_date import get_report_date, is_current_month
+from shared.retry import retry_call
 from shared.weighted_average import INVESTED_BALANCE_LABEL, NON_INVESTED_BALANCE_LABEL, compute_time_weighted_average
 from shared.monthly_yield_waterfall import compute_monthly_yield_shares
 from shared.xirr import compute_xirr
@@ -842,10 +843,12 @@ def run(session: requests.Session | None = None) -> None:
     log.info("Account value at period end (%s - %s): %.2f EUR", start_date, end_date, total)
 
     try:
-        gross_interest_received = fetch_current_month_interest(session, start_date, end_date)
+        gross_interest_received = retry_call(
+            lambda: fetch_current_month_interest(session, start_date, end_date), "this month's interest"
+        )
     except Exception:
-        log.exception("Failed to fetch Lande this month's interest - defaulting to 0.0.")
-        gross_interest_received = 0.0
+        log.exception("Failed to fetch Lande this month's interest - aborting rather than writing 0 to the Sheet.")
+        sys.exit(1)
 
     log.info("This month's gross interest received: %.2f EUR", gross_interest_received)
 

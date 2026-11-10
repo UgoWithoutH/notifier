@@ -191,6 +191,7 @@ from shared.google_sheet import (
 from shared.rate_sheet import fill_rate_amounts
 from shared.remaining_duration import RateWeights, base_term_between, base_term_from_days, overdue_months_and_days, remaining_months_and_days
 from shared.report_date import get_report_now, is_current_month
+from shared.retry import retry_call
 from shared.session_cache import get_or_refresh_session
 from shared.state import load_state, save_state
 from shared.weighted_average import INVESTED_BALANCE_LABEL, NON_INVESTED_BALANCE_LABEL, compute_time_weighted_average
@@ -1057,10 +1058,10 @@ def run() -> None:
         sys.exit(1)
 
     try:
-        statement_totals = fetch_current_month_statement_totals(session)
+        statement_totals = retry_call(lambda: fetch_current_month_statement_totals(session), "this month's statement totals")
     except Exception:
-        log.exception("Failed to fetch this month's Interest income - defaulting to 0.0.")
-        statement_totals = {"interest_income": 0.0, "opening_balance": 0.0, "closing_balance": 0.0}
+        log.exception("Failed to fetch this month's Interest income - aborting rather than writing 0 to the Sheet.")
+        sys.exit(1)
     interest_income = statement_totals["interest_income"]
 
     originators = normalize_originators(payload)
