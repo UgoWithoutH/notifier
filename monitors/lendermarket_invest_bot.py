@@ -634,7 +634,8 @@ def invest_selected_lenders(
     on the marketplace is reported by mail (once, see shared/missing_loans.py).
     `search_state` is a dict persisted between runs (known lenders, last scan,
     mail gates). Each loan is then checked against its lender's
-    min/max rate, and the whole `balance` is allocated across all the
+    min/max rate, and the whole investable balance (`balance` minus the
+    "Garder non investi" amount) is allocated across all the
     candidate loans by `plan_allocations()`: per-lender min/max amount per
     investment, "Pourcentage max du solde par loan" and "Pourcentage max du
     solde par pays" caps (both relative to balance + everything already
@@ -736,9 +737,10 @@ def invest_selected_lenders(
         log.info("No available loan for the active Lendermarket lenders %s - nothing to invest this run.", [m[0] for m in matched])
         return stats
 
-    plan = plan_allocations(candidates, tracker, balance, MIN_INVESTMENT_AMOUNT)
+    budget = config.investable_balance(balance)
+    plan = plan_allocations(candidates, tracker, budget, MIN_INVESTMENT_AMOUNT)
     if not plan:
-        log.info("%d candidate loan(s), nothing fundable under the configured limits (balance=%.2f EUR).", len(candidates), balance)
+        log.info("%d candidate loan(s), nothing fundable under the configured limits (balance=%.2f EUR, investable=%.2f EUR).", len(candidates), balance, budget)
         return stats
 
     for loan_uuid, amount in plan.items():
@@ -836,6 +838,11 @@ def run() -> None:
             pass
         elif not config.active_names():
             log.info("Skipping auto-invest: no Lendermarket lender is active (ACTIF = x) in the 'config robots' sheet.")
+        elif config.investable_balance(balance) < MIN_INVESTMENT_AMOUNT:
+            log.info(
+                "Auto-invest bot stopping: balance (%.2f EUR) minus the amount kept uninvested (%.2f EUR) is below the minimum investment amount (%.2f EUR).",
+                balance, config.keep_uninvested, MIN_INVESTMENT_AMOUNT,
+            )
         else:
             geo_snapshot = None
             try:
@@ -893,7 +900,8 @@ def run() -> None:
     # balance couldn't be determined, rather than guessing and possibly
     # slowing down polling incorrectly.
     if balance is not None:
-        sufficient = balance >= 10
+        investable = config.investable_balance(balance) if config else balance
+        sufficient = investable >= 10
         ensure_schedule_interval(
             resolve_schedule_minutes("Lendermarket", sufficient, 2 if sufficient else 30, config),
             cron_job_id=LENDERMARKET_CRON_JOB_ID, state_file=CRON_SCHEDULE_STATE_FILE, sufficient=sufficient,

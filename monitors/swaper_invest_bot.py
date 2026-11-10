@@ -1248,11 +1248,13 @@ def run(headless: bool = True) -> None:
                         )
 
                         pass_attempts = []
-                        if balance_now < MIN_INVESTMENT_AMOUNT:
+                        budget_now = config.investable_balance(balance_now)
+                        if budget_now < MIN_INVESTMENT_AMOUNT:
                             log.info(
-                                "Balance %.2f EUR is below the minimum (%.2f EUR) - availability was still "
-                                "checked above for diagnostics, but skipping the actual auto-invest step.",
-                                balance_now, MIN_INVESTMENT_AMOUNT,
+                                "Investable balance %.2f EUR (balance %.2f EUR minus %.2f EUR kept uninvested) is below the "
+                                "minimum (%.2f EUR) - availability was still checked above for diagnostics, but skipping "
+                                "the actual auto-invest step.",
+                                budget_now, balance_now, config.keep_uninvested, MIN_INVESTMENT_AMOUNT,
                             )
                         else:
                             # Per-country / per-originator caps ("Pourcentage max du
@@ -1316,7 +1318,7 @@ def run(headless: bool = True) -> None:
                             # One allocation across ALL candidate loans: per-originator
                             # rate bounds, min/max amount, caps and the "Répartition
                             # équivalente" flag (see shared/robot_config.py).
-                            plan = plan_allocations(candidates, tracker, balance_now, MIN_INVESTMENT_AMOUNT)
+                            plan = plan_allocations(candidates, tracker, budget_now, MIN_INVESTMENT_AMOUNT)
                             log.info("Investment plan (loan id -> EUR): %s", plan)
                             shares_by_name = {}
                             for candidate in candidates:
@@ -1433,7 +1435,7 @@ def run(headless: bool = True) -> None:
     # money to invest. The two intervals come from the "Temps planification
     # solde (in)suffisant" columns of the Swaper row in "config robots"
     # (defaults 30 min / 2 min).
-    sufficient = balance >= 10
+    sufficient = (robot_config.investable_balance(balance) if robot_config else balance) >= 10
     ensure_schedule_interval(
         resolve_schedule_minutes("Swaper", sufficient, 2 if sufficient else 30, robot_config),
         cron_job_id=SWAPER_CRON_JOB_ID, state_file=CRON_SCHEDULE_STATE_FILE, sufficient=sufficient,
