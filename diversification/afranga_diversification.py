@@ -180,9 +180,9 @@ MY_INVESTMENTS_URL = "https://afranga.com/profile/my-investments"
 ROWS_API_URL = "https://afranga.com/profile/my-investments/api/rows"
 ROWS_API_LIMIT = 50  # largest accepted value (10/25/50); others return 400
 STATEMENT_PAGE_URL = "https://afranga.com/profile/account-statement"
-STATEMENT_REFRESH_URL = "https://afranga.com/profile/account-statement/refresh"
+STATEMENT_DATA_URL = "https://afranga.com/profile/account-statement/data"
 BONUS_CASHBACK_HISTORY_URL = "https://afranga.com/profile/bonus-cashback/history"
-MAX_LIMIT = 250  # largest value offered by the page's own rows-per-page dropdown
+MAX_LIMIT = 100  # largest per_page offered by the page's own dropdown (10/25/50/100; others redirect to HTML)
 # Cache of every Account Statement "Details" row ever fetched (see
 # get_cached_account_details() below) - same incremental-fetch idea as
 # swaper_diversification.XIRR_CASHFLOWS_STATE_FILE, avoids re-fetching the
@@ -525,6 +525,31 @@ def aggregate_by_originator(investments: list) -> list:
     return originators
 
 
+def _fetch_statement_data(session: requests.Session, start_date: date, end_date: date, page: int, per_page: int) -> dict:
+    """One page of the redesigned Account Statement page's JSON endpoint
+    (`/profile/account-statement/data`, verified live 2026-11-11; the old
+    HTML `/refresh` fragment now 404s). Returns {summary: {opening, rows,
+    closing}, rows, total, lastPage, ...}. `per_page` must be 10/25/50/100,
+    any other value makes the endpoint redirect to an HTML page."""
+    log.info("Requesting Account statement data for %s to %s (page %d)...", start_date, end_date, page)
+    r = session.get(
+        STATEMENT_DATA_URL,
+        params={
+            "period": "custom", "from": start_date.isoformat(), "to": end_date.isoformat(),
+            "page": str(page), "per_page": str(per_page),
+        },
+        headers={**_HEADERS, "Accept": "application/json", "X-Requested-With": "XMLHttpRequest"},
+        timeout=20,
+    )
+    log.info("Account statement data endpoint response: status=%s", r.status_code)
+    if not r.ok:
+        raise RuntimeError(f"Account statement data endpoint returned status {r.status_code}")
+    try:
+        return r.json()
+    except ValueError as exc:
+        raise RuntimeError("Account statement data endpoint did not return JSON (session expired or bad params?).") from exc
+
+
 def fetch_statement_totals(session: requests.Session, start_date: date, end_date: date) -> dict:
     """Fetch the "Transaction Summary" panel of the Account Statement page
     (https://afranga.com/profile/account-statement) for an arbitrary
@@ -570,40 +595,15 @@ def fetch_statement_totals(session: requests.Session, start_date: date, end_date
        swaper_diversification.py's referral_bonus_earned, without having
        to re-sum the (paginated) Details rows for it.
     """
-    start_str = start_date.strftime("%d.%m.%Y")
-    end_str = end_date.strftime("%d.%m.%Y")
+    summary = _fetch_statement_data(session, start_date, end_date, page=1, per_page=10)["summary"] or {}
 
-    r = session.get(STATEMENT_PAGE_URL, headers=_HEADERS, timeout=20)
-    r.raise_for_status()
-    token = _extract_csrf_token(r.text)
-
-    log.info("Requesting Account statement refresh endpoint for %s to %s...", start_str, end_str)
-    r = session.get(
-        STATEMENT_REFRESH_URL,
-        params={"_token": token, "createdAt[from]": start_str, "createdAt[to]": end_str},
-        headers={**_HEADERS, "X-Requested-With": "XMLHttpRequest"},
-        timeout=20,
-    )
-    log.info("Account statement refresh endpoint response: status=%s", r.status_code)
-    if not r.ok:
-        raise RuntimeError(f"Account statement refresh endpoint returned status {r.status_code}")
-
-    # Each summary line is a "row" block with a label div (text-18-400-gray)
-    # followed by a value div containing the amount - capture the label
-    # text and everything up to the next row block, then pull the first €
-    # amount out of that trailing chunk.
-    rows = re.findall(
-        r'text-18-400-gray">(.*?)</div>(.*?)(?=<div class="row\b|\Z)',
-        r.text,
-        re.DOTALL,
-    )
-    parsed_rows = []
-    for label_html, rest_html in rows:
-        label = re.sub(r"<[^>]+>", " ", label_html)
-        label = re.sub(r"\s+", " ", label).strip()
-        label = re.split(r"\(net", label)[0].strip()
-        amount_m = re.search(r"€\s*([\d\s.,]+)", rest_html)
-        parsed_rows.append({"label": label, "value": amount_m.group(1) if amount_m else None})
+    parsed_rows = [
+        {"label": re.split(r"\(net", row.get("label") or "")[0].strip(), "value": row.get("value")}
+        for row in summary.get("rows") or []
+    ]
+    for key in ("opening", "closing"):
+        if summary.get(key):
+            parsed_rows.append({"label": summary[key].get("label") or "", "value": summary[key].get("value")})
 
     log.info("Found %d summary row(s) in the Transaction Summary panel: %r", len(parsed_rows), [r["label"] for r in parsed_rows])
 
@@ -725,119 +725,58 @@ def fetch_current_month_bonus_cashback(session: requests.Session) -> float:
     return total
 
 
-# Each Details row's Net Amount <div> carries a "direction-in"/"direction-out"
-# class alongside its own transaction ID (e.g. "direction-out | 692745") -
-# verified 2026-08-14 against a real account: "in" = debits the uninvested
-# wallet (Investments in loans, Withdrawn funds), "out" = credits it
-# (everything else - Deposited funds, Interest received (regular and early
-# repayment), Principal received from early repayment, Bonus received,
-# Cashback bonus, Registration Bonus). Generic (keyed off the CSS class, not
-# a hardcoded label list), so any future transaction type is still handled
-# correctly without code changes.
-_DETAILS_DIRECTION_RE = re.compile(r"direction-(in|out)\s*\|\s*(\d+)")
-
-
-def _parse_statement_details_rows(html: str) -> list:
-    """Parse every row of the Account Statement page's "Details" table
-    (the per-transaction ledger, as opposed to the "Transaction Summary"
-    aggregate panel parsed by fetch_statement_totals()) out of one HTML
-    fragment page. Returns a list of {"transaction_id", "date"
-    ("YYYY-MM-DD"), "label", "net_amount", "direction"} dicts - "label" is
-    the last " - "-separated segment of the "Details" cell (e.g. "Deposited
-    funds", "Interest received", "Bonus received"), which is where Afranga
-    puts the actual transaction type regardless of whether a loan/
-    originator/campaign prefix is also present on that same cell.
-    """
-    tbody_m = re.search(r"account-statement-table.*?<tbody>(.*?)</tbody>", html, re.DOTALL)
-    if not tbody_m:
-        return []
-
+def _parse_statement_details_rows(data_rows: list) -> list:
+    """Convert the `rows` of one /account-statement/data page into
+    {"transaction_id", "date" ("YYYY-MM-DD"), "label", "net_amount",
+    "direction"} dicts. "label" = the row's `type` ("Deposited funds",
+    "Interest received", ...). "direction" is "out" for a row credited to
+    the uninvested wallet (`positive`), "in" for one debited from it (same
+    convention as the old HTML "direction-in"/"direction-out" CSS class,
+    verified 2026-08-14). Cancelled rows are skipped."""
     rows = []
-    for row_html in re.findall(r"<tr>(.*?)</tr>", tbody_m.group(1), re.DOTALL):
-        cells = re.findall(r"<td[^>]*>(.*?)</td>", row_html, re.DOTALL)
-        if len(cells) < 6:
+    for row in data_rows:
+        if row.get("cancelled"):
             continue
-
-        date_text = re.sub(r"<[^>]+>", " ", cells[0])
-        date_text = re.sub(r"\s+", " ", date_text).strip()
-        try:
-            row_date = datetime.strptime(date_text, "%d.%m.%Y").date()
-        except ValueError:
+        row_date = _parse_card_date(row.get("date"))
+        if row_date is None:
             continue
-
-        details_text = re.sub(r"<[^>]+>", " ", cells[1].split("<br")[0])
-        details_text = re.sub(r"\s+", " ", details_text).strip()
-        parts = [p.strip() for p in details_text.split(" - ") if p.strip()]
-        label = parts[-1] if parts else "Unknown"
-
-        net_cell = cells[5]
-        direction_m = _DETAILS_DIRECTION_RE.search(net_cell)
-        amount_m = re.search(r"€\s*([\d\s.,]+)", net_cell)
-
         rows.append({
-            "transaction_id": direction_m.group(2) if direction_m else None,
+            "transaction_id": str(row["transaction_id"]) if row.get("transaction_id") else None,
             "date": row_date.strftime("%Y-%m-%d"),
-            "label": label,
-            "net_amount": _parse_amount(amount_m.group(1) if amount_m else None),
-            "direction": direction_m.group(1) if direction_m else None,
+            "label": row.get("type") or "Unknown",
+            "net_amount": _parse_amount(row.get("amount")),
+            "direction": "out" if row.get("positive") else "in",
         })
     return rows
 
 
 def fetch_account_statement_details(session: requests.Session, start_date: date, end_date: date) -> list:
-    """Fetch EVERY row of the Account Statement page's "Details" table
-    within [start_date, end_date], paginated via MAX_LIMIT (250, the
-    largest page size the page itself offers)/MAX_XIRR_PAGES - same role
-    as swaper_diversification._fetch_account_entries_pages(). Total record
-    count is read off the page's own "Showing X to Y of Z results" text.
+    """Fetch EVERY row of the Account Statement page's transaction list
+    within [start_date, end_date], paginated via MAX_LIMIT/MAX_XIRR_PAGES -
+    same role as swaper_diversification._fetch_account_entries_pages().
     """
-    start_str = start_date.strftime("%d.%m.%Y")
-    end_str = end_date.strftime("%d.%m.%Y")
-
-    r = session.get(STATEMENT_PAGE_URL, headers=_HEADERS, timeout=20)
-    r.raise_for_status()
-    token = _extract_csrf_token(r.text)
-
     all_rows = []
     page_number = 1
-    total_records = None
     while page_number <= MAX_XIRR_PAGES:
-        log.info("Requesting Account statement Details page %d for %s to %s...", page_number, start_str, end_str)
-        r = session.get(
-            STATEMENT_REFRESH_URL,
-            params={
-                "_token": token, "createdAt[from]": start_str, "createdAt[to]": end_str,
-                "limit": str(MAX_LIMIT), "page": str(page_number),
-            },
-            headers={**_HEADERS, "X-Requested-With": "XMLHttpRequest"},
-            timeout=20,
-        )
-        if not r.ok:
-            raise RuntimeError(f"Account statement refresh endpoint returned status {r.status_code} (Details page {page_number})")
-
-        page_rows = _parse_statement_details_rows(r.text)
+        body = _fetch_statement_data(session, start_date, end_date, page=page_number, per_page=MAX_LIMIT)
+        page_rows = _parse_statement_details_rows(body.get("rows") or [])
         all_rows.extend(page_rows)
-
-        total_m = re.search(r"of\s*<span[^>]*>\s*(\d+)\s*</span>\s*results", r.text)
-        total_records = int(total_m.group(1)) if total_m else None
-        log.info("Details page %d: %d row(s) found (total_records=%s).", page_number, len(page_rows), total_records)
-
-        if total_records is None or len(page_rows) == 0:
-            break
-        if page_number * MAX_LIMIT >= total_records:
+        last_page = int(body.get("lastPage") or 1)
+        log.info("Details page %d/%d: %d row(s) found (total=%s).", page_number, last_page, len(page_rows), body.get("total"))
+        if page_number >= last_page:
             break
         page_number += 1
     else:
-        log.warning("Hit MAX_XIRR_PAGES (%d) without exhausting total_records=%s - Details history may be incomplete.", MAX_XIRR_PAGES, total_records)
+        log.warning("Hit MAX_XIRR_PAGES (%d) without exhausting the Details pages - history may be incomplete.", MAX_XIRR_PAGES)
 
     return all_rows
 
 
 def _cash_delta_for_detail_row(row: dict) -> float:
     """Signed change to the uninvested-cash balance a single Details row
-    represents, based on its "direction-in"/"direction-out" CSS class (see
-    _DETAILS_DIRECTION_RE's comment above) - a row with neither class is
-    treated as cash-neutral (logged) rather than guessed at."""
+    represents, based on its "in"/"out" direction (see
+    _parse_statement_details_rows()) - a row with neither is treated as
+    cash-neutral (logged) rather than guessed at."""
     if row["direction"] == "in":
         return -abs(row["net_amount"] or 0.0)
     if row["direction"] == "out":
