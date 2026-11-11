@@ -195,7 +195,6 @@ XIRR_CACHE_OVERLAP_DAYS = 30
 # XIRR is a since-inception money-weighted return (not per-month) - this
 # start date is early enough to cover any real account's full history.
 XIRR_HISTORY_START_DATE = date(2000, 1, 1)
-MAX_XIRR_PAGES = 20
 # Afranga's own "Current Month" quick filter on the Account Statement page
 # (verified 2026-07-10 by capturing its request) uses the CURRENT calendar
 # month up to TODAY (createdAt[from] = 1st of the month, createdAt[to] =
@@ -752,12 +751,12 @@ def _parse_statement_details_rows(data_rows: list) -> list:
 
 def fetch_account_statement_details(session: requests.Session, start_date: date, end_date: date) -> list:
     """Fetch EVERY row of the Account Statement page's transaction list
-    within [start_date, end_date], paginated via MAX_LIMIT/MAX_XIRR_PAGES -
+    within [start_date, end_date], paginated via MAX_LIMIT until the last page -
     same role as swaper_diversification._fetch_account_entries_pages().
     """
     all_rows = []
     page_number = 1
-    while page_number <= MAX_XIRR_PAGES:
+    while True:
         body = _fetch_statement_data(session, start_date, end_date, page=page_number, per_page=MAX_LIMIT)
         page_rows = _parse_statement_details_rows(body.get("rows") or [])
         all_rows.extend(page_rows)
@@ -766,8 +765,6 @@ def fetch_account_statement_details(session: requests.Session, start_date: date,
         if page_number >= last_page:
             break
         page_number += 1
-    else:
-        log.warning("Hit MAX_XIRR_PAGES (%d) without exhausting the Details pages - history may be incomplete.", MAX_XIRR_PAGES)
 
     return all_rows
 

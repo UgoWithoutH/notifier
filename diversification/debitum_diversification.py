@@ -203,7 +203,6 @@ TRANSACTIONS_SUMMARY_URL = f"{API_BASE}/loans/api/balances/v3/transactions-summa
 ALL_TRANSACTIONS_URL = f"{API_BASE}/loans/api/balances/v3/all-transactions"
 INVESTMENT_ENTRIES_URL = f"{API_BASE}/loans/api/investments/entries/v3"
 INVESTMENT_ENTRIES_PAGE_SIZE = 500
-MAX_INVESTMENT_ENTRIES_PAGES = 50
 
 DEBITUM_EMAIL = os.environ.get("DEBITUM_EMAIL")
 DEBITUM_PASSWORD = os.environ.get("DEBITUM_PASSWORD")
@@ -220,7 +219,6 @@ _BASE_HEADERS = {
 }
 
 ALL_TRANSACTIONS_PAGE_SIZE = 500
-MAX_ALL_TRANSACTIONS_PAGES = 50
 
 # XIRR is a since-inception money-weighted return - this start date is
 # early enough to cover any real account's full history.
@@ -343,7 +341,7 @@ def _fetch_investment_entries(session: requests.Session, headers: dict, body: di
     """All pages of `POST /gtw/loans/api/investments/entries/v3` for `body`."""
     entries = []
     page = 0
-    while page < MAX_INVESTMENT_ENTRIES_PAGES:
+    while True:
         r = session.post(
             INVESTMENT_ENTRIES_URL, params={"page": page, "size": INVESTMENT_ENTRIES_PAGE_SIZE},
             json=body, headers=headers, timeout=20,
@@ -353,8 +351,7 @@ def _fetch_investment_entries(session: requests.Session, headers: dict, body: di
         entries.extend(page_data.get("content") or [])
         page += 1
         if page >= (page_data.get("page") or {}).get("totalPages", 0):
-            break
-    return entries
+            return entries
 
 
 def _parse_entry_date(raw) -> date | None:
@@ -521,7 +518,8 @@ def fetch_all_transactions(session: requests.Session, headers: dict, start_date:
     """Fetch every transaction in [start_date, end_date] (inclusive),
     paginating via the response's own `page.totalPages`/`page.number`."""
     all_transactions = []
-    for page in range(MAX_ALL_TRANSACTIONS_PAGES):
+    page = 0
+    while True:
         data = _fetch_all_transactions_page(session, headers, start_date, end_date, page)
         rows = data.get("content", [])
         log.info("all-transactions page %d: %d row(s) fetched.", page, len(rows))
@@ -529,8 +527,7 @@ def fetch_all_transactions(session: requests.Session, headers: dict, start_date:
         page_info = data.get("page", {})
         if page + 1 >= page_info.get("totalPages", 1):
             break
-    else:
-        log.warning("Hit MAX_ALL_TRANSACTIONS_PAGES (%d) - history may be truncated.", MAX_ALL_TRANSACTIONS_PAGES)
+        page += 1
     return all_transactions
 
 

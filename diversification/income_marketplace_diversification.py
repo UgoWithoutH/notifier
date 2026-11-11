@@ -84,9 +84,10 @@ Data endpoints (all under api.getincome.com, `Authorization: Bearer` auth):
       1 returns a PDF blob (`%PDF-1.4...`) instead of a JSON "empty next
       page", crashing a naive fetch/JSON-parse. Since this account is
       small (a handful of dozens of rows per category over its whole
-      lifetime, confirmed live), this module only ever requests page 0 -
-      see `fetch_all_statement_transactions()`'s own docstring for the
-      (best-effort, not foolproof) large-row-count warning tripwire.
+      lifetime, confirmed live), page 0 only is requested; a category
+      reaching a possible page-size limit makes the date range get split
+      into smaller ranges instead - see
+      `fetch_all_statement_transactions()`'s own docstring.
       IMPORTANT GOTCHA (same class of bug as Afranga's/Debitum's own
       documented lesson): the same `transaction_id` is reused across
       MULTIPLE distinct rows for one real underlying event (e.g. a single
@@ -176,7 +177,10 @@ LOGIN_PAGE_URL = "https://getincome.com/login"
 API_BASE = "https://api.getincome.com/api"
 INVESTOR_DETAILS_URL = f"{API_BASE}/investor-details"
 ACCOUNT_STATEMENT_URL_TEMPLATE = API_BASE + "/account-statement/{start}/{end}/{page}"
-INVESTMENTS_URL = API_BASE + "/investments/?page_size=1000"
+INVESTMENTS_URL = API_BASE + "/investments/"
+INVESTMENTS_DEFAULT_PAGE_SIZE = 1000
+# A statement category returning this many rows may be cut by a page-size limit - see fetch_all_statement_transactions().
+STATEMENT_ROW_COUNT_SPLIT_THRESHOLD = 200
 
 INCOME_MARKETPLACE_EMAIL = os.environ.get("INCOME_MARKETPLACE_EMAIL")
 INCOME_MARKETPLACE_PASSWORD = os.environ.get("INCOME_MARKETPLACE_PASSWORD")
@@ -430,7 +434,8 @@ def fetch_investments(page, token: str) -> list:
     ?page_size=1000, `{"items": [...], "total": N}`, verified live
     2026-10-16). The `page` query parameter is ignored by the API (page=1 and
     page=2 return the same 20 rows), so everything is fetched in a single
-    large page; a warning is logged if fewer than `total` rows come back.
+    page: if fewer than `total` rows come back, it is requested again with
+    page_size=total, and a `RuntimeError` is raised if rows are still missing.
     Returns [{"originator", "outstanding", "maturity", "status",
     "overdue_since", "rate", "base_term"}] where `rate` is the investor's interest rate in
     percent (`loan_investor_interest_rate`, e.g. "15.00000" -> 15.0, verified
@@ -447,10 +452,16 @@ def fetch_investments(page, token: str) -> list:
     "forcedBuyback" and "paidBack" - never observed on the account, so only
     inferred. `buyback_guarantee` is `loan_buyback_guarantee == 1`. `base_term` is the loan's original term
     (see _base_term), None if unknown."""
-    data = _fetch_json(page, INVESTMENTS_URL, token)
+    data = _fetch_json(page, f"{INVESTMENTS_URL}?page_size={INVESTMENTS_DEFAULT_PAGE_SIZE}", token)
     items = data.get("items") or []
-    if len(items) < data.get("total", len(items)):
-        log.warning("Only %d of %s investments returned - remaining-duration amounts are incomplete.", len(items), data.get("total"))
+    total = data.get("total", len(items))
+    if len(items) < total:
+        # More investments than the default page size: ask for exactly `total` rows.
+        log.info("Only %d of %s investments returned - retrying with page_size=%s.", len(items), total, total)
+        data = _fetch_json(page, f"{INVESTMENTS_URL}?page_size={total}", token)
+        items = data.get("items") or []
+    if len(items) < total:
+        raise RuntimeError(f"Only {len(items)} of {total} investments returned - remaining-duration amounts would be incomplete.")
     investments = []
     for item in items:
         try:
@@ -581,26 +592,31 @@ def fetch_all_statement_transactions(page, token: str, start_date: date, end_dat
     higher) returns a PDF blob instead of JSON (verified live 2026-09-08,
     `Page.evaluate: SyntaxError: ... is not valid JSON` - the response body
     starts with the PDF magic bytes "%PDF-1.4", not an empty/next JSON
-    page). So this ONLY ever requests page 0 - safe for this small/new
-    account (confirmed live: a full lifetime fetch returns everything in
-    one page), but if a future run's row count for any category looks
-    suspiciously close to a true page-size limit, that would silently
-    truncate history with no error raised - the warning below is a
-    best-effort tripwire for that, not a real fix (no known way to safely
-    request "the next page" was found)."""
-    STATEMENT_ROW_COUNT_WARNING_THRESHOLD = 200
+    page). So only page 0 is ever requested, and the date range is what gets
+    "paginated" instead: if any category of a response reaches
+    STATEMENT_ROW_COUNT_SPLIT_THRESHOLD rows (a possible page-size limit),
+    the range is split in two halves (disjoint, both inclusive) that are
+    fetched separately, recursively, down to a single day (a single day
+    still at the threshold raises rather than silently truncating)."""
     body = fetch_account_statement(page, token, start_date, end_date, page_num=0)
+    groups = body.get("statement", [])
+    if any(len(group.get("turnover", [])) >= STATEMENT_ROW_COUNT_SPLIT_THRESHOLD for group in groups):
+        if start_date >= end_date:
+            raise RuntimeError(
+                f"Account statement for {start_date} still returns {STATEMENT_ROW_COUNT_SPLIT_THRESHOLD}+ rows in a "
+                "category on a single day - it may be truncated by a page-size limit that can't be paged past."
+            )
+        middle = start_date + (end_date - start_date) // 2
+        log.info("Account statement (%s to %s) hit the row threshold - splitting at %s.", start_date, end_date, middle)
+        return (
+            fetch_all_statement_transactions(page, token, start_date, middle)
+            + fetch_all_statement_transactions(page, token, middle + timedelta(days=1), end_date)
+        )
     all_transactions = []
-    for group in body.get("statement", []):
+    for group in groups:
         account_type = group.get("account_type")
         account_type_name = group.get("account_type_name")
         rows = group.get("turnover", [])
-        if len(rows) >= STATEMENT_ROW_COUNT_WARNING_THRESHOLD:
-            log.warning(
-                "Category %s (%s) returned %d rows, close to/at a possible page-size limit - "
-                "history may be silently truncated (page 1+ is known to return a PDF, not more JSON).",
-                account_type, account_type_name, len(rows),
-            )
         for row in rows:
             all_transactions.append({
                 "account_type": account_type,

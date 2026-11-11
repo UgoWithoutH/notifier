@@ -247,7 +247,6 @@ log = logging.getLogger("bienpreter_diversification")
 LOGIN_URL = "https://www.bienpreter.com/connexion"
 DASHBOARD_URL = "https://www.bienpreter.com/u/tableau-de-bord"
 OPERATIONS_URL = "https://www.bienpreter.com/u/operations"
-MAX_OPERATIONS_PAGES = 300  # safety cap against an infinite loop if pagination ever misbehaves
 # Bienpreter is a French platform; "this month" below means the current
 # calendar month up to TODAY (1st of the month through today, NOT the full
 # month) - same semantics verified for Swaper's "This Month" / Afranga's
@@ -409,7 +408,6 @@ API_TOKEN_URL = "https://www.bienpreter.com/api-token-from-session"
 ACTIVE_LOANS_API_URL = "https://www.bienpreter.com/api/v2/contracts/me"
 ACTIVE_LOANS_PAGE_SIZE = 100
 LOAN_STATUS_ACTIVE = "3"  # criteria[status][] = "en cours"
-MAX_ACTIVE_LOANS_PAGES = 20  # safety net against an infinite loop
 PROJECT_API_URL = "https://www.bienpreter.com/api/v2/project/{project_id}"
 USER_ME_API_URL = "https://www.bienpreter.com/api/v2/user/me"
 # `criteria[litigation]` filter (same values as the old HTML page's
@@ -495,23 +493,24 @@ def _get_contracts_page(session: requests.Session, params: dict) -> dict:
 def fetch_active_loans(session: requests.Session, litigation: str = ""):
     """Fetches every currently active ("en cours") Bienprêter loan from the
     JSON API (/api/v2/contracts/me, see ACTIVE_LOANS_API_URL), paginating
-    via `page`/`limit` until the API's own `total` is reached (bounded by
-    MAX_ACTIVE_LOANS_PAGES as a safety net). `litigation` optionally
+    via `page`/`limit` until the API's own `total` is reached. `litigation` optionally
     restricts it to late (LITIGATION_LATE) or defaulted (LITIGATION_DEFAULT)
     loans. Returns (loans, issues):
     - loans : flat list of {"project_id", "borrower", "amount",
       "contract_id", "next_payment_date"} dicts, one per loan/contract (a
       single borrower can appear multiple times, once per contract).
-    - issues : list of short strings describing a pagination problem (hit
-      the page safety net, or collected a different number of loans than
-      the API's own `total` - both signal the result may be incomplete) -
+    - issues : list of short strings describing a pagination problem (collected
+      a different number of loans than
+      the API's own `total` - signals the result may be incomplete) -
       feeds shared.notifier.send_bienpreter_geo_issues_email()."""
     loans = []
     issues = []
     seen_contract_ids = set()
     expected_total = None
     _refresh_api_token(session)
-    for page_number in range(1, MAX_ACTIVE_LOANS_PAGES + 1):
+    page_number = 0
+    while True:
+        page_number += 1
         params = {
             "page": page_number,
             "limit": ACTIVE_LOANS_PAGE_SIZE,
@@ -539,13 +538,6 @@ def fetch_active_loans(session: requests.Session, litigation: str = ""):
         loans.extend(rows)
         if expected_total is not None and page_number * ACTIVE_LOANS_PAGE_SIZE >= expected_total:
             break
-    else:
-        message = (
-            f"Pagination des prêts actifs interrompue après {MAX_ACTIVE_LOANS_PAGES} pages sans "
-            "atteindre le total attendu - les résultats sont peut-être incomplets."
-        )
-        log.warning(message)
-        issues.append(message)
 
     if expected_total is not None and len(loans) != expected_total:
         message = (
@@ -871,24 +863,24 @@ def _fetch_operations_page(session: requests.Session, start_date: str, end_date:
 def fetch_all_operations(session: requests.Session, start_date: str, end_date: str) -> list:
     """Fetch EVERY /u/operations row within [start_date, end_date]
     ("YYYY-MM-DD" strings), paginating via the `page` query param until a
-    page returns no real rows (bounded by MAX_OPERATIONS_PAGES as a safety
-    net) - the shared pagination loop behind both
+    page returns no real rows - the shared pagination loop behind both
     fetch_current_month_interest_totals() (this month only) and
     get_cached_operations() (full/incremental history, for XIRR/Cash drag).
     """
     all_rows = []
-    for page_number in range(1, MAX_OPERATIONS_PAGES + 1):
+    previous_rows = None
+    page_number = 0
+    while True:
+        page_number += 1
         rows = _fetch_operations_page(session, start_date, end_date, page_number)
         rows = [r for r in rows if r.get("label")]
         log.info("Operations page %d (%s to %s): %d real row(s) found.", page_number, start_date, end_date, len(rows))
         if not rows:
             break
+        if rows == previous_rows:
+            raise RuntimeError(f"Operations pagination is not advancing (page {page_number} repeats page {page_number - 1}).")
+        previous_rows = rows
         all_rows.extend(rows)
-    else:
-        log.warning(
-            "Hit MAX_OPERATIONS_PAGES (%d) without an empty page (%s to %s) - results may be truncated.",
-            MAX_OPERATIONS_PAGES, start_date, end_date,
-        )
     return all_rows
 
 
