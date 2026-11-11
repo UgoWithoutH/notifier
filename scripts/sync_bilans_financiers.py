@@ -87,13 +87,29 @@ def fetch_reference_data() -> tuple[list[dict], list[dict], list[dict]]:
     r.raise_for_status()
     chunks = re.findall(r'self\.__next_f\.push\(\[1,"(.*?)"\]\)</script>', r.text, flags=re.S)
     payload = "".join(json.loads('"' + c + '"') for c in chunks)
+    payload_bytes = payload.encode("utf-8")
     decoder = json.JSONDecoder()
+
+    def resolve_text(value):
+        """Les textes longs sont des références "$<id>" vers un chunk "<id>:T<longueur hex>,<texte>"
+        (longueur en octets UTF-8, chunks parfois collés sans saut de ligne)."""
+        if not isinstance(value, str) or not re.fullmatch(r"\$[0-9a-f]+", value):
+            return value
+        m = re.search(rb"(?<![0-9A-Za-z])" + re.escape(value[1:].encode()) + rb":T([0-9a-f]+),", payload_bytes)
+        if not m:
+            log.warning("Référence de texte %s introuvable dans la page des bilans.", value)
+            return ""
+        start = m.end()
+        return payload_bytes[start:start + int(m.group(1), 16)].decode("utf-8")
 
     def extract(key: str) -> list[dict]:
         idx = payload.find(f'"{key}":[')
         if idx < 0:
             raise RuntimeError(f"Clé '{key}' introuvable dans la page des bilans.")
         value, _ = decoder.raw_decode(payload[idx + len(key) + 3:])
+        for item in value:
+            if "note_externe" in item:
+                item["note_externe"] = resolve_text(item["note_externe"])
         return value
 
     return extract("plateformes"), extract("societesPrets"), extract("associationLinks")
