@@ -68,7 +68,7 @@ jobs:
             "packages\.microsoft\.com|azure-cli|dl\.google\.com|chrome-stable" \
             /etc/apt/sources.list /etc/apt/sources.list.d || true
 
-          sudo apt-get update
+          sudo apt-get update -o Acquire::Retries=0 -o Acquire::http::Timeout=10 -o Acquire::https::Timeout=10 || true
 
       - name: Cache Playwright browsers
         uses: actions/cache@v4
@@ -83,7 +83,10 @@ jobs:
 
       - name: Install Playwright Chromium (cache miss only)
         if: steps.playwright-cache.outputs.cache-hit != 'true'
-        run: playwright install --with-deps chromium
+        run: |
+          playwright install chromium
+          # Ubuntu apt mirrors can be unreachable for hours; the image already ships the core libs.
+          playwright install-deps chromium || echo "::warning::install-deps failed (apt unreachable), continuing"
 
       - name: Install Playwright OS dependencies (cache hit)
         if: steps.playwright-cache.outputs.cache-hit == 'true'
@@ -93,7 +96,8 @@ jobs:
         # This is a no-op download-wise if the binary is already present.
         run: |
           playwright install chromium
-          playwright install-deps chromium
+          # Ubuntu apt mirrors can be unreachable for hours; the image already ships the core libs.
+          playwright install-deps chromium || echo "::warning::install-deps failed (apt unreachable), continuing"
 
       - name: Restore persisted state (session cookies + seen loan IDs + cron schedule)
         uses: actions/cache/restore@v4
