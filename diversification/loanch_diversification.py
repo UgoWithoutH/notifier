@@ -267,7 +267,6 @@ BONUS_TYPE = 10
 # Server caps page_size at 200 regardless of the value requested (verified
 # live 2026-08-14: page_size=500 still returned only 200 rows/page).
 TRANSACTIONS_PAGE_SIZE = 200
-MAX_TRANSACTIONS_PAGES = 100
 # Cache of every transaction row ever fetched (see get_cached_transactions()
 # below) - avoids re-fetching the account's entire history every run, same
 # idea as peerberry_diversification.XIRR_CASHFLOWS_STATE_FILE.
@@ -652,7 +651,7 @@ def get_cached_transactions(session: requests.Session) -> list:
     new_entries = []
     page_number = 1
     reached_cached_entry = False
-    while page_number <= MAX_TRANSACTIONS_PAGES:
+    while True:
         body = fetch_transactions_page(session, page_number)
         page_entries = body.get("results") or []
         log.info("Page %d: %d entrie(s) found.", page_number, len(page_entries))
@@ -664,8 +663,6 @@ def get_cached_transactions(session: requests.Session) -> list:
         if reached_cached_entry or not body.get("next"):
             break
         page_number += 1
-    else:
-        log.warning("Hit MAX_TRANSACTIONS_PAGES (%d) without reaching a cached entry or the end of the ledger - it may be incomplete.", MAX_TRANSACTIONS_PAGES)
 
     seen = set()
     merged = []

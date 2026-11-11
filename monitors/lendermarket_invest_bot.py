@@ -134,7 +134,6 @@ DEFAULT_STATE = {
 INVEST_MIN_REMAINING_TERM_IN_DAYS = 1
 INVEST_MAX_REMAINING_TERM_IN_DAYS = 360
 INVEST_REGULATION_STATUSES = ("REGULATED", "UNREGULATED")
-MAX_LOANS_PAGES = 100
 # Whole-marketplace scan (many pages) at most this often, only triggered by a
 # sheet name matching no known lender.
 LENDER_SCAN_INTERVAL_SECONDS = 30 * 60
@@ -158,7 +157,9 @@ def fetch_marketplace_loans(
     rate bounds are checked per lender by plan_allocations()). Returns None
     if the API could not be read completely."""
     loans, seen = [], set()
-    for page in range(1, MAX_LOANS_PAGES + 1):
+    page = 0
+    while True:
+        page += 1
         params = [
             ("minRemainingTermInDays", str(INVEST_MIN_REMAINING_TERM_IN_DAYS)),
             ("maxRemainingTermInDays", str(INVEST_MAX_REMAINING_TERM_IN_DAYS)),
@@ -185,8 +186,6 @@ def fetch_marketplace_loans(
                 loans.append(loan)
         if page >= int((payload.get("meta") or {}).get("last_page") or 1):
             return loans
-    log.warning("Hit MAX_LOANS_PAGES (%d) listing %s loans - listing truncated.", MAX_LOANS_PAGES, regulation_status)
-    return loans
 
 
 def _sheet_name_for_lender(lender: dict, sheet_names: list) -> str | None:

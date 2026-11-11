@@ -243,7 +243,6 @@ PORTFOLIO_PROPERTIES_URL = "https://api.bricks.co/investor/portfolio/properties"
 _PROJECT_STATUS_SECTIONS = {"repayment-delay": "delay", "repayment-default": "default"}
 # Server-side cap, confirmed live (requesting take=2000 still only returned 50).
 WALLET_TRANSACTIONS_PAGE_SIZE = 50
-MAX_WALLET_TRANSACTIONS_PAGES = 200
 # Incremental cache of every wallet-transactions row ever fetched (since
 # account inception) - same idea as loanch_diversification.XIRR_CASHFLOWS_STATE_FILE.
 SESSION_STATE_FILE = Path(__file__).parent / "bricks_diversification_session_state.json"
@@ -664,8 +663,10 @@ def get_cached_wallet_transactions(session: requests.Session) -> list:
     log.info("Found %d cached wallet-transaction(s) - fetching newest page(s) until an already-cached one is seen...", len(cached_entries))
     new_entries = []
     cursor = 0
+    page_number = 0
     reached_cached_entry = False
-    for page_number in range(1, MAX_WALLET_TRANSACTIONS_PAGES + 1):
+    while True:
+        page_number += 1
         body = fetch_wallet_transactions_page(session, cursor)
         page_entries = body.get("data") or []
         log.info("Page %d (cursor=%d): %d entrie(s) found.", page_number, cursor, len(page_entries))
@@ -680,8 +681,6 @@ def get_cached_wallet_transactions(session: requests.Session) -> list:
         if next_cursor is None or next_cursor == cursor:
             break
         cursor = next_cursor
-    else:
-        log.warning("Hit MAX_WALLET_TRANSACTIONS_PAGES (%d) without reaching a cached entry or the end of the ledger - it may be incomplete.", MAX_WALLET_TRANSACTIONS_PAGES)
 
     seen = set()
     merged = []

@@ -55,9 +55,8 @@ verified live 2026-07-29):
   summed for gross interest. No separate withholding-tax transaction type
   was found on this account (net == gross, tax = 0.0, same convention as
   Swaper/Loanch/Iuvo/etc. for platforms with no tax breakdown). Pagination
-  continues until a page returns zero `<article>` blocks (capped by
-  MAX_TRANSACTIONS_PAGES as a safety net, same pattern as
-  bienpreter_diversification.py's operations pagination).
+  continues until a page returns zero `<article>` blocks (or fewer than a
+  full page's worth).
 - **"total" (the account balance figure) comes from the "Compte de
   résultat" (tax report) button, same period as the interest above** -
   found 2026-08-04 (correcting the earlier note here that assumed this was
@@ -235,7 +234,6 @@ OVERVIEW_URL = "https://lande.finance/fr/investor"
 INVESTMENTS_URL = "https://lande.finance/fr/investor/investments"
 LANDE_ACTIVE_PAYMENT_STATUSES = ("current", "5-30", "31-60", "60", "default")
 PLATFORM_LABEL = "Lande"
-MAX_TRANSACTIONS_PAGES = 200  # safety net, see bienpreter_diversification.py's identical pattern
 TRANSACTIONS_PAGE_SIZE = 15  # confirmed via the page's own "Showing X to Y of Z" footer
 # Since-inception range used by the XIRR/Cash drag block below (see module
 # docstring) - well before this account's real inception (~Sept 2025), just
@@ -360,7 +358,8 @@ def fetch_transactions(session: requests.Session, start_date: str, end_date: str
     cash-balance impact>}."""
     entries = []
     page = 1
-    while page <= MAX_TRANSACTIONS_PAGES:
+    previous_articles = None
+    while True:
         params = {"search": "1", "start_date": start_date, "end_date": end_date, "page": page}
         log.info("GET %s (page %s, fetching transactions %s - %s)...", TRANSACTIONS_URL, page, start_date, end_date)
         r = session.get(TRANSACTIONS_URL, params=params, timeout=20)
@@ -374,6 +373,9 @@ def fetch_transactions(session: requests.Session, start_date: str, end_date: str
             log.info("Page %s has no transactions - stopping pagination.", page)
             break
 
+        if articles == previous_articles:
+            raise RuntimeError(f"Transactions pagination is not advancing (page {page} repeats page {page - 1}).")
+        previous_articles = articles
         page_parsed = 0
         for article in articles:
             body = article.split("</article>")[0]
@@ -390,8 +392,6 @@ def fetch_transactions(session: requests.Session, start_date: str, end_date: str
             # Fewer than a full page's worth of rows -> this was the last page.
             break
         page += 1
-    else:
-        log.warning("Hit MAX_TRANSACTIONS_PAGES (%s) without an empty/partial page.", MAX_TRANSACTIONS_PAGES)
 
     return entries
 

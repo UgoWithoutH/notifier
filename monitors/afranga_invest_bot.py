@@ -81,7 +81,6 @@ AFRANGA_CRON_JOB_ID = os.environ.get("AFRANGA_CRON_JOB_ID")
 MODE = os.environ.get("AFRANGA_BOT_MODE", "probe").strip().lower()
 MIN_INVESTMENT_AMOUNT = float(os.environ.get("AFRANGA_MIN_INVESTMENT_AMOUNT", "10"))
 PAGE_SIZE = 100
-MAX_PAGES = 10
 # Secondary: a partial purchase must be >= this and leave >= this; smaller listings are bought in full only.
 SECONDARY_MIN_LEFT = 100.0
 MAX_DIAGNOSTICS_EMAIL_CHARS = 2_000_000
@@ -173,7 +172,9 @@ def fetch_market(session: requests.Session, page_url: str, filters: dict) -> Mar
     config = _extract_market_config(r.text)
 
     rows = []
-    for page in range(1, MAX_PAGES + 1):
+    page = 0
+    while True:
+        page += 1
         params = {**filters, "limit": str(PAGE_SIZE), "page": str(page)}
         resp = session.get(config["urls"]["rows"], params=params, headers=_ajax_headers(), timeout=20)
         resp.raise_for_status()
@@ -181,8 +182,6 @@ def fetch_market(session: requests.Session, page_url: str, filters: dict) -> Mar
         rows.extend(body.get("rows") or [])
         if page >= (body.get("last_page") or 1):
             break
-    else:
-        log.warning("Hit MAX_PAGES (%d) on %s - listing truncated.", MAX_PAGES, page_url)
     return MarketRows(config, rows)
 
 

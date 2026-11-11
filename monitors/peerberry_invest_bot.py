@@ -70,7 +70,7 @@ via one-off, read-only/network-intercepted Playwright explorations on
 Which originator actually gets INVESTED IN (and how much budget it gets)
 is driven 100% by the Google Sheet - there is no server-side id filter
 anymore, so a newly-selected Sheet originator is always visible to the bot
-(subject only to pagination, see the `total > pageSize` log warning).
+(fetch_loans() follows `total` across every page).
 shared.google_sheet.get_selected_peerberry_loan_originators() finds the
 "Répartition géographique" cell, then the "Peerberry" cell below it (same
 column) - every row between "Peerberry" and the next "Swaper" cell (both
@@ -519,14 +519,29 @@ def fetch_originator_invested_amounts(session: requests.Session) -> dict:
 
 
 def fetch_loans(session: requests.Session, public_id: str) -> dict:
-    r = session.get(
-        f"{API_BASE}/v1/{public_id}/loans",
-        headers=_HEADERS,
-        params=build_loans_params(),
-        timeout=HTTP_REQUEST_TIMEOUT_SECONDS,
-    )
-    r.raise_for_status()
-    return r.json() or {}
+    """First page plus, when `total` says there are more matching loans, every following
+    page (offset-based) merged into `data`, so no listed loan is invisible to a poll."""
+    params = build_loans_params()
+    body = {}
+    data = []
+    while True:
+        r = session.get(
+            f"{API_BASE}/v1/{public_id}/loans",
+            headers=_HEADERS,
+            params={**params, "offset": len(data)},
+            timeout=HTTP_REQUEST_TIMEOUT_SECONDS,
+        )
+        r.raise_for_status()
+        page_body = r.json() or {}
+        page_data = page_body.get("data") or []
+        if not body:
+            body = page_body
+        data.extend(page_data)
+        total = page_body.get("total")
+        if not page_data or not isinstance(total, (int, float)) or len(data) >= total:
+            break
+    body["data"] = data
+    return body
 
 
 def _relogin(session: requests.Session) -> None:
@@ -1051,16 +1066,7 @@ def run() -> None:
 
             if signature != last_loan_signature:
                 # Only logged when the signature actually changes (not every
-                # poll) to avoid spamming the console. `total` can now be
-                # much larger since there's no server-side loanOriginators[]
-                # filter narrowing it down anymore - meaning loans further
-                # down the list (older loanIds) than the 40 newest returned
-                # here are invisible to this poll. Flagged here so a future
-                # "why didn't it see loan X" question can start from "was
-                # pagination the reason" instead of guessing.
-                total_now = body.get("total") or 0
-                if isinstance(total_now, (int, float)) and total_now > 40:
-                    log.info("Loan listing total=%s exceeds pageSize=40 - only the 40 newest loanIds are visible this poll.", total_now)
+                # poll) to avoid spamming the console.
                 if data:
                     log.info(
                         "%d prêt(s) reçu(s) de l'API (poll=%d, total=%s) : %s",

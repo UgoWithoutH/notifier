@@ -138,7 +138,6 @@ ACCOUNT_ENTRIES_API_URL = "https://swaper.com/rest/public/profile/account-entrie
 REFERRAL_BONUS_PAGE_URL = "https://swaper.com/en/bonuses/refer-friends"
 OPEN_INVESTMENTS_API_URL = "https://swaper.com/rest/public/profile/invests"
 OPEN_INVESTMENTS_PAGE_SIZE = 100
-OPEN_INVESTMENTS_MAX_PAGES = 50
 # (loanStatus, loanStatusDetail) filters of the invests API whose union is
 # every open investment: a DELAYED (late) loan is NOT returned by
 # loanStatus="OPEN" (verified live 2026-10-16), only by loanStatusDetail
@@ -168,7 +167,6 @@ XIRR_CACHE_OVERLAP_DAYS = 30
 # cap). Kept as a generous page size/safety net for accounts with more
 # history than this one.
 XIRR_PAGE_SIZE = 1000
-MAX_XIRR_PAGES = 20
 # XIRR is a since-inception money-weighted return (not per-month) - this
 # start date is early enough to cover any real account's full history.
 XIRR_HISTORY_START_DATE = "2000-01-01"
@@ -286,7 +284,7 @@ def fetch_open_investments(page) -> list:
     for loan_status, status_detail in OPEN_INVESTMENTS_FILTERS:
         page_number = 1
         fetched = 0
-        while page_number <= OPEN_INVESTMENTS_MAX_PAGES:
+        while True:
             result = page.evaluate(
                 """
                 async ([url, pageNumber, pageSize, loanStatus, loanStatusDetail]) => {
@@ -320,8 +318,6 @@ def fetch_open_investments(page) -> list:
             if not results or total_records is None or fetched >= total_records:
                 break
             page_number += 1
-        else:
-            log.warning("Hit OPEN_INVESTMENTS_MAX_PAGES (%d) - open investments may be incomplete.", OPEN_INVESTMENTS_MAX_PAGES)
 
     return investments
 
@@ -523,7 +519,7 @@ def fetch_statement_totals(page, start_date: str, end_date: str) -> dict:
 
 def _fetch_account_entries_pages(page, start_date: str, end_date: str) -> list:
     """Fetch EVERY raw account-entries row within [start_date, end_date]
-    (no type filtering at all), paginated via XIRR_PAGE_SIZE/MAX_XIRR_PAGES.
+    (no type filtering at all), paginated via XIRR_PAGE_SIZE.
     Shared by _split_cashflows_from_entries() (which keeps only FUNDING/WITHDRAW*
     rows for the XIRR cashflow list) and compute_average_idle_cash()'s
     caller in run() (which needs EVERY row - INVESTMENT/REPAYMENT_*/
@@ -533,7 +529,7 @@ def _fetch_account_entries_pages(page, start_date: str, end_date: str) -> list:
     entries = []
     page_number = 1
     total_records = None
-    while page_number <= MAX_XIRR_PAGES:
+    while True:
         result = page.evaluate(
             """
             async ([url, startDate, endDate, pageNumber, pageSize]) => {
@@ -569,11 +565,11 @@ def _fetch_account_entries_pages(page, start_date: str, end_date: str) -> list:
 
         if total_records is None or len(results) == 0:
             break
-        if page_number * XIRR_PAGE_SIZE >= total_records:
+        # Compared with the rows actually received (not page_number * page size)
+        # so a server-side cap on the page size can't end the loop early.
+        if len(entries) >= total_records:
             break
         page_number += 1
-    else:
-        log.warning("Hit MAX_XIRR_PAGES (%d) without exhausting totalRecords=%s - entry history may be incomplete.", MAX_XIRR_PAGES, total_records)
 
     return entries
 

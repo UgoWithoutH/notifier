@@ -185,7 +185,6 @@ _HEADERS = {
 # `direction` field (read directly, never inferred from `type`) - this
 # list is informational/for reference only, not actually branched on.
 STATEMENT_PAGE_SIZE = 500
-MAX_STATEMENT_PAGES = 50
 
 # XIRR is a since-inception money-weighted return - this start date is
 # early enough to cover any real account's full history (Nectaro itself
@@ -382,7 +381,9 @@ def fetch_current_loans(session: requests.Session, headers: dict) -> list:
     12%), "maturity", "late": [(share, due date, is_buyback)]}]."""
     loans = []
     seen = 0
-    for page in range(1, MAX_STATEMENT_PAGES + 1):
+    page = 0
+    while True:
+        page += 1
         r = session.post(
             PORTFOLIO_URL,
             json={
@@ -564,17 +565,22 @@ def _fetch_statement_page(session: requests.Session, headers: dict, start_date: 
 
 def fetch_all_statement_transactions(session: requests.Session, headers: dict, start_date: date, end_date: date) -> list:
     """Fetch every statement transaction in [start_date, end_date]
-    (inclusive), paginating until a page returns fewer than
-    STATEMENT_PAGE_SIZE rows."""
+    (inclusive), paginating until a page comes back empty (not "fewer than
+    STATEMENT_PAGE_SIZE rows", so a server-side cap on the page size can't
+    silently truncate the history)."""
     all_transactions = []
-    for page in range(1, MAX_STATEMENT_PAGES + 1):
+    previous_rows = None
+    page = 0
+    while True:
+        page += 1
         rows = _fetch_statement_page(session, headers, start_date, end_date, page)
         log.info("Statement page %d: %d row(s) fetched.", page, len(rows))
-        all_transactions.extend(rows)
-        if len(rows) < STATEMENT_PAGE_SIZE:
+        if not rows:
             break
-    else:
-        log.warning("Hit MAX_STATEMENT_PAGES (%d) without an incomplete page - history may be truncated.", MAX_STATEMENT_PAGES)
+        if rows == previous_rows:
+            raise RuntimeError(f"Statement pagination is not advancing (page {page} repeats page {page - 1}).")
+        previous_rows = rows
+        all_transactions.extend(rows)
     return all_transactions
 
 
