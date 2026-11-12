@@ -57,7 +57,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 from diversification.afranga_diversification import _HEADERS, fetch_uninvested_balance, login
-from shared.cron_schedule import DAY_MINUTES, apply_startup_jitter, ensure_schedule_interval
+from shared.cron_schedule import apply_startup_jitter, ensure_schedule_interval
 from shared.google_sheet import get_geo_platform_snapshot
 from shared.missing_loans import TRANSIENT_GRACE_SECONDS, report_missing_loans
 from shared.notifier import send_afranga_invest_summary_email
@@ -453,7 +453,7 @@ def execute_market(session: requests.Session, market: MarketRows, lines: list, t
 
 def run() -> None:
     # Before the startup wait: schedule check against the sheet + stop if no market is active.
-    disabled, wait_range = begin_run("Afranga", AFRANGA_CRON_JOB_ID, CRON_SCHEDULE_STATE_FILE, 2, DAY_MINUTES)
+    disabled, wait_range = begin_run("Afranga", AFRANGA_CRON_JOB_ID, CRON_SCHEDULE_STATE_FILE)
     if disabled:
         return
 
@@ -486,11 +486,11 @@ def run() -> None:
             log.exception("Could not read the Afranga configuration from the 'config robots' sheet.")
         investable = config.investable_balance(balance) if config else balance
         sufficient = investable >= MIN_INVESTMENT_AMOUNT
-        default_minutes = 2 if sufficient else DAY_MINUTES
-        ensure_schedule_interval(
-            config.schedule_minutes(sufficient, default_minutes) if config else default_minutes,
-            cron_job_id=AFRANGA_CRON_JOB_ID, state_file=CRON_SCHEDULE_STATE_FILE, sufficient=sufficient,
-        )
+        if config:
+            ensure_schedule_interval(
+                config.schedule_minutes(sufficient),
+                cron_job_id=AFRANGA_CRON_JOB_ID, state_file=CRON_SCHEDULE_STATE_FILE, sufficient=sufficient,
+            )
         if not sufficient:
             log.info(
                 "Investable balance %.2f EUR (balance %.2f EUR minus %.2f EUR kept uninvested) is below the minimum investment amount - nothing to do.",
