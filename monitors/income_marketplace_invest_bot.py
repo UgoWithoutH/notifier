@@ -239,8 +239,8 @@ def _term_matches(loan: dict, config_loan, today: date) -> bool:
 
 
 def _accepted(loan: dict, config_loan, today: date) -> bool:
-    # "Exclure prêts extensibles" of the sheet = the site's "Exclude extendable loans" option.
-    if config_loan.exclude_extendable and loan.get("loan_extendable_schedule"):
+    # "Inclure prêts extensibles" of the sheet (unchecked = the site's "Exclude extendable loans" option).
+    if not config_loan.include_extendable and loan.get("loan_extendable_schedule"):
         return False
     return _term_matches(loan, config_loan, today)
 
