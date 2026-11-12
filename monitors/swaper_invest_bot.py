@@ -1013,7 +1013,7 @@ def _invest_loans_via_ui(page, loans: list, shares: dict, captured_api_calls: li
 
 def run(headless: bool = True) -> None:
     # Before the startup wait: schedule check against the sheet + stop if no market is active.
-    disabled, wait_range = begin_run("Swaper", SWAPER_CRON_JOB_ID, CRON_SCHEDULE_STATE_FILE, 2, 30)
+    disabled, wait_range = begin_run("Swaper", SWAPER_CRON_JOB_ID, CRON_SCHEDULE_STATE_FILE)
     if disabled:
         return
 
@@ -1434,12 +1434,14 @@ def run(headless: bool = True) -> None:
     # shared/cron_schedule.py's own docstring) - poll faster while there's
     # money to invest. The two intervals come from the "Temps planification
     # solde (in)suffisant" columns of the Swaper row in "config robots"
-    # (defaults 30 min / 2 min).
+    # (both required).
     sufficient = (robot_config.investable_balance(balance) if robot_config else balance) >= 10
-    ensure_schedule_interval(
-        resolve_schedule_minutes("Swaper", sufficient, 2 if sufficient else 30, robot_config),
-        cron_job_id=SWAPER_CRON_JOB_ID, state_file=CRON_SCHEDULE_STATE_FILE, sufficient=sufficient,
-    )
+    minutes = resolve_schedule_minutes("Swaper", sufficient, robot_config)
+    if minutes is not None:
+        ensure_schedule_interval(
+            minutes,
+            cron_job_id=SWAPER_CRON_JOB_ID, state_file=CRON_SCHEDULE_STATE_FILE, sufficient=sufficient,
+        )
 
     save_state(STATE_FILE, state)
 

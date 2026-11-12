@@ -779,7 +779,7 @@ def invest_selected_lenders(
 
 def run() -> None:
     # Before the startup wait: schedule check against the sheet + stop if no market is active.
-    disabled, wait_range = begin_run("Lendermarket", LENDERMARKET_CRON_JOB_ID, CRON_SCHEDULE_STATE_FILE, 2, 30)
+    disabled, wait_range = begin_run("Lendermarket", LENDERMARKET_CRON_JOB_ID, CRON_SCHEDULE_STATE_FILE)
     if disabled:
         return
 
@@ -895,16 +895,18 @@ def run() -> None:
     # Same cron-job.org speed-up/slow-down as Swaper (see cron_schedule.py):
     # poll faster while there's money to invest. The two intervals come from
     # the "Temps planification solde (in)suffisant" columns of the Lendermarket
-    # row in "config robots" (defaults 30 min / 2 min). Skipped when the
+    # row in "config robots" (both required). Skipped when the
     # balance couldn't be determined, rather than guessing and possibly
     # slowing down polling incorrectly.
     if balance is not None:
         investable = config.investable_balance(balance) if config else balance
         sufficient = investable >= 10
-        ensure_schedule_interval(
-            resolve_schedule_minutes("Lendermarket", sufficient, 2 if sufficient else 30, config),
-            cron_job_id=LENDERMARKET_CRON_JOB_ID, state_file=CRON_SCHEDULE_STATE_FILE, sufficient=sufficient,
-        )
+        minutes = resolve_schedule_minutes("Lendermarket", sufficient, config)
+        if minutes is not None:
+            ensure_schedule_interval(
+                minutes,
+                cron_job_id=LENDERMARKET_CRON_JOB_ID, state_file=CRON_SCHEDULE_STATE_FILE, sufficient=sufficient,
+            )
 
     save_state(STATE_FILE, state)
 

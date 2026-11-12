@@ -30,14 +30,15 @@ suivante) :
   exécutions du robot (cron-job.org) quand le solde est sous / au-dessus du
   minimum d'investissement. Format : un ou plusieurs "<nombre><unité>" avec
   unité min / h / j, ex. "5min", "1h", "1h 5min", "2j", "1j 12h", "1h30"
-  (nombre seul = minutes). Vide ou invalide = valeur par défaut du robot.
+  (nombre seul = minutes). Obligatoire : vide ou invalide = le robot s'arrête
+  avec une erreur.
   cron-job.org ne sait exprimer exactement que : diviseurs de 60 min, heures
   entières divisant 24, jours entiers ; le reste est arrondi au plus proche.
 - Temps attente avant démarrage borne inférieure / supérieure (colonnes
   facultatives, ligne de la PLATEFORME, même format) : le robot attend une
-  durée aléatoire (jitter) entre ces deux bornes avant de démarrer. Borne
-  inférieure vide = 0 ; borne supérieure vide = égale à la borne inférieure
-  (attente fixe) ; les deux vides ou invalides = jitter par défaut du robot.
+  durée aléatoire (jitter) entre ces deux bornes avant de démarrer (0min =
+  pas d'attente). Les deux bornes sont obligatoires : vide ou invalide = le
+  robot s'arrête avec une erreur.
 - Garder non investi (colonne facultative, ligne de la PLATEFORME, en €) :
   somme que le robot laisse non investie. Il n'investit que le solde
   disponible au-delà de cette somme (et seulement si l'excédent atteint le
@@ -228,24 +229,31 @@ class PlatformConfig:
         le marché primaire ni sur le secondaire) : le robot ne doit rien faire."""
         return not (self.active_names() or self.secondary_names())
 
-    def startup_wait_range(self) -> tuple | None:
-        """(borne basse, borne haute) en minutes du jitter de démarrage ; None
-        si les deux colonnes sont vides/invalides."""
+    def startup_wait_range(self) -> tuple:
+        """(borne basse, borne haute) en minutes du jitter de démarrage ; les
+        deux colonnes doivent être renseignées (RuntimeError sinon)."""
         low, high = self.startup_wait_min_minutes, self.startup_wait_max_minutes
-        if low is None and high is None:
-            return None
-        low = 0 if low is None else low
-        high = low if high is None else high
+        if low is None or high is None:
+            raise RuntimeError(
+                f"Config robot {self.platform} : 'Temps attente avant démarrage' borne inférieure et supérieure "
+                f"obligatoires (0min accepté). Choisis-les dans la page Configuration robots."
+            )
         return min(low, high), max(low, high)
 
     def active_names(self) -> list:
         return [name for name, loan in self.loans.items() if loan.active]
 
-    def schedule_minutes(self, sufficient: bool, default: int) -> int:
+    def schedule_minutes(self, sufficient: bool) -> int:
         """Intervalle (minutes) entre deux exécutions du robot selon que le
-        solde est suffisant ou non ; `default` si la cellule est vide/invalide."""
+        solde est suffisant ou non ; la cellule doit être renseignée
+        (RuntimeError sinon)."""
         value = self.schedule_sufficient_minutes if sufficient else self.schedule_insufficient_minutes
-        return value if value is not None else default
+        if value is None:
+            raise RuntimeError(
+                f"Config robot {self.platform} : 'Temps planification solde {'suffisant' if sufficient else 'insuffisant'}' "
+                f"obligatoire. Choisis-le dans la page Configuration robots."
+            )
+        return value
 
     def find_loan(self, raw_name) -> LoanConfig | None:
         """Retrouve le loan dont le nom correspond à `raw_name` (exact puis
@@ -375,9 +383,7 @@ def get_platform_config(platform: str) -> PlatformConfig:
     return config
 
 
-def begin_run(
-    platform: str, cron_job_id, state_file: Path, default_sufficient: int, default_insufficient: int,
-) -> tuple:
+def begin_run(platform: str, cron_job_id, state_file: Path) -> tuple:
     """À appeler tout au début du run, avant le jitter de démarrage. Lit
     "config robots" et remet le cron cron-job.org au bon intervalle si besoin :
     celui des colonnes "Temps planification solde suffisant / insuffisant"
@@ -386,17 +392,20 @@ def begin_run(
     solde est inconnu). Retourne (arrêter, plage du jitter) : `arrêter` est
     True si aucune société de prêt de la plateforme n'est active (marché
     primaire ou secondaire) ;
-    une config illisible ne bloque pas le run (False, None)."""
+    une config illisible ne bloque pas le run (False, (0, 0) : pas d'attente, cron
+    inchangé), mais des temps de planification / d'attente non renseignés
+    l'arrêtent (RuntimeError)."""
     try:
         config = get_platform_config(platform)
     except Exception:
-        log.exception("Config robot %s illisible, vérifications de début de run ignorées.", platform)
-        return False, None
+        log.exception("Config robot %s illisible, vérifications de début de run ignorées (aucune attente).", platform)
+        return False, (0, 0)
 
+    wait_range = config.startup_wait_range()
     sufficient = load_state(state_file, CRON_DEFAULT_STATE).get("cron_schedule_sufficient")
     if isinstance(sufficient, bool):
         ensure_schedule_interval(
-            config.schedule_minutes(sufficient, default_sufficient if sufficient else default_insufficient),
+            config.schedule_minutes(sufficient),
             cron_job_id=cron_job_id, state_file=state_file, sufficient=sufficient,
         )
     else:
@@ -404,7 +413,7 @@ def begin_run(
 
     if config.disabled:
         log.info("%s : aucune société de prêt active (primaire ou secondaire) dans 'config robots', run ignoré.", platform)
-    return config.disabled, config.startup_wait_range()
+    return config.disabled, wait_range
 
 
 def is_platform_disabled(platform: str) -> bool:
@@ -421,28 +430,18 @@ def is_platform_disabled(platform: str) -> bool:
     return config.disabled
 
 
-def resolve_startup_wait_range(platform: str) -> tuple | None:
-    """(borne basse, borne haute) en minutes du jitter de démarrage du robot
-    `platform`, lues dans l'onglet "config robots" ; None si les deux sont
-    vides/invalides ou si la lecture échoue."""
-    try:
-        return get_platform_config(platform).startup_wait_range()
-    except Exception:
-        log.exception("Config robot %s illisible, jitter de démarrage par défaut utilisé.", platform)
-        return None
-
-
-def resolve_schedule_minutes(platform: str, sufficient: bool, default: int, config: "PlatformConfig | None" = None) -> int:
+def resolve_schedule_minutes(platform: str, sufficient: bool, config: "PlatformConfig | None" = None) -> int | None:
     """Intervalle de planification cron-job.org du robot `platform` : lu dans
-    l'onglet "config robots" (`config` s'il a déjà été lu ce run), `default`
-    si la lecture échoue ou si la cellule est vide/invalide."""
+    l'onglet "config robots" (`config` s'il a déjà été lu ce run). None si la
+    feuille est illisible (le cron reste inchangé) ; une cellule vide lève
+    une RuntimeError."""
     if config is None:
         try:
             config = get_platform_config(platform)
         except Exception:
-            log.exception("Config robot %s illisible, temps de planification par défaut utilisé.", platform)
-            return default
-    return config.schedule_minutes(sufficient, default)
+            log.exception("Config robot %s illisible, planification inchangée.", platform)
+            return None
+    return config.schedule_minutes(sufficient)
 
 
 class CapTracker:
