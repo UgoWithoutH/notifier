@@ -22,7 +22,8 @@ suivante) :
   secondaire (colonnes optionnelles ci-dessous, ignorées sur le marché primaire).
   Si aucun loan de la plateforme n'est actif (primaire ou secondaire), le
   robot s'arrête dès le début du run, avant le jitter.
-- Durée restante min / max : durée restante du prêt, en mois.
+- Durée restante min / max : durée restante du prêt, en mois (Income Marketplace :
+  mois avant la date de rachat, comme le filtre "Remaining Term" du site).
 - décote / prime min / max : en % du principal, négatif = décote, positif = prime.
 - Temps planification solde insuffisant / suffisant (colonnes facultatives,
   lues sur la LIGNE DE LA PLATEFORME uniquement) : intervalle entre deux
@@ -42,6 +43,10 @@ suivante) :
   disponible au-delà de cette somme (et seulement si l'excédent atteint le
   montant minimum d'investissement). Vide ou invalide = tout le solde est
   investissable.
+- Exclure prêts extensibles (colonne facultative, propre à Income Marketplace,
+  lue sur la ligne de chaque loan) : "x" = le robot ignore les prêts dont
+  l'échéancier est prolongeable (option "Exclude extendable loans" du site).
+  Vide = ces prêts sont acceptés.
 """
 
 import logging
@@ -90,6 +95,7 @@ _OPTIONAL_COLUMN_PREFIXES = {
     "min_premium": "decote / prime min",
     "max_premium": "decote / prime max",
     "keep_uninvested": "garder non investi",
+    "exclude_extendable": "exclure prets extensibles",
 }
 
 
@@ -164,6 +170,7 @@ class LoanConfig:
     max_months: float | None = None
     min_premium: float | None = None
     max_premium: float | None = None
+    exclude_extendable: bool = False
 
     def secondary_rejection_reason(self, rate, premium, months) -> str | None:
         """None si un prêt du marché secondaire (taux, prime en % -
@@ -356,6 +363,7 @@ def get_platform_config(platform: str) -> PlatformConfig:
             max_months=_parse_number(cell(row, "max_months")),
             min_premium=_parse_number(cell(row, "min_premium")),
             max_premium=_parse_number(cell(row, "max_premium")),
+            exclude_extendable=cell(row, "exclude_extendable").lower() == "x",
         )
 
     log.info(

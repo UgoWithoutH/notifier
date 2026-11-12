@@ -347,6 +347,30 @@ def send_afranga_invest_summary_email(stats: dict, error: str | None = None, dia
     )
 
 
+def send_income_marketplace_invest_summary_email(stats: dict, error: str | None = None, diagnostics_text: str | None = None, robot_config=None) -> None:
+    """Recap of monitors/income_marketplace_invest_bot.py (same email format
+    as the other invest bots). Only real purchases (`stats["invested"]`) are
+    listed; dry runs never buy anything, so they only get here on error."""
+    grouped = {}
+    for item in stats.get("invested") or []:
+        entry = grouped.setdefault(item["loan"], {"amount": 0.0, "rates": [], "amounts": []})
+        entry["amount"] += item["amount"]
+        entry["amounts"].append(item["amount"])
+        if item.get("rate") is not None:
+            entry["rates"].append(item["rate"])
+    invested = [
+        {"label": loan, "amount": entry["amount"], "rates": entry["rates"], "amounts": entry["amounts"]}
+        for loan, entry in grouped.items()
+    ]
+    attachment = None
+    if diagnostics_text:
+        attachment = ("income_marketplace_invest_bot_diagnostics_this_run.log", diagnostics_text)
+    _send_invest_summary_email(
+        "Income Marketplace", invested, failures=stats.get("failures", 0), error=error,
+        robot_config=robot_config, attachment=attachment, failed=stats.get("failed_attempts"),
+    )
+
+
 def send_peerberry_email(originators: list) -> None:
     """Send the PeerBerry "distribution by loan originators" recap.
 
