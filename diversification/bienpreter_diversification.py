@@ -208,6 +208,7 @@ Optional:
 import re
 import os
 import sys
+import time
 import html
 import logging
 from datetime import date, datetime, timedelta
@@ -415,6 +416,8 @@ USER_ME_API_URL = "https://www.bienpreter.com/api/v2/user/me"
 # 12 = "Prêts en défaut (retard > 6 mois)" (1 = either of them).
 LITIGATION_LATE = "11"
 LITIGATION_DEFAULT = "12"
+CONTRACT_DATES_ATTEMPTS = 4
+CONTRACT_DATES_RETRY_DELAY = 5.0
 
 
 def _parse_active_loans_results(results: list) -> list:
@@ -693,12 +696,24 @@ def fetch_contract_dates(session: requests.Session, contract_id: str) -> tuple:
     behind the "Gérer mon prêt" page, /api/v1/contracts/{id} (verified live
     2026-10-16): maturity = "refundDateEstimation" (YYYY-MM-DD; 1st due +
     duesLeft - 1 months), next_due = "nextDue.dueDate" (the next instalment
-    to be received). Either is None if absent."""
-    r = session.get(
-        f"https://www.bienpreter.com/api/v1/contracts/{contract_id}",
-        headers={"Accept": "application/ld+json"},
-        timeout=30,
-    )
+    to be received). Either is None if absent.
+
+    Retried on 403/429 (observed 2026-11-13 in GitHub Actions: 42 of 55
+    contracts in a row answered 403 after ~13 calls, while the very same
+    calls all succeed from a local machine - transient anti-bot/rate
+    limiting), re-fetching the API token and backing off between attempts."""
+    url = f"https://www.bienpreter.com/api/v1/contracts/{contract_id}"
+    for attempt in range(1, CONTRACT_DATES_ATTEMPTS + 1):
+        r = session.get(url, headers={"Accept": "application/ld+json"}, timeout=30)
+        if r.status_code not in (403, 429) or attempt == CONTRACT_DATES_ATTEMPTS:
+            break
+        wait = CONTRACT_DATES_RETRY_DELAY * attempt
+        log.warning(
+            "Contract %s: HTTP %s (attempt %d/%d) - refreshing the API token and retrying in %.0fs.",
+            contract_id, r.status_code, attempt, CONTRACT_DATES_ATTEMPTS, wait,
+        )
+        time.sleep(wait)
+        _refresh_api_token(session)
     r.raise_for_status()
     data = r.json()
     estimate = data.get("refundDateEstimation")
@@ -751,9 +766,11 @@ def aggregate_remaining_durations(session: requests.Session, loans: list, today:
         contract_id = loan.get("contract_id")
         try:
             maturity, next_due = fetch_contract_dates(session, contract_id) if contract_id else (None, None)
-        except Exception:
-            log.exception("Failed to fetch the dates of contract %s.", contract_id)
-            maturity, next_due = None, None
+        except Exception as exc:
+            # Abort instead of skipping the loan: the "durée"/"taux" sheets would
+            # otherwise be overwritten with a partial total (2026-11-13: 2468 EUR
+            # written instead of 6588 EUR after a burst of 403s).
+            raise RuntimeError(f"Failed to fetch the dates of contract {contract_id} - not writing partial durations.") from exc
 
         term = None
         litigation = litigation_loans.get(contract_id)
@@ -775,9 +792,8 @@ def aggregate_remaining_durations(session: requests.Session, loans: list, today:
             if project_id not in base_terms:
                 try:
                     base_terms[project_id] = fetch_project_base_term(session, project_id)
-                except Exception:
-                    log.exception("Failed to fetch the base term of project %s.", project_id)
-                    base_terms[project_id] = None
+                except Exception as exc:
+                    raise RuntimeError(f"Failed to fetch the base term of project {project_id} - not writing partial rates.") from exc
             if base_terms[project_id] is None:
                 log.warning("No base term found for a loan of %s (project %s) - excluded from the 'taux' sheet.", name, project_id)
             rates.add(name, term, loan["amount"], loan.get("rate"), base_term=base_terms[project_id])
