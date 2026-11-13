@@ -39,9 +39,10 @@ Endpoints (verified live 2026-11-12, all JSON, Bearer token):
     GET  /api/investments/?page_size=1000 {total, items, pages}; the new purchase shows up there
          right away (`investment_id`, `investment_invest_amount` "10.00", `loan_ref` as a string).
 
-MODE (env INCOME_MARKETPLACE_BOT_MODE, default "dry"):
-    dry  - plan only, nothing is bought.
+MODE (env INCOME_MARKETPLACE_BOT_MODE, default "live"; the workflow's manual-run
+"mode" input can select "dry"):
     live - real purchases.
+    dry  - plan only, nothing is bought.
 
 Required env vars: INCOME_MARKETPLACE_EMAIL, INCOME_MARKETPLACE_PASSWORD,
 INCOME_MARKETPLACE_TOTP_SECRET, GOOGLE_SHEET_ID, GOOGLE_CREDENTIALS, SMTP_* / EMAIL_TO.
@@ -90,7 +91,7 @@ DIAGNOSTICS_FILE = Path(__file__).parent / "income_marketplace_invest_diagnostic
 CRON_SCHEDULE_STATE_FILE = Path(__file__).parent / "income_marketplace_cron_schedule_state.json"
 INCOME_MARKETPLACE_CRON_JOB_ID = os.environ.get("INCOME_MARKETPLACE_CRON_JOB_ID")
 
-MODE = os.environ.get("INCOME_MARKETPLACE_BOT_MODE", "dry").strip().lower()
+MODE = os.environ.get("INCOME_MARKETPLACE_BOT_MODE", "live").strip().lower()
 MIN_INVESTMENT_AMOUNT = float(os.environ.get("INCOME_MARKETPLACE_MIN_INVESTMENT_AMOUNT", "10"))
 MAX_PAGES = 60
 LIST_MAX_ATTEMPTS = 4

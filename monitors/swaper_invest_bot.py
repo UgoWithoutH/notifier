@@ -285,6 +285,10 @@ SWAPER_CRON_JOB_ID = os.environ.get("SWAPER_CRON_JOB_ID")
 # monitors/peerberry_invest_bot.py).
 MIN_INVESTMENT_AMOUNT = float(os.environ.get("MIN_INVESTMENT_AMOUNT", "10"))
 
+# "dry" (selected through the workflow's manual-run "mode" input) plans the
+# investments but buys nothing; scheduled runs are always "live".
+DRY_RUN = os.environ.get("SWAPER_BOT_MODE", "live").strip().lower() == "dry"
+
 # Loans-listing page navigated to directly (fetch_loans() lets the real
 # Angular app fire the API call itself - see that function's docstring for
 # why a manually-built request gets 403).
@@ -1327,6 +1331,9 @@ def run(headless: bool = True) -> None:
 
                             for name, shares in shares_by_name.items():
                                 log.info("Investing %.2f EUR into originator %r's loan(s).", sum(shares.values()), name)
+                                if DRY_RUN:
+                                    log.info("Dry run - nothing bought.")
+                                    continue
                                 try:
                                     attempts = _with_relogin_retry(
                                         lambda: _invest_available_loans(

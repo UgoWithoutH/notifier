@@ -7,6 +7,12 @@ on:
         description: 'TEMP DEBUG: force-send a recap email regardless of balance/new loans'
         type: boolean
         default: false
+      mode:
+        description: "live = real purchases (default, also for scheduled runs), dry = plan only"
+        required: false
+        default: live
+        type: choice
+        options: [live, dry]
 
 permissions:
   contents: read
@@ -115,6 +121,7 @@ jobs:
           SWAPER_EMAIL: ${{ secrets.SWAPER_EMAIL }}
           SWAPER_PASSWORD: ${{ secrets.SWAPER_PASSWORD }}
           SWAPER_TOTP_SECRET: ${{ secrets.SWAPER_TOTP_SECRET }}
+          SWAPER_BOT_MODE: ${{ github.event.inputs.mode || 'live' }}
           CRON_JOB_API_KEY: ${{ secrets.CRON_JOB_API_KEY }}
           SWAPER_CRON_JOB_ID: ${{ secrets.SWAPER_CRON_JOB_ID }}
           SMTP_HOST: ${{ secrets.SMTP_HOST }}

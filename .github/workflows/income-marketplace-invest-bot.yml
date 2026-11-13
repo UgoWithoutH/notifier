@@ -1,7 +1,14 @@
 name: Income Marketplace Invest Bot
 
 on:
-  workflow_dispatch: {}
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "live = real purchases (default, also for scheduled runs), dry = plan only"
+        required: false
+        default: live
+        type: choice
+        options: [live, dry]
 
 permissions:
   contents: read
@@ -59,7 +66,7 @@ jobs:
           INCOME_MARKETPLACE_EMAIL: ${{ secrets.INCOME_MARKETPLACE_EMAIL }}
           INCOME_MARKETPLACE_PASSWORD: ${{ secrets.INCOME_MARKETPLACE_PASSWORD }}
           INCOME_MARKETPLACE_TOTP_SECRET: ${{ secrets.INCOME_MARKETPLACE_TOTP_SECRET }}
-          INCOME_MARKETPLACE_BOT_MODE: ${{ vars.INCOME_MARKETPLACE_BOT_MODE || 'dry' }}
+          INCOME_MARKETPLACE_BOT_MODE: ${{ github.event.inputs.mode || 'live' }}
           CRON_JOB_API_KEY: ${{ secrets.CRON_JOB_API_KEY }}
           INCOME_MARKETPLACE_CRON_JOB_ID: ${{ secrets.INCOME_MARKETPLACE_CRON_JOB_ID }}
           GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}

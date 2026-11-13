@@ -25,12 +25,13 @@ XMLHttpRequest, X-CSRF-TOKEN (token from the page's `investConfirm` config); ans
 {"status": "ok"|"redirect", "redirect": url} or {"status": "risk"} (resend with
 risk_confirmed=true). Primary: legacy `pmForm` form POST (not verified).
 
-MODE (env AFRANGA_BOT_MODE, default "probe"):
+MODE (env AFRANGA_BOT_MODE, default "live"; the workflow's manual-run "mode" input
+can select "dry" or "probe"):
+    live  - real purchases.
     dry   - plan only, no HTTP call that changes anything.
     probe - adds the first planned line of each market to the cart, captures the
             review page structure into the diagnostics (emailed), removes the
             line again. Never buys.
-    live  - real purchases.
 
 Required env vars: AFRANGA_EMAIL, AFRANGA_PASSWORD, AFRANGA_TOTP_SECRET (if 2FA),
 GOOGLE_SHEET_ID, GOOGLE_CREDENTIALS, SMTP_* / EMAIL_TO.
@@ -78,7 +79,7 @@ DIAGNOSTICS_FILE = Path(__file__).parent / "afranga_invest_diagnostics.log"
 CRON_SCHEDULE_STATE_FILE = Path(__file__).parent / "afranga_cron_schedule_state.json"
 AFRANGA_CRON_JOB_ID = os.environ.get("AFRANGA_CRON_JOB_ID")
 
-MODE = os.environ.get("AFRANGA_BOT_MODE", "probe").strip().lower()
+MODE = os.environ.get("AFRANGA_BOT_MODE", "live").strip().lower()
 MIN_INVESTMENT_AMOUNT = float(os.environ.get("AFRANGA_MIN_INVESTMENT_AMOUNT", "10"))
 PAGE_SIZE = 100
 # Secondary: a partial purchase must be >= this and leave >= this; smaller listings are bought in full only.
