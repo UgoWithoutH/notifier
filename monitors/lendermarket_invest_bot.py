@@ -94,6 +94,7 @@ LENDERMARKET_CRON_JOB_ID = os.environ.get("LENDERMARKET_CRON_JOB_ID")
 API_BASE = "https://api.lendermarket.com"
 CSRF_URL = f"{API_BASE}/users/v1/auth/getCsrfToken"
 LOGIN_URL = f"{API_BASE}/users/v1/auth/login"
+_LOGIN_MAX_ATTEMPTS = 3
 TOTP_URL = f"{API_BASE}/users/v1/auth/submitTotpChallenge"
 LOANS_API_URL = f"{API_BASE}/claims/v1/public/getActiveLoans"
 BALANCE_API_URL = f"{API_BASE}/ledger/v1/investor/getInvestorAccountSummary"
@@ -333,17 +334,39 @@ def login(session: requests.Session) -> str:
     if not LENDERMARKET_EMAIL or not LENDERMARKET_PASSWORD:
         raise RuntimeError("LENDERMARKET_EMAIL/LENDERMARKET_PASSWORD environment variables are required.")
 
-    r = session.get(CSRF_URL, headers=_HEADERS, timeout=20)
-    r.raise_for_status()
+    # Lendermarket intermittently answers the login POST with a 2xx and a
+    # non-JSON (empty/HTML) body, seen on GitHub Actions - retry with a fresh
+    # CSRF token and log what came back instead of crashing on r.json().
+    payload = None
+    for attempt in range(1, _LOGIN_MAX_ATTEMPTS + 1):
+        r = session.get(CSRF_URL, headers=_HEADERS, timeout=20)
+        r.raise_for_status()
 
-    r = session.post(
-        LOGIN_URL,
-        json={"email": LENDERMARKET_EMAIL, "password": LENDERMARKET_PASSWORD},
-        headers=_xsrf_headers(session),
-        timeout=20,
-    )
-    r.raise_for_status()
-    data = r.json().get("data") or {}
+        r = session.post(
+            LOGIN_URL,
+            json={"email": LENDERMARKET_EMAIL, "password": LENDERMARKET_PASSWORD},
+            headers=_xsrf_headers(session),
+            timeout=20,
+        )
+        r.raise_for_status()
+        try:
+            payload = r.json()
+            break
+        except ValueError:
+            log.warning(
+                "Lendermarket login returned a non-JSON body (attempt %d/%d, status=%s, content-type=%s, "
+                "length=%d): %r",
+                attempt, _LOGIN_MAX_ATTEMPTS, r.status_code, r.headers.get("Content-Type"),
+                len(r.content), r.text[:200],
+            )
+            if attempt < _LOGIN_MAX_ATTEMPTS:
+                time.sleep(2 * attempt)
+    if payload is None:
+        raise RuntimeError(
+            f"Lendermarket login returned a non-JSON response {_LOGIN_MAX_ATTEMPTS} times in a row "
+            f"(last status={r.status_code})."
+        )
+    data = payload.get("data") or {}
     mandatory_steps = (data.get("person") or {}).get("mandatorySteps") or []
     needs_totp = any(step.get("stepName") == "TOTP_CHALLENGE" for step in mandatory_steps)
 
