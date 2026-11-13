@@ -116,6 +116,10 @@ INVEST_DIAGNOSTICS_FILE = Path(__file__).parent / "lendermarket_invest_diagnosti
 # investment, confirmed by the user 2026-07-24.
 MIN_INVESTMENT_AMOUNT = float(os.environ.get("LENDERMARKET_MIN_INVESTMENT_AMOUNT", "10"))
 
+# "dry" (selected through the workflow's manual-run "mode" input) plans the
+# investments but buys nothing; scheduled runs are always "live".
+DRY_RUN = os.environ.get("LENDERMARKET_BOT_MODE", "live").strip().lower() == "dry"
+
 _HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
     "Referer": "https://app.lendermarket.com/",
@@ -747,6 +751,9 @@ def invest_selected_lenders(
         stats["lender_budgets"][sheet_name] = stats["lender_budgets"].get(sheet_name, 0.0) + amount
         stats["lender_stats"][sheet_name]["budget"] += amount
     log.info("Investment plan (loan uuid -> EUR): %s", plan)
+    if DRY_RUN:
+        log.info("Dry run - nothing bought.")
+        return stats
 
     for loan_uuid, amount in plan.items():
         sheet_name, rate = loan_lookup[loan_uuid]

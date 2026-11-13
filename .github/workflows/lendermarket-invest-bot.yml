@@ -1,7 +1,14 @@
 name: Lendermarket Invest Bot
 
 on:
-  workflow_dispatch: {}
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "live = real purchases (default, also for scheduled runs), dry = plan only"
+        required: false
+        default: live
+        type: choice
+        options: [live, dry]
 
 permissions:
   contents: read
@@ -42,6 +49,7 @@ jobs:
           LENDERMARKET_EMAIL: ${{ secrets.LENDERMARKET_EMAIL }}
           LENDERMARKET_PASSWORD: ${{ secrets.LENDERMARKET_PASSWORD }}
           LENDERMARKET_TOTP_SECRET: ${{ secrets.LENDERMARKET_TOTP_SECRET }}
+          LENDERMARKET_BOT_MODE: ${{ github.event.inputs.mode || 'live' }}
           CRON_JOB_API_KEY: ${{ secrets.CRON_JOB_API_KEY }}
           LENDERMARKET_CRON_JOB_ID: ${{ secrets.LENDERMARKET_CRON_JOB_ID }}
           GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
