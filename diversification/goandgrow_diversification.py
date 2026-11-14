@@ -731,11 +731,12 @@ def run() -> None:
             fill_remaining_duration_amounts(PLATFORM_LABEL, durations, platform_level=True, rates=rates)
         except Exception:
             log.exception("Failed to update the 'durée' sheet for Go & Grow.")
-
-        try:
-            fill_rate_amounts(PLATFORM_LABEL, rates, platform_level=True)
-        except Exception:
-            log.exception("Failed to update the 'taux' sheet for Go & Grow.")
+        else:
+            # Only when the durations were filled: a half-built `rates` would wipe the base-term rows of "taux".
+            try:
+                fill_rate_amounts(PLATFORM_LABEL, rates, platform_level=True)
+            except Exception:
+                log.exception("Failed to update the 'taux' sheet for Go & Grow.")
 
 
 if __name__ == "__main__":

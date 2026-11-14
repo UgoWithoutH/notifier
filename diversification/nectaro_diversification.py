@@ -1028,12 +1028,12 @@ def run() -> None:
             )
         except Exception:
             log.exception("Failed to update the 'durée' sheet for Nectaro.")
-
-        # Own try/except too: the "taux" tab is independent of the "durée" one.
-        try:
-            fill_rate_amounts("Nectaro", rates, target_totals=company_totals)
-        except Exception:
-            log.exception("Failed to update the 'taux' sheet for Nectaro.")
+        else:
+            # Only when the durations were fetched: an empty `rates` would wipe the base-term rows of "taux".
+            try:
+                fill_rate_amounts("Nectaro", rates, target_totals=company_totals)
+            except Exception:
+                log.exception("Failed to update the 'taux' sheet for Nectaro.")
 
 
 if __name__ == "__main__":

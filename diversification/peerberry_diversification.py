@@ -192,7 +192,7 @@ from shared.rate_sheet import fill_rate_amounts
 from shared.remaining_duration import RateWeights, base_term_between, base_term_from_days, overdue_months_and_days, remaining_months_and_days
 from shared.report_date import get_report_now, is_current_month
 from shared.retry import retry_call
-from shared.session_cache import get_or_refresh_session
+from shared.session_cache import get_or_refresh_session, save_session_state
 from shared.state import load_state, save_state
 from shared.weighted_average import INVESTED_BALANCE_LABEL, NON_INVESTED_BALANCE_LABEL, compute_time_weighted_average
 from shared.monthly_yield_waterfall import compute_monthly_yield_shares
@@ -281,6 +281,17 @@ def normalize_originators(payload: list) -> list:
     return originators
 
 
+def _get_with_relogin(session: requests.Session, url: str, **kwargs) -> requests.Response:
+    """GET `url`; on a 401 (token expired/invalidated mid-run) log in again once and retry."""
+    r = session.get(url, headers=_HEADERS, timeout=20, **kwargs)
+    if r.status_code == 401:
+        log.warning("PeerBerry API returned 401 for %s - logging in again and retrying once.", url)
+        login(session)
+        save_session_state(session, SESSION_STATE_FILE)
+        r = session.get(url, headers=_HEADERS, timeout=20, **kwargs)
+    return r
+
+
 def fetch_current_investments(session: requests.Session) -> list:
     """Fetch every current investment (the "My investments" list, `type=CURRENT`, late ones included).
 
@@ -293,11 +304,10 @@ def fetch_current_investments(session: requests.Session) -> list:
     page_number = 0
     while True:
         page_number += 1
-        r = session.get(
+        r = _get_with_relogin(
+            session,
             INVESTMENTS_API_URL,
             params={"type": "CURRENT", "offset": offset, "pageSize": INVESTMENTS_PAGE_SIZE},
-            headers=_HEADERS,
-            timeout=20,
         )
         if not r.ok:
             raise RuntimeError(f"Investments API returned status {r.status_code} (offset={offset})")
@@ -332,7 +342,7 @@ def fetch_loan_base_terms(session: requests.Session, investments: list) -> dict:
         if loan_id is None:
             continue
         try:
-            r = session.get(f"{LOANS_API_URL}/{loan_id}", headers=_HEADERS, timeout=20)
+            r = _get_with_relogin(session, f"{LOANS_API_URL}/{loan_id}")
             r.raise_for_status()
             loan = (r.json() or {}).get("loan") or {}
             term = base_term_from_days(loan.get("initialTerm")) or base_term_between(
@@ -1474,12 +1484,13 @@ def run() -> None:
             )
         except Exception:
             log.exception("Failed to update the 'durée' sheet for Peerberry.")
-
-        # Own try/except too: the "taux" tab is independent of the "durée" one.
-        try:
-            fill_rate_amounts("Peerberry", rates)
-        except Exception:
-            log.exception("Failed to update the 'taux' sheet for Peerberry.")
+        else:
+            # Only when the durations were fetched: an empty `rates` (e.g. API 401)
+            # would make fill_rate_amounts wipe the base-term rows of "taux".
+            try:
+                fill_rate_amounts("Peerberry", rates)
+            except Exception:
+                log.exception("Failed to update the 'taux' sheet for Peerberry.")
 
 
 if __name__ == "__main__":

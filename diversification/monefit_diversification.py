@@ -963,12 +963,12 @@ def run() -> None:
             )
         except Exception:
             log.exception("Failed to update the 'durée' sheet for Monefit.")
-
-        # Own try/except too: the "taux" tab is independent of the "durée" one.
-        try:
-            fill_rate_amounts("Monefit", rates, platform_level=True, target_totals={None: balance})
-        except Exception:
-            log.exception("Failed to update the 'taux' sheet for Monefit.")
+        else:
+            # Only when the durations were fetched: an empty `rates` would wipe the base-term rows of "taux".
+            try:
+                fill_rate_amounts("Monefit", rates, platform_level=True, target_totals={None: balance})
+            except Exception:
+                log.exception("Failed to update the 'taux' sheet for Monefit.")
 
 
 if __name__ == "__main__":

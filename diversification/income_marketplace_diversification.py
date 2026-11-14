@@ -1068,11 +1068,12 @@ def run() -> None:
                 fill_remaining_duration_amounts("Income Marketplace", remaining_durations, rates=duration_rates, reclassify_buyback=False)
             except Exception:
                 log.exception("Failed to update the 'durée' sheet for Income Marketplace.")
-
-            try:
-                fill_rate_amounts("Income Marketplace", duration_rates)
-            except Exception:
-                log.exception("Failed to update the 'taux' sheet for Income Marketplace.")
+            else:
+                # Only when the durations were filled: an empty `duration_rates` would wipe the base-term rows of "taux".
+                try:
+                    fill_rate_amounts("Income Marketplace", duration_rates)
+                except Exception:
+                    log.exception("Failed to update the 'taux' sheet for Income Marketplace.")
 
 
 if __name__ == "__main__":

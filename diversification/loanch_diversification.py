@@ -1441,11 +1441,12 @@ def run() -> None:
             )
         except Exception:
             log.exception("Failed to update the 'durée' sheet for Loanch.")
-
-        try:
-            fill_rate_amounts("Loanch", rates)
-        except Exception:
-            log.exception("Failed to update the 'taux' sheet for Loanch.")
+        else:
+            # Only when the durations were fetched: an empty `rates` would wipe the base-term rows of "taux".
+            try:
+                fill_rate_amounts("Loanch", rates)
+            except Exception:
+                log.exception("Failed to update the 'taux' sheet for Loanch.")
 
 
 if __name__ == "__main__":

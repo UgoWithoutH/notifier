@@ -1217,11 +1217,12 @@ def run() -> None:
             )
         except Exception:
             log.exception("Failed to update the 'durée' sheet for Iuvo.")
-
-        try:
-            fill_rate_amounts("Iuvo", rates)
-        except Exception:
-            log.exception("Failed to update the 'taux' sheet for Iuvo.")
+        else:
+            # Only when the durations were fetched: an empty `rates` would wipe the base-term rows of "taux".
+            try:
+                fill_rate_amounts("Iuvo", rates)
+            except Exception:
+                log.exception("Failed to update the 'taux' sheet for Iuvo.")
 
 
 if __name__ == "__main__":
