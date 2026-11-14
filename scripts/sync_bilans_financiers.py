@@ -9,7 +9,9 @@ Pour chaque plateforme listée dans l'onglet (sections "Crowdlending", ...) :
   prêts" sans plateforme) ;
 - sous chaque société (et sous la plateforme elle-même pour ses propres bilans),
   une ligne par bilan est (ré)écrite avec tous les détails, y compris le détail
-  de la note par critère.
+  de la note par critère ;
+- le pays du siège de chaque société de prêts (colonne "Pays du siège", écrite sur
+  la ligne de la société, en français) est lu dans les données de la page.
 
 Les pondérations de la note sont lues dans la page du site (valeurs de secours sinon).
 Données : API publique /api/public/bilans-financiers + liens plateforme/société
@@ -46,7 +48,7 @@ DRY_RUN = os.environ.get("DRY_RUN", "").strip().lower() in ("1", "true", "yes")
 EXTRA_PLATFORMS = {"bondora"}
 
 COLUMNS = [
-    "Exercice", "Type de compte", "Audit", "Auditeur", "Opinion d'audit", "Normes comptables",
+    "Exercice", "Type de compte", "Pays du siège", "Audit", "Auditeur", "Opinion d'audit", "Normes comptables",
     "Devise", "Taux (1 € =)",
     "CA brut (devise)", "CA brut (€)", "Résultat net (devise)",
     "Total actif (devise)", "Trésorerie (devise)", "Total dettes (devise)",
@@ -62,7 +64,7 @@ INTEGER_COLUMNS = {"CA brut (devise)", "CA brut (€)", "Résultat net (devise)"
                    "Total actif (devise)", "Trésorerie (devise)",
                    "Total dettes (devise)", "Capitaux propres (devise)",
                    "Dépréciations (devise)", "Charges d'exploitation (devise)"}
-TEXT_COLUMNS = {"PDF 1", "PDF 2", "PDF 3", "Exercice", "Type de compte", "Audit", "Auditeur",
+TEXT_COLUMNS = {"PDF 1", "PDF 2", "PDF 3", "Exercice", "Type de compte", "Pays du siège", "Audit", "Auditeur",
                 "Opinion d'audit", "Normes comptables", "Devise", "Détail de la note", "Alertes",
                 "Analyse IA", "Mis à jour le", "Commentaire plateforme / société"}
 
@@ -82,6 +84,21 @@ AUDIT_OPINIONS = {"sans_reserve": "Sans réserve", "avec_reserve": "Avec réserv
                   "examen_limite": "Examen limité", "non_audite": "Non audité", "extrait": "Extrait des comptes",
                   "non_disponible": "Non disponible"}
 ACCOUNTING_STANDARDS = {"ifrs": "IFRS", "local": "Normes locales"}
+
+# Code ISO du site (pays_siege) -> nom français, tel qu'utilisé dans les autres onglets du Sheet
+# (la web app en déduit le drapeau). Un code absent est écrit tel quel.
+COUNTRY_NAMES_FR = {
+    "AE": "Émirats arabes unis", "AL": "Albanie", "AM": "Arménie", "AR": "Argentine", "AT": "Autriche",
+    "AU": "Australie", "BG": "Bulgarie", "BW": "Botswana", "CA": "Canada", "CH": "Suisse",
+    "CO": "Colombie", "CY": "Chypre", "CZ": "République tchèque", "EE": "Estonie", "ES": "Espagne",
+    "FI": "Finlande", "FR": "France", "GB": "Royaume-Uni", "GE": "Géorgie", "HR": "Croatie",
+    "ID": "Indonésie", "IE": "Irlande", "IS": "Islande", "IT": "Italie", "KE": "Kenya",
+    "KZ": "Kazakhstan", "LT": "Lituanie", "LU": "Luxembourg", "LV": "Lettonie", "MD": "Moldavie",
+    "MK": "Macédoine du Nord", "MT": "Malte", "MX": "Mexique", "MY": "Malaisie", "NA": "Namibie",
+    "NG": "Nigeria", "PE": "Pérou", "PH": "Philippines", "PL": "Pologne", "PT": "Portugal",
+    "RO": "Roumanie", "SE": "Suède", "SG": "Singapour", "SK": "Slovaquie", "UG": "Ouganda",
+    "US": "États-Unis", "UZ": "Ouzbékistan", "VN": "Vietnam", "XK": "Kosovo", "ZA": "Afrique du Sud",
+}
 
 
 def norm(text: str) -> str:
@@ -159,6 +176,11 @@ def find_societe(name: str, societes: list[dict]) -> dict | None:
     return None
 
 
+def country_label(societe: dict | None) -> str:
+    code = ((societe or {}).get("pays_siege") or "").strip().upper()
+    return COUNTRY_NAMES_FR.get(code, code)
+
+
 def audit_label(row: dict) -> str:
     if not row.get("audite"):
         return "Non audité"
@@ -204,6 +226,7 @@ def bilan_line(row: dict, weights: dict = WEIGHTS) -> list:
     values = {
         "Exercice": row.get("exercice_label") or "",
         "Type de compte": ACCOUNT_TYPES.get(row.get("type_compte"), row.get("type_compte") or ""),
+        "Pays du siège": "",
         "Audit": audit_label(row),
         "Auditeur": row.get("auditeur_nom") or "",
         "Opinion d'audit": AUDIT_OPINIONS.get(row.get("opinion_audit"), row.get("opinion_audit") or ""),
@@ -291,9 +314,13 @@ def build_grid(header: list[str], items: list[dict], rows: list[dict],
     width = 1 + len(COLUMNS)
     comment_idx = width - 1
 
-    def line(name="", data=None, comment=""):
+    country_idx = 1 + COLUMNS.index("Pays du siège")
+
+    def line(name="", data=None, comment="", country=""):
         out = [name] + (data if data is not None else [""] * len(COLUMNS))
         out[comment_idx] = comment
+        if country:
+            out[country_idx] = country
         return out
 
     grid, kinds, issues = [header], ["header"], []
@@ -320,7 +347,8 @@ def build_grid(header: list[str], items: list[dict], rows: list[dict],
             log.warning("Plateforme '%s' introuvable sur le site.", item["b"])
             issues.append(f"Plateforme '{item['b']}' introuvable sur le site")
         grid.append(line(item["b"],
-                         comment=(platform or {}).get("note_externe") or (same_name or {}).get("note_externe") or ""))
+                         comment=(platform or {}).get("note_externe") or (same_name or {}).get("note_externe") or "",
+                         country=country_label(same_name)))
         kinds.append("platform")
         add_bilans(own_rows)
 
@@ -341,7 +369,8 @@ def build_grid(header: list[str], items: list[dict], rows: list[dict],
             if s is None:
                 log.warning("Société '%s' (sous %s) introuvable sur le site.", entry["label"], item["b"])
                 issues.append(f"Société '{entry['label']}' (sous {item['b']}) introuvable sur le site")
-            grid.append(line(entry["label"], comment=(s or {}).get("note_externe") or ""))
+            grid.append(line(entry["label"], comment=(s or {}).get("note_externe") or "",
+                             country=country_label(s)))
             kinds.append("company")
             if s:
                 add_bilans(by_societe_id.get(s["id"], []))
