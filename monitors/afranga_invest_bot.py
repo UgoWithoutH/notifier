@@ -237,7 +237,8 @@ def plan_secondary(rows: list, tracker, budget: float) -> list:
             remaining / factor,
         )
         amount = _floor2(ceiling)
-        min_amount = max(min_principal, loan.min_amount or 0.0)
+        # The platform rejects any purchase below MIN_INVESTMENT_AMOUNT, even a full exit of a tiny residual.
+        min_amount = max(min_principal, loan.min_amount or 0.0, MIN_INVESTMENT_AMOUNT)
         if row.get("full_exit_only") or max_principal < SECONDARY_MIN_LEFT:
             if amount + 0.005 < max_principal:
                 continue
