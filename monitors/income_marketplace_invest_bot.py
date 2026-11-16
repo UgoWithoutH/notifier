@@ -93,11 +93,13 @@ INCOME_MARKETPLACE_CRON_JOB_ID = os.environ.get("INCOME_MARKETPLACE_CRON_JOB_ID"
 
 MODE = os.environ.get("INCOME_MARKETPLACE_BOT_MODE", "live").strip().lower()
 MIN_INVESTMENT_AMOUNT = float(os.environ.get("INCOME_MARKETPLACE_MIN_INVESTMENT_AMOUNT", "10"))
-MAX_PAGES = 60
+MAX_PAGES = 300
+PAGES_PER_BATCH = 60
 LIST_MAX_ATTEMPTS = 4
 LIST_RETRY_BASE_DELAY_SECONDS = 3
 BALANCE_CHECK_ATTEMPTS = 4
 BALANCE_CHECK_DELAY_SECONDS = 2
+NETWORK_ERROR_MAX_ATTEMPTS = 2
 MAX_DIAGNOSTICS_EMAIL_CHARS = 2_000_000
 
 
@@ -168,11 +170,10 @@ def fetch_cash_balance(page, token: str) -> float:
     return float(funds.get("available") or 0.0)
 
 
-def fetch_marketplace_loans(page, token: str, min_rate: float | None) -> list:
-    """Every listed loan (deduplicated on `loan_id`), highest interest rate first.
+def iter_marketplace_pages(page, token: str, min_rate: float | None):
+    """Yields the loans of each listing page, highest interest rate first (up to MAX_PAGES pages).
     `min_rate` is a server-side pre-filter (falls back to an unfiltered listing if refused)."""
     filters = [] if min_rate is None else [{"id": RATE_FILTER_ID, "values": [min_rate, RATE_FILTER_MAX]}]
-    loans: dict = {}
     page_count = 1
     page_number = 1
     while page_number <= min(page_count, MAX_PAGES):
@@ -196,13 +197,25 @@ def fetch_marketplace_loans(page, token: str, min_rate: float | None) -> list:
             raise RuntimeError(f"POST {LOAN_LIST_URL}{page_number} returned HTTP {result['status']}: {result['text'][:300]}")
         data = json.loads(result["text"])
         page_count = int(data.get("pages") or 0)
-        for loan in data.get("loanList") or []:
+        batch = data.get("loanList") or []
+        for loan in batch:
             loan.pop("loan_schedule", None)
-            loans.setdefault(loan["loan_id"], loan)
+        yield batch
         page_number += 1
     if page_count > MAX_PAGES:
         log.warning("Hit MAX_PAGES (%d) of %d - listing truncated.", MAX_PAGES, page_count)
-    return list(loans.values())
+
+
+def read_more_loans(pages, loans: dict, page_budget: int) -> bool:
+    """Reads up to `page_budget` more listing pages into `loans` (deduplicated on `loan_id`).
+    Returns True once the listing is exhausted."""
+    for _ in range(page_budget):
+        batch = next(pages, None)
+        if batch is None:
+            return True
+        for loan in batch:
+            loans.setdefault(loan["loan_id"], loan)
+    return False
 
 
 def _is_investable(loan: dict) -> bool:
@@ -291,34 +304,41 @@ def place_investment(page, token: str, loan: dict, amount: float, balance_before
     Without a readable body (network error, unexpected format) the purchase is confirmed from
     the uninvested cash dropping instead."""
     payload = [{"loan_ref": loan["loan_ref"], "amount": _format_amount(amount)}]
-    result = _post_json(page, INVESTMENT_CREATE_URL, token, payload)
-    _log_diagnostics(
-        "investment_create", payload=payload, status=result["status"], response=result["text"][:3000],
-        balance_before=balance_before,
-        loan={key: loan.get(key) for key in (
-            "loan_ref", "loan_originator_name", "loan_status", "loan_investor_interest_rate", "investable_amount",
-            "loan_term_period", "loan_due_date", "loan_buyback_date", "loan_extendable_schedule",
-        )},
-    )
-    invested, rejection = _parse_investment_response(result, loan["loan_ref"])
-    if invested:
-        if invested < amount - 0.01:
-            log.warning("Loan %s: %.2f EUR requested but only %.2f EUR invested.", loan["loan_ref"], amount, invested)
-        return True, invested, fetch_cash_balance(page, token), None
-    if rejection:
-        return False, 0.0, balance_before, f"HTTP {result['status']} : {rejection}"
-    balance_after = balance_before
-    # status 0 = no response (network): the purchase may still have gone through.
-    check_balance = result["status"] == 0 or 200 <= result["status"] < 300
-    for attempt in range(BALANCE_CHECK_ATTEMPTS if check_balance else 1):
-        if attempt:
-            time.sleep(BALANCE_CHECK_DELAY_SECONDS)
-        balance_after = fetch_cash_balance(page, token)
-        if balance_before - balance_after >= amount - 0.01:
-            return True, balance_before - balance_after, balance_after, None
-    snippet = " ".join(result["text"][:300].split())
-    reason = f"HTTP {result['status']}, solde non débité ({balance_before:.2f} -> {balance_after:.2f} €) : {snippet}"
-    return False, 0.0, balance_after, reason
+    for network_attempt in range(1, NETWORK_ERROR_MAX_ATTEMPTS + 1):
+        result = _post_json(page, INVESTMENT_CREATE_URL, token, payload)
+        _log_diagnostics(
+            "investment_create", payload=payload, status=result["status"], response=result["text"][:3000],
+            balance_before=balance_before, network_attempt=network_attempt,
+            loan={key: loan.get(key) for key in (
+                "loan_ref", "loan_originator_name", "loan_status", "loan_investor_interest_rate", "investable_amount",
+                "loan_term_period", "loan_due_date", "loan_buyback_date", "loan_extendable_schedule",
+            )},
+        )
+        invested, rejection = _parse_investment_response(result, loan["loan_ref"])
+        if invested:
+            if invested < amount - 0.01:
+                log.warning("Loan %s: %.2f EUR requested but only %.2f EUR invested.", loan["loan_ref"], amount, invested)
+            return True, invested, fetch_cash_balance(page, token), None
+        if rejection:
+            return False, 0.0, balance_before, f"HTTP {result['status']} : {rejection}"
+        balance_after = balance_before
+        # status 0 = no response (network): the purchase may still have gone through.
+        check_balance = result["status"] == 0 or 200 <= result["status"] < 300
+        for attempt in range(BALANCE_CHECK_ATTEMPTS if check_balance else 1):
+            if attempt:
+                time.sleep(BALANCE_CHECK_DELAY_SECONDS)
+            balance_after = fetch_cash_balance(page, token)
+            if balance_before - balance_after >= amount - 0.01:
+                return True, balance_before - balance_after, balance_after, None
+        # Resending is only safe because the cash was verified as not debited (a dropped
+        # keep-alive connection fails once, the next request opens a fresh one).
+        if result["status"] == 0 and network_attempt < NETWORK_ERROR_MAX_ATTEMPTS:
+            log.warning("Loan %s: network error, cash not debited - retrying the purchase.", loan["loan_ref"])
+            balance_before = balance_after
+            continue
+        snippet = " ".join(result["text"][:300].split())
+        reason = f"HTTP {result['status']}, solde non débité ({balance_before:.2f} -> {balance_after:.2f} €) : {snippet}"
+        return False, 0.0, balance_after, reason
 
 
 def _line_summary(loan: dict, loan_name: str, amount: float) -> dict:
@@ -387,25 +407,39 @@ def run() -> None:
                 geo_snapshot = None
             tracker = build_tracker(config, balance, geo_snapshot)
 
-            loans = fetch_marketplace_loans(page, token, config.lowest_min_rate())
-            log.info("%d loan(s) listed, %d with status Current.", len(loans), sum(_is_investable(loan) for loan in loans))
+            # Pages are read in batches: as long as part of the budget stays unallocated, the next
+            # (lower rate) pages are read and the plan is recomputed from every loan read so far.
+            pages = iter_marketplace_pages(page, token, config.lowest_min_rate())
+            loans: dict = {}
+            while True:
+                exhausted = read_more_loans(pages, loans, PAGES_PER_BATCH)
+                plan = plan_loans(list(loans.values()), tracker, investable)
+                unallocated = investable - sum(amount for *_rest, amount in plan)
+                log.info(
+                    "%d loan(s) listed, %d purchase(s) planned, %.2f EUR unallocated.",
+                    len(loans), len(plan), unallocated,
+                )
+                if exhausted or unallocated < MIN_INVESTMENT_AMOUNT:
+                    break
+            log.info("%d loan(s) with status Current.", sum(_is_investable(loan) for loan in loans.values()))
 
             # Mail (once) when no listed loan belongs to an originator flagged in the sheet.
+            # Skipped while the listing is only partly read (the originator may be further down).
             state = load_state(STATE_FILE, {"missing_loans": {}})
             seen_names = set()
             today = datetime.now(timezone.utc).date()
-            for loan in loans:
+            for loan in loans.values():
                 config_loan = config.find_loan(loan.get("loan_originator_name"))
                 if config_loan is not None and _is_investable(loan) and _accepted(loan, config_loan, today):
                     seen_names.add(config_loan.name)
             all_names = sorted(config.active_names())
-            report_missing_loans(
-                PLATFORM, {name: name in seen_names for name in all_names},
-                state.setdefault("missing_loans", {}), all_names=all_names, grace_seconds=TRANSIENT_GRACE_SECONDS,
-            )
-            save_state(STATE_FILE, state)
+            if exhausted or seen_names.issuperset(all_names):
+                report_missing_loans(
+                    PLATFORM, {name: name in seen_names for name in all_names},
+                    state.setdefault("missing_loans", {}), all_names=all_names, grace_seconds=TRANSIENT_GRACE_SECONDS,
+                )
+                save_state(STATE_FILE, state)
 
-            plan = plan_loans(loans, tracker, investable)
             stats["plan"] = [_line_summary(*line) for line in plan]
             log.info("%d purchase(s) planned (%.2f EUR).", len(plan), sum(amount for *_rest, amount in plan))
             if MODE != "live":
