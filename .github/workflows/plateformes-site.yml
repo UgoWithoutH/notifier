@@ -1,4 +1,4 @@
-name: Plateformes (cadre réglementaire et sièges)
+name: Plateformes
 
 on:
   workflow_dispatch:
