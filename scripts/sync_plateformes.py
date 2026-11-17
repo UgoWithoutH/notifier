@@ -89,7 +89,7 @@ COLUMNS = [
     "Catégorie", "Visible au comparateur", "Cadre réglementaire", "Protection investisseur", "Pays du siège",
     "Pays d'agrément", "Adresse Cerfa 3916", "Autorité de surveillance", "Indemnisation plafond",
     "Fonds séparés", "Sanctions du régulateur", "Nature du contrat", "Modèle économique",
-    *NOTE_COLUMNS.values(),
+    *NOTE_COLUMNS.values(), "Base de la note globale", "Détail des points",
     "WHT", "IFU", "Tax report", "Compte étranger 3916", "Impôts", "Ticket minimal", "AutoInvest",
     "Trustpilot note", "Trustpilot nb avis", "Bonus", "Avantages", "Inconvénients",
     "Indicateurs de performance", "Clôturée le",
@@ -132,11 +132,52 @@ def strip_decorations(text: str | None) -> str:
     return re.sub(r"\s+", " ", text).strip()
 
 
+def fr_number(value: float) -> str:
+    return f"{round(value, 2):g}".replace(".", ",")
+
+
+def score_breakdown(tabs: list[dict], criteria: list[dict], broker_id: str) -> tuple[str, str]:
+    """(base de la note globale, détail des points) d'une plateforme.
+
+    Le site calcule la note globale comme la moyenne, pondérée par le poids de chaque onglet,
+    des seules notes renseignées. Chaque note d'onglet est elle-même la somme des points de ses
+    critères notés rapportée à leur maximum ("rollup:<onglet>")."""
+    def cell(criterion: dict) -> dict:
+        return criterion["values"].get(broker_id) or {}
+
+    rated = [t for t in tabs if t.get("notation")
+             and any(c["id"] == f"notation:{t['id']}" and cell(c).get("note") is not None for c in criteria)]
+    weighted = [t for t in tabs if t.get("notation") and t.get("poids") is not None]
+    filled = [t for t in rated if t.get("poids") is not None]
+    base = ""
+    if filled:
+        base = (f"{len(filled)}/{len(weighted)} notes renseignées · poids "
+                f"{fr_number(sum(t['poids'] for t in filled))}/{fr_number(sum(t['poids'] for t in weighted))}")
+
+    lines = []
+    for tab in rated:
+        parts = []
+        for c in criteria:
+            if c["tabId"] != tab["id"] or not c.get("notation"):
+                continue
+            points = cell(c).get("note")
+            if points is None:
+                continue
+            maximum = c.get("pointsMax")
+            parts.append(f"{c['label']} {fr_number(points)}" + (f" / {fr_number(maximum)}" if maximum else ""))
+        if not parts:
+            continue
+        total = next((cell(c).get("text") for c in criteria if c["id"] == f"rollup:{tab['id']}"), "") or ""
+        lines.append(f"{tab['label']} | {total} | {' ; '.join(parts)}")
+    return base, "\n".join(lines)
+
+
 def parse_comparator(page: str) -> dict[int, dict[str, str]]:
     """plateformeId -> valeurs par colonne (vide si le critère n'est pas renseigné)."""
     payload = rsc_payload(page)
     brokers = extract_list(payload, "brokers")
     criteria = extract_list(payload, "criteria")
+    tabs = extract_list(payload, "tabs")
     by_label = {c["label"]: c for c in criteria if not c["id"].startswith(("rollup", "notation"))}
     notes = {c["label"]: c for c in criteria if c["id"].startswith("notation:")}
     missing = set(REQUIRED_CRITERIA) - set(by_label)
@@ -159,6 +200,7 @@ def parse_comparator(page: str) -> dict[int, dict[str, str]]:
         for label, column in NOTE_COLUMNS.items():
             text = (value(label, bid, notes).get("text") or "").strip()
             fields[column] = "" if text == "—" else text
+        fields["Base de la note globale"], fields["Détail des points"] = score_breakdown(tabs, criteria, bid)
         fields["Avantages"] = " ; ".join(t for t in ((value(l, bid).get("text") or "").strip()
                                                      for l in PROS_LABELS) if t)
         fields["Inconvénients"] = " ; ".join(t for t in ((value(l, bid).get("text") or "").strip()
