@@ -24,6 +24,7 @@ import json
 import logging
 import os
 import re
+import traceback
 from collections import defaultdict
 from datetime import datetime
 
@@ -34,6 +35,7 @@ from gspread.utils import rowcol_to_a1
 from scripts.sync_bilans_financiers import (COUNTRY_NAMES_FR, HEADERS_HTTP, PAGE_URL as BILANS_URL, norm,
                                             fetch_reference_data)
 from shared.google_sheet import _call_with_retry, get_worksheet_by_name
+from shared.notifier import send_plateformes_changes_email, send_plateformes_sync_issues_email
 
 log = logging.getLogger(__name__)
 
@@ -418,7 +420,61 @@ def get_or_create_worksheet():
         return _call_with_retry(spreadsheet.add_worksheet, title=SHEET_NAME, rows=500, cols=WIDTH)
 
 
+def _clean(value) -> str:
+    return " ".join(str(value).split())
+
+
+def _short(value: str, limit: int = 160) -> str:
+    return value if len(value) <= limit else value[:limit - 1] + "…"
+
+
+def find_changes(existing: list[list[str]], grid: list[list[str]]) -> tuple[list[str], list[str], list[dict]]:
+    """(ajouts, suppressions, modifications) entre l'onglet actuel et le nouveau tableau.
+
+    Les lignes sont appariées par nom et rang d'apparition (une société peut figurer sous
+    plusieurs plateformes). Seules les colonnes présentes dans l'ancien en-tête sont comparées.
+    """
+    def index(rows):
+        seen, result = defaultdict(int), {}
+        for row in rows[1:]:
+            name = _clean(row[0]) if row else ""
+            if name:
+                seen[name] += 1
+                result[(name, seen[name])] = row
+        return result
+
+    old_header = [_clean(c) for c in existing[0]]
+    columns = [(c, old_header.index(c), 1 + i) for i, c in enumerate(COLUMNS) if c in old_header]
+    old_rows, new_rows = index(existing), index(grid)
+    added = [name for name, n in new_rows if (name, n) not in old_rows]
+    removed = [name for name, n in old_rows if (name, n) not in new_rows]
+    modified = []
+    for key, new_row in new_rows.items():
+        old_row = old_rows.get(key)
+        if old_row is None:
+            continue
+        changes = []
+        for column, old_idx, new_idx in columns:
+            old = _clean(old_row[old_idx]) if old_idx < len(old_row) else ""
+            new = _clean(new_row[new_idx]) if new_idx < len(new_row) else ""
+            if old != new:
+                changes.append((column, _short(old), _short(new)))
+        if changes:
+            modified.append({"name": key[0], "changes": changes})
+    return added, removed, modified
+
+
 def run() -> None:
+    try:
+        sync()
+    except Exception:
+        log.exception("Échec de la synchronisation des plateformes.")
+        if not DRY_RUN:
+            send_plateformes_sync_issues_email([], error=traceback.format_exc())
+        raise
+
+
+def sync() -> None:
     map_payload = rsc_payload(fetch_page(MAP_URL))
     map_plateformes, map_societes = extract_list(map_payload, "plateformes"), extract_list(map_payload, "societes")
     bilans_plateformes, bilans_societes, bilans_links = fetch_reference_data(fetch_page(BILANS_URL))
@@ -438,6 +494,8 @@ def run() -> None:
     grid, kinds, issues = build_grid(plateformes, societes, comparator, regulation)
     for issue in issues:
         log.warning(issue)
+    if issues and not DRY_RUN:
+        send_plateformes_sync_issues_email(issues)
     counts = {k: kinds.count(k) for k in ("section", "platform", "company")}
     log.info("Tableau final : %d lignes (%s).", len(grid), counts)
     if DRY_RUN:
@@ -447,7 +505,8 @@ def run() -> None:
         return
 
     ws = get_or_create_worksheet()
-    existing_rows = len(_call_with_retry(ws.get_all_values))
+    existing = _call_with_retry(ws.get_all_values)
+    existing_rows = len(existing)
     total_rows = max(len(grid), existing_rows)
     padded = [r + [""] * (WIDTH - len(r)) for r in grid] + [[""] * WIDTH for _ in range(total_rows - len(grid))]
     if ws.row_count < total_rows or ws.col_count < WIDTH:
@@ -455,6 +514,14 @@ def run() -> None:
     _call_with_retry(ws.update, values=padded, range_name=f"A1:{rowcol_to_a1(total_rows, WIDTH)}", raw=True)
     _call_with_retry(apply_format, ws, kinds, total_rows)
     log.info("Onglet '%s' mis à jour (%s).", SHEET_NAME, datetime.now().strftime("%Y-%m-%d %H:%M"))
+
+    # Onglet vide (première exécution) : rien à comparer, pas de mail.
+    if len(existing) > 1:
+        added, removed, modified = find_changes(existing, grid)
+        if added or removed or modified:
+            log.info("Changements : %d ajout(s), %d suppression(s), %d modification(s).",
+                     len(added), len(removed), len(modified))
+            send_plateformes_changes_email(added, removed, modified)
 
 
 if __name__ == "__main__":
