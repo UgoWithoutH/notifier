@@ -86,7 +86,7 @@ NOTE_COLUMNS = {label: label if label == "Note globale" else f"Note {label}" for
 OWN_COMMENT_COLUMNS = {"Cadre réglementaire": "Commentaire cadre", "Sanctions du régulateur": "Commentaire sanctions"}
 
 COLUMNS = [
-    "Catégorie", "Visible au comparateur", "Cadre réglementaire", "Protection investisseur", "Pays du siège",
+    "Catégorie", "Cadre réglementaire", "Protection investisseur", "Pays du siège",
     "Pays d'agrément", "Adresse Cerfa 3916", "Autorité de surveillance", "Indemnisation plafond",
     "Fonds séparés", "Sanctions du régulateur", "Nature du contrat", "Modèle économique",
     *NOTE_COLUMNS.values(), "Base de la note globale", "Détail des points",
@@ -193,8 +193,10 @@ def parse_comparator(page: str) -> dict[int, dict[str, str]]:
 
     out = {}
     for broker in brokers:
+        if broker.get("affichage") is False:  # masquée du comparateur public : on ne reprend pas ses données
+            continue
         bid = broker["id"]
-        fields = {"Visible au comparateur": "Oui" if broker.get("affichage") else "Non"}
+        fields = {}
         for label, column in COMPARATOR_CRITERIA.items():
             fields[column] = (value(label, bid).get("text") or "").strip()
         for label, column in NOTE_COLUMNS.items():
