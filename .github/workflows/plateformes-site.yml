@@ -1,0 +1,38 @@
+name: Plateformes (cadre réglementaire et sièges)
+
+on:
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Simulation : n'écrit rien dans le Google Sheet"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: plateformes-site
+  cancel-in-progress: false
+
+jobs:
+  plateformes:
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install Python dependencies
+        run: pip install -r requirements.txt
+
+      - name: Sync plateformes into Google Sheet
+        env:
+          GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
+          GOOGLE_CREDENTIALS: ${{ secrets.GOOGLE_CREDENTIALS }}
+          DRY_RUN: ${{ inputs.dry_run && '1' || '' }}
+        run: python -m scripts.sync_plateformes
