@@ -14,8 +14,8 @@ Pour chaque plateforme listée dans l'onglet (sections "Crowdlending", ...) :
   la ligne de la société, en français) est lu dans les données de la page.
 
 Les pondérations de la note sont lues dans la page du site (valeurs de secours sinon).
-Données : API publique /api/public/bilans-financiers + liens plateforme/société
-embarqués dans la page (payload Next.js). Aucun login, pas de navigateur.
+Données : API publique /api/public/bilans-financiers (+ /{id}/ia-analyse pour le texte de
+l'analyse de chaque bilan) + liens plateforme/société embarqués dans la page (payload Next.js). Aucun login, pas de navigateur.
 
 Lancement : python -m scripts.sync_bilans_financiers   (DRY_RUN=1 pour ne rien écrire)
 """
@@ -23,9 +23,11 @@ import json
 import logging
 import os
 import re
+import time
 import traceback
 import unicodedata
 from collections import Counter
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 
 import requests
@@ -42,6 +44,8 @@ PAGE_URL = "https://liberte-financiere.net/bilans-financiers-p2p"
 API_URL = "https://liberte-financiere.net/api/public/bilans-financiers"
 HEADERS_HTTP = {"User-Agent": "Mozilla/5.0"}
 PAGE_SIZE = 20
+ANALYSIS_WORKERS = 5
+ANALYSIS_RETRIES = 3
 DRY_RUN = os.environ.get("DRY_RUN", "").strip().lower() in ("1", "true", "yes")
 
 # Plateformes du Sheet absentes de la liste des plateformes du site.
@@ -120,7 +124,33 @@ def fetch_rows() -> list[dict]:
         rows += data["rows"]
         offset += PAGE_SIZE
     log.info("%d bilans récupérés (total annoncé : %s).", len(rows), total)
+    fetch_analyses(rows)
     return rows
+
+
+def fetch_analysis(bilan_id: int) -> str:
+    """Analyse du bilan : la liste renvoie toujours `ia_analyse: null`, le texte est servi par un
+    appel dédié (celui du clic sur un bilan, public lui aussi)."""
+    last_error = None
+    for attempt in range(ANALYSIS_RETRIES):
+        try:
+            r = requests.get(f"{API_URL}/{bilan_id}/ia-analyse", headers=HEADERS_HTTP, timeout=30)
+            r.raise_for_status()
+            return (r.json().get("ia_analyse") or "").strip()
+        except (requests.RequestException, ValueError) as exc:
+            last_error = exc
+            time.sleep(2 ** attempt)
+    raise RuntimeError(f"Analyse du bilan {bilan_id} illisible : {last_error}")
+
+
+def fetch_analyses(rows: list[dict]) -> None:
+    """Renseigne `ia_analyse` de chaque bilan. Une erreur annule la synchronisation plutôt
+    que d'effacer des analyses déjà présentes dans le Sheet."""
+    with ThreadPoolExecutor(max_workers=ANALYSIS_WORKERS) as pool:
+        analyses = list(pool.map(lambda r: fetch_analysis(r["id"]), rows))
+    for row, analysis in zip(rows, analyses):
+        row["ia_analyse"] = analysis
+    log.info("%d analyses sur %d bilans.", sum(1 for a in analyses if a), len(rows))
 
 
 def fetch_page() -> str:
