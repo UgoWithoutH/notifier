@@ -246,6 +246,9 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(me
 log = logging.getLogger("bienpreter_diversification")
 
 LOGIN_URL = "https://www.bienpreter.com/connexion"
+LOGIN_FORM_ATTEMPTS = 3
+LOGIN_FORM_RETRY_DELAY_SECONDS = 5
+EMPTY_PAGE_RECHECK_DELAY_SECONDS = 2
 DASHBOARD_URL = "https://www.bienpreter.com/u/tableau-de-bord"
 OPERATIONS_URL = "https://www.bienpreter.com/u/operations"
 # Bienpreter is a French platform; "this month" below means the current
@@ -302,13 +305,28 @@ def login(session: requests.Session) -> str:
     if the post-login response doesn't land on /u/tableau-de-bord (wrong
     credentials show the same /connexion form again with an error banner).
     """
-    log.info("GET %s (fetching login form + CSRF tokens)...", LOGIN_URL)
-    r = session.get(LOGIN_URL, timeout=30)
-    log.info("GET login page: status=%s", r.status_code)
-    r.raise_for_status()
+    # 2026-11-18: /connexion once answered 200 without the form tokens right
+    # after the session was invalidated mid-run (cause unknown, one-off), so
+    # retry a few times and log what came back instead of failing at once.
+    csrf_match = token_match = None
+    for attempt in range(1, LOGIN_FORM_ATTEMPTS + 1):
+        log.info("GET %s (fetching login form + CSRF tokens, attempt %d/%d)...", LOGIN_URL, attempt, LOGIN_FORM_ATTEMPTS)
+        r = session.get(LOGIN_URL, timeout=30)
+        log.info("GET login page: status=%s, final_url=%s", r.status_code, r.url)
+        r.raise_for_status()
 
-    csrf_match = re.search(r'name="_csrf_token" value="([^"]*)"', r.text)
-    token_match = re.search(r'name="user_login\[_token\]" value="([^"]*)"', r.text)
+        csrf_match = re.search(r'name="_csrf_token" value="([^"]*)"', r.text)
+        token_match = re.search(r'name="user_login\[_token\]" value="([^"]*)"', r.text)
+        if csrf_match and token_match:
+            break
+        title_match = re.search(r"<title[^>]*>(.*?)</title>", r.text, re.DOTALL | re.IGNORECASE)
+        log.warning(
+            "Login form tokens not found (final_url=%s, %d chars, title=%r).",
+            r.url, len(r.text), _strip_tags(title_match.group(1)) if title_match else None,
+        )
+        session.cookies.clear()
+        if attempt < LOGIN_FORM_ATTEMPTS:
+            time.sleep(LOGIN_FORM_RETRY_DELAY_SECONDS * attempt)
     if not csrf_match or not token_match:
         raise RuntimeError("Could not find Bienpreter login CSRF tokens on the /connexion page.")
 
@@ -823,6 +841,8 @@ def _fetch_operations_page(session: requests.Session, start_date: str, end_date:
     r = session.get(url, timeout=30)
     log.info("GET operations page %d: status=%s", page_number, r.status_code)
     r.raise_for_status()
+    if "/connexion" in r.url or 'name="user_login[email]"' in r.text:
+        raise SessionExpiredError(f"Operations page {page_number} redirected to the login form ({r.url}).")
 
     rows_html = re.findall(r"<tr[^>]*>.*?</tr>", r.text, re.DOTALL)
     rows = []
@@ -876,20 +896,47 @@ def _fetch_operations_page(session: requests.Session, start_date: str, end_date:
     return rows
 
 
+class SessionExpiredError(RuntimeError):
+    """A page that needs authentication came back as the login form."""
+
+
+def _fetch_operations_page_authenticated(session: requests.Session, start_date: str, end_date: str, page_number: int) -> list:
+    """_fetch_operations_page(), re-logging in once if the session expired
+    mid-pagination (the site then serves the login form / an empty page, which
+    would otherwise silently truncate the totals)."""
+    try:
+        return _fetch_operations_page(session, start_date, end_date, page_number)
+    except SessionExpiredError:
+        log.warning("Bienpreter session expired while fetching operations - logging in again.")
+        session.cookies.clear()
+        login(session)
+        save_session_state(session, SESSION_STATE_FILE)
+        return _fetch_operations_page(session, start_date, end_date, page_number)
+
+
 def fetch_all_operations(session: requests.Session, start_date: str, end_date: str) -> list:
     """Fetch EVERY /u/operations row within [start_date, end_date]
     ("YYYY-MM-DD" strings), paginating via the `page` query param until a
     page returns no real rows - the shared pagination loop behind both
     fetch_current_month_interest_totals() (this month only) and
     get_cached_operations() (full/incremental history, for XIRR/Cash drag).
+
+    2026-11-18: a run got an empty page 4 (of 5) and wrote 55.09 EUR of
+    interest instead of 80.89 EUR, right before its session was found
+    invalidated. An empty page is therefore re-fetched once (after a short
+    pause) before being trusted as the end of the list.
     """
     all_rows = []
     previous_rows = None
     page_number = 0
     while True:
         page_number += 1
-        rows = _fetch_operations_page(session, start_date, end_date, page_number)
+        rows = _fetch_operations_page_authenticated(session, start_date, end_date, page_number)
         rows = [r for r in rows if r.get("label")]
+        if not rows:
+            time.sleep(EMPTY_PAGE_RECHECK_DELAY_SECONDS)
+            rows = _fetch_operations_page_authenticated(session, start_date, end_date, page_number)
+            rows = [r for r in rows if r.get("label")]
         log.info("Operations page %d (%s to %s): %d real row(s) found.", page_number, start_date, end_date, len(rows))
         if not rows:
             break
