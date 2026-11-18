@@ -93,7 +93,8 @@ CHROME_CANDIDATES = [
     r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
     os.path.expandvars(r"%LOCALAPPDATA%\Google\Chrome\Application\chrome.exe"),
 ]
-PROFILE_DIR = os.path.join(os.environ.get("TEMP", "."), "lande_get_session_chrome_profile")
+# Persistent (not TEMP) so cookies/history survive between runs and Cloudflare sees a lived-in profile.
+PROFILE_DIR = os.path.join(os.path.expanduser("~"), ".lande_get_session_chrome_profile")
 
 LANDE_EMAIL = os.environ.get("LANDE_EMAIL")
 LANDE_PASSWORD = os.environ.get("LANDE_PASSWORD")
@@ -183,9 +184,17 @@ def _wait_for_login_page(timeout: float = 300, settle: float = 2) -> bool:
         time.sleep(0.5)
     return False
 
+
+def _debug_port_open() -> bool:
+    try:
+        return requests.get(f"http://localhost:{DEBUG_PORT}/json/version", timeout=1).ok
+    except requests.RequestException:
+        return False
+
+
 def main() -> None:
     chrome_path = _find_chrome()
-    log.info("Launching real Chrome (%s) with a separate profile, remote debugging on :%s ...", chrome_path, DEBUG_PORT)
+    log.info("Launching real Chrome (%s) with a persistent profile, remote debugging on :%s ...", chrome_path, DEBUG_PORT)
     subprocess.Popen([
         chrome_path,
         f"--remote-debugging-port={DEBUG_PORT}",
@@ -194,7 +203,16 @@ def main() -> None:
         "--no-default-browser-check",
         LOGIN_URL,
     ])
-    time.sleep(2)
+    for _ in range(20):
+        if _debug_port_open():
+            break
+        time.sleep(0.5)
+    else:
+        log.error(
+            "Chrome did not expose the debug port %s. If a Chrome using the profile %s is already open "
+            "without it, close that window and retry.", DEBUG_PORT, PROFILE_DIR,
+        )
+        sys.exit(1)
 
     if not _wait_for_login_page():
         log.error("Timed out waiting for the Cloudflare check to be passed / the login page to appear.")
