@@ -227,6 +227,7 @@ from shared.google_sheet import (
     fill_remaining_duration_amounts,
 )
 from shared.rate_sheet import fill_rate_amounts
+from shared.html_forms import extract_hidden_inputs
 from shared.remaining_duration import RateWeights, overdue_months_and_days, remaining_months_and_days
 from shared.report_date import get_report_now, is_current_month
 from shared.retry import retry_call
@@ -308,34 +309,35 @@ def login(session: requests.Session) -> str:
     # 2026-11-18: /connexion once answered 200 without the form tokens right
     # after the session was invalidated mid-run (cause unknown, one-off), so
     # retry a few times and log what came back instead of failing at once.
-    csrf_match = token_match = None
+    hidden_fields = {}
     for attempt in range(1, LOGIN_FORM_ATTEMPTS + 1):
         log.info("GET %s (fetching login form + CSRF tokens, attempt %d/%d)...", LOGIN_URL, attempt, LOGIN_FORM_ATTEMPTS)
         r = session.get(LOGIN_URL, timeout=30)
         log.info("GET login page: status=%s, final_url=%s", r.status_code, r.url)
         r.raise_for_status()
 
-        csrf_match = re.search(r'name="_csrf_token" value="([^"]*)"', r.text)
-        token_match = re.search(r'name="user_login\[_token\]" value="([^"]*)"', r.text)
-        if csrf_match and token_match:
+        hidden_fields = extract_hidden_inputs(r.text)
+        if hidden_fields:
             break
         title_match = re.search(r"<title[^>]*>(.*?)</title>", r.text, re.DOTALL | re.IGNORECASE)
         log.warning(
-            "Login form tokens not found (final_url=%s, %d chars, title=%r).",
+            "Login form hidden fields not found (final_url=%s, %d chars, title=%r).",
             r.url, len(r.text), _strip_tags(title_match.group(1)) if title_match else None,
         )
         session.cookies.clear()
         if attempt < LOGIN_FORM_ATTEMPTS:
             time.sleep(LOGIN_FORM_RETRY_DELAY_SECONDS * attempt)
-    if not csrf_match or not token_match:
+    if not hidden_fields:
         raise RuntimeError("Could not find Bienpreter login CSRF tokens on the /connexion page.")
+    log.info("Login form hidden field(s) found: %s", ", ".join(sorted(hidden_fields)))
 
+    # Every hidden field of the form is echoed back as-is, so a renamed or
+    # extra token does not break the login (only the credentials are ours).
     payload = {
+        **hidden_fields,
         "user_login[email]": BIENPRETER_EMAIL,
         "user_login[password]": BIENPRETER_PASSWORD,
         "user_login[remember_me]": "1",
-        "_csrf_token": csrf_match.group(1),
-        "user_login[_token]": token_match.group(1),
     }
     log.info("POST %s (submitting credentials)...", LOGIN_URL)
     r2 = session.post(LOGIN_URL, data=payload, timeout=30)

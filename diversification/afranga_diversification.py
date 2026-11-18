@@ -154,6 +154,7 @@ from shared.google_sheet import (
     fill_remaining_duration_amounts,
 )
 from shared.rate_sheet import fill_rate_amounts
+from shared.html_forms import extract_hidden_inputs
 from shared.remaining_duration import (
     RateWeights,
     base_term_between,
@@ -212,14 +213,11 @@ _HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
 }
 
-_TOKEN_RE = re.compile(r'name="_token"\s+value="([^"]+)"')
-
-
 def _extract_csrf_token(html: str) -> str:
-    m = _TOKEN_RE.search(html)
-    if not m:
+    token = extract_hidden_inputs(html).get("_token")
+    if not token:
         raise RuntimeError("Could not find the CSRF _token in the page HTML.")
-    return m.group(1)
+    return token
 
 
 def login(session: requests.Session) -> None:
