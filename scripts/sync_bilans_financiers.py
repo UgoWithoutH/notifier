@@ -26,6 +26,7 @@ import re
 import time
 import traceback
 import unicodedata
+from pathlib import Path
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
@@ -34,6 +35,7 @@ import requests
 from gspread.utils import rowcol_to_a1
 
 from scripts.bilans_methodo import parse_methodo
+from scripts.site_drift import new_keys, new_values, notify_novelties
 from shared.google_sheet import _call_with_retry, get_worksheet_by_name
 from shared.notifier import send_bilans_sync_issues_email, send_new_bilans_email
 
@@ -47,6 +49,7 @@ PAGE_SIZE = 20
 ANALYSIS_WORKERS = 5
 ANALYSIS_RETRIES = 3
 DRY_RUN = os.environ.get("DRY_RUN", "").strip().lower() in ("1", "true", "yes")
+DRIFT_STATE_FILE = Path(__file__).parent / "bilans_site_drift_state.json"
 
 # Plateformes du Sheet absentes de la liste des plateformes du site.
 EXTRA_PLATFORMS = {"bondora"}
@@ -88,6 +91,27 @@ AUDIT_OPINIONS = {"sans_reserve": "Sans réserve", "avec_reserve": "Avec réserv
                   "examen_limite": "Examen limité", "non_audite": "Non audité", "extrait": "Extrait des comptes",
                   "non_disponible": "Non disponible"}
 ACCOUNTING_STANDARDS = {"ifrs": "IFRS", "local": "Normes locales"}
+
+# Champs du site connus (lus ou volontairement ignorés). Tout champ absent de ces listes est signalé
+# par email : il faut alors l'intégrer, ou l'ajouter ici pour l'ignorer.
+KNOWN_ROW_KEYS = {
+    "alerte_continuite", "alerte_covenant", "audite", "auditeur_nom", "aussi_societe_pret", "ca_brut",
+    "charges_exploitation", "computed", "computed_sans_actifs", "created_at", "depreciations", "devise",
+    "est_holding", "exercice_label", "ia_analyse", "id", "normes_comptables", "opinion_audit", "pdf_fichier_1",
+    "pdf_fichier_2", "pdf_fichier_3", "plateforme_id", "plateforme_nom", "resultat_net", "societe_pret_id",
+    "societe_pret_nom", "taux_vers_eur", "total_actif", "total_capitaux_propres", "total_dettes", "tresorerie",
+    "type_compte", "updated_at"}
+KNOWN_COMPUTED_KEYS = {"alertes", "charges_manquantes", "grille", "note_sur_5", "ratios", "scores",
+                       "trimestriel", "v2_complet", "computed_sans_actifs"}
+KNOWN_RATIO_KEYS = {"dettes_sur_cp", "fiabilite", "fonds_propres", "impayes", "marge", "rentabilite", "roe",
+                    "tresorerie", "tresorerie_mois"}
+KNOWN_SCORE_KEYS = set(CRITERIA_LABELS)
+KNOWN_PLATFORM_KEYS = {
+    "id", "indicateurs_performance_last_check", "logo_media_id", "logo_url", "nom", "note_externe", "note_interne",
+    "pays_siege", "plateforme_cloturee_le", "plateforme_themes", "societe_proprietaire_id", "tx_parrain_as_bonus",
+    "url_indicateurs_performance"}
+KNOWN_COMPANY_KEYS = {"id", "nom", "note_externe", "note_interne", "pays_siege", "societe_mere_id"}
+KNOWN_LINK_KEYS = {"plateforme_id", "societe_pret_id"}
 
 # Code ISO du site (pays_siege) -> nom français, tel qu'utilisé dans les autres onglets du Sheet
 # (la web app en déduit le drapeau). Un code absent est écrit tel quel.
@@ -480,6 +504,26 @@ def apply_format(ws, kinds: list[str], total_rows: int) -> None:
     ws.freeze(rows=1, cols=1)
 
 
+def site_changes(rows: list[dict], plateformes: list[dict], societes: list[dict], links: list[dict]) -> list[str]:
+    """Nouveautés du site (champ, type de compte, code pays...) que ce script ne connaît pas."""
+    computed = [r.get("computed") or {} for r in rows]
+    issues = new_keys("bilans, bilan", rows, KNOWN_ROW_KEYS)
+    issues += new_keys("bilans, note calculée", computed, KNOWN_COMPUTED_KEYS)
+    issues += new_keys("bilans, ratio", [c.get("ratios") or {} for c in computed], KNOWN_RATIO_KEYS)
+    issues += new_keys("bilans, score", [c.get("scores") or {} for c in computed], KNOWN_SCORE_KEYS)
+    issues += new_keys("page des bilans, plateforme", plateformes, KNOWN_PLATFORM_KEYS)
+    issues += new_keys("page des bilans, société de prêts", societes, KNOWN_COMPANY_KEYS)
+    issues += new_keys("page des bilans, lien plateforme/société", links, KNOWN_LINK_KEYS)
+    issues += new_values("type de compte", (r.get("type_compte") for r in rows), ACCOUNT_TYPES)
+    issues += new_values("opinion d'audit", (r.get("opinion_audit") for r in rows), AUDIT_OPINIONS)
+    issues += new_values("normes comptables", (r.get("normes_comptables") for r in rows), ACCOUNTING_STANDARDS)
+    issues += new_values("grille de notation", (c.get("grille") for c in computed), WEIGHTS)
+    issues += new_values("code pays (affiché tel quel dans le sheet)",
+                         (s.get("pays_siege", "").strip().upper() for s in societes if s.get("pays_siege")),
+                         COUNTRY_NAMES_FR)
+    return issues
+
+
 def run() -> None:
     try:
         _run()
@@ -512,8 +556,13 @@ def _run() -> None:
     items = parse_sheet(existing, platform_names)
     header_name = (existing[0][0] if existing and existing[0] else "") or "Nom"
     grid, kinds, issues = build_grid([header_name] + COLUMNS, items, rows, plateformes, societes, links, weights)
-    if issues and not DRY_RUN:
-        send_bilans_sync_issues_email(issues)
+    novelties = site_changes(rows, plateformes, societes, links)
+    for issue in issues + novelties:
+        log.warning(issue)
+    if not DRY_RUN:
+        if issues:
+            send_bilans_sync_issues_email(issues)
+        notify_novelties("Bilans", novelties, DRIFT_STATE_FILE)
 
     counts = {k: kinds.count(k) for k in ("platform", "company", "bilan")}
     log.info("Tableau final : %d lignes (%s).", len(grid), counts)

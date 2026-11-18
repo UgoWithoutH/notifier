@@ -30,6 +30,14 @@ jobs:
       - name: Install Python dependencies
         run: pip install -r requirements.txt
 
+      - name: Restore known site novelties
+        uses: actions/cache/restore@v4
+        with:
+          path: scripts/plateformes_site_drift_state.json
+          key: plateformes-site-drift-${{ github.run_id }}
+          restore-keys: |
+            plateformes-site-drift-
+
       - name: Sync plateformes into Google Sheet
         env:
           GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
@@ -42,3 +50,10 @@ jobs:
           EMAIL_TO: ${{ secrets.EMAIL_TO }}
           DRY_RUN: ${{ inputs.dry_run && '1' || '' }}
         run: python -m scripts.sync_plateformes
+
+      - name: Save known site novelties
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: scripts/plateformes_site_drift_state.json
+          key: plateformes-site-drift-${{ github.run_id }}

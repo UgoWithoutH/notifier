@@ -11,7 +11,7 @@ Sources (pages publiques, aucun login, pas de navigateur ; payload Next.js des p
   MiFID II, ...), adresse du siège, autorité de surveillance, indemnisation, fonds séparés,
   sanctions, nature du contrat, fiscalité (WHT, IFU, 3916...), ticket minimal, AutoInvest,
   Trustpilot, avantages / inconvénients, notes ;
-- /reglementation-p2p : protection investisseur de chaque cadre, pays d'agrément et modèle.
+- /reglementation-p2p : pays d'agrément et modèle économique de chaque plateforme.
 
 L'onglet est entièrement réécrit à chaque lancement : une section par catégorie, une ligne
 par plateforme et, dessous, une ligne par société de prêts rattachée. Les commentaires
@@ -27,11 +27,13 @@ import re
 import traceback
 from collections import defaultdict
 from datetime import datetime
+from pathlib import Path
 
 import gspread
 import requests
 from gspread.utils import rowcol_to_a1
 
+from scripts.site_drift import PREFIX, new_keys, new_values, notify_novelties, split_novelties
 from scripts.sync_bilans_financiers import (COUNTRY_NAMES_FR, HEADERS_HTTP, PAGE_URL as BILANS_URL, norm,
                                             fetch_reference_data)
 from shared.google_sheet import _call_with_retry, get_worksheet_by_name
@@ -46,6 +48,7 @@ MAP_URL = f"{BASE_URL}/carte-p2p"
 COMPARATOR_URL = f"{BASE_URL}/comparateur-p2p"
 REGULATION_URL = f"{BASE_URL}/reglementation-p2p"
 DRY_RUN = os.environ.get("DRY_RUN", "").strip().lower() in ("1", "true", "yes")
+DRIFT_STATE_FILE = Path(__file__).parent / "plateformes_site_drift_state.json"
 
 COUNTRY_NAMES = {**COUNTRY_NAMES_FR, "DK": "Danemark", "NL": "Pays-Bas", "LK": "Sri Lanka",
                  "UA": "Ukraine", "HU": "Hongrie", "DE": "Allemagne", "BE": "Belgique", "VC": "Saint-Vincent"}
@@ -53,6 +56,23 @@ THEMES = [("p2p_crowdlending", "Crowdlending"), ("crowdfunding_immobilier", "Cro
           ("immobilier_fractionne", "Immobilier fractionné"), ("autres", "Autres")]
 OTHER_SECTION = "Autres"
 ORPHAN_SECTION = "Sociétés de prêts sans plateforme (groupes, holdings)"
+
+# Champs du site connus (lus ou volontairement ignorés). Tout champ absent de ces listes est signalé
+# par email : il faut alors l'intégrer, ou l'ajouter ici pour l'ignorer.
+KNOWN_MAP_PLATFORM_KEYS = {"id", "logo", "nom", "pays", "proprietaireId", "themes"}
+KNOWN_MAP_COMPANY_KEYS = {"id", "mereId", "nom", "pays", "plateformeIds", "siege", "type",
+                          "groupeNom", "groupeSiege"}
+KNOWN_BROKER_KEYS = {"affichage", "bitlyLienId", "bonusText", "comparatifTypes", "id", "logoUrl", "name",
+                     "plateformeId"}
+KNOWN_TAB_KEYS = {"actif", "description", "descriptionExterne", "descriptionInterne", "id", "label",
+                  "notation", "poids", "systeme"}
+KNOWN_CRITERION_KEYS = {"affichage", "descriptionExterne", "descriptionInterne", "id", "label", "line",
+                        "notation", "pointsMax", "tabId", "values"}
+KNOWN_CELL_KEYS = {"text", "note", "commentaireInterne", "commentaireExterne"}
+KNOWN_CRITERION_ID_PREFIXES = {"rollup", "rollup-note", "notation"}
+# En-têtes des tableaux de la page réglementation qui ne sont volontairement pas repris.
+IGNORED_REGULATION_TABLES = {("Cadre", "Exemples de plateformes"), ("Plateforme", "Pays"),
+                             ("Plateforme", "Siège")}
 
 # Libellé du critère du comparateur -> colonne. Les trois premiers sont indispensables : s'ils
 # disparaissent du site, l'écriture est annulée plutôt que de vider ces colonnes.
@@ -88,7 +108,7 @@ NOTE_COLUMNS = {label: label if label == "Note globale" else f"Note {label}" for
 OWN_COMMENT_COLUMNS = {"Cadre réglementaire": "Commentaire cadre", "Sanctions du régulateur": "Commentaire sanctions"}
 
 COLUMNS = [
-    "Catégorie", "Cadre réglementaire", "Protection investisseur", "Pays du siège",
+    "Catégorie", "Cadre réglementaire", "Pays du siège",
     "Pays d'agrément", "Adresse Cerfa 3916", "Autorité de surveillance", "Indemnisation plafond",
     "Fonds séparés", "Sanctions du régulateur", "Nature du contrat", "Modèle économique",
     *NOTE_COLUMNS.values(), "Base de la note globale", "Détail des points",
@@ -174,8 +194,9 @@ def score_breakdown(tabs: list[dict], criteria: list[dict], broker_id: str) -> t
     return base, "\n".join(lines)
 
 
-def parse_comparator(page: str) -> dict[int, dict[str, str]]:
-    """plateformeId -> valeurs par colonne (vide si le critère n'est pas renseigné)."""
+def parse_comparator(page: str) -> tuple[dict[int, dict[str, str]], list[str]]:
+    """plateformeId -> valeurs par colonne (vide si le critère n'est pas renseigné), et la
+    liste des critères attendus qui ont disparu du comparateur (colonnes alors vides)."""
     payload = rsc_payload(page)
     brokers = extract_list(payload, "brokers")
     criteria = extract_list(payload, "criteria")
@@ -187,8 +208,26 @@ def parse_comparator(page: str) -> dict[int, dict[str, str]]:
         raise RuntimeError(f"Critères introuvables dans le comparateur : {sorted(missing)}")
     absent = (set(COMPARATOR_CRITERIA) | set(PROS_LABELS) | set(CONS_LABELS)) - set(by_label)
     absent |= set(NOTE_LABELS) - set(notes)
+    problems = []
     if absent:
         log.warning("Critères du comparateur absents (colonnes vides) : %s", sorted(absent))
+        problems.append(f"Comparateur : critères introuvables sur le site (colonnes vides) : {sorted(absent)}")
+
+    used_labels = set(COMPARATOR_CRITERIA) | set(PROS_LABELS) | set(CONS_LABELS)
+    for label in sorted(set(by_label) - used_labels):
+        problems.append(f"{PREFIX} : critère « {label} » du comparateur (onglet "
+                        f"« {next((t['label'] for t in tabs if t['id'] == by_label[label]['tabId']), '?')} »)")
+    for label in sorted(set(notes) - set(NOTE_LABELS)):
+        problems.append(f"{PREFIX} : note « {label} » du comparateur")
+    for c in criteria:
+        prefix = c["id"].split(":")[0]
+        if not prefix.isdigit() and prefix not in KNOWN_CRITERION_ID_PREFIXES:
+            problems.append(f"{PREFIX} : type de critère « {c['id']} » ({c['label']}) du comparateur")
+    problems += new_keys("comparateur, plateforme", brokers, KNOWN_BROKER_KEYS)
+    problems += new_keys("comparateur, onglet", tabs, KNOWN_TAB_KEYS)
+    problems += new_keys("comparateur, critère", criteria, KNOWN_CRITERION_KEYS)
+    problems += new_keys("comparateur, valeur d'un critère",
+                         [v for c in criteria for v in c["values"].values()], KNOWN_CELL_KEYS)
 
     def value(label: str, broker_id: str, source=by_label) -> dict:
         return (source.get(label, {}).get("values", {}).get(broker_id)) or {}
@@ -220,7 +259,7 @@ def parse_comparator(page: str) -> dict[int, dict[str, str]]:
                 others.append(f"{label} : {comment}")
         fields["Autres commentaires comparateur"] = "\n".join(others)
         out[broker["plateformeId"]] = fields
-    return out
+    return out, problems
 
 
 def regulation_key(name: str) -> str:
@@ -228,11 +267,19 @@ def regulation_key(name: str) -> str:
     return REGULATION_ALIASES.get(key, key)
 
 
-def parse_regulation(page: str) -> dict[str, dict[str, str]]:
+REGULATION_TABLES = {
+    "agrement": ("« Plateforme / Pays d'agrément »", "Pays d'agrément"),
+    "modele": ("« Plateforme / Pays / Modèle »", "Modèle économique"),
+}
+
+
+def parse_regulation(page: str) -> tuple[dict[str, dict[str, str]], list[str]]:
     """Tableaux de la page réglementation, indexés par nom de plateforme normalisé :
-    {"levels": {cadre: protection}, "agrement": {plateforme: pays}, "modele": {plateforme: modèle}}."""
+    {"agrement": {plateforme: pays}, "modele": {plateforme: modèle}},
+    et la liste des tableaux attendus qui n'ont pas été trouvés (colonnes alors vides)."""
     payload = rsc_payload(page)
-    out = {"levels": {}, "agrement": {}, "modele": {}}
+    out = {"agrement": {}, "modele": {}}
+    unknown_tables = []
     for table in re.findall(r"<table>.*?</table>", payload, flags=re.S):
         rows = [[html.unescape(re.sub(r"<[^>]+>", "", c)).replace("\xa0", " ").strip()
                  for c in re.findall(r"<t[hd][^>]*>(.*?)</t[hd]>", row, flags=re.S)]
@@ -240,27 +287,20 @@ def parse_regulation(page: str) -> dict[str, dict[str, str]]:
         if not rows:
             continue
         header = rows[0]
-        if "Cadre" in header and "Protection investisseur" in header:
-            cadre_idx, level_idx = header.index("Cadre"), header.index("Protection investisseur")
-            for row in rows[1:]:
-                cadre = re.sub(r"\s*/\s*PSFP|\s+agrément investisseur", "", row[cadre_idx])
-                out["levels"][norm(cadre)] = row[level_idx]
-        elif len(header) == 2 and "agrément" in header[1].casefold():
+        if len(header) == 2 and "agrément" in header[1].casefold():
             for name, country in (r for r in rows[1:] if len(r) == 2):
                 out["agrement"][regulation_key(name)] = country
         elif header[:1] == ["Plateforme"] and "Modèle" in header:
             idx = header.index("Modèle")
-            for row in rows[1:]:
+            for row in (r for r in rows[1:] if len(r) > idx):
                 out["modele"][regulation_key(row[0])] = row[idx]
-    if not out["levels"]:
-        raise RuntimeError("Tableau des cadres réglementaires introuvable dans la page réglementation.")
-    return out
-
-
-def protection_level(cadre: str, levels: dict[str, str]) -> str:
-    key = norm(cadre)
-    matches = [k for k in levels if k and key.startswith(k)]
-    return levels[max(matches, key=len)] if matches else ""
+        elif tuple(header) not in IGNORED_REGULATION_TABLES:
+            unknown_tables.append(" / ".join(header))
+    problems = [f"Page réglementation : tableau {label} introuvable (la structure de la page a changé) ; "
+                f"la colonne « {column} » est vide pour toutes les plateformes."
+                for key, (label, column) in REGULATION_TABLES.items() if not out[key]]
+    problems += [f"{PREFIX} : tableau « {name} » de la page réglementation" for name in unknown_tables]
+    return out, problems
 
 
 def merge_sources(map_plateformes: list[dict], map_societes: list[dict], bilans_plateformes: list[dict],
@@ -356,12 +396,11 @@ def build_grid(plateformes: list[dict], societes: list[dict], comparator: dict[i
                 info = {**info, "Cadre réglementaire": cadre, "Pays du siège": comparator_country or site_country,
                         "Fonds séparés": strip_decorations(info["Fonds séparés"]),
                         "Adresse Cerfa 3916": ", ".join(part.strip() for part in
-                                                        info["Adresse Cerfa 3916"].splitlines() if part.strip()),
-                        "Protection investisseur": protection_level(cadre, regulation["levels"])}
+                                                        info["Adresse Cerfa 3916"].splitlines() if part.strip())}
                 values.update(info)
             for table, column in (("agrement", "Pays d'agrément"), ("modele", "Modèle économique")):
                 if key in regulation[table]:
-                    values[column] = regulation[table][key]
+                    values[column] = strip_decorations(regulation[table][key])
                     used_regulation.add((table, key))
             grid.append(line(p["nom"], **values))
             kinds.append("platform")
@@ -428,6 +467,33 @@ def _short(value: str, limit: int = 160) -> str:
     return value if len(value) <= limit else value[:limit - 1] + "…"
 
 
+def emptied_columns(existing: list[list[str]], grid: list[list[str]]) -> list[str]:
+    """Colonnes renseignées dans l'onglet actuel mais entièrement vides dans le nouveau tableau :
+    signe qu'une donnée du site n'est plus lue (changement de structure) et que l'écriture va l'effacer."""
+    if len(existing) < 2:
+        return []
+    old_header = [_clean(c) for c in existing[0]]
+    issues = []
+    for i, column in enumerate(COLUMNS, start=1):
+        if column not in old_header:
+            continue
+        old_idx = old_header.index(column)
+        was_filled = any(old_idx < len(r) and _clean(r[old_idx]) for r in existing[1:])
+        is_filled = any(_clean(r[i]) for r in grid[1:])
+        if was_filled and not is_filled:
+            issues.append(f"Colonne « {column} » : renseignée dans l'onglet mais plus aucune valeur n'est "
+                          "lue sur le site ; elle vient d'être vidée.")
+    return issues
+
+
+def dropped_columns(existing: list[list[str]]) -> list[str]:
+    """Colonnes de l'onglet actuel qui ne figurent plus dans COLUMNS (supprimées par cette écriture)."""
+    if not existing:
+        return []
+    dropped = [c for c in (_clean(h) for h in existing[0][1:]) if c and c not in COLUMNS]
+    return [f"Colonne(s) supprimée(s) de l'onglet car absente(s) du site : {', '.join(dropped)}."] if dropped else []
+
+
 def find_changes(existing: list[list[str]], grid: list[list[str]]) -> tuple[list[str], list[str], list[dict]]:
     """(ajouts, suppressions, modifications) entre l'onglet actuel et le nouveau tableau.
 
@@ -478,27 +544,38 @@ def sync() -> None:
     map_payload = rsc_payload(fetch_page(MAP_URL))
     map_plateformes, map_societes = extract_list(map_payload, "plateformes"), extract_list(map_payload, "societes")
     bilans_plateformes, bilans_societes, bilans_links = fetch_reference_data(fetch_page(BILANS_URL))
-    comparator = parse_comparator(fetch_page(COMPARATOR_URL))
+    comparator, problems = parse_comparator(fetch_page(COMPARATOR_URL))
     try:
-        regulation = parse_regulation(fetch_page(REGULATION_URL))
-    except Exception:
+        regulation, regulation_problems = parse_regulation(fetch_page(REGULATION_URL))
+    except Exception as exc:
         log.exception("Page réglementation illisible : colonnes correspondantes laissées vides.")
-        regulation = {"levels": {}, "agrement": {}, "modele": {}}
+        regulation = {"agrement": {}, "modele": {}}
+        regulation_problems = [f"Page réglementation illisible ({type(exc).__name__} : {exc}) ; les colonnes "
+                               "« Pays d'agrément » et « Modèle économique » sont vides pour toutes les plateformes."]
+    problems += regulation_problems
     plateformes, societes = merge_sources(map_plateformes, map_societes, bilans_plateformes,
                                           bilans_societes, bilans_links)
-    log.info("Site : %d plateformes, %d sociétés, %d plateformes au comparateur, %d cadres.",
-             len(plateformes), len(societes), len(comparator), len(regulation["levels"]))
+    problems += new_keys("carte, plateforme", map_plateformes, KNOWN_MAP_PLATFORM_KEYS)
+    problems += new_keys("carte, société de prêts", map_societes, KNOWN_MAP_COMPANY_KEYS)
+    problems += new_values("thème de plateforme", (t for p in plateformes for t in p.get("themes") or []),
+                           [code for code, _ in THEMES])
+    codes = [c for p in plateformes for c in [p.get("pays")]]
+    codes += [c for s in societes for c in [s.get("siege"), s.get("siege_groupe"), *(s.get("pays") or [])]]
+    problems += new_values("code pays (affiché tel quel dans le sheet)",
+                           (c.strip().upper() for c in codes if c and c.strip()), COUNTRY_NAMES)
+    log.info("Site : %d plateformes, %d sociétés, %d plateformes au comparateur, %d agréments.",
+             len(plateformes), len(societes), len(comparator), len(regulation["agrement"]))
     if not plateformes or not societes or not comparator:
         raise RuntimeError("Données du site vides : écriture annulée.")
 
     grid, kinds, issues = build_grid(plateformes, societes, comparator, regulation)
-    for issue in issues:
-        log.warning(issue)
-    if issues and not DRY_RUN:
-        send_plateformes_sync_issues_email(issues)
+    issues = problems + issues
+    issues, novelties = split_novelties(issues)
     counts = {k: kinds.count(k) for k in ("section", "platform", "company")}
     log.info("Tableau final : %d lignes (%s).", len(grid), counts)
     if DRY_RUN:
+        for issue in issues + novelties:
+            log.warning(issue)
         for row, kind in list(zip(grid, kinds))[:40]:
             log.info("[%s] %s | %s", kind, row[0], row[1:5])
         log.info("DRY_RUN : aucune écriture.")
@@ -506,12 +583,22 @@ def sync() -> None:
 
     ws = get_or_create_worksheet()
     existing = _call_with_retry(ws.get_all_values)
+    issues += emptied_columns(existing, grid)
+    issues += dropped_columns(existing)
+    for issue in issues + novelties:
+        log.warning(issue)
+    if issues:
+        send_plateformes_sync_issues_email(issues)
+    notify_novelties("Plateformes", novelties, DRIFT_STATE_FILE)
     existing_rows = len(existing)
     total_rows = max(len(grid), existing_rows)
     padded = [r + [""] * (WIDTH - len(r)) for r in grid] + [[""] * WIDTH for _ in range(total_rows - len(grid))]
     if ws.row_count < total_rows or ws.col_count < WIDTH:
         _call_with_retry(ws.resize, rows=max(ws.row_count, total_rows), cols=max(ws.col_count, WIDTH))
     _call_with_retry(ws.update, values=padded, range_name=f"A1:{rowcol_to_a1(total_rows, WIDTH)}", raw=True)
+    old_width = max((len(r) for r in existing), default=0)
+    if old_width > WIDTH:  # colonnes supprimées : les dernières, décalées vers la gauche, restent à effacer
+        _call_with_retry(ws.batch_clear, [f"{rowcol_to_a1(1, WIDTH + 1)}:{rowcol_to_a1(total_rows, old_width)}"])
     _call_with_retry(apply_format, ws, kinds, total_rows)
     log.info("Onglet '%s' mis à jour (%s).", SHEET_NAME, datetime.now().strftime("%Y-%m-%d %H:%M"))
 

@@ -831,13 +831,14 @@ def send_bilans_sync_issues_email(issues: list, error: str | None = None) -> Non
         log.exception("Failed to send bilans sync issues email.")
 
 
-def _send_plain_email(subject: str, body: str, label: str) -> None:
+def _send_plain_email(subject: str, body: str, label: str) -> bool:
+    """True si l'email est parti."""
     if not all([SMTP_HOST, SMTP_USER, SMTP_PASSWORD, EMAIL_TO]):
         log.error(
             "SMTP configuration is incomplete; cannot send email. "
             "Required env vars: SMTP_HOST, SMTP_USER, SMTP_PASSWORD, EMAIL_TO."
         )
-        return
+        return False
 
     msg = MIMEMultipart()
     msg["From"] = EMAIL_FROM
@@ -851,8 +852,19 @@ def _send_plain_email(subject: str, body: str, label: str) -> None:
             server.login(SMTP_USER, SMTP_PASSWORD)
             server.sendmail(EMAIL_FROM, [EMAIL_TO], msg.as_string())
         log.info("%s email sent to %s.", label, EMAIL_TO)
+        return True
     except Exception:
         log.exception("Failed to send %s email.", label)
+        return False
+
+
+def send_site_novelties_email(site: str, novelties: list) -> bool:
+    """Sent by the liberte-financiere.net sync scripts (site = "Bilans" / "Plateformes") once per
+    novelty the script doesn't integrate. True if the email was sent."""
+    subject = f"[{site}][NOUVEAUTÉ] {len(novelties)} nouveauté(s) du site non intégrée(s)"
+    body = "\n".join(["Nouveautés détectées sur liberte-financiere.net, absentes du script de synchronisation "
+                      "(signalées une seule fois) :", "", *[f"- {n}" for n in novelties]])
+    return _send_plain_email(subject, body, f"{site} novelties")
 
 
 def send_plateformes_changes_email(added: list, removed: list, modified: list) -> None:
