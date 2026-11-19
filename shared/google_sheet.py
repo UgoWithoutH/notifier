@@ -1360,7 +1360,7 @@ def default_after_late_days(platform: str, originator: str) -> int:
     return remaining_duration.default_after_late_days(buyback_days_for(platform, originator))
 
 
-def _duration_status_requests(worksheet, grid, platform, platform_row, end_row, desired, new_data, platform_level, row_range) -> list:
+def _duration_status_requests(worksheet, grid, platform, platform_row, end_row, desired, new_data, platform_level, row_range, bought_back=None) -> list:
     """Requêtes batchUpdate gérant les colonnes de mois (partagées par tous les secteurs, mois courant à gauche)
     et, sur les lignes "normaux"/"retards"/"défauts" de `desired`, la moyenne mensuelle des parts (%), pondérée
     par l'encours de chaque jour,
@@ -1380,7 +1380,10 @@ def _duration_status_requests(worksheet, grid, platform, platform_row, end_row, 
         merged = status_history.merge_durations({key: durations for key, (_, durations) in new_data.items()})
         shares_by_key = {status_history.PLATFORM_KEY: status_history.status_shares(merged)}
     else:
-        shares_by_key = {key: status_history.status_shares(durations) for key, (_, durations) in new_data.items()}
+        shares_by_key = {
+            key: status_history.with_bought_back(status_history.status_shares(durations), (bought_back or {}).get(key, 0.0))
+            for key, (_, durations) in new_data.items()
+        }
     shares_by_key = {key: shares for key, shares in shares_by_key.items() if shares}
 
     def display(history_key: str) -> str:
@@ -1493,7 +1496,7 @@ def _duration_status_requests(worksheet, grid, platform, platform_row, end_row, 
 
 def fill_remaining_duration_amounts(
     platform: str, durations_by_originator: dict, platform_level: bool = False, projects: bool = False, rates=None,
-    target_totals: dict | None = None, reclassify_buyback: bool = True,
+    target_totals: dict | None = None, reclassify_buyback: bool = True, bought_back: dict | None = None,
 ):
     """Synchronise le bloc de la plateforme `platform` (ligne dont la
     colonne A vaut exactement son nom) dans l'onglet "durée" :
@@ -1536,8 +1539,13 @@ def fill_remaining_duration_amounts(
     montant affiché dans l'onglet "répartition géographique"). Sans total connu, la somme des prêts fait foi.
     `reclassify_buyback` : False quand la plateforme pose elle-même les termes (mois, jours, "buyback") (délai de
     buyback compté depuis autre chose que le retard du terme, ex. Lendermarket) ; les termes en retard restent alors tels quels.
+    `bought_back` : {société de prêt (casse et espaces ignorés) : montant} de prêts déjà rachetés, donc plus dans
+    l'encours (ex. Loanch rachète et clôture le prêt dès le délai atteint) ; ils comptent comme "buyback" dans les
+    parts (%) du jour enregistrées dans l'historique, sans ajouter de ligne de durée (voir
+    shared.duration_status_history.with_bought_back).
         Le bloc s'arrête à la prochaine plateforme/section ou à la fin de la feuille.
     """
+    bought_back = {name.strip().casefold(): float(amount) for name, amount in (bought_back or {}).items()}
     worksheet = get_worksheet_by_name(DURATION_SHEET_NAME)
     grid = _call_with_retry(worksheet.get_all_values)
     if _duration_layout_is_legacy(grid):
@@ -1726,6 +1734,7 @@ def fill_remaining_duration_amounts(
         # dans son historique (pour que son % des mois passés ne disparaisse pas dès que ses prêts en buyback sont remboursés).
         has_buyback = (
             bool(buyback_days_by_key.get(key))
+            or bought_back.get(key, 0.0) > 0
             or any(status_history.classify_term(term) == "buyback" for term in durations)
             or any(key in shares and status_history.buyback_share(shares[key]) > 0 for shares in history_days.values())
         )
@@ -1884,7 +1893,7 @@ def fill_remaining_duration_amounts(
         }})
 
     requests.extend(_duration_status_requests(
-        worksheet, grid, platform, platform_row, end_row, desired, new_data, platform_level, row_range,
+        worksheet, grid, platform, platform_row, end_row, desired, new_data, platform_level, row_range, bought_back,
     ))
 
     if requests:

@@ -128,6 +128,21 @@ def status_shares(durations: dict):
     return (totals["normal"] / total, totals["late"] / total, totals["default"] / total, total, totals["buyback"] / total)
 
 
+def with_bought_back(shares, bought_back: float):
+    """`shares` ((normal, late, default, total, buyback) of the loans still outstanding) completed with `bought_back`
+    euros of loans the platform already repurchased and removed from the outstanding (e.g. Loanch buys a loan back
+    and closes it as soon as the delay is reached, so it is never seen as a buyback loan): the shares are then
+    taken over outstanding + bought back, while the total (the day's weight) stays the outstanding amount."""
+    if not shares or bought_back <= 0:
+        return shares
+    normal, late, default, total, buyback = shares
+    with_total = total + bought_back
+    return (
+        normal * total / with_total, late * total / with_total, default * total / with_total,
+        total, (buyback * total + bought_back) / with_total,
+    )
+
+
 def buyback_share(shares) -> float:
     """Buyback share of a day's/run's [normal, late, default, total, buyback] (0 for the older, shorter records)."""
     return shares[4] if len(shares) > 4 else 0.0

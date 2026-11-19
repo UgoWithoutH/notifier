@@ -216,6 +216,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 from shared.google_sheet import (
+    buyback_days_for,
     fill_current_month_amounts,
     fill_current_month_bonus_breakdown,
     fill_geographic_repartition_amounts,
@@ -253,6 +254,13 @@ STATEMENT_API_URL = "https://api.loanch.com/api/v1/statement-report"
 DASHBOARD_API_URL = "https://api.loanch.com/api/v1/dashboard"
 TRANSACTIONS_API_URL = "https://api.loanch.com/api/v1/transaction"
 PAGE_SIZE = 100
+# Loanch repurchases a late loan and closes it as soon as its buyback delay is reached (30 days for Tambadana), so it
+# never shows up as a "buyback" loan among the active investments. A bought-back loan counts as buyback in the
+# daily shares of the "durée" history for BUYBACK_WINDOW_DAYS days (see fetch_bought_back_amounts()).
+BUYBACK_WINDOW_DAYS = 30
+# Observed 2026-11-19 on 87 closed investments with a late schedule: 35 paid 30 days late, 11 paid 29 (the 30th day,
+# counting the due date as day 1), 6 paid 28 and 6 paid 25-27 (can't be told from the borrower's own late payment).
+BUYBACK_DELAY_TOLERANCE_DAYS = 1
 # Loanch exposes no default status: a loan late by more than the shared
 # DEFAULT_AFTER_LATE_DAYS (buyback trigger + grace period) is treated as in
 # default in the "durée" tab (inferred).
@@ -429,12 +437,74 @@ def fetch_investments(session: requests.Session) -> list:
         detail = r.json() or {}
         inv["principal_left"] = detail.get("principal_left")
         inv["maturity_date"] = (detail.get("loan") or {}).get("maturity_date")
+        inv["schedules"] = detail.get("schedules") or []
         unpaid_dues = sorted(s["date"] for s in detail.get("schedules") or [] if not s.get("is_paid") and s.get("date"))
         inv["oldest_unpaid_date"] = unpaid_dues[0] if unpaid_dues else None
         if i % 20 == 0 or i == len(investments):
             log.info("Fetched detail for %d/%d investment(s) so far.", i, len(investments))
 
     return investments
+
+
+def bought_back_payments(schedules: list, buyback_days: int) -> dict:
+    """{paid date: principal bought back that day} from an investment's schedules (investments/<id> detail). A
+    schedule paid at least `buyback_days` (minus BUYBACK_DELAY_TOLERANCE_DAYS) days after its due date was paid by
+    Loanch's buyback. The principal of every schedule paid that day is counted: the buyback of a late installment
+    alone (the investment goes on) or, when the whole investment is closed, of all its remaining installments (verified
+    2026-11-19: 5 x 40.00 = the 200.00 invested). Only the schedule's own delay counts, so a loan that was already
+    late before the investment was placed (no late schedule on it) is not seen."""
+    threshold = buyback_days - BUYBACK_DELAY_TOLERANCE_DAYS
+    paid = [s for s in schedules if s.get("is_paid") and s.get("paid_date")]
+    bought_back_dates = {s["paid_date"][:10] for s in paid if int(s.get("days_delayed") or 0) >= threshold}
+    return {
+        paid_date: sum(float(s.get("principal") or 0) for s in paid if s["paid_date"][:10] == paid_date)
+        for paid_date in bought_back_dates
+    }
+
+
+def fetch_bought_back_amounts(session: requests.Session, investments: list, today: date) -> dict:
+    """{originator: principal bought back over the last BUYBACK_WINDOW_DAYS days up to `today`} by Loanch (see
+    BUYBACK_WINDOW_DAYS), from the schedules of the active `investments` (fetch_investments() keeps them) and of the
+    investments closed inside the window (their detail is fetched here). Only originators with a buyback delay in the
+    "durée" tab are considered (no delay = no buyback)."""
+    window_start = today - timedelta(days=BUYBACK_WINDOW_DAYS - 1)
+    result = {}
+
+    def add_payments(inv: dict, schedules: list) -> None:
+        originator = inv.get("originator_name") or "Unknown"
+        buyback_days = buyback_days_for("Loanch", originator)
+        if not buyback_days:
+            return
+        for paid_date, amount in bought_back_payments(schedules, buyback_days).items():
+            if window_start <= date.fromisoformat(paid_date) <= today:
+                log.info("Investment %s of %s bought back on %s: %.2f EUR.", inv["id"], originator, paid_date, amount)
+                result[originator] = result.get(originator, 0.0) + amount
+
+    for inv in investments:
+        add_payments(inv, inv.get("schedules") or [])
+
+    page_number = 1
+    while True:
+        r = session.get(
+            INVESTMENTS_API_URL,
+            params={"closed": "true", "ordering": "-invested_date", "page": page_number, "page_size": PAGE_SIZE},
+            headers=_HEADERS,
+            timeout=20,
+        )
+        if not r.ok:
+            raise RuntimeError(f"Closed investments API returned status {r.status_code} on page {page_number}")
+        body = r.json() or {}
+        for inv in body.get("results") or []:
+            if not ((inv.get("closed_date") or "")[:10] >= window_start.isoformat()):
+                continue
+            detail_response = session.get(f"{INVESTMENTS_API_URL}/{inv['id']}", headers=_HEADERS, timeout=20)
+            if not detail_response.ok:
+                raise RuntimeError(f"Investment detail API returned status {detail_response.status_code} for {inv['id']}")
+            add_payments(inv, (detail_response.json() or {}).get("schedules") or [])
+        if not body.get("next") or page_number >= (body.get("total_pages") or 1):
+            break
+        page_number += 1
+    return result
 
 
 def aggregate_by_originator(investments: list) -> list:
@@ -1436,8 +1506,13 @@ def run() -> None:
         # must not fail the whole run.
         try:
             rates = RateWeights()
+            try:
+                bought_back = fetch_bought_back_amounts(session, investments, today_date)
+            except Exception:
+                log.exception("Failed to detect the bought-back Loanch investments - no buyback share recorded today.")
+                bought_back = {}
             fill_remaining_duration_amounts(
-                "Loanch", aggregate_remaining_durations(investments, today_date, rates=rates), rates=rates
+                "Loanch", aggregate_remaining_durations(investments, today_date, rates=rates), rates=rates, bought_back=bought_back
             )
         except Exception:
             log.exception("Failed to update the 'durée' sheet for Loanch.")

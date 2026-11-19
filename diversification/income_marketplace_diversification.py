@@ -212,6 +212,18 @@ FETCH_MAX_ATTEMPTS = 4
 FETCH_RETRY_BASE_DELAY_SECONDS = 3
 
 
+def _goto_login_page(page) -> None:
+    """Open the login page without requiring a fully idle network: the site
+    keeps background requests going, so `wait_until="networkidle"` regularly
+    timed out on CI. Wait for DOM ready, then give the network a short,
+    best-effort chance to settle."""
+    page.goto(LOGIN_PAGE_URL, wait_until="domcontentloaded", timeout=60000)
+    try:
+        page.wait_for_load_state("networkidle", timeout=15000)
+    except PlaywrightTimeoutError:
+        log.info("Login page network not idle after 15s, continuing anyway.")
+
+
 def _reuse_persisted_session(page) -> str | None:
     """Try to reuse a previously persisted session (an accessToken restored
     into localStorage via Playwright's storage_state, see
@@ -267,7 +279,7 @@ def _submit_credentials(page):
             )
             if attempt < LOGIN_SUBMIT_MAX_ATTEMPTS:
                 time.sleep(LOGIN_RETRY_DELAY_SECONDS * attempt)
-                page.goto(LOGIN_PAGE_URL, wait_until="networkidle", timeout=30000)
+                _goto_login_page(page)
     raise last_exc
 
 
@@ -284,7 +296,7 @@ def login(page) -> str:
     2FA rejection during a rapid month-range backfill (see repo memory,
     2026-09-11), so this skips logging in again as long as the last saved
     accessToken is still valid."""
-    page.goto(LOGIN_PAGE_URL, wait_until="networkidle", timeout=30000)
+    _goto_login_page(page)
 
     reused_token = _reuse_persisted_session(page)
     if reused_token:
