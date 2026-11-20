@@ -408,56 +408,55 @@ def aggregate_remaining_durations(investments: list, today: date, rates: RateWei
     return result
 
 
-def fetch_loan_originators(session: requests.Session, loan_ids: set, current_investments: list) -> dict:
-    """{loanId: originatorTitle} of `loan_ids`, from the current investments and then from the finished ones
-    (`type=FINISHED`, same shape as CURRENT; a bought-back loan is closed so it is only there), paginated until every
-    loan is found."""
-    originators = {inv.get("loanId"): inv.get("originatorTitle") for inv in current_investments}
+def fetch_loan_infos(session: requests.Session, loan_ids: set, current_investments: list) -> dict:
+    """{loanId: (originatorTitle, finalPaymentDate)} of `loan_ids`, from the current investments and then from the
+    finished ones (`type=FINISHED`, same shape as CURRENT; a bought-back loan is closed so it is only there),
+    paginated until every loan is found."""
+    infos = {}
+
+    def collect(investments: list) -> None:
+        for inv in investments:
+            infos[inv.get("loanId")] = (inv.get("originatorTitle"), _parse_iso_date(inv.get("finalPaymentDate")))
+
+    collect(current_investments)
     offset = 0
-    while not loan_ids <= originators.keys():
+    while not loan_ids <= infos.keys():
         r = _get_with_relogin(session, INVESTMENTS_API_URL, params={"type": "FINISHED", "offset": offset, "pageSize": INVESTMENTS_PAGE_SIZE})
         if not r.ok:
             raise RuntimeError(f"Finished investments API returned status {r.status_code} (offset={offset})")
         page = (r.json() or {}).get("data") or []
-        originators.update({inv.get("loanId"): inv.get("originatorTitle") for inv in page})
+        collect(page)
         if len(page) < INVESTMENTS_PAGE_SIZE:
             break
         offset += INVESTMENTS_PAGE_SIZE
-    return originators
+    return infos
 
 
 def bought_back_amounts(session: requests.Session, entries: list, current_investments: list, today: date) -> dict:
     """{originator: principal bought back by PeerBerry's guarantee over the last BUYBACK_WINDOW_DAYS days up to
     `today`}, from the transactions' BUYBACK_PRINCIPAL rows (the loan is then closed so it is no longer in the current
     investments). Verified live 2026-11-20: PeerBerry books EVERY repayment as BUYBACK_* (393 of 396 principal rows),
-    even a loan paid 2-25 days after its due date, so a row only counts when it happens at least the originator's
-    buyback delay after the loan's first investment (a loan can't be late for the delay before that). Only
-    originators with a buyback delay in the "durée" tab are considered (no delay = no buyback)."""
+    even a loan paid 2-25 days after its due date, so a row only counts when it is booked at least the originator's
+    buyback delay after the loan's final payment date (the investment date is no use: a long loan repaid on time is
+    booked long after it). Only originators with a buyback delay in the "durée" tab are considered (no delay = no
+    buyback)."""
     window_start = today - timedelta(days=BUYBACK_WINDOW_DAYS - 1)
-    first_invested = {}
-    for entry in entries or []:
-        if entry.get("type") == "INVESTMENT" and (invested := _entry_date(entry)):
-            loan_id = entry.get("loanId")
-            first_invested[loan_id] = min(invested, first_invested.get(loan_id, invested))
     candidates = [
         entry for entry in entries or []
         if entry.get("type") == "BUYBACK_PRINCIPAL" and (booked := _entry_date(entry)) and window_start <= booked <= today
     ]
     if not candidates:
         return {}
-    originators = fetch_loan_originators(session, {entry.get("loanId") for entry in candidates}, current_investments)
+    infos = fetch_loan_infos(session, {entry.get("loanId") for entry in candidates}, current_investments)
     result = {}
     for entry in candidates:
-        loan_id = entry.get("loanId")
-        originator = originators.get(loan_id)
-        if originator is None:
-            log.warning("Bought-back loan %s ignored (no originator found).", loan_id)
+        originator, final_payment = infos.get(entry.get("loanId"), (None, None))
+        if originator is None or final_payment is None:
+            log.warning("Bought-back loan %s ignored (no originator/final payment date found).", entry.get("loanId"))
             continue
         buyback_days = buyback_days_for("Peerberry", originator)
-        invested = first_invested.get(loan_id)
-        if not buyback_days or (invested is not None and (_entry_date(entry) - invested).days < buyback_days):
-            continue
-        result[originator] = result.get(originator, 0.0) + _entry_amount(entry)
+        if buyback_days and (_entry_date(entry) - final_payment).days >= buyback_days:
+            result[originator] = result.get(originator, 0.0) + _entry_amount(entry)
     return result
 
 

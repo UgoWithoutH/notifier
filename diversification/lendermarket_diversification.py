@@ -161,6 +161,7 @@ from zoneinfo import ZoneInfo
 import requests
 from dotenv import load_dotenv
 
+from shared.duration_status_history import BUYBACK_WINDOW_DAYS
 from shared.google_sheet import (
     fill_current_month_amounts,
     fill_current_month_bonus_breakdown,
@@ -253,6 +254,60 @@ def fetch_investments(session: requests.Session, investor_id: str) -> list:
         page_number += 1
 
     return investments
+
+
+def fetch_finished_investments(session: requests.Session, investor_id: str) -> list:
+    """Every finished investment (same endpoint and shape as fetch_investments() with `activeInvestments=0`; verified live
+    2026-11-20: `finishedAt` and `loan.finalPaymentDate` are set, `repaidPrincipal` is what the loan paid back)."""
+    investments = []
+    page_number = 1
+    while True:
+        r = session.get(
+            INVESTMENTS_API_URL,
+            params={"activeInvestments": 0, "currency": "EUR", "page": page_number},
+            headers=_xsrf_headers(session, investor_id),
+            timeout=20,
+        )
+        if not r.ok:
+            raise RuntimeError(f"Finished investments API returned status {r.status_code} on page {page_number}")
+        body = r.json() or {}
+        investments.extend(body.get("data") or [])
+        if page_number >= ((body.get("meta") or {}).get("last_page") or 1):
+            return investments
+        page_number += 1
+
+
+def _lender_name(inv: dict) -> str:
+    return (
+        (inv.get("lender") or {}).get("displayName")
+        or ((inv.get("loan") or {}).get("lender") or {}).get("displayName")
+        or "Fournisseur inconnu"
+    )
+
+
+def bought_back_amounts(finished: list, today: date) -> dict:
+    """{lender: principal bought back over the last BUYBACK_WINDOW_DAYS days up to `today`} from the finished
+    investments: a loan closed (`finishedAt`) at least the lender's buyback delay ("durée" tab) after its final maturity
+    was paid by the buyback guarantee (checked 2026-11-20 on 404 finished investments: 9 Dineo loans were closed 60-61 days
+    after maturity, the others at most 29 days after, the open loans in buyback stay open until then), and being
+    closed it is no longer among the active investments. Only lenders with a buyback delay are considered."""
+    window_start = today - timedelta(days=BUYBACK_WINDOW_DAYS - 1)
+    result = {}
+    for inv in finished:
+        loan = inv.get("loan") or {}
+        try:
+            closed = date.fromisoformat(inv["finishedAt"][:10])
+            maturity = date.fromisoformat(loan["finalPaymentDate"][:10])
+            amount = float(inv.get("repaidPrincipal") or 0.0)
+        except (KeyError, TypeError, ValueError):
+            continue
+        if not window_start <= closed <= today:
+            continue
+        lender = _lender_name(inv)
+        buyback_days = buyback_days_for("Lendermarket", lender)
+        if buyback_days and (closed - maturity).days >= buyback_days:
+            result[lender] = result.get(lender, 0.0) + amount
+    return result
 
 
 def aggregate_by_lender(investments: list) -> list:
@@ -1116,9 +1171,15 @@ def run() -> None:
         # must not fail the whole run.
         try:
             rates = RateWeights()
+            # A failure here only leaves the bought-back loans out (as before), it must not skip the sheet update.
+            try:
+                bought_back = bought_back_amounts(fetch_finished_investments(session, investor_id), today_date)
+            except Exception:
+                log.exception("Failed to compute Lendermarket's bought-back amounts - ignored.")
+                bought_back = {}
             fill_remaining_duration_amounts(
                 "Lendermarket", aggregate_remaining_durations(investments, today_date, rates=rates), rates=rates,
-                reclassify_buyback=False,
+                reclassify_buyback=False, bought_back=bought_back,
             )
         except Exception:
             log.exception("Failed to update the 'durée' sheet for Lendermarket.")
