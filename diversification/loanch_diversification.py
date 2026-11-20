@@ -215,6 +215,7 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+from shared.duration_status_history import BUYBACK_WINDOW_DAYS
 from shared.google_sheet import (
     buyback_days_for,
     fill_current_month_amounts,
@@ -257,7 +258,6 @@ PAGE_SIZE = 100
 # Loanch repurchases a late loan and closes it as soon as its buyback delay is reached (30 days for Tambadana), so it
 # never shows up as a "buyback" loan among the active investments. A bought-back loan counts as buyback in the
 # daily shares of the "durée" history for BUYBACK_WINDOW_DAYS days (see fetch_bought_back_amounts()).
-BUYBACK_WINDOW_DAYS = 30
 # Observed 2026-11-19 on 87 closed investments with a late schedule: 35 paid 30 days late, 11 paid 29 (the 30th day,
 # counting the due date as day 1), 6 paid 28 and 6 paid 25-27 (can't be told from the borrower's own late payment).
 BUYBACK_DELAY_TOLERANCE_DAYS = 1

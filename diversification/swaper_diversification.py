@@ -105,7 +105,9 @@ from zoneinfo import ZoneInfo
 
 from dotenv import load_dotenv
 
+from shared.duration_status_history import BUYBACK_WINDOW_DAYS
 from shared.google_sheet import (
+    buyback_days_for,
     fill_current_month_amounts,
     fill_current_month_bonus_breakdown,
     fill_geographic_repartition_amounts,
@@ -403,6 +405,37 @@ def aggregate_remaining_durations(investments: list, today: date, rates: RateWei
             if base_term is None:
                 log.warning("No base term found for an investment of %s (%.2f EUR) - excluded from the 'taux' sheet.", originator, amount)
             rates.add(originator, term, amount, inv.get("interestRatePerYear"), base_term=base_term)
+    return result
+
+
+def bought_back_amounts(entries: list, today: date) -> dict:
+    """{originator: principal bought back by its originator over the last BUYBACK_WINDOW_DAYS days up to `today`},
+    from the account entries (BUYBACK_PRINCIPAL rows, the loan is then closed so it is no longer in the open
+    investments). Only originators with a buyback delay in the "durée" tab are considered (no delay = no buyback).
+    Swaper also buys back loans that were not late (verified 2026-11-19: over half of the 27 buybacks of the
+    account came 1-29 days after the investment), and the entries carry no due date: a buyback only counts when it
+    happens at least the originator's buyback delay after the loan's first investment (a loan can't be late for the
+    delay before that)."""
+    window_start = today - timedelta(days=BUYBACK_WINDOW_DAYS - 1)
+    first_invested = {}
+    for entry in entries or []:
+        invested = _parse_iso_date(entry.get("bookingDate"))
+        if entry.get("transactionType") == "INVESTMENT" and invested is not None:
+            loan_id = entry.get("loanId")
+            first_invested[loan_id] = min(invested, first_invested.get(loan_id, invested))
+    result = {}
+    for entry in entries or []:
+        if entry.get("transactionType") != "BUYBACK_PRINCIPAL":
+            continue
+        booked = _parse_iso_date(entry.get("bookingDate"))
+        originator = (entry.get("loanOriginator") or "Unknown").strip()
+        if booked is None or not window_start <= booked <= today:
+            continue
+        buyback_days = buyback_days_for("Swaper", originator)
+        invested = first_invested.get(entry.get("loanId"))
+        if not buyback_days or (invested is not None and (booked - invested).days < buyback_days):
+            continue
+        result[originator] = result.get(originator, 0.0) + float(entry.get("amount") or 0.0)
     return result
 
 
@@ -1685,10 +1718,12 @@ def run(headless: bool = True) -> None:
         if open_investments is not None:
             try:
                 rates = RateWeights()
+                report_date = get_report_now(REPORT_TIMEZONE).date()
                 fill_remaining_duration_amounts(
                     "Swaper",
-                    aggregate_remaining_durations(open_investments, get_report_now(REPORT_TIMEZONE).date(), rates),
+                    aggregate_remaining_durations(open_investments, report_date, rates),
                     rates=rates,
+                    bought_back=bought_back_amounts(all_account_entries, report_date),
                 )
             except Exception:
                 log.exception("Failed to update the 'durée' sheet for Swaper.")

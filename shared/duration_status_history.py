@@ -30,6 +30,9 @@ log = logging.getLogger("duration_status_history")
 
 DEFAULT_HORIZON_MONTHS = 12
 PLATFORM_KEY = "__platform__"
+# Days a loan repurchased and closed by its platform (so no longer outstanding) keeps counting as buyback in the daily
+# shares (see with_bought_back()).
+BUYBACK_WINDOW_DAYS = 30
 STATE_DIR = Path(__file__).resolve().parents[1] / "diversification"
 
 FRENCH_MONTHS = (

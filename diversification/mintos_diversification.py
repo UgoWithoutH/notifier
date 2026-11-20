@@ -280,7 +280,9 @@ from pathlib import Path
 import requests
 from dotenv import load_dotenv
 
+from shared.duration_status_history import BUYBACK_WINDOW_DAYS
 from shared.google_sheet import (
+    buyback_days_for,
     fill_current_month_amounts_with_labels,
     fill_current_month_bonus_breakdown,
     fill_geographic_repartition_amounts,
@@ -338,6 +340,11 @@ TRANSACTIONS_PAGE_SIZE = 100
 # resume pagination from next run (see get_cached_transactions() below).
 XIRR_CASHFLOWS_STATE_FILE = Path(__file__).parent / "mintos_xirr_cashflows_state.json"
 XIRR_CASHFLOWS_STATE_DEFAULT = {"all_entries": [], "resume_cursor": None}
+# {isin: originator} (see update_isin_originators()).
+ISIN_ORIGINATORS_STATE_FILE = Path(__file__).parent / "mintos_isin_originators_state.json"
+# Ledger label (the ledger's details are HTML-wrapped, so a substring) of the principal received from a loan the originator
+# bought back for a late payment (see bought_back_amounts()).
+REBUY_BUYBACK_PRINCIPAL_LABEL = "Rebuy Purpose Buyback: Principal"
 
 _ACTION_LABEL_HTML_TAG = re.compile(r"<[^>]+>")
 
@@ -727,6 +734,62 @@ def aggregate_remaining_durations(
             durations[term] = durations.get(term, 0.0) + amount
             if rates is not None:
                 rates.add(originator, term, amount, inv.get("rate"), base_term=base_term)
+    return result
+
+
+def update_isin_originators(investments: list) -> dict:
+    """{isin: originator} of every note series seen in the current investments, kept in
+    ISIN_ORIGINATORS_STATE_FILE: the account-statement ledger only gives the ISIN of a loan, and a note series
+    whose loans were all bought back is no longer in the current investments."""
+    known = load_state(ISIN_ORIGINATORS_STATE_FILE, {})
+    known.update({inv["isin"]: inv["originator"] for inv in investments if inv.get("isin") and inv.get("originator")})
+    save_state(ISIN_ORIGINATORS_STATE_FILE, known)
+    return known
+
+
+def _ledger_date(entry: dict) -> date | None:
+    try:
+        return datetime.strptime(entry.get("date") or "", "%d.%m.%Y").date()
+    except ValueError:
+        return None
+
+
+def bought_back_amounts(entries: list, isin_originators: dict, today: date) -> dict:
+    """{originator: principal bought back over the last BUYBACK_WINDOW_DAYS days up to `today`} by the loan originator
+    under the buyback guarantee, from the ledger's "Rebuy Purpose Buyback" principal rows (the loan is then closed so
+    it is no longer in the current investments; the other rebuy reasons - Agreement Amendment/Prolongation, early
+    repayment - are not late loans; checked 2026-11-19 on the cached ledger: the last regular payment of a "Rebuy
+    Purpose Buyback" loan was mostly 60-98 days before the rebuy, against ~22-28 days for the other reasons, but a
+    few came much sooner), so a rebuy only counts when it happens at least the originator's buyback delay after
+    the loan's first investment in the ledger (a loan can't be late for the delay before that; a loan with no
+    investment row, bought before the ledger's start, is kept).
+    Only originators with a buyback delay in the "durée" tab are considered (no delay = no buyback), and rows
+    whose ISIN has no known originator are skipped (warning)."""
+    window_start = today - timedelta(days=BUYBACK_WINDOW_DAYS - 1)
+    first_invested = {}
+    for entry in entries or []:
+        if "Investissement" in (entry.get("details") or "") and (invested := _ledger_date(entry)):
+            key = (entry.get("isin"), entry.get("loanIdentifier"))
+            first_invested[key] = min(invested, first_invested.get(key, invested))
+    result = {}
+    unknown_isins = set()
+    for entry in entries or []:
+        if REBUY_BUYBACK_PRINCIPAL_LABEL not in (entry.get("details") or ""):
+            continue
+        booked = _ledger_date(entry)
+        if booked is None or not window_start <= booked <= today:
+            continue
+        originator = isin_originators.get(entry.get("isin"))
+        if originator is None:
+            unknown_isins.add(entry.get("isin"))
+            continue
+        buyback_days = buyback_days_for(PLATFORM_LABEL, originator)
+        invested = first_invested.get((entry.get("isin"), entry.get("loanIdentifier")))
+        if not buyback_days or (invested is not None and (booked - invested).days < buyback_days):
+            continue
+        result[originator] = result.get(originator, 0.0) + _money(entry.get("turnover"))
+    if unknown_isins:
+        log.warning("Bought-back loans of %d unknown ISIN(s) ignored (no originator known): %s", len(unknown_isins), ", ".join(sorted(unknown_isins)))
     return result
 
 
@@ -1760,6 +1823,7 @@ def run(session: requests.Session | None = None) -> None:
                 "Mintos",
                 aggregate_remaining_durations(investments, today_date, rates, base_terms),
                 rates=rates,
+                bought_back=bought_back_amounts(all_entries, update_isin_originators(investments), today_date),
             )
         except Exception:
             log.exception("Failed to update the 'durée' sheet for Mintos.")
