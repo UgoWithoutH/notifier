@@ -12,7 +12,8 @@ shortest remaining term), then whatever budget is left on the primary market.
 Endpoints (found 2026-10-07 by reading the pages' own JS, all JSON):
     GET  /profile/invest-sm/api/rows   secondary listings, Laravel-style filters
          interest_rate_percent[from|to], discount[from|to] (signed %, negative =
-         discount), remaining_term[from|to] (months), originator_id[], limit, page
+         discount), remaining_term[from|to] (months), originator_id[], limit, page,
+         order[market_secondary][premium]=asc|desc (server-side sort, verified 2026-11-20)
     GET  /profile/invest/api/rows      primary listings (interest_rate_percent, term)
     POST /profile/cart/add-to-cart     JSON, header X-CSRF-TOKEN (token embedded in
          the market page's `investMarket(JSON.parse(...))` config)
@@ -82,6 +83,9 @@ AFRANGA_CRON_JOB_ID = os.environ.get("AFRANGA_CRON_JOB_ID")
 MODE = os.environ.get("AFRANGA_BOT_MODE", "live").strip().lower()
 MIN_INVESTMENT_AMOUNT = float(os.environ.get("AFRANGA_MIN_INVESTMENT_AMOUNT", "10"))
 PAGE_SIZE = 100
+MAX_PASSES = 3
+# Server-side sort (verified 2026-11-20): the same key plan_secondary() uses, so reading can stop early.
+SECONDARY_ORDER = {"order[market_secondary][premium]": "asc"}
 # Secondary: a partial purchase must be >= this and leave >= this; smaller listings are bought in full only.
 SECONDARY_MIN_LEFT = 100.0
 MAX_DIAGNOSTICS_EMAIL_CHARS = 2_000_000
@@ -156,6 +160,7 @@ def _extract_market_config(html: str) -> dict:
 class MarketRows:
     config: dict
     rows: list
+    complete: bool = True
 
 
 def _ajax_headers(csrf: str | None = None) -> dict:
@@ -165,9 +170,10 @@ def _ajax_headers(csrf: str | None = None) -> dict:
     return headers
 
 
-def fetch_market(session: requests.Session, page_url: str, filters: dict) -> MarketRows:
-    """Loads the market page (for its csrf/urls config) then every page of
-    `<page>/api/rows` matching `filters` (already in Laravel query form)."""
+def fetch_market(session: requests.Session, page_url: str, filters: dict, enough=None) -> MarketRows:
+    """Loads the market page (for its csrf/urls config) then the pages of
+    `<page>/api/rows` matching `filters` (already in Laravel query form), until
+    the last one or until `enough(rows_so_far)` is true (`complete` is then False)."""
     r = session.get(page_url, headers=_HEADERS, timeout=20)
     r.raise_for_status()
     config = _extract_market_config(r.text)
@@ -182,8 +188,13 @@ def fetch_market(session: requests.Session, page_url: str, filters: dict) -> Mar
         body = resp.json()
         rows.extend(body.get("rows") or [])
         if page >= (body.get("last_page") or 1):
-            break
-    return MarketRows(config, rows)
+            return MarketRows(config, rows)
+        if enough is not None and enough(rows):
+            return MarketRows(config, rows, complete=False)
+
+
+def _row_key(market: str, row: dict):
+    return market, row.get("market_secondary_id") or row.get("loan_id")
 
 
 def _range_filters(out: dict, name: str, low, high) -> None:
@@ -278,6 +289,20 @@ def plan_primary(rows: list, tracker, budget: float) -> list:
             continue
         plan.append(Line(row, (tracker.config.find_loan(row["originator"]["name"])).name, amount, amount, "primary"))
     return plan
+
+
+def _secondary_enough(tracker, budget: float, excluded: set):
+    """Stop condition of the secondary listing: the budget is fully placed and
+    every listing tied with the worst premium of the plan has been read."""
+    def enough(rows: list) -> bool:
+        premiums = [row.get("premium") or 0.0 for row in rows]
+        if premiums != sorted(premiums):
+            return False  # server order not honoured: read everything
+        lines = plan_secondary([row for row in rows if _row_key("secondary", row) not in excluded], tracker, budget)
+        if not lines or budget - sum(line.cost for line in lines) >= MIN_INVESTMENT_AMOUNT:
+            return False
+        return premiums[-1] > max(line.row.get("premium") or 0.0 for line in lines)
+    return enough
 
 
 def _add_to_cart(session: requests.Session, csrf: str, urls: dict, line: Line) -> tuple:
@@ -390,11 +415,12 @@ def _remove_from_cart(session: requests.Session, csrf: str, urls: dict, cart_loa
     _log_diagnostics("cart_cleanup", status=resp.status_code, response=_redact(resp.text[:1000]))
 
 
-def execute_market(session: requests.Session, market: MarketRows, lines: list, tracker, stats: dict) -> None:
+def execute_market(session: requests.Session, market: MarketRows, lines: list, tracker, stats: dict) -> list:
     """dry: nothing. probe: first line only, added then removed, never bought.
-    live: add every line, then confirm the whole cart once."""
+    live: add every line, then confirm the whole cart once. Returns the lines the
+    platform refused at the add-to-cart step (loan taken / amount changed)."""
     if not lines or MODE == "dry":
-        return
+        return []
     csrf, urls = market.config["csrf"], market.config["urls"]
     # A confirm buys the WHOLE cart: lines left by a crashed run / manual use must never be bought blindly.
     order = market.config.get("order") or {}
@@ -407,6 +433,7 @@ def execute_market(session: requests.Session, market: MarketRows, lines: list, t
     to_add = lines[:1] if MODE == "probe" else lines
     added = []
     review_url = market.config.get("order", {}).get("review_url")
+    refused = []
     for line in to_add:
         stats["attempts"] += 1
         ok, body, reason = _add_to_cart(session, csrf, urls, line)
@@ -414,10 +441,11 @@ def execute_market(session: requests.Session, market: MarketRows, lines: list, t
             added.append((line, _find_key((body or {}).get("line", body), "cart_loan_id")))
             review_url = _find_key(body, "review_url") or review_url
         else:
+            refused.append(line)
             stats["failures"] += 1
             stats["failed_attempts"].append({"label": f"[{line.market}] {line.loan_name}", "amount": line.amount, "reason": reason})
     if not added:
-        return
+        return refused
 
     try:
         review_html = _capture_review_page(session, review_url, lines[0].market)
@@ -432,7 +460,7 @@ def execute_market(session: requests.Session, market: MarketRows, lines: list, t
         stats["probed"] = True
         for _line, cart_loan_id in added:
             _remove_from_cart(session, csrf, urls, cart_loan_id)
-        return
+        return refused
 
     if confirmed:
         for line, _id in added:
@@ -451,6 +479,29 @@ def execute_market(session: requests.Session, market: MarketRows, lines: list, t
                 "label": f"[{line.market}] {line.loan_name}", "amount": line.amount,
                 "reason": "confirmation du panier refusée (voir diagnostics 'confirm_*')",
             })
+    return refused
+
+
+def run_market(session, tracker, config, stats: dict, budget: float, build, on_listing) -> float:
+    """Plans and buys on one market (`build(budget, excluded)` -> (market, lines)).
+    Lines refused when added to the cart (loan taken, amount changed) leave part
+    of the budget unplaced: a fresh listing is then read without them and the
+    rest planned, up to MAX_PASSES. Returns the budget left."""
+    excluded: set = set()
+    for pass_number in range(1, MAX_PASSES + 1):
+        market, lines = build(budget, excluded)
+        if pass_number == 1:
+            on_listing(market)
+        stats["plan"] += [_line_summary(line) for line in lines]
+        failures_before = stats["failures"]
+        refused = execute_market(session, market, lines, tracker, stats)
+        budget = config.investable_balance(stats["balance_after"]) if MODE == "live" else budget - sum(line.cost for line in lines)
+        excluded |= {_row_key(line.market, line.row) for line in refused}
+        # A refused confirmation (not only refused lines) is not retried.
+        if MODE != "live" or not refused or pass_number == MAX_PASSES or stats["failures"] - failures_before > len(refused) or budget < MIN_INVESTMENT_AMOUNT:
+            break
+        log.info("Part of the plan could not be placed - planning the remaining %.2f EUR (pass %d/%d).", budget, pass_number + 1, MAX_PASSES)
+    return budget
 
 
 def run() -> None:
@@ -518,12 +569,15 @@ def run() -> None:
         seen_names, checked_names = set(), set()
         all_names = sorted(set(config.active_names()) | set(config.secondary_names()))
 
-        def check_originators(expected: list, rows: list) -> None:
-            checked_names.update(expected)
-            for row in rows:
+        def check_originators(expected: list, market: MarketRows) -> None:
+            for row in market.rows:
                 loan = config.find_loan((row.get("originator") or {}).get("name"))
                 if loan is not None:
                     seen_names.add(loan.name)
+            # A partly read listing only settles the originators seen in it.
+            checked_names.update(expected if market.complete else [name for name in expected if name in seen_names])
+            if not checked_names:
+                return
             report_missing_loans(
                 "Afranga", {name: name in seen_names for name in checked_names},
                 state.setdefault("missing_loans", {}), all_names=all_names, grace_seconds=TRANSIENT_GRACE_SECONDS,
@@ -532,27 +586,42 @@ def run() -> None:
 
         budget = investable
         if config.secondary_names():
-            filters = {}
+            filters = dict(SECONDARY_ORDER)
             _range_filters(filters, "interest_rate_percent", config.lowest_min_rate(secondary=True), None)
             _range_filters(filters, "discount", *config.secondary_bounds("min_premium", "max_premium"))
             _range_filters(filters, "remaining_term", *config.secondary_bounds("min_months", "max_months"))
-            market = fetch_market(session, SECONDARY_PAGE_URL, filters)
-            check_originators(config.secondary_names(), market.rows)
-            lines = plan_secondary(market.rows, tracker, budget)
-            log.info("Secondary: %d listing(s) fetched, %d planned.", len(market.rows), len(lines))
-            stats["plan"] += [_line_summary(line) for line in lines]
-            execute_market(session, market, lines, tracker, stats)
-            budget = config.investable_balance(stats["balance_after"]) if MODE == "live" else budget - sum(line.cost for line in lines)
 
-        if config.active_names() and budget >= MIN_INVESTMENT_AMOUNT:
+            def build_secondary(pass_budget: float, excluded: set) -> tuple:
+                market = fetch_market(session, SECONDARY_PAGE_URL, filters, _secondary_enough(tracker, pass_budget, excluded))
+                rows = [row for row in market.rows if _row_key("secondary", row) not in excluded]
+                lines = plan_secondary(rows, tracker, pass_budget)
+                log.info(
+                    "Secondary: %d listing(s) fetched%s, %d planned.",
+                    len(market.rows), "" if market.complete else " (enough read)", len(lines),
+                )
+                return market, lines
+
+            budget = run_market(
+                session, tracker, config, stats, budget, build_secondary,
+                lambda market: check_originators(config.secondary_names(), market),
+            )
+
+        open_primary = tracker.investable_names(MIN_INVESTMENT_AMOUNT)
+        if open_primary and budget >= MIN_INVESTMENT_AMOUNT:
             filters = {}
-            _range_filters(filters, "interest_rate_percent", config.lowest_min_rate(), None)
-            market = fetch_market(session, PRIMARY_PAGE_URL, filters)
-            check_originators(config.active_names(), market.rows)
-            lines = plan_primary(market.rows, tracker, budget)
-            log.info("Primary: %d listing(s) fetched, %d planned.", len(market.rows), len(lines))
-            stats["plan"] += [_line_summary(line) for line in lines]
-            execute_market(session, market, lines, tracker, stats)
+            _range_filters(filters, "interest_rate_percent", config.lowest_min_rate(names=set(open_primary)), None)
+
+            def build_primary(pass_budget: float, excluded: set) -> tuple:
+                market = fetch_market(session, PRIMARY_PAGE_URL, filters)
+                rows = [row for row in market.rows if _row_key("primary", row) not in excluded]
+                lines = plan_primary(rows, tracker, pass_budget)
+                log.info("Primary: %d listing(s) fetched, %d planned.", len(market.rows), len(lines))
+                return market, lines
+
+            run_market(
+                session, tracker, config, stats, budget, build_primary,
+                lambda market: check_originators(open_primary, market),
+            )
     except Exception as exc:
         error = str(exc)
         _log_diagnostics("run_error", error=error, traceback=traceback.format_exc())

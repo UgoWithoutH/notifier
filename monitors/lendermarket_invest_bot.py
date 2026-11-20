@@ -138,6 +138,8 @@ DEFAULT_STATE = {
 # their regulation status (see search_lender_loans()).
 INVEST_MIN_REMAINING_TERM_IN_DAYS = 1
 INVEST_MAX_REMAINING_TERM_IN_DAYS = 360
+# Planning passes per run (a refused loan triggers a new listing + plan for the rest).
+MAX_PASSES = 3
 INVEST_REGULATION_STATUSES = ("REGULATED", "UNREGULATED")
 # Whole-marketplace scan (many pages) at most this often, only triggered by a
 # sheet name matching no known lender.
@@ -701,106 +703,129 @@ def invest_selected_lenders(
 
     active_names = config.active_names()
     search_state = search_state if search_state is not None else {}
-    loans_by_name, found, listing_complete = search_lender_loans(
-        active_names, search_state, {name: config.loans[name].min_rate for name in active_names},
-    )
-    # An incomplete listing must not flag lenders as unknown.
-    if listing_complete and found:
-        report_missing_loans(
-            "Lendermarket", found, search_state.setdefault("missing_gates", {}), all_names=active_names,
-        )
-    matched = []
+    excluded: set = set()
     relevant_countries = set()
-    for sheet_name in active_names:
-        country = tracker.country_of(sheet_name)
-        if country:
-            relevant_countries.add(country)
-        if tracker.loan_room(sheet_name) <= 0:
-            log.info("Lender '%s' is blocked this run: already at/above its own cap.", sheet_name)
-            stats["originator_blocked"].append(sheet_name)
-            continue
-        if tracker.country_room(country) <= 0:
-            log.info("Lender '%s' (country '%s') is blocked this run: already at/above the country cap.", sheet_name, country)
-            stats["country_blocked"].append(sheet_name)
-            continue
-        matched.append((sheet_name, country))
-
-    stats["country_status"] = tracker.country_status(relevant_countries)
-    stats["originator_cap_status"] = tracker.loan_cap_status()
-
-    candidates = []
-    loan_lookup = {}
-    loan_raw = {}
-    for sheet_name, country in matched:
-        loans = loans_by_name[sheet_name]
-        stats["lender_stats"][sheet_name] = {
-            "budget": 0.0,
-            "country": country,
-            "loans_seen": len(loans),
-            "attempts": 0,
-            "successes": 0,
-            "failures": 0,
-            "invested_amount": 0.0,
-            "invested_loans": [],
-        }
-        for loan in loans:
-            loan_uuid = loan.get("uuid")
-            if not loan_uuid:
+    # A loan refused (taken by someone else, amount changed) leaves part of the
+    # budget unplaced: the listing is read again without it and the rest planned.
+    for pass_number in range(1, MAX_PASSES + 1):
+        first_pass = pass_number == 1
+        # Lenders at their own / country cap cannot be bought from: they are not even fetched.
+        open_names = tracker.investable_names(MIN_INVESTMENT_AMOUNT)
+        loans_by_name, found, listing_complete = (
+            search_lender_loans(open_names, search_state, {name: config.loans[name].min_rate for name in open_names})
+            if open_names else ({}, {}, True)
+        )
+        # An incomplete listing must not flag lenders as unknown.
+        if first_pass and listing_complete and found:
+            report_missing_loans(
+                "Lendermarket", found, search_state.setdefault("missing_gates", {}), all_names=open_names,
+            )
+        matched = []
+        for sheet_name in active_names:
+            country = tracker.country_of(sheet_name)
+            if country:
+                relevant_countries.add(country)
+            if tracker.loan_room(sheet_name) <= 0:
+                if first_pass:
+                    log.info("Lender '%s' is blocked this run: already at/above its own cap.", sheet_name)
+                    stats["originator_blocked"].append(sheet_name)
                 continue
-            try:
-                available = float(loan.get("investableAmount") or loan.get("loanAmount") or 0)
-            except (TypeError, ValueError):
-                available = 0.0
-            try:
-                rate = float(loan.get("interestRate"))
-            except (TypeError, ValueError):
-                rate = None
-            candidates.append(Candidate(loan_uuid, sheet_name, available, rate))
-            loan_lookup[loan_uuid] = (sheet_name, rate)
-            loan_raw[loan_uuid] = loan
+            if tracker.country_room(country) <= 0:
+                if first_pass:
+                    log.info("Lender '%s' (country '%s') is blocked this run: already at/above the country cap.", sheet_name, country)
+                    stats["country_blocked"].append(sheet_name)
+                continue
+            if sheet_name not in loans_by_name:
+                if first_pass:
+                    log.info("Lender '%s' has less room under its caps than the minimum amount: not fetched.", sheet_name)
+                continue
+            matched.append((sheet_name, country))
 
-    if not candidates:
-        log.info("No available loan for the active Lendermarket lenders %s - nothing to invest this run.", [m[0] for m in matched])
-        return stats
-
-    budget = config.investable_balance(balance)
-    plan = plan_allocations(candidates, tracker, budget, MIN_INVESTMENT_AMOUNT)
-    if not plan:
-        log.info("%d candidate loan(s), nothing fundable under the configured limits (balance=%.2f EUR, investable=%.2f EUR).", len(candidates), balance, budget)
-        return stats
-
-    for loan_uuid, amount in plan.items():
-        sheet_name, _rate = loan_lookup[loan_uuid]
-        stats["lender_budgets"][sheet_name] = stats["lender_budgets"].get(sheet_name, 0.0) + amount
-        stats["lender_stats"][sheet_name]["budget"] += amount
-    log.info("Investment plan (loan uuid -> EUR): %s", plan)
-    if DRY_RUN:
-        log.info("Dry run - nothing bought.")
-        return stats
-
-    for loan_uuid, amount in plan.items():
-        sheet_name, rate = loan_lookup[loan_uuid]
-        lender_stat = stats["lender_stats"][sheet_name]
-        stats["invest_attempts"] += 1
-        lender_stat["attempts"] += 1
-        success, failure_reason, invested = attempt_investment(session, loan_uuid, amount)
-        if success:
-            stats["invest_successes"] += 1
-            stats["total_invested"] += invested
-            stats["balance_after"] -= invested
-            lender_stat["successes"] += 1
-            lender_stat["invested_amount"] += invested
-            lender_stat["invested_loans"].append({"amount": invested, "interestRate": rate})
-            tracker.add(sheet_name, invested)
-        else:
-            stats["invest_failures"] += 1
-            lender_stat["failures"] += 1
-            stats["failed_attempts"].append({
-                "label": sheet_name, "amount": amount, "reason": failure_reason,
-                # Marketplace data of the loan + plan, attached to the email to diagnose a rejection.
-                "loan_uuid": loan_uuid, "loan": loan_raw.get(loan_uuid),
-                "context": {"balance_before": balance, "balance_now": stats["balance_after"], "plan": plan},
+        candidates = []
+        loan_lookup = {}
+        loan_raw = {}
+        for sheet_name, country in matched:
+            loans = [loan for loan in loans_by_name[sheet_name] if loan.get("uuid") not in excluded]
+            lender_stat = stats["lender_stats"].setdefault(sheet_name, {
+                "budget": 0.0,
+                "country": country,
+                "loans_seen": 0,
+                "attempts": 0,
+                "successes": 0,
+                "failures": 0,
+                "invested_amount": 0.0,
+                "invested_loans": [],
             })
+            lender_stat["loans_seen"] = max(lender_stat["loans_seen"], len(loans))
+            for loan in loans:
+                loan_uuid = loan.get("uuid")
+                if not loan_uuid:
+                    continue
+                try:
+                    available = float(loan.get("investableAmount") or loan.get("loanAmount") or 0)
+                except (TypeError, ValueError):
+                    available = 0.0
+                try:
+                    rate = float(loan.get("interestRate"))
+                except (TypeError, ValueError):
+                    rate = None
+                candidates.append(Candidate(loan_uuid, sheet_name, available, rate))
+                loan_lookup[loan_uuid] = (sheet_name, rate)
+                loan_raw[loan_uuid] = loan
+
+        if not candidates:
+            log.info("No available loan for the active Lendermarket lenders %s - nothing to invest this run.", [m[0] for m in matched])
+            break
+
+        budget = config.investable_balance(stats["balance_after"])
+        plan = plan_allocations(candidates, tracker, budget, MIN_INVESTMENT_AMOUNT)
+        if not plan:
+            log.info("%d candidate loan(s), nothing fundable under the configured limits (balance=%.2f EUR, investable=%.2f EUR).", len(candidates), stats["balance_after"], budget)
+            break
+
+        for loan_uuid, amount in plan.items():
+            sheet_name, _rate = loan_lookup[loan_uuid]
+            stats["lender_budgets"][sheet_name] = stats["lender_budgets"].get(sheet_name, 0.0) + amount
+            stats["lender_stats"][sheet_name]["budget"] += amount
+        log.info("Investment plan (loan uuid -> EUR): %s", plan)
+        if DRY_RUN:
+            log.info("Dry run - nothing bought.")
+            break
+
+        unplaced = False
+        for loan_uuid, amount in plan.items():
+            sheet_name, rate = loan_lookup[loan_uuid]
+            lender_stat = stats["lender_stats"][sheet_name]
+            stats["invest_attempts"] += 1
+            lender_stat["attempts"] += 1
+            success, failure_reason, invested = attempt_investment(session, loan_uuid, amount)
+            if success:
+                stats["invest_successes"] += 1
+                stats["total_invested"] += invested
+                stats["balance_after"] -= invested
+                lender_stat["successes"] += 1
+                lender_stat["invested_amount"] += invested
+                lender_stat["invested_loans"].append({"amount": invested, "interestRate": rate})
+                tracker.add(sheet_name, invested)
+                if invested < amount - 0.01:
+                    unplaced = True
+                    excluded.add(loan_uuid)
+            else:
+                stats["invest_failures"] += 1
+                lender_stat["failures"] += 1
+                unplaced = True
+                excluded.add(loan_uuid)
+                stats["failed_attempts"].append({
+                    "label": sheet_name, "amount": amount, "reason": failure_reason,
+                    # Marketplace data of the loan + plan, attached to the email to diagnose a rejection.
+                    "loan_uuid": loan_uuid, "loan": loan_raw.get(loan_uuid),
+                    "context": {"balance_before": balance, "balance_now": stats["balance_after"], "plan": plan},
+                })
+
+        remaining = config.investable_balance(stats["balance_after"])
+        if not unplaced or pass_number == MAX_PASSES or remaining < MIN_INVESTMENT_AMOUNT:
+            break
+        log.info("Part of the plan could not be placed - planning the remaining %.2f EUR (pass %d/%d).", remaining, pass_number + 1, MAX_PASSES)
 
     stats["country_status"] = tracker.country_status(relevant_countries)
     stats["originator_cap_status"] = tracker.loan_cap_status()

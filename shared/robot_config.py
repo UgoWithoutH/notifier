@@ -264,12 +264,15 @@ class PlatformConfig:
     def secondary_names(self) -> list:
         return [name for name, loan in self.loans.items() if loan.secondary_active]
 
-    def lowest_min_rate(self, secondary: bool = False) -> float | None:
+    def lowest_min_rate(self, secondary: bool = False, names=None) -> float | None:
         """Plus petit taux min parmi les loans actifs (None si au moins un
-        loan actif n'a pas de taux min) - sert de pré-filtre côté API."""
+        loan actif n'a pas de taux min) - sert de pré-filtre côté API.
+        `names` restreint le calcul à ces loans (ex. ceux sous leurs plafonds)."""
         rates = []
         for loan in self.loans.values():
             if not (loan.secondary_active if secondary else loan.active):
+                continue
+            if names is not None and loan.name not in names:
                 continue
             if loan.min_rate is None:
                 return None
@@ -494,6 +497,18 @@ class CapTracker:
         if cap is None:
             return []
         return sorted(c for c, amount in self.country_invested.items() if amount >= cap)
+
+    def investable_names(self, default_min_amount: float) -> list:
+        """Loans actifs pour lesquels il reste, sous les plafonds du loan et de son pays,
+        de la place pour au moins le montant minimum d'un achat."""
+        names = []
+        for name in self.config.active_names():
+            loan = self.config.loans[name]
+            min_amount = loan.min_amount if loan.min_amount is not None else default_min_amount
+            room = min(self.loan_room(name), self.country_room(self.country_of(name)))
+            if room + 1e-9 >= min_amount:
+                names.append(name)
+        return names
 
     def blocked_loans(self) -> list:
         return sorted(

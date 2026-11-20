@@ -15,9 +15,11 @@ Endpoints (verified live 2026-11-12, all JSON, Bearer token):
     GET  /api/investor-details            funds.available = uninvested cash
     POST /api/loan/list/<page>            body {"filters": [{"id": 7, "values": [min, max]}],
                                           "search": "", "sort": ..., "sort_dir": ..., "minimum_investment": ...}
-         20 loans per page, `{loanCount, pages, loanList}`. Only the interest-rate
-         range filter (id 7) is honoured server-side (status / originator
-         multiselects are ignored), so those are filtered here. The listing is live
+         20 loans per page, `{loanCount, pages, loanList}`. The interest-rate range filter
+         (id 7) and the free-text `search` (matches the originator name, verified live
+         2026-11-20: "Virtus Lending" -> 3 of 4446 loans, unknown name -> 0) are honoured
+         server-side; the other filters (status / originator multiselects) are ignored, so
+         those are filtered here. The listing is live
          (loans are taken while paging), so rows are deduplicated on `loan_id`.
     POST /api/investment-create           body [{"loan_ref": <int>, "amount": "<str>"}]
          Verified with a real 10 EUR purchase: HTTP 201 and
@@ -51,8 +53,11 @@ Optional: CRON_JOB_API_KEY, INCOME_MARKETPLACE_CRON_JOB_ID -> cron-job.org sched
 (defaults: every 2 min when the balance >= minimum, once a day below).
 """
 
+import heapq
+import itertools
 import json
 import logging
+import math
 import os
 import sys
 import time
@@ -94,7 +99,9 @@ INCOME_MARKETPLACE_CRON_JOB_ID = os.environ.get("INCOME_MARKETPLACE_CRON_JOB_ID"
 MODE = os.environ.get("INCOME_MARKETPLACE_BOT_MODE", "live").strip().lower()
 MIN_INVESTMENT_AMOUNT = float(os.environ.get("INCOME_MARKETPLACE_MIN_INVESTMENT_AMOUNT", "10"))
 MAX_PAGES = 300
-PAGES_PER_BATCH = 60
+PAGES_PER_BATCH_MAX = 60
+LOANS_PER_PAGE = 20
+MAX_PASSES = 3
 LIST_MAX_ATTEMPTS = 4
 LIST_RETRY_BASE_DELAY_SECONDS = 3
 BALANCE_CHECK_ATTEMPTS = 4
@@ -170,15 +177,16 @@ def fetch_cash_balance(page, token: str) -> float:
     return float(funds.get("available") or 0.0)
 
 
-def iter_marketplace_pages(page, token: str, min_rate: float | None):
+def iter_marketplace_pages(page, token: str, min_rate: float | None, search: str = ""):
     """Yields the loans of each listing page, highest interest rate first (up to MAX_PAGES pages).
-    `min_rate` is a server-side pre-filter (falls back to an unfiltered listing if refused)."""
+    `min_rate` is a server-side pre-filter (falls back to an unfiltered listing if refused).
+    `search` is the server-side free-text filter, which matches the originator name."""
     filters = [] if min_rate is None else [{"id": RATE_FILTER_ID, "values": [min_rate, RATE_FILTER_MAX]}]
     page_count = 1
     page_number = 1
     while page_number <= min(page_count, MAX_PAGES):
         body = {
-            "filters": filters, "search": "", "minimum_investment": _format_amount(MIN_INVESTMENT_AMOUNT),
+            "filters": filters, "search": search, "minimum_investment": _format_amount(MIN_INVESTMENT_AMOUNT),
             "sort": "loan_investor_interest_rate", "sort_dir": "desc",
         }
         for attempt in range(1, LIST_MAX_ATTEMPTS + 1):
@@ -204,6 +212,98 @@ def iter_marketplace_pages(page, token: str, min_rate: float | None):
         page_number += 1
     if page_count > MAX_PAGES:
         log.warning("Hit MAX_PAGES (%d) of %d - listing truncated.", MAX_PAGES, page_count)
+
+
+def iter_open_loan_pages(page, token: str, config, names: list):
+    """Returns `(pages, readable, drained)`: the listing pages restricted to the originators in
+    `names` (one server-side search per originator, with its own minimum rate), merged back in
+    descending rate order so the plan still favours the highest rates first; the set of
+    originators still being read; and the set whose listing was read to the end (or is empty).
+    The caller can remove an originator from `readable` to stop fetching its pages. An
+    originator whose search finds nothing has no loan on the marketplace."""
+    readable, drained = set(), set()
+
+    def tracked(name, first, pages):
+        batch = first
+        while True:
+            yield batch
+            if name not in readable:
+                return
+            batch = next(pages, None)
+            if batch is None:
+                readable.discard(name)
+                drained.add(name)
+                return
+
+    streams = []
+    for name in names:
+        pages = iter_marketplace_pages(page, token, config.loans[name].min_rate, search=name)
+        first = next(pages, [])
+        if first:
+            readable.add(name)
+            streams.append(itertools.chain.from_iterable(tracked(name, first, pages)))
+        else:
+            drained.add(name)
+    rate_desc = lambda loan: -(_number(loan.get("loan_investor_interest_rate")) or 0.0)
+    merged = heapq.merge(*streams, key=rate_desc)
+    return iter(lambda: list(itertools.islice(merged, LOANS_PER_PAGE)) or None, None), readable, drained
+
+
+def retire_capped_originators(plan: list, tracker, readable: set) -> None:
+    """Removes from `readable` the originators that cannot take another purchase on top of
+    `plan` (no room left under their loan or country cap for at least their minimum amount):
+    their remaining pages cannot change the plan."""
+    spent_loan, spent_country = {}, {}
+    for _loan, name, amount in plan:
+        spent_loan[name] = spent_loan.get(name, 0.0) + amount
+        country = tracker.country_of(name)
+        if country:
+            spent_country[country] = spent_country.get(country, 0.0) + amount
+    for name in list(readable):
+        loan = tracker.config.loans[name]
+        country = tracker.country_of(name)
+        room = min(
+            tracker.loan_room(name, spent_loan.get(name, 0.0)),
+            tracker.country_room(country, spent_country.get(country, 0.0)),
+        )
+        if room + 1e-9 < (loan.min_amount if loan.min_amount is not None else MIN_INVESTMENT_AMOUNT):
+            log.info("Originator %r is at its cap with this plan - its remaining pages are not read.", name)
+            readable.discard(name)
+
+
+def _pages_needed(unallocated: float, config, names) -> int:
+    """Listing pages worth reading to place `unallocated` EUR: at most one loan per minimum
+    amount of the sheet (the smallest among `names`), LOANS_PER_PAGE loans per page."""
+    smallest = min(
+        (config.loans[name].min_amount if config.loans[name].min_amount is not None else MIN_INVESTMENT_AMOUNT)
+        for name in names
+    ) or MIN_INVESTMENT_AMOUNT
+    loans_needed = math.ceil(unallocated / smallest - 1e-9)
+    return max(1, min(PAGES_PER_BATCH_MAX, math.ceil(loans_needed / LOANS_PER_PAGE)))
+
+
+def build_plan(page, token: str, config, tracker, open_names: list, budget: float, excluded=()) -> tuple:
+    """`(plan, loans, drained)`: reads only as many listing pages as the budget and the
+    sheet's minimum amounts call for, then keeps reading (lower rates) while part of the budget
+    stays unallocated and an originator still has room under its caps. The plan is recomputed
+    from every loan read so far. `drained`: the originators whose whole listing was read."""
+    pages, readable, drained = iter_open_loan_pages(page, token, config, open_names)
+    loans: dict = {}
+    unallocated = budget
+    while True:
+        exhausted = read_more_loans(pages, loans, _pages_needed(unallocated, config, open_names))
+        plan = plan_loans(list(loans.values()), tracker, budget, excluded)
+        unallocated = budget - sum(amount for *_rest, amount in plan)
+        log.info(
+            "%d loan(s) listed, %d purchase(s) planned, %.2f EUR unallocated.",
+            len(loans), len(plan), unallocated,
+        )
+        if exhausted or unallocated < MIN_INVESTMENT_AMOUNT:
+            break
+        retire_capped_originators(plan, tracker, readable)
+        if not readable:
+            break
+    return plan, loans, drained
 
 
 def read_more_loans(pages, loans: dict, page_budget: int) -> bool:
@@ -259,12 +359,13 @@ def _accepted(loan: dict, config_loan, today: date) -> bool:
     return _term_matches(loan, config_loan, today)
 
 
-def plan_loans(loans: list, tracker, budget: float) -> list:
-    """[(loan, originator name in the sheet, amount)] in listing order."""
+def plan_loans(loans: list, tracker, budget: float, excluded=()) -> list:
+    """[(loan, originator name in the sheet, amount)] in listing order. `excluded`: loan refs
+    not to buy (already refused / cut during this run)."""
     candidates, by_ref = [], {}
     today = datetime.now(timezone.utc).date()
     for loan in loans:
-        if not _is_investable(loan):
+        if not _is_investable(loan) or loan.get("loan_ref") in excluded:
             continue
         config_loan = tracker.config.find_loan(loan.get("loan_originator_name"))
         available = _number(loan.get("investable_amount"))
@@ -406,56 +507,70 @@ def run() -> None:
                 log.exception("Geographic snapshot unavailable - caps computed from the balance only.")
                 geo_snapshot = None
             tracker = build_tracker(config, balance, geo_snapshot)
-
-            # Pages are read in batches: as long as part of the budget stays unallocated, the next
-            # (lower rate) pages are read and the plan is recomputed from every loan read so far.
-            pages = iter_marketplace_pages(page, token, config.lowest_min_rate())
-            loans: dict = {}
-            while True:
-                exhausted = read_more_loans(pages, loans, PAGES_PER_BATCH)
-                plan = plan_loans(list(loans.values()), tracker, investable)
-                unallocated = investable - sum(amount for *_rest, amount in plan)
-                log.info(
-                    "%d loan(s) listed, %d purchase(s) planned, %.2f EUR unallocated.",
-                    len(loans), len(plan), unallocated,
-                )
-                if exhausted or unallocated < MIN_INVESTMENT_AMOUNT:
-                    break
-            log.info("%d loan(s) with status Current.", sum(_is_investable(loan) for loan in loans.values()))
-
-            # Mail (once) when no listed loan belongs to an originator flagged in the sheet.
-            # Skipped while the listing is only partly read (the originator may be further down).
-            state = load_state(STATE_FILE, {"missing_loans": {}})
-            seen_names = set()
-            today = datetime.now(timezone.utc).date()
-            for loan in loans.values():
-                config_loan = config.find_loan(loan.get("loan_originator_name"))
-                if config_loan is not None and _is_investable(loan) and _accepted(loan, config_loan, today):
-                    seen_names.add(config_loan.name)
-            all_names = sorted(config.active_names())
-            if exhausted or seen_names.issuperset(all_names):
-                report_missing_loans(
-                    PLATFORM, {name: name in seen_names for name in all_names},
-                    state.setdefault("missing_loans", {}), all_names=all_names, grace_seconds=TRANSIENT_GRACE_SECONDS,
-                )
-                save_state(STATE_FILE, state)
-
-            stats["plan"] = [_line_summary(*line) for line in plan]
-            log.info("%d purchase(s) planned (%.2f EUR).", len(plan), sum(amount for *_rest, amount in plan))
-            if MODE != "live":
+            open_names = tracker.investable_names(MIN_INVESTMENT_AMOUNT)
+            if not open_names:
+                log.info("Every active %s loan originator has reached its loan / country cap - nothing to do.", PLATFORM)
                 return
-            for loan, loan_name, amount in plan:
-                stats["attempts"] += 1
-                ok, invested, balance_after, reason = place_investment(page, token, loan, amount, stats["balance_after"])
-                if ok:
-                    stats["successes"] += 1
-                    stats["total_invested"] += invested
-                    tracker.add(loan_name, invested)
-                    stats["invested"].append(_line_summary(loan, loan_name, invested))
-                else:
-                    stats["failures"] += 1
-                    stats["failed_attempts"].append({"label": loan_name, "amount": amount, "reason": reason})
-                stats["balance_after"] = balance_after
+            skipped = sorted(set(config.active_names()) - set(open_names))
+            if skipped:
+                log.info("Loan originator(s) at their cap, not looked for: %s.", ", ".join(skipped))
+
+            excluded: set = set()
+            state = load_state(STATE_FILE, {"missing_loans": {}})
+            for pass_number in range(1, MAX_PASSES + 1):
+                plan, loans, drained = build_plan(page, token, config, tracker, open_names, investable, excluded)
+                log.info("%d loan(s) with status Current.", sum(_is_investable(loan) for loan in loans.values()))
+
+                if pass_number == 1:
+                    # Mail (once) when no listed loan belongs to an originator flagged in the sheet.
+                    # Only originators whose result is settled are reported: seen, or listing read to
+                    # the end / empty (an originator whose pages were not all read may still be listed).
+                    seen_names = set()
+                    today = datetime.now(timezone.utc).date()
+                    for loan in loans.values():
+                        config_loan = config.find_loan(loan.get("loan_originator_name"))
+                        if config_loan is not None and _is_investable(loan) and _accepted(loan, config_loan, today):
+                            seen_names.add(config_loan.name)
+                    all_names = sorted(open_names)
+                    found = {name: True for name in all_names if name in seen_names}
+                    found.update({name: False for name in all_names if name in drained and name not in seen_names})
+                    if found:
+                        report_missing_loans(
+                            PLATFORM, found, state.setdefault("missing_loans", {}),
+                            all_names=all_names, grace_seconds=TRANSIENT_GRACE_SECONDS,
+                        )
+                        save_state(STATE_FILE, state)
+
+                stats["plan"] += [_line_summary(*line) for line in plan]
+                log.info("%d purchase(s) planned (%.2f EUR).", len(plan), sum(amount for *_rest, amount in plan))
+                if MODE != "live" or not plan:
+                    break
+                shortfall = False
+                for loan, loan_name, amount in plan:
+                    stats["attempts"] += 1
+                    ok, invested, balance_after, reason = place_investment(page, token, loan, amount, stats["balance_after"])
+                    if ok:
+                        stats["successes"] += 1
+                        stats["total_invested"] += invested
+                        tracker.add(loan_name, invested)
+                        stats["invested"].append(_line_summary(loan, loan_name, invested))
+                        if invested < amount - 0.01:
+                            shortfall = True
+                            excluded.add(loan["loan_ref"])
+                    else:
+                        stats["failures"] += 1
+                        stats["failed_attempts"].append({"label": loan_name, "amount": amount, "reason": reason})
+                        shortfall = True
+                        excluded.add(loan["loan_ref"])
+                    stats["balance_after"] = balance_after
+
+                # A loan taken by someone else or whose amount dropped leaves cash unplaced:
+                # read a fresh listing and plan the rest.
+                investable = config.investable_balance(stats["balance_after"])
+                open_names = tracker.investable_names(MIN_INVESTMENT_AMOUNT)
+                if not shortfall or pass_number == MAX_PASSES or investable < MIN_INVESTMENT_AMOUNT or not open_names:
+                    break
+                log.info("Part of the plan could not be placed - planning the remaining %.2f EUR (pass %d/%d).", investable, pass_number + 1, MAX_PASSES)
     except Exception as exc:
         error = str(exc)
         _log_diagnostics("run_error", error=error, traceback=traceback.format_exc())
