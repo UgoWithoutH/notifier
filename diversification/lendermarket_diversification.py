@@ -407,6 +407,13 @@ def aggregate_remaining_durations(investments: list, today: date, rates=None) ->
                 term = overdue_months_and_days(today, maturity, default=is_default)
             if is_buyback and term is not None and len(term) == 2:
                 term = (-term[0], -term[1], "buyback")
+        if is_buyback or is_default:
+            log.info(
+                "[Lendermarket] %s - prêt %s : maturité finale %s (%d j de dépassement), échéance manquée %s, loanOverdueDays=%d, "
+                "délai de buyback=%s, terme retenu=%s, encours=%.2f.",
+                lender_name, "en défaut" if is_default else "en buyback", maturity, past_maturity,
+                inv.get("nextPaymentDate"), overdue_days, buyback_days, term, remaining,
+            )
         if term is None:
             term = remaining_months_and_days(today, maturity)
         durations = result.setdefault(lender_name, {})

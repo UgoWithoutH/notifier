@@ -555,6 +555,12 @@ def _overdue_term(inv: dict, today: date):
     )
     if term is not None and len(term) == 2 and not is_default and status in BUYBACK_STATUSES:
         term = (-term[0], -term[1], "buyback")
+    if status in BUYBACK_STATUSES:
+        log.info(
+            "[Income Marketplace] prêt %s en %r : overdue_since=%s (%s), défaut=%s, terme retenu=%s, encours=%.2f.",
+            inv.get("originator"), inv.get("status"), overdue_since, "absente -> repli 61 j" if not overdue_since else f"{(today - overdue_since).days} j de retard",
+            is_default, term, inv.get("outstanding", 0.0),
+        )
     return term
 
 

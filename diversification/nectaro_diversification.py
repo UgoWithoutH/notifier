@@ -527,6 +527,10 @@ def aggregate_remaining_durations(session: requests.Session, headers: dict, toda
                 # Status given by the API: no default inference, the term is (months, days, "buyback") since the missed payment.
                 term = overdue_months_and_days(today, due)
                 term = (-term[0], -term[1], "buyback") if term is not None else None
+                log.info(
+                    "[Nectaro] %s - prêt sous-jacent BUYBACK : échéance manquée (updatedAt - dpd)=%s, %d j depuis, terme retenu=%s, part de la note=%.1f%%.",
+                    loan["originator"], due, (today - due).days, term, share * 100,
+                )
             else:
                 overdue_days = (today - due).days
                 term = overdue_months_and_days(today, due, default=overdue_days > default_after_late_days("Nectaro", loan["originator"]))

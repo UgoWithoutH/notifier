@@ -1699,6 +1699,19 @@ def fill_remaining_duration_amounts(
             if rates is not None:
                 for term in durations:
                     rate_entries[(key, term, "")] = [rates.entry(key, rate_terms.get((key, term), term))]
+    # Trace des durées non normales (retard / buyback / défaut) telles qu'écrites dans l'onglet : la date de départ
+    # du compteur se déduit de la date du rapport moins la durée.
+    log_date = get_report_date()
+    for key, (name, durations) in new_data.items():
+        abnormal = [
+            (term, amount) for term, amount in sorted(durations.items(), key=lambda item: _duration_sort_key(item[0]))
+            if status_history.classify_term(term) != "normal"
+        ]
+        if abnormal:
+            logger.info(
+                "[%s] %s - durées non normales au %s (délai de buyback : %s jours) : %s", platform, name or platform, log_date,
+                buyback_days_by_key.get(key), "; ".join(f"{status_history.classify_term(term)} '{_duration_label(term)}' = {amount:.2f}" for term, amount in abnormal),
+            )
     # Arrondi au centime des montants de chaque société, sans que la somme de ses lignes dérive du total voulu.
     targets = {None if key is None else originator_key(key): total for key, total in (target_totals or {}).items()}
     for key, by_term in amounts_by_term.items():
