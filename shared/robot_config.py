@@ -626,6 +626,67 @@ def _distribute_leftover_cents(budget: float, items: list, shares: dict) -> dict
     return shares
 
 
+# Deux écarts au plafond du loan sont considérés équivalents sous ce seuil (€).
+_LEVEL_TOLERANCE = 0.02
+
+
+def _level_budget(loans: list, budget: float, country_room) -> dict:
+    """Répartit `budget` entre des loans plafonnés pour égaliser leur écart au
+    plafond configuré (plafond du loan - montant déjà investi), et retourne
+    {loan: montant}.
+
+    loans : [(loan, écart, capacité, montant_min, pays)] dans l'ordre du listing.
+    Le loan le plus éloigné de son plafond est servi seul jusqu'à atteindre
+    l'écart du suivant, puis les loans à écart équivalent sont servis
+    ensemble à parts égales, et ainsi de suite. Si le solde ne permet pas de
+    servir tout le groupe (montants min), les derniers du listing sont écartés
+    et le premier est pris. `country_room(pays)` : place restante du pays."""
+    amounts = {loan[0]: 0.0 for loan in loans}
+    spent_country: dict = {}
+    dead: set = set()
+    remaining = budget
+    for _ in range(6 * len(loans) + 6):
+        if remaining < 0.01:
+            break
+        active = []
+        for name, deficit, capacity, min_amount, country in loans:
+            if name in dead:
+                continue
+            room = min(capacity - amounts[name], country_room(country) - spent_country.get(country, 0.0))
+            need_min = max(0.0, min_amount - amounts[name])
+            if room <= 0.004 or room + 1e-9 < need_min:
+                continue
+            active.append((name, deficit - amounts[name], room, need_min, country))
+        if not active:
+            break
+        top = max(entry[1] for entry in active)
+        group = [entry for entry in active if entry[1] >= top - _LEVEL_TOLERANCE]
+        lower = [entry[1] for entry in active if entry[1] < top - _LEVEL_TOLERANCE]
+        next_level = max(lower) if lower else 0.0
+        shares = _split_equally(
+            remaining,
+            [(name, min(room, max(top - next_level, need_min)), need_min) for name, _gap, room, need_min, _c in group],
+        )
+        if not shares:
+            dead.add(group[0][0])
+            continue
+        placed = 0.0
+        for name, _gap, _room, need_min, country in group:
+            share = _floor2(min(shares.get(name, 0.0), country_room(country) - spent_country.get(country, 0.0)))
+            if share <= 0 or share + 1e-9 < need_min:
+                if name in shares:
+                    dead.add(name)
+                continue
+            amounts[name] += share
+            placed += share
+            if country:
+                spent_country[country] = spent_country.get(country, 0.0) + share
+        if placed <= 0:
+            break
+        remaining -= placed
+    return {name: round(amount, 2) for name, amount in amounts.items() if amount > 0}
+
+
 def plan_allocations(candidates: list, tracker: CapTracker, budget: float, default_min_amount: float) -> dict:
     """Répartit `budget` entre les prêts candidats (dans l'ordre du listing)
     et retourne {id: montant}.
@@ -634,11 +695,21 @@ def plan_allocations(candidates: list, tracker: CapTracker, budget: float, defau
     plafonds par pays / par loan sont atteints. Le montant d'un prêt est borné
     par sa disponibilité, le montant max configuré et la place restante sous
     les plafonds, et doit être >= au montant min configuré (à défaut
-    `default_min_amount`). Les loans "répartition équivalente" sont servis en
-    premier à parts égales ; les autres le sont ensuite séquentiellement
+    `default_min_amount`).
+
+    Les loans ayant un plafond (% max du solde par loan) sont servis en
+    premier, par priorité à l'écart le plus grand entre leur plafond et leur
+    taux réel (voir `_level_budget`) : le budget est réparti entre loans pour
+    égaliser ces écarts, sans tout investir dans le plus éloigné. Un loan sans
+    prêt disponible dans le run n'y participe pas : le budget va aux autres.
+    Le montant attribué à un loan est ensuite réparti sur ses prêts (à parts
+    égales si "répartition équivalente", sinon séquentiellement). Les loans
+    sans plafond sont servis après avec le solde restant : "répartition
+    équivalente" d'abord à parts égales, puis les autres séquentiellement
     (le premier prêt prend le maximum possible, puis le suivant, etc.)."""
     config = tracker.config
     equal_items, greedy_items = [], []
+    capped_items: dict = {}
     for candidate in candidates:
         loan = config.loans.get(candidate.loan_name)
         if loan is None or loan.rejection_reason(candidate.rate) is not None:
@@ -651,7 +722,10 @@ def plan_allocations(candidates: list, tracker: CapTracker, budget: float, defau
             tracker.loan_room(candidate.loan_name), tracker.country_room(country),
         )
         item = (candidate.id, cap, min_amount, candidate.loan_name, country)
-        (equal_items if loan.equal_split else greedy_items).append(item)
+        if tracker.loan_cap_amount(candidate.loan_name) is not None:
+            capped_items.setdefault(candidate.loan_name, []).append(item)
+        else:
+            (equal_items if loan.equal_split else greedy_items).append(item)
 
     plan = {}
     spent_loan: dict = {}
@@ -674,6 +748,30 @@ def plan_allocations(candidates: list, tracker: CapTracker, budget: float, defau
         spent_loan[loan_name] = spent_loan.get(loan_name, 0.0) + amount
         if country:
             spent_country[country] = spent_country.get(country, 0.0) + amount
+
+    levelled = []
+    for name, items in capped_items.items():
+        capacity = min(
+            sum(item[1] for item in items),
+            tracker.loan_cap_amount(name) - tracker.loan_invested.get(name, 0.0),
+        )
+        if capacity > 0:
+            levelled.append((
+                name, tracker.loan_cap_amount(name) - tracker.loan_invested.get(name, 0.0),
+                capacity, items[0][2], items[0][4],
+            ))
+    for name, amount in _level_budget(levelled, remaining, tracker.country_room).items():
+        items = [item for item in capped_items[name] if item[1] > 0]
+        if config.loans[name].equal_split:
+            shares = _split_equally(amount, [(i[0], i[1], i[2]) for i in items])
+            for item in items:
+                if item[0] in shares:
+                    commit(item, shares[item[0]])
+            continue
+        left = amount
+        for item in items:
+            commit(item, min(item[1], left))
+            left = amount - sum(plan.get(i[0], 0.0) for i in items)
 
     if equal_items:
         shares = _split_equally(remaining, [(i[0], i[1], i[2]) for i in equal_items])
