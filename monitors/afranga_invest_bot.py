@@ -58,7 +58,7 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-from diversification.afranga_diversification import _HEADERS, fetch_uninvested_balance, login
+from diversification.afranga_diversification import _HEADERS, fetch_investments, fetch_uninvested_balance, login
 from shared.cron_schedule import apply_startup_jitter, ensure_schedule_interval
 from shared.google_sheet import get_geo_platform_snapshot
 from shared.missing_loans import TRANSIENT_GRACE_SECONDS, report_missing_loans
@@ -562,6 +562,10 @@ def run() -> None:
             log.exception("Geographic snapshot unavailable - caps computed from the balance only.")
             geo_snapshot = None
         tracker = build_tracker(config, balance, geo_snapshot)
+        try:
+            tracker.sync_live_invested((inv["originator"], inv["outstanding"]) for inv in fetch_investments(session))
+        except Exception:
+            log.exception("Could not read the live investments - caps use the (possibly stale) geographic sheet this run.")
 
         # Companies searched by their sheet name: mail (once) when none of the
         # fetched listings has a loan of a company flagged in the sheet.

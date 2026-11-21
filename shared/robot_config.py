@@ -492,6 +492,30 @@ class CapTracker:
         if country:
             self.country_invested[country] = self.country_invested.get(country, 0.0) + amount
 
+    def sync_live_invested(self, live_amounts) -> None:
+        """Replace the invested amount of every configured loan by its live figure.
+
+        "Répartition géographique" is only refreshed by the hourly diversification
+        report, while the bots run every few minutes: purchases made since would be
+        invisible and the caps overshot. `live_amounts` is an iterable of
+        (platform originator name, outstanding amount); the difference with the
+        sheet is carried over to the country amounts and the total budget."""
+        live = {}
+        for raw_name, amount in live_amounts:
+            loan = self.config.find_loan(raw_name)
+            if loan is not None:
+                live[loan.name] = live.get(loan.name, 0.0) + amount
+        for name in self.config.loans:
+            delta = live.get(name, 0.0) - self.loan_invested.get(name, 0.0)
+            if abs(delta) < 0.005:
+                continue
+            log.info("%s: live invested %.2f EUR vs %.2f EUR in the sheet.", name, live.get(name, 0.0), self.loan_invested.get(name, 0.0))
+            self.loan_invested[name] = live.get(name, 0.0)
+            self.total_budget += delta
+            country = self.country_of(name)
+            if country:
+                self.country_invested[country] = self.country_invested.get(country, 0.0) + delta
+
     def blocked_countries(self) -> list:
         cap = self.country_cap_amount()
         if cap is None:

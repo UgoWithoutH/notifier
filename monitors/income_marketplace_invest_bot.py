@@ -72,7 +72,9 @@ load_dotenv()
 
 from playwright.sync_api import sync_playwright
 
-from diversification.income_marketplace_diversification import API_BASE, INVESTOR_DETAILS_URL, _fetch_json, login
+from diversification.income_marketplace_diversification import (
+    API_BASE, INVESTOR_DETAILS_URL, _fetch_json, companies_from_investments, fetch_investments, login,
+)
 from shared.cron_schedule import apply_startup_jitter, ensure_schedule_interval
 from shared.google_sheet import get_geo_platform_snapshot
 from shared.missing_loans import TRANSIENT_GRACE_SECONDS, report_missing_loans
@@ -507,6 +509,7 @@ def run() -> None:
                 log.exception("Geographic snapshot unavailable - caps computed from the balance only.")
                 geo_snapshot = None
             tracker = build_tracker(config, balance, geo_snapshot)
+            tracker.sync_live_invested((c["name"], c["amount"]) for c in companies_from_investments(fetch_investments(page, token)))
             open_names = tracker.investable_names(MIN_INVESTMENT_AMOUNT)
             if not open_names:
                 log.info("Every active %s loan originator has reached its loan / country cap - nothing to do.", PLATFORM)

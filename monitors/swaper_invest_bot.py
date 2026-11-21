@@ -1156,6 +1156,16 @@ def run(headless: bool = True) -> None:
                     except Exception:
                         log.exception("Could not read the Swaper geographic snapshot from the Google Sheet, country/originator caps are computed from the balance only this run.")
                 tracker = build_tracker(config, balance_now, geo_snapshot) if config else None
+                if tracker:
+                    try:
+                        # Imported here: the diversification module itself imports this one.
+                        from diversification.swaper_diversification import fetch_open_investments
+
+                        tracker.sync_live_invested(
+                            ((inv.get("group") or "").strip(), float(inv.get("ownAmount") or 0.0)) for inv in fetch_open_investments(page)
+                        )
+                    except Exception:
+                        log.exception("Could not read the live open investments - caps use the (possibly stale) geographic sheet this run.")
 
                 country_blocked_originators = []
                 originator_cap_blocked = []

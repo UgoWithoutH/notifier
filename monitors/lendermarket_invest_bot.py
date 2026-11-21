@@ -651,6 +651,7 @@ def invest_selected_lenders(
     config: PlatformConfig,
     geo_snapshot: dict | None = None,
     search_state: dict | None = None,
+    investor_id: str | None = None,
 ) -> dict:
     """Real auto-invest step, driven by the "config robots" Google Sheet
     (`config` = get_platform_config("Lendermarket"), see
@@ -700,6 +701,15 @@ def invest_selected_lenders(
     }
 
     tracker = build_tracker(config, balance, geo_snapshot)
+    if investor_id:
+        try:
+            # Imported here: the diversification module itself imports this one.
+            from diversification.lendermarket_diversification import aggregate_by_lender, fetch_investments
+
+            lenders = aggregate_by_lender(fetch_investments(session, investor_id))
+            tracker.sync_live_invested((l["lender"], l["remaining_principal"]) for l in lenders)
+        except Exception:
+            log.exception("Could not read the live investments - caps use the (possibly stale) geographic sheet this run.")
 
     active_names = config.active_names()
     search_state = search_state if search_state is not None else {}
@@ -908,6 +918,7 @@ def run() -> None:
             try:
                 invest_stats = invest_selected_lenders(
                     session, balance, config, geo_snapshot, search_state=state.setdefault("lender_search", {}),
+                                        investor_id=investor_id,
                 )
             except Exception as exc:
                 invest_error = str(exc)
