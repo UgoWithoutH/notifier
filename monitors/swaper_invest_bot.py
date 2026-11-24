@@ -299,6 +299,7 @@ TWO_FACTOR_ATTEMPTS = 3
 TWO_FACTOR_REDIRECT_TIMEOUT_MS = 15000
 TWO_FACTOR_PROMPT_TIMEOUT_MS = 30000
 LOGIN_REDIRECT_TIMEOUT_MS = 30000
+LOGIN_ATTEMPTS = 3
 
 
 class SwaperSessionExpired(RuntimeError):
@@ -310,6 +311,13 @@ class SwaperSessionExpired(RuntimeError):
     `_relogin()`/`_with_relogin_retry()`) instead of just giving up for the
     rest of the loop.
     """
+
+
+class SwaperInvalidCredentials(RuntimeError):
+    """Swaper answered the login POST with
+    EXCEPTION_THE_USERNAME_OR_PASSWORD_IS_INCORRECT (real GitHub Actions
+    failures, 2026-11-24). Never retried: it can't succeed and would only
+    risk locking the account."""
 
 
 class SwaperMaintenanceMode(RuntimeError):
@@ -463,7 +471,29 @@ def _type_with_retry(page, selector: str, text: str, attempts: int = 3) -> None:
 
 
 def login(page) -> None:
-    """Log in to Swaper using the credentials (and TOTP secret, if 2FA is
+    """Log in to Swaper, retrying the whole attempt (with cookies cleared)
+    when the page silently stays on /login: real GitHub Actions failures,
+    2026-11-24 (Swaper monitor + diversification, 6 of 8 hourly runs), where
+    the credentials were typed but neither a 2FA prompt nor a redirect ever
+    showed up - intermittent, and the next fresh attempt usually works."""
+    for attempt in range(1, LOGIN_ATTEMPTS + 1):
+        try:
+            _login_attempt(page)
+            return
+        except PlaywrightTimeoutError:
+            if attempt == LOGIN_ATTEMPTS:
+                raise
+            log.warning("Login attempt %d/%d failed, retrying from a clean session.", attempt, LOGIN_ATTEMPTS)
+            try:
+                page.context.clear_cookies()
+                page.evaluate("() => { localStorage.clear(); sessionStorage.clear(); }")
+            except Exception:
+                pass
+            human_pause(5.0, 10.0)
+
+
+def _login_attempt(page) -> None:
+    """Single login attempt using the credentials (and TOTP secret, if 2FA is
     enabled) from env vars.
 
     Selectors verified against the real login form on 2026-07-06: the email
@@ -513,20 +543,66 @@ def login(page) -> None:
             "restored asynchronously), already logged in at %s", page.url,
         )
         return
-    page.locator("div.button.clickable", has_text="Log In").click()
-
-    handle_two_factor(page)
-
-    # Wait until we've left the login page (successful redirect to dashboard).
+    submit = page.locator("div.button.clickable", has_text="Log In")
     try:
-        page.wait_for_url(lambda url: "/login" not in url, timeout=LOGIN_REDIRECT_TIMEOUT_MS)
-    except PlaywrightTimeoutError:
+        log.info(
+            "Submitting login form (submit classes=%r, email len=%d, password len=%d).",
+            submit.first.get_attribute("class", timeout=2000),
+            len(page.locator("input[name='email']").input_value(timeout=2000)),
+            len(page.locator("input[name='password']").input_value(timeout=2000)),
+        )
+    except Exception:
+        pass
+
+    credentials_rejected = []
+
+    def _log_post(response) -> None:
+        if response.request.method != "POST":
+            return
+        body = ""
+        if "/rest/public/login" in response.url and response.status >= 400:
+            try:
+                body = response.text()[:500]
+            except Exception:
+                body = "<unavailable>"
+            if "USERNAME_OR_PASSWORD_IS_INCORRECT" in body:
+                credentials_rejected.append(body)
+        log.info("Login diagnostics: POST %s -> HTTP %s %s", response.url, response.status, body)
+
+    def _log_failed(request) -> None:
+        log.info("Login diagnostics: request failed %s %s (%s)", request.method, request.url, request.failure)
+
+    page.on("response", _log_post)
+    page.on("requestfailed", _log_failed)
+    try:
+        submit.click()
+
+        # Fail fast instead of retrying: repeated bad-password attempts
+        # (hourly runs x retries) risk locking the account.
+        page.wait_for_timeout(3000)
+        if credentials_rejected:
+            raise SwaperInvalidCredentials(
+                "Swaper rejected the credentials (EXCEPTION_THE_USERNAME_OR_PASSWORD_IS_INCORRECT) - "
+                "update the SWAPER_EMAIL/SWAPER_PASSWORD secrets."
+            )
+
+        handle_two_factor(page)
+
+        # Wait until we've left the login page (successful redirect to dashboard).
         try:
-            page_text = " ".join(page.locator("body").inner_text(timeout=2000).split())[:300]
-        except Exception:
-            page_text = "<unavailable>"
-        log.error("Login did not leave /login (url=%s). Page text: %s", page.url, page_text)
-        raise
+            page.wait_for_url(lambda url: "/login" not in url, timeout=LOGIN_REDIRECT_TIMEOUT_MS)
+        except PlaywrightTimeoutError:
+            try:
+                # The first ~300 chars are only the site header/banners, so keep
+                # enough to see any error message shown under the form.
+                page_text = " ".join(page.locator("body").inner_text(timeout=2000).split())[:1500]
+            except Exception:
+                page_text = "<unavailable>"
+            log.error("Login did not leave /login (url=%s). Page text: %s", page.url, page_text)
+            raise
+    finally:
+        page.remove_listener("response", _log_post)
+        page.remove_listener("requestfailed", _log_failed)
     log.info("Logged in successfully, current URL: %s", page.url)
 
 
