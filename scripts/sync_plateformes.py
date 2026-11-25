@@ -120,7 +120,7 @@ COLUMNS = [
 ]
 WIDTH = 1 + len(COLUMNS)
 # Noms (normalisés) de la page réglementation différents de ceux de la carte.
-REGULATION_ALIASES = {"bondora": "goandgrow", "monefitsmartsaver": "monefit"}
+REGULATION_ALIASES = {"bondora": "goandgrow", "gogrow": "goandgrow", "monefitsmartsaver": "monefit"}
 
 
 def fetch_page(url: str) -> str:
