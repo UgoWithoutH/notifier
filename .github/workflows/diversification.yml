@@ -11,14 +11,14 @@ on:
         description: "Mois de fin de la plage à traiter (MM/AAAA, inclus). Laisser vide (avec start_month) pour utiliser la date du jour."
         required: false
         default: ""
-      # All default to true so the cron-job.org trigger (which never sets
-      # inputs, only relying on defaults) keeps running every platform -
-      # decocher one here only affects a manual run.
+      # Defaults to true so the cron-job.org trigger (which never sets inputs,
+      # only relying on defaults) keeps running every platform. Swaper is
+      # disabled by default; enabling it here only affects a manual run.
       run_swaper:
         description: "Swaper"
         type: boolean
         required: false
-        default: true
+        default: false
       run_iuvo:
         description: "Iuvo"
         type: boolean
