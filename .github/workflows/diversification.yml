@@ -14,12 +14,11 @@ on:
       # All default to true so the cron-job.org trigger (which never sets
       # inputs, only relying on defaults) keeps running every platform -
       # decocher one here only affects a manual run.
-      # TEMP: disabled (default false) while Swaper rejects the login - set back to true.
       run_swaper:
         description: "Swaper"
         type: boolean
         required: false
-        default: false
+        default: true
       run_iuvo:
         description: "Iuvo"
         type: boolean
