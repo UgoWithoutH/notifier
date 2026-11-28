@@ -18,7 +18,7 @@ on:
         description: "Swaper"
         type: boolean
         required: false
-        default: false
+        default: true
       run_iuvo:
         description: "Iuvo"
         type: boolean
