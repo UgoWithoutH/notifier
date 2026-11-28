@@ -1,0 +1,51 @@
+name: OKX vers Journal crypto
+
+on:
+  schedule:
+    # Les bonus dépôt OKX arrivent vers 13h07 UTC : passage quotidien en fin d'après-midi
+    - cron: "30 15 * * *"
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Simulation : n'écrit rien dans le Google Sheet"
+        type: boolean
+        default: false
+      lookback_days:
+        description: "Nombre de jours d'historique OKX à relire"
+        type: string
+        default: "120"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: okx-journal-crypto
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - name: Install Python dependencies
+        run: pip install -r requirements.txt
+
+      - name: Sync OKX into Journal crypto
+        env:
+          GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
+          GOOGLE_CREDENTIALS: ${{ secrets.GOOGLE_CREDENTIALS }}
+          OKX_API_KEY: ${{ secrets.OKX_API_KEY }}
+          OKX_SECRET_KEY: ${{ secrets.OKX_SECRET_KEY }}
+          OKX_PASSPHRASE: ${{ secrets.OKX_PASSPHRASE }}
+          LOOKBACK_DAYS: ${{ inputs.lookback_days || '120' }}
+          DRY_RUN: ${{ inputs.dry_run && '1' || '' }}
+        run: python -m scripts.sync_okx_journal
