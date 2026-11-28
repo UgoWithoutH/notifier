@@ -250,7 +250,7 @@ import pyotp
 from dotenv import load_dotenv
 from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
 
-from shared.notifier import send_swaper_investment_summary_email
+from shared.notifier import send_swaper_investment_summary_email, send_swaper_login_failure_email
 from shared.state import load_state, save_state
 from shared.cron_schedule import ensure_schedule_interval, apply_startup_jitter
 from shared.google_sheet import get_geo_platform_snapshot
@@ -323,7 +323,14 @@ class SwaperInvalidCredentials(RuntimeError):
     """Swaper answered the login POST with
     EXCEPTION_THE_USERNAME_OR_PASSWORD_IS_INCORRECT (real GitHub Actions
     failures, 2026-11-24). login() retries it only once (see
-    LOGIN_CREDENTIALS_ATTEMPTS) to limit the risk of locking the account."""
+    LOGIN_CREDENTIALS_ATTEMPTS) to limit the risk of locking the account.
+    `diagnostics`/`screenshot` describe the page at the moment of the
+    refusal (see _capture_login_failure)."""
+
+    def __init__(self, message: str, diagnostics: str = "", screenshot: bytes | None = None):
+        super().__init__(message)
+        self.diagnostics = diagnostics
+        self.screenshot = screenshot
 
 
 class SwaperMaintenanceMode(RuntimeError):
@@ -476,6 +483,52 @@ def _type_with_retry(page, selector: str, text: str, attempts: int = 3) -> None:
     raise last_exc
 
 
+def _capture_login_failure(page, response_body: str) -> tuple:
+    """Best-effort snapshot of what the browser shows right after Swaper
+    refused the login: (diagnostics text, PNG screenshot or None). Each part
+    is independent so one failing never hides the others. The password field
+    is masked on the page, so the screenshot never shows it."""
+    try:
+        page_text = " ".join(page.locator("body").inner_text(timeout=2000).split())[:1500]
+    except Exception:
+        page_text = "<unavailable>"
+    try:
+        user_agent = page.evaluate("() => navigator.userAgent")
+    except Exception:
+        user_agent = "<unavailable>"
+    try:
+        recaptcha_frames = [frame.url[:120] for frame in page.frames if "recaptcha" in frame.url]
+    except Exception:
+        recaptcha_frames = ["<unavailable>"]
+    try:
+        # Runner egress IP, to compare refused vs accepted runners.
+        import requests
+        egress_ip = requests.get("https://api.ipify.org", timeout=5).text.strip()
+    except Exception:
+        egress_ip = "<unavailable>"
+    try:
+        screenshot = page.screenshot(type="png", timeout=5000)
+    except Exception:
+        screenshot = None
+
+    run_url = ""
+    if os.environ.get("GITHUB_RUN_ID"):
+        run_url = (
+            f"{os.environ.get('GITHUB_SERVER_URL', 'https://github.com')}/"
+            f"{os.environ.get('GITHUB_REPOSITORY', '')}/actions/runs/{os.environ['GITHUB_RUN_ID']}"
+        )
+    diagnostics = "\n".join([
+        f"Response body: {response_body}",
+        f"URL: {page.url}",
+        f"Egress IP: {egress_ip}",
+        f"User-Agent: {user_agent}",
+        f"reCAPTCHA frames ({len(recaptcha_frames)}): {recaptcha_frames}",
+        f"Page text: {page_text}",
+        f"Run: {run_url or '<local>'}",
+    ])
+    return diagnostics, screenshot
+
+
 def login(page) -> None:
     """Log in to Swaper, retrying the whole attempt (with cookies cleared)
     when the page silently stays on /login: real GitHub Actions failures,
@@ -494,13 +547,17 @@ def login(page) -> None:
                 raise
             log.warning("Login attempt %d/%d failed, retrying from a clean session.", timeouts, LOGIN_ATTEMPTS)
             pause = (5.0, 10.0)
-        except SwaperInvalidCredentials:
+        except SwaperInvalidCredentials as exc:
             # Swaper also returns this for the same, known-good credentials
             # when its reCAPTCHA scores a GitHub runner badly (real runs,
             # 2026-11-28: same secrets failed, then passed minutes later), so
             # retry once after a longer pause instead of failing immediately.
             rejections += 1
             if rejections >= LOGIN_CREDENTIALS_ATTEMPTS:
+                send_swaper_login_failure_email(
+                    f"{exc}\n\n{exc.diagnostics}\n\nAttempts: {rejections}/{LOGIN_CREDENTIALS_ATTEMPTS}",
+                    exc.screenshot,
+                )
                 raise
             log.warning(
                 "Swaper rejected the credentials (attempt %d/%d), retrying once from a clean session.",
@@ -602,9 +659,11 @@ def _login_attempt(page) -> None:
 
         page.wait_for_timeout(3000)
         if credentials_rejected:
+            diagnostics, screenshot = _capture_login_failure(page, credentials_rejected[-1])
             raise SwaperInvalidCredentials(
                 "Swaper rejected the credentials (EXCEPTION_THE_USERNAME_OR_PASSWORD_IS_INCORRECT) - "
-                "update the SWAPER_EMAIL/SWAPER_PASSWORD secrets."
+                "update the SWAPER_EMAIL/SWAPER_PASSWORD secrets.",
+                diagnostics, screenshot,
             )
 
         handle_two_factor(page)

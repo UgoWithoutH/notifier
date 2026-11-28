@@ -5,6 +5,7 @@ import os
 import smtplib
 import logging
 from math import isfinite
+from email.mime.image import MIMEImage
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 log = logging.getLogger("notifier")
@@ -855,6 +856,39 @@ def _send_plain_email(subject: str, body: str, label: str) -> bool:
         return True
     except Exception:
         log.exception("Failed to send %s email.", label)
+        return False
+
+
+def send_swaper_login_failure_email(details: str, screenshot_png: bytes | None = None) -> bool:
+    """Sent when Swaper keeps rejecting the login: `details` is the page
+    diagnostics text and `screenshot_png` the page as the browser saw it, to
+    tell a visible captcha / error message apart from a silent refusal."""
+    if not all([SMTP_HOST, SMTP_USER, SMTP_PASSWORD, EMAIL_TO]):
+        log.error(
+            "SMTP configuration is incomplete; cannot send email. "
+            "Required env vars: SMTP_HOST, SMTP_USER, SMTP_PASSWORD, EMAIL_TO."
+        )
+        return False
+
+    msg = MIMEMultipart()
+    msg["From"] = EMAIL_FROM
+    msg["To"] = EMAIL_TO
+    msg["Subject"] = "Swaper : connexion refusée"
+    msg.attach(MIMEText(details, "plain"))
+    if screenshot_png:
+        image = MIMEImage(screenshot_png, _subtype="png")
+        image.add_header("Content-Disposition", "attachment", filename="swaper_login_failure.png")
+        msg.attach(image)
+
+    try:
+        with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=15) as server:
+            server.starttls()
+            server.login(SMTP_USER, SMTP_PASSWORD)
+            server.sendmail(EMAIL_FROM, [EMAIL_TO], msg.as_string())
+        log.info("Swaper login failure email sent to %s.", EMAIL_TO)
+        return True
+    except Exception:
+        log.exception("Failed to send Swaper login failure email.")
         return False
 
 
