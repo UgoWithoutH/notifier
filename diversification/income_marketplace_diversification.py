@@ -146,6 +146,7 @@ from playwright.sync_api import sync_playwright
 
 load_dotenv()
 
+from shared.browser_stealth import apply_stealth, get_context_options, get_launch_options
 from shared.google_sheet import (
     fill_current_month_amounts,
     fill_current_month_bonus_breakdown,
@@ -735,9 +736,10 @@ def run() -> None:
 
     try:
         with sync_playwright() as p:
-            browser = p.chromium.launch(headless=True)
+            browser = p.chromium.launch(headless=True, **get_launch_options())
             storage_state = str(STORAGE_STATE_FILE) if STORAGE_STATE_FILE.exists() else None
-            context = browser.new_context(storage_state=storage_state)
+            context = browser.new_context(storage_state=storage_state, **get_context_options(browser))
+            apply_stealth(context)
             page = context.new_page()
             token = login(page)
             context.storage_state(path=str(STORAGE_STATE_FILE))

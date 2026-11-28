@@ -75,6 +75,7 @@ from playwright.sync_api import sync_playwright
 from diversification.income_marketplace_diversification import (
     API_BASE, INVESTOR_DETAILS_URL, _fetch_json, companies_from_investments, fetch_investments, login,
 )
+from shared.browser_stealth import apply_stealth, get_context_options, get_launch_options
 from shared.cron_schedule import apply_startup_jitter, ensure_schedule_interval
 from shared.google_sheet import get_geo_platform_snapshot
 from shared.missing_loans import TRANSIENT_GRACE_SECONDS, report_missing_loans
@@ -467,8 +468,12 @@ def run() -> None:
     config = None
     try:
         with sync_playwright() as p:
-            browser = p.chromium.launch(headless=True)
-            context = browser.new_context(storage_state=str(STORAGE_STATE_FILE) if STORAGE_STATE_FILE.exists() else None)
+            browser = p.chromium.launch(headless=True, **get_launch_options())
+            context = browser.new_context(
+                storage_state=str(STORAGE_STATE_FILE) if STORAGE_STATE_FILE.exists() else None,
+                **get_context_options(browser),
+            )
+            apply_stealth(context)
             page = context.new_page()
             token = login(page)
             context.storage_state(path=str(STORAGE_STATE_FILE))

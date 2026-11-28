@@ -23,6 +23,7 @@ by this flag - they don't touch the UA/fingerprint, so they're always used.
 
 import os
 import random
+import sys
 import time
 
 _force = os.environ.get("FORCE_BROWSER_STEALTH")
@@ -80,15 +81,51 @@ if (originalQuery) {{
 """
 
 
-def get_context_options() -> dict:
+def get_launch_options() -> dict:
+    """Extra kwargs for `chromium.launch(...)`. Swaper-only for now: Playwright's
+    default headless build (chrome-headless-shell) sends a `HeadlessChrome`
+    Sec-CH-UA brand and exposes no plugins, both easy bot signals. When
+    stealth is enabled, `channel="chromium"` selects the full Chromium in
+    "new headless" mode instead (verified: clean Client Hints, native
+    plugins). The AutomationControlled switch hides `navigator.webdriver`
+    and is harmless locally."""
+    options = {"args": ["--disable-blink-features=AutomationControlled"]}
+    if STEALTH_ENABLED:
+        options["channel"] = "chromium"
+    return options
+
+
+def _real_platform_token() -> str:
+    # Matches the host OS on purpose: claiming Windows from a Linux runner
+    # contradicts navigator.platform / Sec-CH-UA-Platform.
+    if sys.platform.startswith("linux"):
+        return "X11; Linux x86_64"
+    if sys.platform == "darwin":
+        return "Macintosh; Intel Mac OS X 10_15_7"
+    return "Windows NT 10.0; Win64; x64"
+
+
+def get_context_options(browser=None) -> dict:
     """Extra kwargs for browser.new_context(...): a randomly picked realistic
     desktop Chrome user_agent/viewport when stealth is enabled, or {} to let
     Playwright use its own real fingerprint (safe on networks that block
-    spoofed ones)."""
+    spoofed ones).
+
+    When the launched `browser` is passed, the UA is built from its REAL
+    version (and host OS) so it matches the Sec-CH-UA Client Hints Chromium
+    sends itself - the fixed pool below goes stale (Chrome 124-126 vs the
+    real ~158) and that mismatch is a detectable inconsistency."""
     if not STEALTH_ENABLED:
         return {}
     profile = random.choice(BROWSER_PROFILES)
-    return {"user_agent": profile["user_agent"], "viewport": profile["viewport"]}
+    if browser is None:
+        return {"user_agent": profile["user_agent"], "viewport": profile["viewport"]}
+    major = browser.version.split(".")[0]
+    user_agent = (
+        f"Mozilla/5.0 ({_real_platform_token()}) AppleWebKit/537.36 "
+        f"(KHTML, like Gecko) Chrome/{major}.0.0.0 Safari/537.36"
+    )
+    return {"user_agent": user_agent, "viewport": profile["viewport"]}
 
 
 def apply_stealth(context, languages: str = "['en-US', 'en']") -> None:

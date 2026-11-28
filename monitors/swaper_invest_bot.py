@@ -259,7 +259,9 @@ from shared.robot_config import (
     Candidate, begin_run, build_tracker, get_platform_config, match_name, plan_allocations,
     resolve_schedule_minutes,
 )
-from shared.browser_stealth import get_context_options, apply_stealth, human_pause, human_mouse_wander, human_type
+from shared.browser_stealth import (
+    get_context_options, get_launch_options, apply_stealth, human_pause, human_mouse_wander, human_type,
+)
 
 DEFAULT_STATE = {
     "missing_loans": {},
@@ -1145,18 +1147,13 @@ def run(headless: bool = True) -> None:
     robot_config = None
 
     with sync_playwright() as p:
-        browser = p.chromium.launch(
-            headless=headless,
-            args=[
-                "--disable-blink-features=AutomationControlled",
-            ],
-        )
+        browser = p.chromium.launch(headless=headless, **get_launch_options())
         storage_state = str(STORAGE_STATE_FILE) if STORAGE_STATE_FILE.exists() else None
         context = browser.new_context(
             storage_state=storage_state,
             locale="en-US",
             timezone_id="Europe/Paris",
-            **get_context_options(),
+            **get_context_options(browser),
         )
         apply_stealth(context)
         page = context.new_page()

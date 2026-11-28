@@ -128,7 +128,7 @@ load_dotenv()
 
 from playwright.sync_api import sync_playwright
 
-from shared.browser_stealth import get_context_options, apply_stealth
+from shared.browser_stealth import get_context_options, get_launch_options, apply_stealth
 from monitors.swaper_invest_bot import login, SWAPER_EMAIL, SWAPER_PASSWORD, fetch_loans, extract_balance
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
@@ -1236,12 +1236,13 @@ def run(headless: bool = True) -> None:
     log.info("Starting Swaper diversification run (headless=%s, storage_state_exists=%s).", headless, STORAGE_STATE_FILE.exists())
 
     with sync_playwright() as p:
-        browser = p.chromium.launch(headless=headless)
+        browser = p.chromium.launch(headless=headless, **get_launch_options())
         storage_state = str(STORAGE_STATE_FILE) if STORAGE_STATE_FILE.exists() else None
         context = browser.new_context(
             storage_state=storage_state,
             locale="en-US",
-            **get_context_options(),
+            timezone_id="Europe/Paris",
+            **get_context_options(browser),
         )
         apply_stealth(context)
         page = context.new_page()
