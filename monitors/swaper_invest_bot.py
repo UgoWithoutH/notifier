@@ -300,6 +300,10 @@ TWO_FACTOR_REDIRECT_TIMEOUT_MS = 15000
 TWO_FACTOR_PROMPT_TIMEOUT_MS = 30000
 LOGIN_REDIRECT_TIMEOUT_MS = 30000
 LOGIN_ATTEMPTS = 3
+# Total tries (not extra retries) when Swaper answers "username or password
+# incorrect": kept at 2 so a genuinely wrong password only costs one extra
+# attempt per run (account lock-out risk).
+LOGIN_CREDENTIALS_ATTEMPTS = 2
 
 
 class SwaperSessionExpired(RuntimeError):
@@ -316,8 +320,8 @@ class SwaperSessionExpired(RuntimeError):
 class SwaperInvalidCredentials(RuntimeError):
     """Swaper answered the login POST with
     EXCEPTION_THE_USERNAME_OR_PASSWORD_IS_INCORRECT (real GitHub Actions
-    failures, 2026-11-24). Never retried: it can't succeed and would only
-    risk locking the account."""
+    failures, 2026-11-24). login() retries it only once (see
+    LOGIN_CREDENTIALS_ATTEMPTS) to limit the risk of locking the account."""
 
 
 class SwaperMaintenanceMode(RuntimeError):
@@ -476,20 +480,37 @@ def login(page) -> None:
     2026-11-24 (Swaper monitor + diversification, 6 of 8 hourly runs), where
     the credentials were typed but neither a 2FA prompt nor a redirect ever
     showed up - intermittent, and the next fresh attempt usually works."""
-    for attempt in range(1, LOGIN_ATTEMPTS + 1):
+    timeouts = 0
+    rejections = 0
+    while True:
         try:
             _login_attempt(page)
             return
         except PlaywrightTimeoutError:
-            if attempt == LOGIN_ATTEMPTS:
+            timeouts += 1
+            if timeouts >= LOGIN_ATTEMPTS:
                 raise
-            log.warning("Login attempt %d/%d failed, retrying from a clean session.", attempt, LOGIN_ATTEMPTS)
-            try:
-                page.context.clear_cookies()
-                page.evaluate("() => { localStorage.clear(); sessionStorage.clear(); }")
-            except Exception:
-                pass
-            human_pause(5.0, 10.0)
+            log.warning("Login attempt %d/%d failed, retrying from a clean session.", timeouts, LOGIN_ATTEMPTS)
+            pause = (5.0, 10.0)
+        except SwaperInvalidCredentials:
+            # Swaper also returns this for the same, known-good credentials
+            # when its reCAPTCHA scores a GitHub runner badly (real runs,
+            # 2026-11-28: same secrets failed, then passed minutes later), so
+            # retry once after a longer pause instead of failing immediately.
+            rejections += 1
+            if rejections >= LOGIN_CREDENTIALS_ATTEMPTS:
+                raise
+            log.warning(
+                "Swaper rejected the credentials (attempt %d/%d), retrying once from a clean session.",
+                rejections, LOGIN_CREDENTIALS_ATTEMPTS,
+            )
+            pause = (30.0, 60.0)
+        try:
+            page.context.clear_cookies()
+            page.evaluate("() => { localStorage.clear(); sessionStorage.clear(); }")
+        except Exception:
+            pass
+        human_pause(*pause)
 
 
 def _login_attempt(page) -> None:
@@ -577,8 +598,6 @@ def _login_attempt(page) -> None:
     try:
         submit.click()
 
-        # Fail fast instead of retrying: repeated bad-password attempts
-        # (hourly runs x retries) risk locking the account.
         page.wait_for_timeout(3000)
         if credentials_rejected:
             raise SwaperInvalidCredentials(

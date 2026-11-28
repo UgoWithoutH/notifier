@@ -90,6 +90,8 @@ jobs:
     concurrency:
       group: swaper-diversification
       cancel-in-progress: false
+    outputs:
+      ok: ${{ steps.report.outcome == 'success' }}
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -151,7 +153,94 @@ jobs:
           restore-keys: |
             swaper-diversification-state-
 
+      # Swaper intermittently rejects the (valid) credentials from some
+      # GitHub runner IPs (reCAPTCHA), so a failure here is not fatal: the
+      # swaper_retry job below re-runs it on a different runner.
       - name: Run Swaper diversification report
+        id: report
+        continue-on-error: true
+        env:
+          SWAPER_EMAIL: ${{ secrets.SWAPER_EMAIL }}
+          SWAPER_PASSWORD: ${{ secrets.SWAPER_PASSWORD }}
+          SWAPER_TOTP_SECRET: ${{ secrets.SWAPER_TOTP_SECRET }}
+          GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
+          GOOGLE_CREDENTIALS: ${{ secrets.GOOGLE_CREDENTIALS }}
+        run: bash scripts/run_diversification_for_month_range.sh diversification.swaper_diversification "${{ github.event.inputs.start_month }}" "${{ github.event.inputs.end_month }}"
+
+      - name: Report first attempt failure
+        if: steps.report.outcome == 'failure'
+        run: echo "::warning::Swaper report failed on this runner, retrying on a new runner (swaper_retry job)."
+
+      - name: Save persisted state (session cookies) for the next run
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            diversification/swaper_diversification_storage_state.json
+            diversification/swaper_xirr_cashflows_state.json
+            diversification/swaper_duration_status_state.json
+            diversification/swaper_rate_history_state.json
+          key: swaper-diversification-state-${{ github.run_id }}
+
+  swaper_retry:
+    needs: swaper
+    if: ${{ always() && needs.swaper.outputs.ok == 'false' }}
+    runs-on: ubuntu-22.04
+    concurrency:
+      group: swaper-diversification
+      cancel-in-progress: false
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - name: Install Python dependencies
+        run: pip install -r requirements.txt
+
+      - name: Remove broken third-party apt repos (Azure CLI / Microsoft)
+        run: |
+          sudo find /etc/apt/sources.list.d -maxdepth 1 -type f \( -name "*microsoft*" -o -name "*azure*" \) -print -delete || true
+          sudo sed -i '/packages.microsoft.com/d;/azure-cli/d' /etc/apt/sources.list || true
+          sudo apt-get update
+
+      - name: Cache Playwright browsers
+        uses: actions/cache@v4
+        id: playwright-cache
+        with:
+          path: ~/.cache/ms-playwright
+          key: ${{ runner.os }}-playwright-v2-${{ hashFiles('requirements.txt') }}
+
+      - name: Install Playwright Chromium (cache miss only)
+        if: steps.playwright-cache.outputs.cache-hit != 'true'
+        run: |
+          playwright install chromium
+          playwright install-deps chromium || echo "::warning::install-deps failed (apt unreachable), continuing"
+
+      - name: Install Playwright OS dependencies (cache hit)
+        if: steps.playwright-cache.outputs.cache-hit == 'true'
+        run: |
+          playwright install chromium
+          playwright install-deps chromium || echo "::warning::install-deps failed (apt unreachable), continuing"
+
+      - name: Restore persisted state (session cookies)
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            diversification/swaper_diversification_storage_state.json
+            diversification/swaper_xirr_cashflows_state.json
+            diversification/swaper_duration_status_state.json
+            diversification/swaper_rate_history_state.json
+          key: swaper-diversification-state-retry-${{ github.run_id }}
+          restore-keys: |
+            swaper-diversification-state-
+
+      - name: Run Swaper diversification report (retry on a new runner)
         env:
           SWAPER_EMAIL: ${{ secrets.SWAPER_EMAIL }}
           SWAPER_PASSWORD: ${{ secrets.SWAPER_PASSWORD }}
@@ -169,10 +258,10 @@ jobs:
             diversification/swaper_xirr_cashflows_state.json
             diversification/swaper_duration_status_state.json
             diversification/swaper_rate_history_state.json
-          key: swaper-diversification-state-${{ github.run_id }}
+          key: swaper-diversification-state-retry-${{ github.run_id }}
 
   iuvo:
-    needs: swaper
+    needs: [swaper, swaper_retry]
     if: ${{ always() && inputs.run_iuvo }}
     runs-on: ubuntu-22.04
     concurrency:
